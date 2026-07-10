@@ -1,0 +1,32 @@
+# PyInstaller version resource for LORE.
+# This is what makes Windows show the program as "Lore" (publisher "Gate")
+# in Task Manager's Details tab and in the file's right-click > Properties.
+# Bump the version numbers here together with APP_VERSION / installer.iss.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [StringStruct('CompanyName', 'Gate'),
+           StringStruct('FileDescription', 'LORE - the living tome'),
+           StringStruct('FileVersion', '1.0.0.0'),
+           StringStruct('InternalName', 'Lore'),
+           StringStruct('LegalCopyright', 'Created by Gate'),
+           StringStruct('OriginalFilename', 'Lore.exe'),
+           StringStruct('ProductName', 'Lore'),
+           StringStruct('ProductVersion', '1.0.0.0')])
+      ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

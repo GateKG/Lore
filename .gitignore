@@ -1,0 +1,26 @@
+# build artifacts - build.bat regenerates all of this
+build/
+dist/
+installer_output/
+__pycache__/
+*.spec
+*.log
+
+# ffmpeg binaries are NOT committed (size + licensing) - put ffmpeg.exe and
+# ffprobe.exe in ffmpeg/bin/ yourself; build.bat explains
+ffmpeg/
+
+# local dev scraps and session tooling
+_tests/
+.claude/
+HANDOFF.md
+READ_ME_FIRST.txt
+CHANGES-*.md
+game_autorecord.py
+
+# runtime files that must never ship (settings live next to the installed exe)
+settings.json
+auto_game_names.json
+user_game_names.json
+finish_queue.json
+lore.log
