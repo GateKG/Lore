@@ -8292,6 +8292,31 @@ def lore_app(show_window=True):
             if _paint_it_black():
                 break
             time.sleep(0.1)
+        # The TASKBAR shows the RUNNING window's icon, not the exe resource -
+        # and pywebview never sets one, so the button wore whatever stale mark
+        # Windows had cached. Stamp the form with lore.ico directly: the live
+        # button always shows the current grimoire.
+        try:
+            import webview.platforms.winforms as _wf
+            from System.Drawing import Icon as _NIcon
+            from System import Action as _NAction
+            ip = os.path.join(_here(), "lore.ico")
+            if os.path.isfile(ip):
+                for _form in list(getattr(_wf.BrowserView, "instances", {}).values()):
+                    def _seticon(f=_form):
+                        try:
+                            f.Icon = _NIcon(ip)
+                        except Exception:
+                            pass
+                    try:
+                        if _form.InvokeRequired:
+                            _form.Invoke(_NAction(_seticon))
+                        else:
+                            _seticon()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # The native HWND arrives a beat after the form exists - wait for it,
         # or the corner-rounding and size enforcement silently miss.
         for _ in range(100):
