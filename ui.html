@@ -429,6 +429,23 @@ body.cinema #grip:hover{opacity:1}
 #grip svg{width:22px;height:22px}
 /* the window-mover for the player: the scrying backdrop covers the leather,
    so a slim gold pill up top is the one handle left for dragging the window */
+/* the saving card: top-left, out of the way, gone the moment the bind lands */
+#bindcard{position:fixed;top:52px;left:14px;z-index:60;width:238px;padding:10px 13px 11px;
+  border-radius:11px;background:rgba(16,11,6,.88);pointer-events:none;
+  box-shadow:0 6px 22px rgba(0,0,0,.5),0 0 0 1px rgba(200,160,95,.35);
+  opacity:0;transform:translateY(-6px);transition:opacity .25s,transform .25s}
+#bindcard.on{opacity:1;transform:none}
+#bindcard .bc-title{font:600 9.5px var(--ui);letter-spacing:.14em;text-transform:uppercase;color:#c9a05e}
+#bindcard .bc-name{font:12px var(--serif);color:#e8dcc0;margin:3px 0 7px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+#bindcard .bc-bar{height:5px;border-radius:3px;background:rgba(255,240,214,.14);overflow:hidden}
+#bindcard .bc-bar>div{height:100%;border-radius:3px;width:0%;
+  background:linear-gradient(to right,#8a6428,var(--gold-hi));transition:width .6s ease}
+#bindcard .bc-bar>div.pulse{animation:bcpulse 1.6s ease-in-out infinite}
+@keyframes bcpulse{0%,100%{opacity:.5}50%{opacity:1}}
+#bindcard .bc-sub{font:italic 10.5px var(--serif);color:#b39868;margin-top:6px}
+body.intro #bindcard,body.vfull #bindcard{opacity:0!important}
+
 #dragpill{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:96;
   width:110px;height:5px;border-radius:3px;background:#c9a05e;opacity:.4;
   cursor:grab;display:none;transition:opacity .2s}
@@ -1099,7 +1116,7 @@ body.reduced #intro{display:none}
       <div class="iwrap">
         <div class="isigil" id="introsigil"></div>
         <div class="iname">LORE</div>
-        <div class="isub">the living tome of your games</div>
+        <div class="isub">where your games write their story</div>
       </div>
       <!-- hint removed: the cover opens on click -->
     </div>
@@ -1345,7 +1362,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'1.0'}),
+      webhook:true,version:'1.01'}),
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1376,7 +1393,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.0'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.01'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -1935,7 +1952,7 @@ function renderFront(cL,cR,spreadIdx){
   const sg=el('div','front-sigil');sg.innerHTML=sigilSVG('lore-itself',{c:'#c9a05e'},true);
   sg.style.filter='drop-shadow(0 0 14px rgba(201,160,94,.4))';
   wrap.append(sg,el('div','front-wordmark','LORE'),
-    el('div','front-sub','the living tome of your games'));
+    el('div','front-sub','where your games write their story'));
   bl.append(wrap);
   folio(cL,spreadIdx,'l','frontispiece');
   ptitle(cR,'','',{c:'#8a6f42'});
@@ -2282,13 +2299,8 @@ function renderSet(cL,cR,app,spreadIdx){
     const pb=el('button','wbtn','Preview');
     pb.addEventListener('click',()=>api.preview_popup(S.settings.settings.popup_style,S.settings.settings.popup_size));
     row(R,'See one',pb);
-    divider(R,'The light');
-    row(R,'Mood',(()=>{const sg=el('div','seg');
-      [['dark','Midnight'],['light','Candlelit']].forEach(([val,lab])=>{
-        const b=el('button','',lab);if(v.theme===val)b.classList.add('on');
-        b.addEventListener('click',()=>{sg.querySelectorAll('button').forEach(x=>x.classList.remove('on'));
-          b.classList.add('on');queueSave({theme:val});});sg.append(b);});
-      return sg;})());
+    /* the Mood toggle is gone: LORE wears ONE look now (the midnight leather).
+       a second "light" skin was a maintenance tax on every visual fix. */
     divider(R,'The tome');
     R.append(el('div','shint',`LORE v${esc(st.version)} — created by Gate. Drag the leather to move (snap to screen edges works); the brass corner or ▢ resizes.`));
     const qb=el('button','wbtn danger','Close the tome for the night');
@@ -2396,6 +2408,16 @@ function prewarmTurn(){
       const tpl=$('#leaf'),pages=$('#pages');
       if(!tpl||!pages||!S.spreads.length){_turnWarmed=true;resolve(true);return;}
       warmCache(); cachedSpread(S.idx);
+      /* the visible warm STAGE (leaf clones at opacity .02) exists ONLY while
+         the opaque intro cover hides it. Re-armed after the intro (resize
+         settles reset _turnWarmed) it sat right on the naked leather - the
+         "ghost of the papers with a shadow" he kept seeing. Post-intro, warm
+         by decoding alone: the paused-spawn + 2-rAF lift covers the raster. */
+      if(!document.body.classList.contains('intro')){
+        Promise.all([decodeSpread(S.idx),decodeSpread(S.idx+1),decodeSpread(S.idx-1)])
+          .catch(()=>{}).then(()=>{_turnWarmed=true;resolve(true);});
+        return;
+      }
       const jobs=[];
       if(S.idx<S.spreads.length-1)jobs.push([S.idx,S.idx+1,1]);
       if(S.idx>0)jobs.push([S.idx,S.idx-1,-1]);
@@ -2818,7 +2840,7 @@ function paintTabs(){
      now (~2/3 the old length) and the gem sits on the INNER edge, next to
      the page. Left column: gem appended (right=inner). Right column: gem
      prepended (left=inner). */
-  const GW=Math.round(wing())+23;   /* stretch the plate out toward the book's edge, stopping just before the gold rim line */
+  const GW=Math.min(150,Math.round(wing()))+23;   /* LOCKED plate length: the tabs are furniture, not upholstery - on an ultrawide the old wing()-stretch made them a metre long while only the PAGES were meant to grow */
   const GEMS=['#09eee6','#7F99E8','#c9b4ff','#96e8de','#a8aed1','#6a70f2','#b79ade'];
   const glowOf=hex=>{const n=parseInt(hex.slice(1),16);
     return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},.42)`;};
@@ -2907,7 +2929,32 @@ function sealColor(state){
   return {watching:'var(--gold)',starting:'var(--gold-hi)',recording:'var(--ember)',
     paused:'var(--warn)',saving:'var(--violet)',stopped:'#666'}[state]||'var(--gold)';
 }
+/* the top-left saving card: filename, live bar, ETA and write speed while a
+   session is being bound into the book. Honest numbers beat a mystery pill. */
+function applyBindCard(b){
+  let c=$('#bindcard');
+  if(!b){if(c)c.classList.remove('on');return;}
+  if(!c){
+    c=el('div');c.id='bindcard';
+    c.innerHTML='<div class="bc-title">sealing into the book</div>'+
+      '<div class="bc-name"></div><div class="bc-bar"><div></div></div>'+
+      '<div class="bc-sub"></div>';
+    document.body.appendChild(c);
+  }
+  c.classList.add('on');
+  c.querySelector('.bc-name').textContent=b.name||'';
+  const pct=(b.pct!=null)?Math.max(0,Math.min(100,b.pct)):null;
+  const bar=c.querySelector('.bc-bar>div');
+  bar.style.width=(pct!=null?pct:8)+'%';
+  bar.classList.toggle('pulse',pct==null);
+  const bits=[];
+  if(pct!=null)bits.push(pct+'%');
+  if(b.eta!=null)bits.push('~'+(b.eta>=90?Math.round(b.eta/60)+' min':b.eta+'s')+' left');
+  if(b.mbps!=null&&b.mbps>0.2)bits.push(Math.round(b.mbps)+' MB/s');
+  c.querySelector('.bc-sub').textContent=bits.join(' · ')||'measuring…';
+}
 function applyState(st){
+  applyBindCard(st.binding||null);
   const seal=$('#seal');
   const s=st.status in STATE_TXT?st.status:'watching';
   if(s!==S.lastStatus&&(s==='recording'||s==='saving')){
@@ -3016,8 +3063,9 @@ async function pollLibrary(){
   await refreshLibrary(false);setTimeout(pollLibrary,2000);}
 
 function applyMood(){
-  const th=S.settings&&S.settings.settings.theme;
-  document.body.dataset.mood=(th==='light')?'candle':'midnight';
+  /* one look only: midnight. The candlelit skin is retired (an old saved
+     theme:'light' must not resurrect it). */
+  document.body.dataset.mood='midnight';
 }
 
 /* ---------------------------------------------------------------- dust */
@@ -3644,42 +3692,46 @@ function openTome(){
     _tomeOpening=false;
   }
 }
-/* Called from Python just before the window hides (rest in tray): put the
-   book back in its closed state so the NEXT show opens it again. */
+/* Called from Python just before the window hides (rest in tray). The intro is
+   a ONE-TIME ceremony - it plays when the exe cold-starts and NEVER again, so
+   resting only tidies up: settle sheets, close the player, land on contents.
+   The book stays open exactly as the reader will find it. */
 window.tomeRest=function(){
   try{
-    const iv=$('#intro');
-    if(!iv)return;
     clearTimeout(_openTimer);          /* don't let a pending open hide the overlay */
     settleFlightNow();                 /* abandon any leaf mid-air first */
     closeViewer();
-    iv.classList.remove('fading');     /* reset the card so the next show fades in again */
+    const iv=$('#intro');
+    if(iv){iv.classList.remove('fading');iv.style.display='none';}
+    document.body.classList.remove('intro');
     _tomeOpening=false;
     renderSpread(0);                   /* wake to the first page, current data */
-    if(document.body.classList.contains('reduced')){
-      /* reduced-motion never plays the swing, so it must NOT close the book -
-         it would trap the (hidden-during-intro) window buttons off-screen */
-      iv.style.display='none';
-      document.body.classList.remove('intro');
-    }else{
-      iv.style.display='';
-      document.body.classList.add('intro');
-    }
   }catch(e){}
 };
-/* Called from Python right after the window shows again. */
+/* Called from Python JUST BEFORE the window shows again: arm a leather veil at
+   full opacity (synchronous - no rAF, the window is still hidden), so the
+   first visible frame is calm leather; once frames tick, it fades out fast.
+   That is the tray-open "soft fade in" instead of the content popping. */
 window.tomeWake=function(){
   try{
-    if(document.body.classList.contains('reduced')){
-      /* no ceremony - just make sure the book is open and the chrome is back */
-      document.body.classList.remove('intro');
-      const iv=$('#intro');if(iv)iv.style.display='none';
-      return;
-    }
-    if(document.body.classList.contains('intro')){
-      setTimeout(prewarmTurn,120);
-      setTimeout(openTome,420);   /* the backend's show_tome contract: "the book was closed when it went to rest - open it again". this call was dropped in a rework and every tray-wake stranded a closed cover with hidden chrome */
-    }
+    /* geometry may have changed while we slept (game resolution switches) and
+       the resize settle drops events during rest - reconcile now */
+    try{window._relayout&&window._relayout();}catch(e){}
+    if(document.body.classList.contains('reduced'))return;
+    let v=document.getElementById('wakeveil');
+    if(!v){
+      v=document.createElement('div');v.id='wakeveil';
+      v.style.cssText='position:fixed;inset:0;z-index:200;pointer-events:none;'+
+        'background:linear-gradient(180deg,var(--leather) 0%,var(--leather) 46%,var(--leather-lo) 100%);'+
+        'opacity:1';
+      document.body.appendChild(v);
+    }else{v.style.transition='';v.style.opacity='1';}
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      v.style.transition='opacity .22s ease';
+      v.style.opacity='0';
+      setTimeout(()=>{try{v.remove();}catch(e){}},420);
+    }));
+    setTimeout(()=>{try{v.remove();}catch(e){}},1200);   /* safety: the veil must never be able to linger */
   }catch(e){}
 };
 function playIntro(){

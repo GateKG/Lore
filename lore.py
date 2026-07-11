@@ -2,7 +2,7 @@
 """
 lore.py - the whole LORE app in one file.
 --------------------------------------------------------
-LORE - a living tome that records your games on Windows: smooth video,
+LORE - the book your games write. It records them on Windows: smooth video,
 clean audio, true HDR handling, clips, and a book for every memory.
 
 How it works:
@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.0"   # the first public edition - the 1.2.x line was the private Records lineage
+APP_VERSION = "1.01"
 
 try:
     import psutil
@@ -2507,6 +2507,13 @@ def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset
 # badge (with real percent progress) on the file's card while ffmpeg works.
 _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
               "busy": False, "aborted": False}
+
+# Live BIND (save-mux) progress, read by state() for the tome's saving card:
+# pct from ffmpeg's -progress out_time vs the session's known length, MB/s from
+# the growing temp file. Also the instrumentation for "why was that save slow" -
+# the completion log line records wall time, size and speed for every bind.
+_BINDING = {"name": None, "pct": None, "eta": None, "mbps": None,
+            "t0": 0.0, "total": 0.0}
 _FINISH_FAILS = {}     # path -> genuine failure count (interruptions don't count)
 
 # Files the user is actively READING right now (the in-tome player streaming,
@@ -3355,14 +3362,17 @@ class Session:
                     f"mic {off_mic:+d} ms")
             else:
                 # fallback: the legacy duration guess (anchors unavailable).
-                # Needs the total video length - sum the segments if there's no
-                # merged file (rare path; a few probes beat a multi-GB write).
+                # Needs the total video length - probe FIRST + LAST segment and
+                # extrapolate the uniform middle. The old way probed EVERY
+                # segment: a 30-minute session is ~450 ffprobe SPAWNS, minutes
+                # of pure process churn before the mux even started.
                 if vdur is None:
                     if src_is_concat:
                         try:
-                            parts = [_probe_duration(p) for p in segs]
-                            if all(x is not None for x in parts):
-                                vdur = sum(parts)
+                            dfirst = _probe_duration(segs[0])
+                            dlast = _probe_duration(segs[-1]) if len(segs) > 1 else 0
+                            if dfirst is not None and dlast is not None:
+                                vdur = dfirst * max(1, len(segs) - 1) + dlast
                         except Exception:
                             vdur = None
                     else:
@@ -3376,20 +3386,93 @@ class Session:
         # 3. Mux to a temp file, then rename so the final appears atomically.
         tmp_out = out + ".__assembling__.mp4"
 
+        # the session's length for the progress card - cheap: first + last
+        # segment, uniform middle extrapolated
+        bind_total = 0.0
+        try:
+            d0 = _probe_duration(segs[0])
+            dl = _probe_duration(segs[-1]) if len(segs) > 1 else 0
+            if d0 is not None and dl is not None:
+                bind_total = d0 * max(1, len(segs) - 1) + dl
+        except Exception:
+            pass
+        _BINDING.update({"name": os.path.basename(out), "pct": None, "eta": None,
+                         "mbps": None, "t0": time.time(), "total": bind_total})
+
         def _mux(src, is_concat):
             cmd = build_mux_cmd(src, sys_wav, mic_wav, tmp_out, off_sys, off_mic,
                                 video_is_concat=is_concat)
+            # live progress on stdout (out_time_us lines); stderr kept for errors
+            cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
+            t_start = time.time()
             try:
-                r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.PIPE, creationflags=flags,
-                                   timeout=1800)
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, creationflags=flags)
             except Exception as e:
+                log(f"Mux failed to start ({e}); raw footage kept in the cache.")
+                return False
+            err_tail = []
+
+            def _drain_err():
+                try:
+                    for ln in iter(p.stderr.readline, b""):
+                        err_tail.append(ln)
+                        if len(err_tail) > 8:
+                            err_tail.pop(0)
+                except Exception:
+                    pass
+            threading.Thread(target=_drain_err, daemon=True).start()
+            last_size_t = t_start
+            last_size = 0
+            try:
+                for ln in iter(p.stdout.readline, b""):
+                    if time.time() - t_start > 1800:
+                        p.kill()
+                        log("Mux exceeded 30 minutes; killed. Raw footage kept in the cache.")
+                        return False
+                    s_ln = ln.decode("utf-8", "ignore").strip()
+                    if s_ln.startswith("out_time_us=") or s_ln.startswith("out_time_ms="):
+                        try:
+                            done_s = int(s_ln.split("=")[1]) / 1e6
+                            if bind_total > 1:
+                                pct = max(0, min(99, int(done_s / bind_total * 100)))
+                                _BINDING["pct"] = pct
+                                spent = time.time() - _BINDING["t0"]
+                                if pct >= 3:
+                                    _BINDING["eta"] = max(0, int(spent * (100 - pct) / pct))
+                        except Exception:
+                            pass
+                        now = time.time()
+                        if now - last_size_t >= 1.5:
+                            try:
+                                sz = os.path.getsize(tmp_out) if os.path.isfile(tmp_out) else 0
+                                _BINDING["mbps"] = max(0.0, (sz - last_size) / 1e6
+                                                       / max(0.2, now - last_size_t))
+                                last_size, last_size_t = sz, now
+                            except Exception:
+                                pass
+                p.wait(timeout=60)
+            except Exception as e:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
                 log(f"Mux failed/stalled ({e}); raw footage kept in the cache.")
                 return False
-            good = (r.returncode == 0 and os.path.isfile(tmp_out)
+            good = (p.returncode == 0 and os.path.isfile(tmp_out)
                     and os.path.getsize(tmp_out) > 0)
-            if not good:
-                err = (r.stderr or b"").decode("utf-8", "ignore").strip().splitlines()
+            if good:
+                # the honest ledger: every bind states its wall time and speed,
+                # so a slow save is a MEASURED fact with a size attached
+                try:
+                    secs = max(0.1, time.time() - t_start)
+                    gb = os.path.getsize(tmp_out) / 1e9
+                    log(f"Bound {os.path.basename(out)}: {gb:.2f} GB in "
+                        f"{secs:.0f}s ({gb * 1000 / secs:.0f} MB/s)")
+                except Exception:
+                    pass
+            else:
+                err = b"".join(err_tail).decode("utf-8", "ignore").strip().splitlines()
                 for line in err[-4:]:
                     log("  ffmpeg: " + line)
             return good
@@ -5190,14 +5273,31 @@ def _load_auto_game_names():
         with open(_auto_names_path(), encoding="utf-8") as fh:
             raw = json.load(fh)
         if isinstance(raw, dict):
+            # self-heal: an older learner could persist engine internals
+            # (TAGame et al.) - drop them on load so the filename-derived
+            # title takes over again and the next launch re-learns properly
+            junk = {"tagame", "ue4game", "ue5game", "unrealwindow", "cryengine",
+                    "unityplayer", "godot engine", "gameapp",
+                    "bootstrappackagedgame", "d3d11", "dx11", "main"}
+            healed = False
             for k, v in raw.items():
                 kk = _norm_game_key(k)
                 if not kk:
+                    continue
+                nm = v if isinstance(v, str) else str((v or {}).get("name", ""))
+                if nm.strip().lower() in junk:
+                    healed = True
                     continue
                 if isinstance(v, str):
                     d[kk] = {"name": v, "source": "legacy", "confidence": 50}
                 elif isinstance(v, dict) and str(v.get("name", "")).strip():
                     d[kk] = v
+            if healed:
+                try:
+                    _atomic_write_json(_auto_names_path(), d)
+                    log("Purged engine-junk game titles from the learned names.")
+                except Exception:
+                    pass
     except Exception:
         d = {}
     _AUTO_GAME_NAMES = d
@@ -5252,10 +5352,19 @@ def _clean_game_display_title(title, raw_base=""):
     s = re.sub(r"\s+", " ", s).strip(" -_|—–")
     low = s.lower()
     bad_exact = {"unity", "unreal engine", "game", "launcher", "bootstrapper",
-                 "loading", "not responding", "application", "windows"}
+                 "loading", "not responding", "application", "windows",
+                 # engine INTERNALS that leak through EXE version metadata -
+                 # Rocket League's FileDescription is literally "TAGame"
+                 "tagame", "ue4game", "ue5game", "unrealwindow", "cryengine",
+                 "unityplayer", "godot engine", "gameapp",
+                 "bootstrappackagedgame", "d3d11", "dx11", "main"}
     if low in bad_exact or low.endswith(" launcher") or low.startswith("unreal "):
         return None
-    if raw_base and _norm_game_key(s) in {"", "win64shipping", "shipping", _norm_game_key(raw_base)}:
+    # NOTE: a name that merely EQUALS the exe stem is kept - it is the CORRECT
+    # title and must be able to OUTRANK engine junk. (Rejecting it here once
+    # left "TAGame" as the only exe-version candidate, which then won.) The
+    # learner skips STORING a pointless same-as-stem alias instead.
+    if raw_base and _norm_game_key(s) in {"", "win64shipping", "shipping"}:
         return None
     # Avoid volatile titles that are probably just level/server/editor state.
     if re.search(r"\b(level|map|server|lobby|match|profile|settings|options)\b", low) and len(s.split()) <= 3:
@@ -5438,8 +5547,18 @@ def _learn_game_display_name(pname):
         if not candidates:
             return None
         score, source, name = sorted(candidates, key=lambda x: (-x[0], -len(x[2])))[0]
-        if score < 70 and _norm_game_key(name) == _norm_game_key(raw_base):
-            return None
+        if _norm_game_key(name) == _norm_game_key(raw_base):
+            # the winner just confirms the filename-derived title: nothing worth
+            # persisting, and crucially nothing WRONG got stored either
+            return name
+        # a Steam miss at record start is usually Steam rewriting the manifest
+        # at that exact second (LastPlayed) - re-learn shortly after, when the
+        # acf is whole again, so the 94-point steam name replaces any weaker win
+        if source != "steam-manifest" and exe and "steamapps" in exe.lower():
+            try:
+                threading.Timer(20.0, lambda p=pname: _learn_game_display_name(p)).start()
+            except Exception:
+                pass
         auto = dict(_load_auto_game_names())
         keys = {_norm_game_key(raw_base), _norm_game_key(pname)}
         if exe:
@@ -6409,6 +6528,10 @@ class _JsApi:
         if _FINISHING.get("busy") and _FINISHING.get("path"):
             conv = {"name": os.path.basename(_FINISHING["path"]),
                     "pct": _FINISHING.get("pct")}
+        binding = None
+        if getattr(ctl, "saving", 0) > 0 and _BINDING.get("name"):
+            binding = {"name": _BINDING["name"], "pct": _BINDING.get("pct"),
+                       "eta": _BINDING.get("eta"), "mbps": _BINDING.get("mbps")}
         now = time.time()
         if now - self._hdr_cache["t"] > 5:
             self._hdr_cache = {"t": now, "v": _hdr_active()}
@@ -6425,6 +6548,7 @@ class _JsApi:
                 pass
         return {"status": s, "game": game, "elapsed": elapsed,
                 "saving": getattr(ctl, "saving", 0) > 0,
+                "binding": binding,
                 "converting": conv,
                 "queued": len(_load_finish_queue()) if SETTINGS.get("sdr_finish", True) else 0,
                 "encoder": _friendly_codec(SETTINGS.get("_encoder_resolved")),
@@ -7900,6 +8024,18 @@ def lore_app(show_window=True):
             api._reveal_ok = True
             if api._win is not None:
                 _paint_it_black()      # no white face, even pre-init
+                # Arm the wake veil BEFORE the window is visible: tomeWake sets
+                # a full-opacity leather overlay synchronously (no frame ticks
+                # needed while hidden), so the first visible frame is calm
+                # leather that then fades into the book - the tray-open no
+                # longer POPS. Quick and bounded: one try, then show regardless
+                # (the retry thread below still wakes a slow-booting browser).
+                woke = False
+                try:
+                    api._win.evaluate_js("window.tomeWake&&tomeWake()")
+                    woke = True
+                except Exception:
+                    pass
                 api._win.show()
                 # Only un-MINIMIZE. A blanket restore() also un-maximized a
                 # maximized tome every time it came back from the tray (or
@@ -7913,20 +8049,20 @@ def lore_app(show_window=True):
                         ctypes.windll.user32.SetForegroundWindow(h)
                 except Exception:
                     pass
-                # The book was closed when it went to rest - open it again.
-                # On its own thread with retries: on a hidden autostart the
-                # browser may still be initialising, and evaluate_js would
-                # block whichever thread asked (tray or pump) until it's up.
-                w = api._win
+                # If the pre-show wake failed (hidden autostart: the browser may
+                # still be initialising and evaluate_js raises), retry on a
+                # thread so the geometry-reconcile inside tomeWake still runs.
+                if not woke:
+                    w = api._win
 
-                def _wake():
-                    for _ in range(20):
-                        try:
-                            w.evaluate_js("window.tomeWake&&tomeWake()")
-                            return
-                        except Exception:
-                            time.sleep(0.5)
-                threading.Thread(target=_wake, daemon=True).start()
+                    def _wake():
+                        for _ in range(20):
+                            try:
+                                w.evaluate_js("window.tomeWake&&tomeWake()")
+                                return
+                            except Exception:
+                                time.sleep(0.5)
+                    threading.Thread(target=_wake, daemon=True).start()
         except Exception:
             pass
 
