@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.01"
+APP_VERSION = "1.02"
 
 try:
     import psutil
@@ -128,7 +128,6 @@ DEFAULTS = {
     "popup_style":       "slide",     # slide | rise | pop | glow | sweep | off
     "popup_size":        "large",     # small | medium | large | huge
     "sfx_volume":        25,          # volume of the app's start/stop/shutter sounds (0-100)
-    "theme":             "dark",      # UI theme: "dark" or "light"
 
     # Global hotkeys (assignable in Settings). Blank = disabled.
     # ONE key handles recording: it starts a recording when idle and stops &
@@ -2514,6 +2513,8 @@ _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
 # the completion log line records wall time, size and speed for every bind.
 _BINDING = {"name": None, "pct": None, "eta": None, "mbps": None,
             "t0": 0.0, "total": 0.0}
+_TRAY_ICON = [None]    # the pystray icon, stashed so the bind loop can whisper
+                       # progress into the tooltip without threading ctl through
 _FINISH_FAILS = {}     # path -> genuine failure count (interruptions don't count)
 
 # Files the user is actively READING right now (the in-tome player streaming,
@@ -2582,6 +2583,7 @@ def _save_finish_queue(items):
     try:
         with _FINISH_Q_LOCK:
             _atomic_write_json(_finish_queue_path(), items)
+        _FINISH_Q_CACHE["t"] = 0.0   # every writer lands here - wake the read cache
     except Exception:
         pass
 
@@ -2602,12 +2604,15 @@ def _queue_sdr_finish(path):
             log(f"SDR finish skipped ({dur / 60:.0f} min > {cap_min} min cap): "
                 + os.path.basename(path))
             return
-        q = _load_finish_queue()
-        ap = os.path.abspath(path)
-        if not any(it["path"] == ap for it in q):
-            q.append({"path": ap, "nits": _sdr_white_nits() or 240})
-            _save_finish_queue(q)
-            log("Queued for SDR conversion: " + os.path.basename(path))
+        # one locked unit: a delete's queue rewrite racing this append used to
+        # overwrite the new entry - the file then stayed HDR forever, silently
+        with _FINISH_Q_LOCK:
+            q = _load_finish_queue()
+            ap = os.path.abspath(path)
+            if not any(it["path"] == ap for it in q):
+                q.append({"path": ap, "nits": _sdr_white_nits() or 240})
+                _save_finish_queue(q)
+                log("Queued for SDR conversion: " + os.path.basename(path))
     except Exception:
         pass
 
@@ -2627,6 +2632,19 @@ def _sdr_finish_abort():
 _FINISH_Q_CACHE = {"t": 0.0, "q": []}
 
 
+def _queued_finish_paths():
+    """The queue as plain paths, through a small cache. state() polls every
+    ~.6s and the badge scans hit this per file - each used to be a fresh file
+    read + json parse. 5s is safe: _save_finish_queue zeroes the clock, so a
+    real change still shows on the very next tick."""
+    now = time.time()
+    if now - _FINISH_Q_CACHE["t"] > 5.0:
+        _FINISH_Q_CACHE["q"] = ([it["path"] for it in _load_finish_queue()]
+                                if SETTINGS.get("sdr_finish", True) else [])
+        _FINISH_Q_CACHE["t"] = now
+    return _FINISH_Q_CACHE["q"]
+
+
 def _finish_badge(path):
     """What the dashboard should say on this file's card:
         ('Making standard version - 43%', 'conv')  while ffmpeg works on it
@@ -2637,8 +2655,9 @@ def _finish_badge(path):
     standard video that works everywhere. The badge must not imply the file
     is broken while it waits (that read as 'what is it even converting?').
     The file stays clickable the whole time - conversion writes to a temp name
-    and swaps in atomically. Queue reads are cached ~1s: the cards poll every
-    second and the queue is a file on disk."""
+    and swaps in atomically. Queue reads ride the ~5s
+    _queued_finish_paths cache (writes wake it) - the cards poll every second
+    and the queue is a file on disk."""
     try:
         ap = os.path.abspath(path)
         if _FINISHING["busy"] and _FINISHING["path"] == ap:
@@ -2647,12 +2666,7 @@ def _finish_badge(path):
                 return (f"Restoring true colour — {pct:.0f}%", "conv")
             el = max(0, int(time.time() - (_FINISHING["t0"] or time.time())))
             return (f"Restoring true colour — {el // 60}:{el % 60:02d}", "conv")
-        now = time.time()
-        if now - _FINISH_Q_CACHE["t"] > 1.0:
-            _FINISH_Q_CACHE["q"] = ([it["path"] for it in _load_finish_queue()]
-                                    if SETTINGS.get("sdr_finish", True) else [])
-            _FINISH_Q_CACHE["t"] = now
-        if ap in _FINISH_Q_CACHE["q"]:
+        if ap in _queued_finish_paths():
             return ("Fine to watch — restores colour when idle", "wait")
     except Exception:
         pass
@@ -2706,6 +2720,19 @@ def _sdr_finish_worker(item, ctl=None):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, creationflags=flags)
         _FINISHING["proc"] = proc
+        err_tail = bytearray()
+
+        def _read_err():
+            # drain stderr as it comes: a decode-error-spamming source would
+            # otherwise fill the 64K pipe and wedge ffmpeg until the watchdog
+            # kills it - a stall billed as a strike the file didn't earn
+            try:
+                for raw_e in proc.stderr:
+                    err_tail.extend(raw_e)
+                    del err_tail[:-4096]
+            except Exception:
+                pass
+        threading.Thread(target=_read_err, daemon=True).start()
 
         def _read_progress():
             # ffmpeg -progress emits 'out_time_ms=<microseconds>' lines; against
@@ -2764,11 +2791,7 @@ def _sdr_finish_worker(item, ctl=None):
         elif aborted:
             log("SDR conversion paused (recording started); will retry later.")
         else:
-            err = b""
-            try:
-                err = proc.stderr.read() or b""
-            except Exception:
-                pass
+            err = bytes(err_tail)
             for ln in err.decode("utf-8", "ignore").strip().splitlines()[-2:]:
                 log("  ffmpeg(sdr): " + ln)
             log("SDR conversion attempt failed; keeping the HDR original for now.")
@@ -3436,6 +3459,12 @@ class Session:
                             done_s = int(s_ln.split("=")[1]) / 1e6
                             if bind_total > 1:
                                 pct = max(0, min(99, int(done_s / bind_total * 100)))
+                                if pct != _BINDING["pct"] and _TRAY_ICON[0] is not None:
+                                    # the tray answers "how far along?" without opening the tome
+                                    try:
+                                        _TRAY_ICON[0].title = f"Lore - binding {pct}%"
+                                    except Exception:
+                                        pass
                                 _BINDING["pct"] = pct
                                 spent = time.time() - _BINDING["t0"]
                                 if pct >= 3:
@@ -4212,7 +4241,22 @@ def _trigger_replay(ctl, seconds=None, force_discord=False):
     ctl.notify("Clip", f"Saving the last ~{secs}s...")
 
     def work():
-        path = sess.save_replay(secs)
+        # a clip binds on a worker thread too - wear the same honest card the
+        # session bind wears (and make quit wait for it) unless a session bind
+        # already owns the card and the counter
+        fresh = getattr(ctl, "saving", 0) <= 0
+        if fresh:
+            with ctl.lock:
+                ctl.saving += 1
+            _BINDING.update({"name": f"last {secs}s clip", "pct": None,
+                             "eta": None, "mbps": None,
+                             "t0": time.time(), "total": 0.0})
+        try:
+            path = sess.save_replay(secs)
+        finally:
+            if fresh:
+                with ctl.lock:
+                    ctl.saving -= 1
         if path:
             ctl.notify("Clip captured \u2713", os.path.basename(path))
             # Only the dedicated "Clip + post to Discord" hotkey ever uploads; the
@@ -4285,6 +4329,13 @@ def _finalize_async(ctl, session):
             idle = ctl.saving <= 0 and ctl.session is None
         if idle and ctl.status == "saving":
             ctl.set_status("watching")
+        # the bind is over - never leave the tooltip frozen at 99%
+        ic = ctl.icon
+        if ic is not None:
+            try:
+                ic.title = f"Lore - {ctl.status}"
+            except Exception:
+                pass
     threading.Thread(target=work, daemon=True).start()
 
 
@@ -5228,6 +5279,7 @@ _GAME_NAMES = {
 
 _USER_GAME_NAMES = None   # lazy cache: {current-title.lower(): user's new title}
 _AUTO_GAME_NAMES = None   # lazy cache: {normalised exe/title key: {name, source, confidence, ...}}
+_RELEARN_PENDING = set()  # stems with a steam re-learn timer already ticking - one shot, never a chain
 
 
 def _user_names_path():
@@ -5358,7 +5410,9 @@ def _clean_game_display_title(title, raw_base=""):
                  "tagame", "ue4game", "ue5game", "unrealwindow", "cryengine",
                  "unityplayer", "godot engine", "gameapp",
                  "bootstrappackagedgame", "d3d11", "dx11", "main"}
-    if low in bad_exact or low.endswith(" launcher") or low.startswith("unreal "):
+    # only the ENGINE's splash strings are junk - a bare "unreal " prefix
+    # used to eat the actual Unreal Tournament titles
+    if low in bad_exact or low.endswith(" launcher") or low.startswith(("unreal engine", "unreal editor")):
         return None
     # NOTE: a name that merely EQUALS the exe stem is kept - it is the CORRECT
     # title and must be able to OUTRANK engine junk. (Rejecting it here once
@@ -5516,7 +5570,7 @@ def _folder_name_for_exe(exe_path):
     return None
 
 
-def _learn_game_display_name(pname):
+def _learn_game_display_name(pname, retry=True):
     """Discover and persist the best no-internet display name for a running game.
     Priority: taskbar/window title -> Steam manifest -> registry -> EXE metadata -> folder.
     The alias key is the raw EXE stem, so old recordings and future recordings both
@@ -5547,18 +5601,28 @@ def _learn_game_display_name(pname):
         if not candidates:
             return None
         score, source, name = sorted(candidates, key=lambda x: (-x[0], -len(x[2])))[0]
+        # a Steam miss at record start is usually Steam rewriting the manifest
+        # at that exact second (LastPlayed) - re-learn ONCE shortly after, when
+        # the acf is whole again. gated on steam actually MISSING: window-title
+        # outranks steam 95>94, so testing the winner's source was true on
+        # every run and chained a 20s full-rescan timer all session long.
+        # sits ABOVE the same-as-stem return so a stem-titled winner can't
+        # swallow the retry; one-shot (retry flag + pending set) so parallel
+        # record starts can't stack timers either.
+        if retry and sn is None and exe and "steamapps" in exe.lower() \
+                and raw_base not in _RELEARN_PENDING:
+            try:
+                _RELEARN_PENDING.add(raw_base)
+                def _relearn(p=pname, b=raw_base):
+                    _RELEARN_PENDING.discard(b)
+                    _learn_game_display_name(p, retry=False)
+                threading.Timer(20.0, _relearn).start()
+            except Exception:
+                _RELEARN_PENDING.discard(raw_base)
         if _norm_game_key(name) == _norm_game_key(raw_base):
             # the winner just confirms the filename-derived title: nothing worth
             # persisting, and crucially nothing WRONG got stored either
             return name
-        # a Steam miss at record start is usually Steam rewriting the manifest
-        # at that exact second (LastPlayed) - re-learn shortly after, when the
-        # acf is whole again, so the 94-point steam name replaces any weaker win
-        if source != "steam-manifest" and exe and "steamapps" in exe.lower():
-            try:
-                threading.Timer(20.0, lambda p=pname: _learn_game_display_name(p)).start()
-            except Exception:
-                pass
         auto = dict(_load_auto_game_names())
         keys = {_norm_game_key(raw_base), _norm_game_key(pname)}
         if exe:
@@ -5853,23 +5917,28 @@ def _video_duration(path):
 
 def _scan_dir_mp4s(directory, kind):
     """All finished .mp4s in one folder (work-in-progress '.__' temps skipped,
-    same rule the old dashboard lived by)."""
+    same rule the old dashboard lived by). os.scandir, because the signature
+    poll walks every shelf every 2s: the old isfile+getsize+stat trio paid
+    three syscalls per file, while scandir's entries carry the stat data for
+    free on Windows."""
     items = []
     try:
-        if os.path.isdir(directory):
-            for f in os.listdir(directory):
+        with os.scandir(directory) as it:
+            for e in it:
+                f = e.name
                 if f.startswith(".") or not f.lower().endswith(".mp4"):
                     continue
                 if ".__" in f:
                     continue
-                p = os.path.join(directory, f)
                 try:
-                    if not os.path.isfile(p) or os.path.getsize(p) < 100_000:
+                    if not e.is_file():
                         continue
-                    st = os.stat(p)
+                    st = e.stat()
                 except Exception:
                     continue
-                items.append({"path": p, "file": f, "kind": kind,
+                if st.st_size < 100_000:
+                    continue
+                items.append({"path": e.path, "file": f, "kind": kind,
                               "mtime": st.st_mtime, "size": st.st_size})
     except Exception:
         pass
@@ -6513,6 +6582,7 @@ class _JsApi:
                                   # must never pop the window open on its own
         self._drag_live = [False]   # a cursor-follow move loop is running
         self._fs_prev = None        # Win32 true-fullscreen restore state
+        self._disk_cache = {"t": 0.0, "v": None}   # free-space, 5s pulse
 
     # ---------------- state ----------------
     def state(self):
@@ -6537,7 +6607,12 @@ class _JsApi:
             self._hdr_cache = {"t": now, "v": _hdr_active()}
         free_gb = None
         try:
-            free_gb = shutil.disk_usage(SETTINGS.get("output_dir", ".")).free / 1e9
+            # one syscall, but every ~.6s for a number that crawls (and nothing
+            # in the tome reads it yet) - same 5s pulse as _hdr_cache above
+            if now - self._disk_cache["t"] > 5:
+                self._disk_cache = {"t": now, "v": shutil.disk_usage(
+                    SETTINGS.get("output_dir", ".")).free / 1e9}
+            free_gb = self._disk_cache["v"]
         except Exception:
             pass
         size_mb = None
@@ -6550,7 +6625,7 @@ class _JsApi:
                 "saving": getattr(ctl, "saving", 0) > 0,
                 "binding": binding,
                 "converting": conv,
-                "queued": len(_load_finish_queue()) if SETTINGS.get("sdr_finish", True) else 0,
+                "queued": len(_queued_finish_paths()),
                 "encoder": _friendly_codec(SETTINGS.get("_encoder_resolved")),
                 "fps": SETTINGS.get("framerate", 60),
                 "hdr": self._hdr_cache["v"],
@@ -6717,9 +6792,12 @@ class _JsApi:
             except Exception:
                 pass
             try:
-                q = [it for it in _load_finish_queue()
-                     if os.path.normcase(os.path.abspath(it.get("path", ""))) != ap]
-                _save_finish_queue(q)
+                # locked pair: unlocked, this rewrite could erase an entry a
+                # finishing clip appended between our load and our save
+                with _FINISH_Q_LOCK:
+                    q = [it for it in _load_finish_queue()
+                         if os.path.normcase(os.path.abspath(it.get("path", ""))) != ap]
+                    _save_finish_queue(q)
             except Exception:
                 pass
             try:
@@ -6817,8 +6895,8 @@ class _JsApi:
         HK_KEYS = ("hotkey_record", "hotkey_replay", "hotkey_pause", "hotkey_clip_discord")
         hk_before = tuple(str(SETTINGS.get(k, "") or "") for k in HK_KEYS)
         # Snapshot->merge->write under the settings lock: a concurrent
-        # _persist_setting (the resize grip saving window_size, the watcher
-        # remembering safe_capture) must never be reverted by a stale snapshot.
+        # _persist_setting (the watcher remembering safe_capture) must never
+        # be reverted by a stale snapshot.
         try:
             with _SETTINGS_LOCK:
                 data = {k: v for k, v in SETTINGS.items() if not k.startswith("_")}
@@ -6828,8 +6906,6 @@ class _JsApi:
                 _sanitize_settings(data)
                 hm = str(data.get("hdr_mode", "auto")).lower()
                 data["hdr_mode"] = hm if hm in ("auto", "off") else "auto"
-                th = str(data.get("theme", "dark")).lower()
-                data["theme"] = th if th in ("dark", "light") else "dark"
                 try:
                     data["output_dir"] = str(data.get("output_dir") or "").strip() or DEFAULTS["output_dir"]
                 except Exception:
@@ -7384,6 +7460,10 @@ class _JsApi:
                         got = 0.0
                     if got and abs(got - total) > max(1.0, total * 0.04):
                         raise RuntimeError(f"stitch incomplete: {got:.1f}s of {total:.1f}s")
+                # last exit before the commit: a Cancel during the stitch must
+                # still win - past os.replace the original is gone for good
+                if _EDIT_JOB["cancel"]:
+                    raise _EditCancelled()
                 _EDIT_JOB["phase"] = "saving"
                 _EDIT_JOB["pct"] = 97
                 if replace:
@@ -7470,7 +7550,8 @@ class _JsApi:
 
     def resize_to(self, w, h):
         """The brass grip on the cover corner drives the real window. Clamped
-        to sane book sizes; the chosen size is remembered for next time."""
+        to sane book sizes; the boot size is fixed by _tome_window_size (his
+        call), so nothing is remembered across launches."""
         try:
             try:
                 import ctypes
@@ -7484,19 +7565,10 @@ class _JsApi:
             h = max(645, min(int(ah), int(h)))
             if self._win is not None:
                 self._win.resize(w, h)
-            # persist DEBOUNCED: the grip streams ~15 calls/sec and each
-            # _persist_setting is a locked read+fsync'd rewrite of settings.json
-            # - synchronous disk IO inside the RPC made the drag hitch whenever
-            # ffmpeg was hammering the same disk. Only the LAST size matters.
-            try:
-                if getattr(self, "_rsz_timer", None):
-                    self._rsz_timer.cancel()
-            except Exception:
-                pass
-            self._rsz_timer = threading.Timer(
-                0.5, lambda: _persist_setting("window_size", [w, h]))
-            self._rsz_timer.daemon = True
-            self._rsz_timer.start()
+            # no persist: _tome_window_size fixes every boot at 1152x648 on
+            # purpose, so saving window_size was a write nothing ever read
+            # back - and each save was a locked read+fsync'd rewrite of
+            # settings.json on a disk ffmpeg may be hammering.
             return True
         except Exception as e:
             log(f"resize failed: {e}")
@@ -7688,6 +7760,7 @@ def _start_tray(ctl, api, show_cb):
     )
     icon = pystray.Icon("LORE", icon=idle_img, title="LORE - starting", menu=menu)
     ctl.icon = icon
+    _TRAY_ICON[0] = icon
     try:
         icon.run_detached()
     except Exception:
@@ -8017,11 +8090,23 @@ def lore_app(show_window=True):
 
     ctl = _Ctl()
     api = _JsApi(ctl)
+    # --hidden starts tray-only; set the flag NOW, before the pump and tray
+    # exist. show_tome flips it True on a tray-open, and nothing may ever
+    # demote it back - a click landing in the boot gap must still count.
+    api._reveal_ok = show_window
     _start_media_server()
+
+    _show_pending = [False]   # an open request that beat the window's creation
 
     def show_tome():
         try:
             api._reveal_ok = True
+            if api._win is None:
+                # tray click / second launch landed in the boot gap - the
+                # window isn't built yet, so remember the ask instead of
+                # dropping it (first_paint reveals once the tome is up)
+                _show_pending[0] = True
+                return
             if api._win is not None:
                 _paint_it_black()      # no white face, even pre-init
                 # Arm the wake veil BEFORE the window is visible: tomeWake sets
@@ -8139,11 +8224,16 @@ def lore_app(show_window=True):
         except Exception:
             pass
         _UI_QUIT.set()
+        try:
+            if icon is not None:
+                icon.stop()   # or the dead icon haunts the tray and its thread outlives the quit
+        except Exception:
+            pass
         _release_lock()
         return
 
     w, h = _tome_window_size()
-    api._reveal_ok = show_window
+    api._reveal_ok = show_window or _show_pending[0]
     window = webview.create_window(
         "LORE", url=html, js_api=api,
         width=w, height=h, min_size=(860, 645),
