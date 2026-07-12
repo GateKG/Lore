@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.02"
+APP_VERSION = "1.03"
 
 try:
     import psutil
@@ -120,8 +120,8 @@ DEFAULTS = {
     "notify_on_record":  True,        # subtle tray pop when a recording starts
     "quiet_popups":      True,        # hold Lore's own popups while WRITING a recording
     # What the recorder captures: the whole watched screen (proven path) or,
-    # experimentally, only the detected game's own window (gdigrab; windowed
-    # games without the rest of the desktop - falls back to screen if it fails)
+    # experimentally, only the game's own window - the SAME GPU capture cropped
+    # at the source to the window's client rect, tracked as the window moves
     "capture_scope":     "screen",    # screen | window
     # Popups (Lore' own on-top notifications). Size scales with the watched
     # monitor; style picks the entrance animation (Settings > Replay > Popups).
@@ -1803,15 +1803,169 @@ def _game_window_title(pname):
         return None
 
 
+def _game_window_rect(pname, hwnd=None):
+    """Where the given game's window is RIGHT NOW, as a capture rect:
+        {"hwnd", "mon" (ddagrab output index), "x", "y", "w", "h"}
+      or {"hwnd", "iconic": True}   while the window is minimised
+      or None                       when the process has no usable window.
+    x/y/w/h are the window's CLIENT area (the game's picture, no title bar)
+    in monitor-relative physical pixels, clamped to the screen and aligned
+    for the encoder (offsets even, size mod-8 - AMF pads odd sizes up, which
+    would smuggle dead pixel columns in and shift dims between runs).
+    Used by the EXPERIMENTAL window-only capture scope: the rect crops the
+    same GPU desktop-duplication capture the whole screen uses, so HDR and
+    zero-copy encoding keep working. Pass the previous poll's hwnd - it is
+    revalidated cheaply and the full window hunt runs only when it died
+    (games recreate their window on display-mode switches)."""
+    if os.name != "nt" or not pname:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        # ddagrab captures PHYSICAL pixels, but a system-DPI-aware process
+        # reads VIRTUALISED rects for windows on monitors whose scale differs
+        # from the system DPI (a game on a 150% 4K next to a 100% primary
+        # would get a rect ~2/3 its real size - the file would hold only part
+        # of the game). Flip just this thread to per-monitor awareness while
+        # measuring; restored below. Pre-1703 Windows: quietly skipped -
+        # single-scale setups were already correct there.
+        oldctx = None
+        try:
+            user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            oldctx = user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            oldctx = None
+        try:
+            h = None
+            icon_h = None
+            if hwnd:
+                try:
+                    if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
+                        pid = wintypes.DWORD()
+                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                        if (pid.value
+                                and psutil.Process(pid.value).name().lower()
+                                == pname.lower()):
+                            h = hwnd
+                except Exception:
+                    h = None
+            if h is None:
+                pids = set()
+                for pr in psutil.process_iter(["pid", "name"]):
+                    try:
+                        if (pr.info.get("name") or "").lower() == pname.lower():
+                            pids.add(pr.info["pid"])
+                    except Exception:
+                        pass
+                if not pids:
+                    return None
+                best = {"area": 0, "hwnd": None, "icon": None}
+
+                @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+                def _enum(hw, _l):
+                    try:
+                        if not user32.IsWindowVisible(hw):
+                            return 1
+                        pid = wintypes.DWORD()
+                        user32.GetWindowThreadProcessId(hw, ctypes.byref(pid))
+                        if pid.value not in pids:
+                            return 1
+                        if user32.IsIconic(hw):
+                            # minimised counts (it pauses capture) - tracked
+                            # apart so a tiny visible stub window (a crash
+                            # handler, a notifier) can't make the real,
+                            # minimised game look 'gone'
+                            if best["icon"] is None:
+                                best["icon"] = hw
+                            return 1
+                        r = wintypes.RECT()
+                        user32.GetWindowRect(hw, ctypes.byref(r))
+                        area = (max(0, r.right - r.left)
+                                * max(0, r.bottom - r.top))
+                        if area > best["area"]:
+                            best["area"] = area
+                            best["hwnd"] = hw
+                    except Exception:
+                        pass
+                    return 1
+                user32.EnumWindows(_enum, 0)
+                h = best["hwnd"] or best["icon"]
+                icon_h = best["icon"]
+            if h is None:
+                return None
+            if user32.IsIconic(h):
+                return {"hwnd": h, "iconic": True}
+            cr = wintypes.RECT()
+            if not user32.GetClientRect(h, ctypes.byref(cr)):
+                return None
+            pt = wintypes.POINT(0, 0)
+            if not user32.ClientToScreen(h, ctypes.byref(pt)):
+                return None
+            x, y = pt.x, pt.y
+            w, hh = cr.right - cr.left, cr.bottom - cr.top
+            if w < 64 or hh < 64:
+                # the visible winner is a stub; honour a minimised sibling so
+                # capture pauses instead of falling back to the whole screen
+                if icon_h:
+                    return {"hwnd": icon_h, "iconic": True}
+                return None
+
+            # which screen the window lives on -> the matching ddagrab
+            # output. Ranked by display number: the same contract every other
+            # output_idx consumer uses (_watched_monitor_rect and friends) -
+            # raw EnumDisplayMonitors order is NOT guaranteed to match it.
+            class MI(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+            hm = user32.MonitorFromWindow(h, 2)      # MONITOR_DEFAULTTONEAREST
+            mi = MI()
+            mi.cbSize = ctypes.sizeof(MI)
+            if not user32.GetMonitorInfoW(hm, ctypes.byref(mi)):
+                return None
+            mrect = (mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right, mi.rcMonitor.bottom)
+            mons = sorted(_enumerate_active_monitors(), key=lambda m: m["num"])
+            mon = 0
+            for i, m in enumerate(mons):
+                if tuple(m["rect"]) == mrect:
+                    mon = i
+                    break
+            cx, cy = max(x, mrect[0]), max(y, mrect[1])
+            cw = min(x + w, mrect[2]) - cx
+            ch = min(y + hh, mrect[3]) - cy
+            ox, oy = cx - mrect[0], cy - mrect[1]
+            ox -= ox % 2
+            oy -= oy % 2
+            cw -= cw % 8
+            ch -= ch % 8
+            if cw < 160 or ch < 120:
+                return None  # off-screen sliver / splash remnant - not the game
+            return {"hwnd": h, "mon": mon, "x": ox, "y": oy, "w": cw, "h": ch}
+        finally:
+            if oldctx:
+                try:
+                    user32.SetThreadDpiAwarenessContext(oldctx)
+                except Exception:
+                    pass
+    except Exception:
+        return None
+
+
 def build_video_cmd(out_pattern, start_number=0, monitor_index=None,
-                    window_title=None):
+                    window_rect=None):
     """Capture the screen and encode it, writing the stream as a sequence of
     short MP4 segments (out_pattern like '.../seg_%06d.mp4'). Segments let us
     (a) concat them into the full session file at the end, (b) grab just the
     last minute on demand for the replay hotkey, and (c) continue numbering
     after a pause - all without re-encoding. start_number is where this run's
     segment numbering begins (so a resumed run doesn't overwrite earlier ones).
-    monitor_index overrides which screen to grab; None falls back to settings."""
+    monitor_index overrides which screen to grab; None falls back to settings.
+    window_rect=(x, y, w, h) crops the capture AT THE SOURCE to the game's
+    window (monitor-relative, from _game_window_rect): the same GPU
+    duplication capture, so zero-copy encoding and HDR keep working - unlike
+    the old gdigrab path, which returned black frames for modern games."""
     s = SETTINGS
     enc = _current_encoder()
     br = s["bitrate_mbps"]
@@ -1828,10 +1982,13 @@ def build_video_cmd(out_pattern, start_number=0, monitor_index=None,
     # starts on a valid output instead of failing outright.
     mon = min(mon, _active_monitor_count() - 1)
     grab = f"ddagrab=output_idx={mon}:framerate={s['framerate']}"
+    if window_rect:
+        x, y, w, h = window_rect
+        grab += f":offset_x={x}:offset_y={y}:video_size={w}x{h}"
 
     hdr_enc_args = []
     hdr_pre_args = []
-    strategy = None if (_HDR_LEVEL[0] >= 1 or window_title) else _hdr_strategy()
+    strategy = None if _HDR_LEVEL[0] >= 1 else _hdr_strategy()
     if strategy == "native" and not (enc.endswith("_amf") and _enc_supports_10bit(enc)):
         # Only AMF encoders accept the float16 surface (the sole unclipped HDR
         # source - see _hdr_strategy). Everyone else records plain SDR capture:
@@ -1883,19 +2040,6 @@ def build_video_cmd(out_pattern, start_number=0, monitor_index=None,
         "-segment_start_number", str(int(start_number)),
         out_pattern,
     ]
-    if window_title:
-        # EXPERIMENTAL window-only capture: gdigrab follows the one window by
-        # title, so a windowed game records without the rest of the desktop.
-        # Plain SDR frames via system memory (no HDR handling here - gdigrab
-        # has no access to the float16 surface). If this path yields nothing,
-        # the watcher falls back to the proven screen capture mid-session.
-        return [
-            s["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error", "-stats",
-            "-f", "gdigrab", "-framerate", str(fps),
-            "-i", f"title={window_title}",
-            "-vf", "crop=iw-mod(iw\\,2):ih-mod(ih\\,2),format=nv12",
-            *tail,
-        ]
     return [
         s["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error", "-stats",
         *hdr_pre_args,                 # shared d3d11 device (float16 HDR capture only)
@@ -2907,7 +3051,12 @@ class Session:
         self.vproc = None
         self.audio = None
         self.monitor_idx = None        # which screen to capture (resolved at start)
-        self.window_title = None       # experimental window-only capture target
+        self.win = None                # window-only capture rect (see _game_window_rect)
+        self.win_paused = False        # auto-paused: the game window is minimised
+        self._win_pend = None          # rect waiting to settle (move/resize debounce)
+        self._win_lost = 0.0           # when the game's window first went missing
+        self._rotating = False         # mid rotate-run swap (blocks replay clips)
+        self._gone_polls = 0           # consecutive polls the game looked closed
         self._first_frame = threading.Event()
         self._err = bytearray()        # rolling tail of the encoder's stderr
         self._replay_lock = threading.Lock()
@@ -2960,8 +3109,11 @@ class Session:
                 self.audio = None
         self.vproc = subprocess.Popen(
             build_video_cmd(self.seg_pattern, start_number=self._seg_start,
-                            monitor_index=self.monitor_idx,
-                            window_title=self.window_title),
+                            monitor_index=(self.win["mon"] if self.win
+                                           else self.monitor_idx),
+                            window_rect=((self.win["x"], self.win["y"],
+                                          self.win["w"], self.win["h"])
+                                         if self.win else None)),
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, creationflags=flags,
         )
@@ -3036,54 +3188,40 @@ class Session:
         self.vproc = None
         self.audio = None
 
-    def _abort_run(self):
-        """Tear down a run that produced NO usable video (e.g. gdigrab opened
-        against a title that vanished before the first frame). Unlike
-        _stop_run this records nothing: the stray audio is stopped and
-        dropped - audio with no picture would only skew the sync anchors -
-        and the WAV tag is retired so the next run opens fresh files instead
-        of truncating ones a half-dead writer thread still holds."""
-        if self.audio:
-            try:
-                self.audio.signal_stop()
-                self.audio.finalize()
-            except Exception:
-                pass
-        if self.vproc and self.vproc.poll() is None:
-            try:
-                self.vproc.stdin.write(b"q")
-                self.vproc.stdin.flush()
-            except Exception:
-                pass
-            try:
-                self.vproc.wait(timeout=8)
-            except Exception:
-                try:
-                    self.vproc.kill()
-                except Exception:
-                    pass
-        self._seg_start = len(_list_segments(self.tmp))
-        self._run_index += 1
-        self.vproc = None
-        self.audio = None
-
     def start(self):
         # Create the save folder here (not in __init__) so a permission/offline-drive
         # error is caught by _safe_start and shown to the user in plain language.
         os.makedirs(SETTINGS["output_dir"], exist_ok=True)
         os.makedirs(os.path.dirname(self.final), exist_ok=True)
         self.monitor_idx = _resolve_capture_monitor()
-        # Experimental window-only scope: aim gdigrab at the game's own window
-        # (manual desktop recordings and title-less windows use the screen).
+        # Experimental window-only scope: crop the GPU screen capture to the
+        # game's own window (manual desktop recordings use the whole screen).
         if (str(SETTINGS.get("capture_scope", "screen")) == "window"
                 and self.game and self.game.lower() != "screen"):
-            self.window_title = _game_window_title(self.game)
-            if self.window_title:
-                log(f"Window capture (experimental): '{self.window_title}'")
+            w = _game_window_rect(self.game)
+            if w and not w.get("iconic"):
+                self.win = w
+                log(f"Window capture (experimental): {w['w']}x{w['h']} at "
+                    f"+{w['x']},+{w['y']} on screen #{w['mon'] + 1}.")
             else:
-                log("Window capture: no window found; recording the screen.")
-        log(f"Capturing screen #{self.monitor_idx + 1} (output {self.monitor_idx}).")
+                # No usable window right now - minimised (iconic), still
+                # launching, or hidden to the tray. Recording the desktop
+                # instead would betray "only the game window", so start
+                # PAUSED and let the tracker begin capture the moment a real
+                # window appears (any size is fine then: nothing committed
+                # yet). If the window never comes, the process eventually
+                # exits and the game-gone check finalises the empty session.
+                self.win = {"hwnd": (w or {}).get("hwnd"), "mon": 0,
+                            "x": 0, "y": 0, "w": 0, "h": 0}
+                self.win_paused = True
+                self.suspended = True
+                log("Window capture: waiting for the game's window before "
+                    "recording (no desktop is captured).")
         log(f"Detected '{self.game}'. Recording -> {self.final}")
+        if self.suspended:
+            return                     # born paused: no capture run yet
+        if not self.win:
+            log(f"Capturing screen #{self.monitor_idx + 1} (output {self.monitor_idx}).")
         self._start_run()
 
     def suspend(self):
@@ -4229,11 +4367,195 @@ def _maybe_post_discord(ctl, clip_path):
     ctl.notify("Discord \u2713", "Clip posted." if ok else "Upload failed - check the webhook URL.")
 
 
+def _window_track(ctl, session, current):
+    """Follow the game's window while the EXPERIMENTAL window-only scope is
+    recording. Called once per watcher poll:
+      * minimised          -> pause the run (footage kept); resumes on
+                              restore AT THE SAME SIZE (a window that comes
+                              back resized ends the chapter instead)
+      * window gone        -> grace period (display-mode switches destroy
+                              and recreate windows; 12s live, 60s while
+                              paused), then end the chapter - the follow-up
+                              session decides its own scope from whatever
+                              exists then
+      * moved / new screen -> rotate the capture onto the new rect: same
+                              file, segment numbering continues
+      * RESIZED            -> return 'split' (save the chapter; the watcher
+                              re-attaches at the new size) or 'restart' (a
+                              seconds-old head: throw it away and re-record).
+    One file must NEVER mix two frame sizes - the -c copy concat would
+    produce a broken video - which is why gone/resized/restored-differently
+    all end the chapter rather than rotating in place.
+    Moves/resizes act only after TWO identical polls, so a drag in progress
+    doesn't churn one rotation per poll. Returns None when the caller
+    needn't act, else 'split'/'restart' for _apply_track_act."""
+    if not getattr(session, "win", None):
+        return None
+    if session.suspended and not session.win_paused:
+        return None                    # the USER paused; not ours to touch
+    try:
+        w = _game_window_rect(current or session.game,
+                              hwnd=session.win.get("hwnd"))
+    except Exception:
+        w = None
+    if w is None:
+        # Window missing entirely (destroyed, hidden, or hunt failure).
+        now = time.time()
+        if not session._win_lost:
+            session._win_lost = now
+            return None
+        # Nothing captured yet (born paused - the window never arrived, or a
+        # windowless-but-alive process): keep waiting QUIETLY. There is no
+        # chapter to end, and discarding+recreating the empty session every
+        # grace period would just churn tmp folders. The process-gone check
+        # retires it once the game actually exits.
+        if not _list_segments(session.tmp):
+            return None
+        grace = 60.0 if session.win_paused else 12.0
+        if now - session._win_lost <= grace:
+            return None
+        log("Window capture: the game's window is gone; saving this chapter.")
+        session.win_paused = False     # (if paused: stays suspended - the
+        return ("split"                # finaliser handles that fine)
+                if len(_list_segments(session.tmp)) >= 4 else "restart")
+    session._win_lost = 0.0
+    if w.get("iconic"):
+        if not session.win_paused and not session.suspended:
+            session.win_paused = True
+            session._win_pend = None
+            session.suspend()
+            ctl.set_status("paused")
+            ctl.notify("Recording paused",
+                       f"{current or session.game} is minimised - recording "
+                       "continues when it returns.")
+        return None
+    if session.win_paused:
+        # The window is back. Continue this file only at the SAME size (or
+        # if nothing was captured yet - a session born paused has no
+        # committed dimensions). A different size ends the chapter.
+        first = not _list_segments(session.tmp)
+        if first or (w["w"], w["h"]) == (session.win["w"], session.win["h"]):
+            session.win = w            # a fresh spot/screen is fine - only
+            session.win_paused = False # the frame SIZE is sacred
+            try:
+                session.resume()
+            except Exception as e:
+                log(f"Couldn't resume after minimise: {e}")
+            ctl.set_status("recording")
+            if first:
+                # capture is beginning for the FIRST time (the session was
+                # born paused because the game was minimised/windowless at
+                # detection) - announce it exactly like any recording start.
+                # Clear any stale start-beep flag from an earlier aborted
+                # manual start so it can't swallow this genuine first chime
+                # (a born-paused session skips the usual consuming _loop_sound).
+                ctl.skip_loop_on = False
+                _loop_sound(ctl, "on")
+                if SETTINGS.get("notify_on_record", True):
+                    ctl.notify("Now recording", current or session.game,
+                               force=True)
+                log("Window capture: the window appeared - recording started.")
+            else:
+                log("Window capture: the window is back - recording resumed.")
+            return None
+        log("Window capture: the window returned at a new size - saving "
+            "this chapter and starting fresh.")
+        session.win_paused = False     # stays suspended; stop()/discard cope
+        return ("split"
+                if len(_list_segments(session.tmp)) >= 4 else "restart")
+    cur = session.win
+    if (w["mon"], w["x"], w["y"], w["w"], w["h"]) == \
+            (cur["mon"], cur["x"], cur["y"], cur["w"], cur["h"]):
+        cur["hwnd"] = w["hwnd"]        # keep the freshest hwnd (recreated windows)
+        session._win_pend = None
+        return None
+    p, session._win_pend = session._win_pend, w
+    if not (p and (p["mon"], p["x"], p["y"], p["w"], p["h"]) ==
+            (w["mon"], w["x"], w["y"], w["w"], w["h"])):
+        return None                    # still moving; wait for it to settle
+    session._win_pend = None
+    if (w["w"], w["h"]) == (cur["w"], cur["h"]):
+        log(f"Window capture: following the window to +{w['x']},+{w['y']} "
+            f"on screen #{w['mon'] + 1}.")
+        session.win = w
+        session._rotating = True       # a replay clip must not race the swap
+        try:
+            session._stop_run()
+            try:
+                session._start_run()
+            except Exception as e:
+                log(f"Capture restart failed: {e}")
+        finally:
+            session._rotating = False
+        return None
+    if len(_list_segments(session.tmp)) >= 4:
+        log("Window capture: the window was resized - saving this chapter "
+            "and starting a fresh one at the new size.")
+        return "split"
+    log("Window capture: the window was resized straight away - restarting "
+        "at the new size.")
+    return "restart"
+
+
+def _apply_track_act(ctl, session, current, act):
+    """End the current chapter on _window_track's orders ('split' = save it,
+    'restart' = a seconds-old head, discard it) and immediately re-attach to
+    the still-running game with a fresh session. The re-attach is DIRECT -
+    not left to detection - because a game that just left fullscreen (the
+    usual reason for a resize) no longer passes fullscreen detection, and
+    window scope exists precisely for windowed games. Returns the new
+    session, or None when the game is gone / the fresh start failed (the
+    normal detection loop takes over from there)."""
+    _loop_sound(ctl, "off")
+    with ctl.lock:
+        ctl.session = None
+    if act == "split":
+        ctl.notify("Saving your video…", current or "Screen", force=True)
+        _finalize_async(ctl, session)
+    else:
+        session.discard()
+    if not current or current not in running_process_names():
+        # The game is gone: this chapter was the end. A manual recording's
+        # force_record must be cleared too, or the next poll would start an
+        # endless desktop recording (manual record never auto-stops).
+        ctl.force_record.clear()
+        if ctl.saving <= 0:
+            ctl.set_status("watching")
+        return None
+    # Constructing the next Session touches the disk (its scratch folder);
+    # if that raises (full/again-offline drive) it must NOT escape - the
+    # caller assigns our return to its `session` local, and an exception
+    # would leave that local pointing at the session we JUST handed to
+    # _finalize_async, risking a double stop() on one recording.
+    try:
+        nxt = Session(current)
+    except Exception as e:
+        log(f"Couldn't start the follow-up recording: {e}")
+        ctl.force_record.clear()
+        if ctl.saving <= 0:
+            ctl.set_status("watching")
+        return None
+    ctl.set_status("starting")
+    if not _safe_start(nxt, ctl):
+        ctl.force_record.clear()
+        return None
+    with ctl.lock:
+        ctl.session = nxt
+    # Same game continuing. A live re-attach needs no second "Now recording"
+    # toast (the sound cue is enough); one born paused (its window vanished)
+    # stays silent until _window_track announces its real first frame.
+    ctl.set_status("paused" if nxt.suspended else "recording")
+    if not nxt.suspended:
+        _loop_sound(ctl, "on")
+    return nxt
+
+
 def _trigger_replay(ctl, seconds=None, force_discord=False):
     _play_sound("shutter")
     with ctl.lock:
         sess = ctl.session
-    if sess is None or getattr(sess, "suspended", False):
+    if (sess is None or getattr(sess, "suspended", False)
+            or getattr(sess, "_rotating", False)):
         log("Replay: no active recording right now.")
         ctl.notify("Lore", "Not recording right now - nothing to clip.")
         return
@@ -4412,6 +4734,7 @@ def _watch_core(ctl):
     enc_fails = 0           # consecutive encoder-died restarts (to stop looping)
     start_fails = 0         # consecutive start failures (spawn / output-folder errors)
     gone = 0                # consecutive polls the game looked closed (debounce)
+    win_deaths = 0          # consecutive window-scope capture deaths (rect vs encoder)
     safe_persisted = False  # have we saved a discovered safe-capture mode yet
     try:
         while not ctl.quit.is_set():
@@ -4422,11 +4745,20 @@ def _watch_core(ctl):
                 ctl.force_record.clear()
                 if session:
                     _loop_sound(ctl, "off")
-                    ctl.notify("Recording stopped", "Saving your video...", force=True)
                     ctl.suppressed_game = current
                     with ctl.lock:
                         ctl.session = None
-                    _finalize_async(ctl, session)   # save in the background; UI stays live
+                    # A session that never captured a frame (e.g. window scope
+                    # still waiting for the game's window) has nothing to save
+                    # - promising "Saving your video..." then producing no file
+                    # reads as a lost recording. Discard it quietly instead.
+                    if getattr(session, "win_paused", False) and not _list_segments(session.tmp):
+                        ctl.notify("Recording stopped",
+                                   "Nothing was captured yet.", force=True)
+                        session.discard()
+                    else:
+                        ctl.notify("Recording stopped", "Saving your video...", force=True)
+                        _finalize_async(ctl, session)   # save in background; UI stays live
                     session = current = None
                     manual = False
                 # Stopping always returns to watching - otherwise a stop pressed while
@@ -4451,24 +4783,82 @@ def _watch_core(ctl):
 
             # Just un-paused with a suspended recording: continue it, or - if the
             # game closed while paused - finalise what we already captured.
+            # (win_paused sessions live here every poll: the window-minimise
+            # auto-pause keeps watching set, so only the game-gone check may
+            # act - _window_track resumes when the window returns.)
             if session and session.suspended:
                 game_gone = current is not None and current not in running_process_names()
+                # Debounced: a suspended session can sit here for hours (a
+                # minimised game), and one incomplete process-list poll must
+                # not finalise a recording whose game is merely minimised.
+                session._gone_polls = session._gone_polls + 1 if game_gone else 0
                 if not game_gone:
-                    try:
-                        session.resume()
-                    except Exception as e:
-                        # leave the dead-video state to the health check below
-                        log(f"Couldn't resume recording: {e}")
-                    _loop_sound(ctl, "on")
-                    ctl.notify("Recording resumed", current or "Screen", force=True)
-                    ctl.set_status("recording")
-                else:
-                    _loop_sound(ctl, "off")
-                    ctl.notify("Saving your video…", current or "Screen", force=True)
+                    if not session.win_paused:
+                        if session.win:
+                            # Re-aim before resuming: the window may have
+                            # moved - or the display mode changed - while
+                            # paused; the stale rect would kill ffmpeg at
+                            # start and the death would be blamed on the
+                            # encoder. Same size -> adopt; minimised -> hand
+                            # to the auto-pause; resized/gone -> new chapter.
+                            try:
+                                fresh = _game_window_rect(
+                                    current or session.game,
+                                    hwnd=session.win.get("hwnd"))
+                            except Exception:
+                                fresh = None
+                            if fresh and fresh.get("iconic"):
+                                # The game is minimised right now, so honour
+                                # the Continue by handing to the auto-pause
+                                # (it resumes itself on restore) and say why
+                                # the pill stays paused. Consume the click's
+                                # start-beep flag so it can't later swallow a
+                                # genuine recording-start chime.
+                                session.win_paused = True
+                                ctl.skip_loop_on = False
+                                ctl.notify("Lore", "Paused because the game is "
+                                           "minimised - it continues when the "
+                                           "window returns.")
+                            elif fresh and (
+                                    not _list_segments(session.tmp)
+                                    or (fresh["w"], fresh["h"])
+                                    == (session.win["w"], session.win["h"])):
+                                session.win = fresh
+                            else:
+                                act = ("split"
+                                       if len(_list_segments(session.tmp)) >= 4
+                                       else "restart")
+                                session = _apply_track_act(ctl, session,
+                                                           current, act)
+                                if session is None:
+                                    current = None
+                                    manual = False
+                                _interruptible_sleep(ctl, 0.3)
+                                continue
+                    if not session.win_paused:
+                        try:
+                            session.resume()
+                        except Exception as e:
+                            # leave the dead-video state to the health check below
+                            log(f"Couldn't resume recording: {e}")
+                        _loop_sound(ctl, "on")
+                        ctl.notify("Recording resumed", current or "Screen", force=True)
+                        ctl.set_status("recording")
+                elif session._gone_polls >= 2:
                     ctl.force_record.clear()
                     with ctl.lock:
                         ctl.session = None
-                    _finalize_async(ctl, session)
+                    # A window-scope session that was still waiting for its
+                    # game's window (born paused, never captured a frame) has
+                    # nothing to save - don't promise a video that never comes,
+                    # and don't play the stop chime for a recording that never
+                    # started (no matching start chime ever sounded).
+                    if session.win_paused and not _list_segments(session.tmp):
+                        session.discard()
+                    else:
+                        _loop_sound(ctl, "off")
+                        ctl.notify("Saving your video…", current or "Screen", force=True)
+                        _finalize_async(ctl, session)
                     session = current = None
                     manual = False
 
@@ -4504,10 +4894,13 @@ def _watch_core(ctl):
                     current = g
                     manual = False
                     start_fails = 0
-                    with ctl.lock:
+                    win_deaths = 0          # fresh game: the salvage counter
+                    with ctl.lock:          # from any prior game does not carry
                         ctl.session = session
-                    ctl.set_status("recording")
-                    if enc_fails == 0:          # stay quiet while hunting an encoder
+                    # a window-scope session born while the game is minimised
+                    # starts PAUSED - saying "recording" would be a lie
+                    ctl.set_status("paused" if session.suspended else "recording")
+                    if enc_fails == 0 and not session.suspended:
                         _loop_sound(ctl, "on")
                         if SETTINGS.get("notify_on_record", True):
                             # the user asked for this one ALWAYS: recording
@@ -4536,6 +4929,7 @@ def _watch_core(ctl):
                     current = gg
                     manual = True
                     start_fails = 0
+                    win_deaths = 0          # fresh attach: reset the salvage counter
                     with ctl.lock:
                         ctl.session = session
                     ctl.set_status("recording")
@@ -4545,71 +4939,45 @@ def _watch_core(ctl):
                             # manual start = the user just pressed the sigil
                             ctl.notify("Now recording", name, force=True)
             elif session.suspended:
-                pass   # paused; wait for Continue or Stop (handled above)
+                # paused; wait for Continue or Stop (handled above). A window-
+                # minimise auto-pause watches for the window's return here; a
+                # window that comes back RESIZED - or never comes back - ends
+                # the chapter instead of resuming into the wrong frame size.
+                act = _window_track(ctl, session, current)
+                if act:
+                    session = _apply_track_act(ctl, session, current, act)
+                    if session is None:
+                        current = None
+                        manual = False
+                    _interruptible_sleep(ctl, 0.3)
+                    continue
             else:
                 # 'not session.vproc' matters: a failed RESUME leaves vproc=None with
                 # suspended=False - that dead-video state must enter recovery too,
                 # or audio records to nowhere until the user notices.
                 if not session.vproc or session.vproc.poll() is not None:
-                    # Window-capture death FIRST - and it owns EVERY death of
-                    # a gdigrab run. The capture lives and dies with the
-                    # game's HWND: quitting the game, toggling windowed <->
-                    # borderless, or a resolution switch destroys the window
-                    # and ffmpeg exits mid-run. None of that is the GPU
-                    # encoder's fault, so none of it may reach the encoder
-                    # ladder below (which would blacklist a healthy encoder
-                    # and persist safe mode over a closed window).
-                    if getattr(session, "window_title", None):
+                    # Window-scope deaths FIRST - they are usually the RECT's
+                    # fault, not the encoder's: a display-mode switch shrinks
+                    # the desktop under the pinned subrect and ddagrab errors
+                    # out. Salvage the chapter and re-attach at a freshly-
+                    # resolved rect; only if that ALSO dies twice does the
+                    # encoder ladder below get its turn (a fresh rect that
+                    # still can't encode IS an encoder/HDR problem).
+                    if getattr(session, "win", None) and win_deaths < 2:
                         err = session.err_text()
                         for ln in err.splitlines()[-3:]:
                             if ln.strip():
                                 log("  ffmpeg: " + ln.strip())
-                        had_frames = (len(_list_segments(session.tmp))
-                                      > getattr(session, "_run_vstart", 0))
-                        if had_frames:
-                            session._stop_run()    # keep the footage; anchors on last segment
-                        else:
-                            session._abort_run()   # nothing usable; drop the stray audio too
-                        game_alive = (current is not None
-                                      and current in running_process_names())
-                        if not game_alive:
-                            # The window died because the game closed - just
-                            # the normal end of a session, saved as ever.
-                            _loop_sound(ctl, "off")
-                            ctl.force_record.clear()
-                            with ctl.lock:
-                                ctl.session = None
-                            if _list_segments(session.tmp):
-                                ctl.notify("Saving your video…",
-                                           current or "Screen", force=True)
-                                _finalize_async(ctl, session)
-                            else:
-                                session.discard()
-                            session = current = None
+                        log("Window capture: the recorder stopped mid-run; "
+                            "re-attaching at the window's current position.")
+                        win_deaths += 1
+                        act = ("split"
+                               if len(_list_segments(session.tmp)) >= 4
+                               else "restart")
+                        session = _apply_track_act(ctl, session, current, act)
+                        if session is None:
+                            current = None
                             manual = False
-                            gone = 0
-                        else:
-                            # Game still running: its window was recreated
-                            # (resolution/borderless switch) or renamed after
-                            # loading. Re-aim ONCE at the fresh window; after
-                            # that, the proven screen capture for good -
-                            # footage over purity.
-                            title = None
-                            if not getattr(session, "_win_retry", False):
-                                session._win_retry = True
-                                title = _game_window_title(current)
-                            if title:
-                                session.window_title = title
-                                log("Window capture: the window changed; "
-                                    f"re-aiming at '{title}'.")
-                            else:
-                                session.window_title = None
-                                log("Window capture ended; recording the "
-                                    "whole screen for the rest of this session.")
-                            try:
-                                session._start_run()
-                            except Exception as e:
-                                log(f"Capture restart failed: {e}")
                         _interruptible_sleep(ctl, 0.5)
                         continue
                     # HDR-specific failure NEXT: if this run was handling HDR and
@@ -4746,6 +5114,20 @@ def _watch_core(ctl):
                 else:
                     gone = 0
                     enc_fails = 0   # healthy: encoder alive and the game is running
+                    win_deaths = 0
+                    act = _window_track(ctl, session, current)
+                    if act:
+                        # The game window was RESIZED (or lost for good): a
+                        # new frame size can't join this file. 'split' saves
+                        # the chapter so far; 'restart' discards a seconds-
+                        # old head. Either way the game keeps recording via
+                        # the direct re-attach in _apply_track_act.
+                        session = _apply_track_act(ctl, session, current, act)
+                        if session is None:
+                            current = None
+                            manual = False
+                        _interruptible_sleep(ctl, 0.3)
+                        continue
                     if _ENC_SAFE[0] and not safe_persisted and not SETTINGS.get("safe_capture"):
                         # compatible mode was auto-discovered and is working - remember
                         # it so future launches skip the failed fast-path attempt.
@@ -6708,6 +7090,15 @@ class _JsApi:
         if ctl.eff_status() not in ("recording", "paused"):
             return False
         if ctl.watching.is_set():
+            with ctl.lock:
+                sess = ctl.session
+            if sess is not None and getattr(sess, "win_paused", False):
+                # window-minimise auto-pause: already suspended, and it
+                # resumes by itself when the window returns - a 'Continue'
+                # click here must not turn into a sticky manual pause
+                ctl.notify("Lore", "Paused because the game is minimised - "
+                           "it continues when the window returns.")
+                return True
             ctl.click_feedback("off", "paused")
             ctl.watching.clear()
         else:

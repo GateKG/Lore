@@ -1320,7 +1320,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'1.02'};},
+      webhook:true,version:'1.03'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1350,7 +1350,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.02'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.03'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -2157,7 +2157,7 @@ function renderSet(cL,cR,app,spreadIdx){
     row(R,'Restore to standard colour after the session',ctlToggle('sdr_finish'));
     divider(R,'What is captured');
     row(R,'Capture',ctlSeg('capture_scope',[['screen','The whole screen'],['window','Only the game window']]));
-    hint(R,'Only-the-game-window is EXPERIMENTAL: windowed games record without the rest of your desktop, but HDR is skipped and some games resist it — LORE falls back to the screen mid-session if it fails.');
+    hint(R,'Only-the-game-window is EXPERIMENTAL: the game’s window is recorded without the rest of your desktop — HDR included — and LORE follows it if you move it. Minimising pauses the recording until the window returns; resizing starts a fresh video (one file can’t change size midway). Anything covering the window is recorded too.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
