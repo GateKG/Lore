@@ -1026,6 +1026,7 @@ body.reduced #intro{display:none}
     <button class="vbtn" id="vtrim" title="Edit — keep or cut out pieces">✂</button>
     <button class="vbtn" id="vnext" title="Next video">⏭</button>
     <button class="vbtn" id="vfs" title="Fullscreen (whole screen)">⛶</button>
+    <button class="vbtn" id="vfolder" title="Open this game's folder">📁</button>
     <button class="vbtn" id="vdel" title="Delete this video">🗑</button>
     <button id="vext" title="Open with your video player">⧉ Open in player</button>
   </div>
@@ -1320,7 +1321,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'1.03'};},
+      webhook:true,version:'1.04'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1330,7 +1331,7 @@ function makeMock(){
       else{st.status='recording';st.t0=Date.now()/1000;}return true;},
     pause_toggle:async()=>{st.status=st.status==='paused'?'recording':'paused';return true;},
     clip:async()=>true, clip_discord:async()=>true,
-    open_video:async()=>true,reveal:async()=>true,
+    open_video:async()=>true,reveal:async()=>true,open_game_folder:async()=>true,
     delete_video:async()=>({ok:true}),post_discord:async()=>true,
     edit_video:async()=>{window.__mockEd={pct:0,phase:'cutting',done:false,ok:false,name:'mock_edit.mp4'};return {ok:true,id:'m'};},
     edit_status:async()=>{const m=window.__mockEd;if(!m)return{done:true,ok:false,pct:0,phase:''};
@@ -1350,7 +1351,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.03'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.04'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3390,6 +3391,7 @@ function wireViewer(){
   $('#vclose').addEventListener('click',closeViewer);
   $('#viewer').addEventListener('click',e=>{if(e.target.id==='viewer')closeViewer();});
   $('#vext').addEventListener('click',()=>{const c=V.cur;closeViewer();if(c)api.open_video(c.path);});
+  $('#vfolder').addEventListener('click',()=>{const c=V.cur;if(c){api.open_game_folder(c.path);whisper('opened this game’s folder');}});
   $('#vnext').addEventListener('click',()=>{const n=viewerSibling(1);if(n)openViewer(n);});
   $('#vfs').addEventListener('click',()=>toggleFullscreenTrue());
   let _vdelArm=false,_vdelT=null;

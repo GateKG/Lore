@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.03"
+APP_VERSION = "1.04"
 
 try:
     import psutil
@@ -7157,6 +7157,35 @@ class _JsApi:
             return True
         except Exception as e:
             log(f"open folder failed: {e}")
+            return False
+
+    def open_game_folder(self, path):
+        """Open the folder for the GAME a recording belongs to - the shelf
+        that holds its Videos AND Clips (output_dir/<Game>) - so the player's
+        'this game's folder' button lands you at everything for that game.
+        Falls back to the file's own folder for flat/legacy recordings, and
+        never opens anything outside the library."""
+        p = self._safe_path(path)
+        if not p:
+            return False
+        try:
+            out = os.path.abspath(SETTINGS.get("output_dir", ""))
+            folder = os.path.dirname(p)                 # <Game>/Videos or /Clips
+            parent = os.path.dirname(folder)            # <Game>
+            target = folder
+            # Shelf layout is <out>/<Game>/{Videos,Clips}/file - climb to the
+            # game folder only when that exact shape holds (a direct child of
+            # the library); flat recordings just open their own folder.
+            if (os.path.basename(folder) in ("Videos", "Clips")
+                    and os.path.abspath(os.path.dirname(parent)) == out):
+                target = parent
+            target = os.path.abspath(target)
+            if os.path.commonpath([out, target]) != out:
+                target = out                            # never escape the library
+            os.startfile(target)
+            return True
+        except Exception as e:
+            log(f"open game folder failed: {e}")
             return False
 
     def delete_video(self, path):
