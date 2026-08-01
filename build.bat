@@ -108,9 +108,16 @@ if not exist whisper\Release\whisper-cli.exe (
   echo       ^(Release\ + the two ggml model files^) next to build.bat.
   goto :err
 )
+if not exist whisper\ggml-large-v3-turbo-q5_0.bin (
+  echo   *** whisper\ggml-large-v3-turbo-q5_0.bin is missing. This is THE
+  echo       accurate model ^(the small base.en one transcribes accented
+  echo       speech so badly it is not worth shipping alone^). Download it from
+  echo       huggingface.co/ggerganov/whisper.cpp into the whisper folder.
+  goto :err
+)
 if not exist whisper\ggml-base.en-q5_1.bin (
-  echo   *** whisper\ggml-base.en-q5_1.bin is missing - whisper-cli alone can't
-  echo       transcribe. Put both model files in the whisper folder.
+  echo   *** whisper\ggml-base.en-q5_1.bin is missing - it is the "Quick"
+  echo       setting's model. Put both model files in the whisper folder.
   goto :err
 )
 xcopy /e /i /y whisper "%APP%\whisper" >nul

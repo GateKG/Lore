@@ -784,6 +784,34 @@ body.cinema .tabcol{opacity:0;pointer-events:none;transition:opacity .25s}
   border-radius:10px;background:#000;
   box-shadow:0 0 0 2px rgba(232,181,99,.65), 0 0 0 4px rgba(0,0,0,.55),
     0 24px 74px rgba(0,0,0,.82), 0 0 44px -6px rgba(232,181,99,.32)}
+/* WHAT WAS SAID - the transcript as a readable column. It never covers the
+   video: while it is open the stage gives up exactly its width, in cinema
+   and in theater alike (nothing in this player is allowed to overlap). */
+#vsaid{display:none;position:fixed;top:44px;right:16px;bottom:16px;width:340px;
+  z-index:97;flex-direction:column;border-radius:10px;overflow:hidden;
+  background:rgba(18,12,6,.94);border:1px solid rgba(232,181,99,.32);
+  box-shadow:0 18px 54px rgba(0,0,0,.72)}
+body.vsaid #vsaid{display:flex}
+body.vsaid #vstage,body.vsaid #vstage video{max-width:calc(var(--vmaxw,100vw) - 372px)}
+body.vfull.vsaid #vstage{width:calc(100vw - 372px)}
+body.vfull.vsaid #vstage video{max-width:calc(100vw - 372px)}
+body.vfull.vsaid #vbar{left:calc(50% - 186px)}
+#vsaid .vsaidhead{display:flex;align-items:center;justify-content:space-between;
+  gap:8px;padding:10px 13px;border-bottom:1px solid rgba(232,181,99,.2);
+  font-family:var(--serif);font-size:10.5px;letter-spacing:.24em;
+  text-transform:uppercase;color:var(--gold);flex:0 0 auto}
+#vsaid .vsaidhead button{background:none;border:none;color:var(--gold);
+  cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;opacity:.8}
+#vsaid .vsaidhead button:hover{opacity:1}
+#vsaid .vsaidbody{flex:1;overflow-y:auto;padding:8px 7px 16px;overscroll-behavior:contain}
+#vsaid .sline{display:flex;gap:9px;padding:5px 8px;border-radius:6px;cursor:pointer;
+  font-family:var(--serif);font-size:12.5px;line-height:1.52;color:#d6c7ac}
+#vsaid .sline:hover{background:rgba(232,181,99,.1);color:#f2e4c8}
+#vsaid .sline.now{background:rgba(232,181,99,.18);color:#fff3dc}
+#vsaid .sline b{flex:0 0 auto;color:var(--gold);opacity:.72;font-weight:600;
+  font-size:11px;padding-top:2px;font-variant-numeric:tabular-nums}
+#vsaid .vempty{padding:18px 13px;font-family:var(--serif);font-style:italic;
+  font-size:12px;color:rgba(214,199,172,.62);line-height:1.65}
 #vstage .vring{position:absolute;inset:-13px;border:1px solid rgba(232,181,99,.3);
   border-radius:12px;pointer-events:none}
 #vstage .vcorner{position:absolute;width:30px;height:30px;pointer-events:none;
@@ -1041,6 +1069,12 @@ body.reduced #intro{display:none}
 
 <div id="viewer">
   <div id="vtitle"></div>
+  <!-- what was said: the transcript as a readable column beside the video.
+       Click any line and the video goes there. -->
+  <div id="vsaid">
+    <div class="vsaidhead"><span>What was said</span><button id="vsaidx" title="Close">✕</button></div>
+    <div class="vsaidbody"></div>
+  </div>
   <div id="vstage">
     <video id="vvideo" preload="metadata"></video>
     <div class="vring"></div>
@@ -1056,6 +1090,7 @@ body.reduced #intro{display:none}
     <div id="vtime">0:00 / 0:00</div>
     <input type="range" id="vvol" min="0" max="100" value="80" title="Volume">
     <button class="vbtn" id="vtrim" title="Edit — keep or cut out pieces">✂</button>
+    <button class="vbtn" id="vsay" title="What was said — click any line to jump there">❝</button>
     <button class="vbtn" id="vnext" title="Next video">⏭</button>
     <button class="vbtn" id="vfs" title="Fullscreen (whole screen)">⛶</button>
     <button class="vbtn" id="vfolder" title="Open this game's folder">📁</button>
@@ -1353,7 +1388,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.02'};},
+      webhook:true,version:'2.03'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1364,7 +1399,12 @@ function makeMock(){
     pause_toggle:async()=>{st.status=st.status==='paused'?'recording':'paused';return true;},
     clip:async()=>true, clip_discord:async()=>true,
     open_video:async()=>true,reveal:async()=>true,open_game_folder:async()=>true,
-    search_words:async()=>[],highlights:async()=>[],transcript:async()=>[],
+    search_words:async()=>[],highlights:async()=>[],
+    transcript:async()=>[{a:4000,b:7000,t:'Right, we are going in.'},
+      {a:9000,b:12000,t:'Watch the left side, someone is rotating.'},
+      {a:15500,b:18000,t:'That was a clean one.'},
+      {a:22000,b:26000,t:'I keep leaving the goal wide open, honestly.'},
+      {a:31000,b:34000,t:'Okay, last play — go for it.'}],
     ai_status:async()=>({stt_on:true,hl_on:true,whisper:true,why:'',
       busy:{kind:'stt',name:'mock_session_20260801.mp4'},
       total:1757,stt_done:412,hl_done:380}),
@@ -1376,7 +1416,7 @@ function makeMock(){
     edit_cancel:async()=>{const m=window.__mockEd;if(m){m.done=true;m.ok=false;m.why='cancelled';}return {ok:true};},
     get_settings:async()=>({settings:{output_dir:'C:/mock',framerate:60,bitrate_mbps:25,
       encoder:'auto',amf_quality:'balanced',monitor_index:0,safe_capture:false,
-      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,seek_step:'5',
+      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,seek_step:'5',stt_quality:'best',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',
@@ -1387,7 +1427,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.02'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.03'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -2300,8 +2340,9 @@ function renderSet(cL,cR,app,spreadIdx){
     divider(R,'The tome reads itself');
     row(R,'Transcribe recordings',ctlToggle('ai_transcribe'));
     row(R,'Mark loud moments',ctlToggle('ai_highlights'));
+    row(R,'Reading accuracy',ctlSeg('stt_quality',[['best','Accurate'],['fast','Quick']]));
     R.append(aiStatusPlate());
-    hint(R,'All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
+    hint(R,'Accurate uses a large multilingual model that handles accents properly — it is what makes the words trustworthy, and costs about 1.7x the time. Quick uses a small English-only model: faster, but on this library it produced almost nothing and repeated itself. All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
@@ -3359,6 +3400,8 @@ async function openViewer(vid,seekTo){
   }
   vd.play().catch(()=>{});
   renderHlMarks(vid,req);
+  if(document.body.classList.contains('vsaid'))loadSaid(vid,req);
+  else{_said={lines:[],path:null,at:-1};$('#vsaid .vsaidbody').innerHTML='';}
 }
 /* 2.0: the tome marks the moments worth rewatching - gold ticks above the
    seek bar, one per detected loud moment; click to jump there (2s early,
@@ -3388,6 +3431,55 @@ async function renderHlMarks(vid,req){
   };
   if(vd.duration&&isFinite(vd.duration))place();
   else vd.addEventListener('loadedmetadata',place,{once:true});
+}
+/* ---- WHAT WAS SAID: read the recording instead of scrubbing it ----
+   The transcript sidecar the tome already wrote, laid out as a column.
+   Click a line and the video goes to that second; while it plays, the line
+   being spoken stays lit and scrolls itself into view. */
+let _said={lines:[],path:null,at:-1};
+async function loadSaid(v,req){
+  const body=$('#vsaid .vsaidbody');
+  _said={lines:[],path:v.path,at:-1};
+  body.innerHTML='';
+  body.append(el('div','vempty','listening back…'));
+  let segs=[];try{segs=await api.transcript(v.path)||[];}catch(e){}
+  if(req!==_viewerReq)return;
+  body.innerHTML='';
+  if(!segs.length){
+    body.append(el('div','vempty',
+      'The tome has not read this one yet. Transcription runs only while '
+      +'LORE is idle — leave it be for a while and the words appear here.'));
+    return;
+  }
+  const vd=$('#vvideo');
+  _said.lines=segs.map(s=>{
+    const t=(s.a||0)/1000;
+    const r=el('div','sline');
+    const mm=Math.floor(t/60),ss=String(Math.floor(t%60)).padStart(2,'0');
+    const b=el('b');b.textContent=mm+':'+ss;
+    const p=el('span');p.textContent=s.t||'';
+    r.append(b,p);
+    r.addEventListener('click',()=>{try{vd.currentTime=t;}catch(e){}
+      if(vd.paused)vd.play().catch(()=>{});});
+    body.append(r);
+    return {t,el:r};
+  });
+}
+/* follow the playhead - cheap: a linear walk from the last known line */
+function saidFollow(now){
+  if(!document.body.classList.contains('vsaid')||!_said.lines.length)return;
+  let i=_said.at;
+  if(i<0||now<_said.lines[i].t){i=0;}
+  while(i+1<_said.lines.length&&_said.lines[i+1].t<=now)i++;
+  if(i===_said.at)return;
+  if(_said.at>=0&&_said.lines[_said.at])_said.lines[_said.at].el.classList.remove('now');
+  _said.at=i;
+  const ln=_said.lines[i];if(!ln)return;
+  ln.el.classList.add('now');
+  const body=$('#vsaid .vsaidbody');
+  const r=ln.el.getBoundingClientRect(),br=body.getBoundingClientRect();
+  if(r.top<br.top+8||r.bottom>br.bottom-8)
+    body.scrollTop+=(r.top-br.top)-body.clientHeight*0.38;
 }
 /* our own "fullscreen" is a plain body class, not the HTML Fullscreen API - the
    API half-worked on this frameless WebView2 and could strand a click-blocking
@@ -3439,7 +3531,9 @@ function closeViewer(){
   try{vd.pause();}catch(e){}
   vd.removeAttribute('src');vd.load();
   vw.classList.remove('on');
-  document.body.classList.remove('cinema');
+  document.body.classList.remove('cinema','vsaid');
+  $('#vsay').classList.remove('on');
+  _said={lines:[],path:null,at:-1};$('#vsaid .vsaidbody').innerHTML='';
   sendShape();                             /* the ribbons return */
 }
 /* ---- the editing table: mark pieces, KEEP or REMOVE them, stitch, save ---- */
@@ -3586,6 +3680,14 @@ function wireViewer(){
   $('#vfolder').addEventListener('click',()=>{const c=V.cur;if(c){api.open_game_folder(c.path);whisper('opened this game’s folder');}});
   $('#vnext').addEventListener('click',()=>{const n=viewerSibling(1);if(n)openViewer(n);});
   $('#vfs').addEventListener('click',()=>toggleFullscreenTrue());
+  const saidToggle=()=>{
+    const on=document.body.classList.toggle('vsaid');
+    $('#vsay').classList.toggle('on',on);
+    if(on&&V.cur&&_said.path!==V.cur.path)loadSaid(V.cur,_viewerReq);
+    sizeViewer();
+  };
+  $('#vsay').addEventListener('click',saidToggle);
+  $('#vsaidx').addEventListener('click',saidToggle);
   let _vdelArm=false,_vdelT=null;
   $('#vdel').addEventListener('click',()=>{const b=$('#vdel');
     if(!_vdelArm){_vdelArm=true;b.classList.add('arm');b.textContent='sure?';
@@ -3606,7 +3708,8 @@ function wireViewer(){
     /* trim preview loops inside the chosen cut — only while actually PLAYING.
        a paused scrub also fires timeupdate, and snapping that back to A made
        "set end here" collapse the whole selection to 0.3s */
-    if(V.ed&&V.ed.on&&V.ed.preview&&!vd.paused&&!V.seeking){const s=V.ed.segs[V.ed.sel];if(s&&vd.currentTime>s.b-0.03)vd.currentTime=s.a;}});
+    if(V.ed&&V.ed.on&&V.ed.preview&&!vd.paused&&!V.seeking){const s=V.ed.segs[V.ed.sel];if(s&&vd.currentTime>s.b-0.03)vd.currentTime=s.a;}
+    saidFollow(vd.currentTime);});
   seek.addEventListener('input',()=>{V.seeking=true;
     if(vd.duration)time.textContent=`${fmtT(seek.value/1000*vd.duration)} / ${fmtT(vd.duration)}`;});
   seek.addEventListener('change',()=>{

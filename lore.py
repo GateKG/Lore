@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.02"
+APP_VERSION = "2.03"
 
 try:
     import psutil
@@ -134,6 +134,9 @@ DEFAULTS = {
     # Player: how far ArrowLeft/ArrowRight jump. 'frame' steps a single
     # frame (and pauses); the rest are seconds. Shift multiplies by 10.
     "seek_step":         "5",         # frame | 1 | 5 | 10
+    # Transcription model: 'best' = large-v3-turbo (accurate, handles
+    # accents), 'fast' = base.en (quick, English-only, much weaker).
+    "stt_quality":       "best",      # best | fast
     "afk_pause":         True,
     "afk_minutes":       4,
     # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
@@ -486,6 +489,7 @@ def _sanitize_settings(d):
         "capture_scope": ("screen", "window"),
         "capture_backend": ("auto", "ddagrab"),
         "seek_step": ("frame", "1", "5", "10"),
+        "stt_quality": ("best", "fast"),
     }
     # (hdr_mode is normalised by _migrate_settings_shape, which also maps legacy values)
     for k, allowed in ENUMS.items():
@@ -4135,6 +4139,27 @@ class Session:
         # module is missing, or WGC never shows a first frame (exclusive
         # fullscreen). A resumed run must match the file's locked size.
         self._wgc = None
+        # Say WHY when the real window capture is not used. This was silent,
+        # and it hid a shipping bug for a whole release: the updater never
+        # copied _internal, so `import windows_capture` failed on the user's
+        # machine and LORE quietly served the old screen-region crop while
+        # the settings page still promised window capture.
+        if self.win and self.win.get("hwnd"):
+            why = None
+            if str(SETTINGS.get("capture_backend", "auto")) != "auto":
+                why = "the setting forces the screen-region capture"
+            elif not _wgc_available():
+                why = ("the windows-capture module is missing from this "
+                       "install - reinstall LORE to get true window capture")
+            elif _hdr_active():
+                why = "the desktop is in HDR (window capture is SDR-only)"
+            elif self.win["w"] * self.win["h"] > 4_200_000:
+                why = (f"the window is {self.win['w']}x{self.win['h']} - too "
+                       f"large for the frame pipe (limit ~4.2 megapixels)")
+            if why and why != getattr(self, "_wgc_said", None):
+                self._wgc_said = why
+                log(f"Window capture: recording the SCREEN REGION because "
+                    f"{why}. Things in front of the window will be recorded.")
         if (self.win and self.win.get("hwnd")
                 and str(SETTINGS.get("capture_backend", "auto")) == "auto"
                 and _wgc_available() and not _hdr_active()
@@ -5895,6 +5920,28 @@ def _watch_core(ctl):
     # solid gold. The picker is fixed; drop the sidecars it already wrote so
     # they are rebuilt properly on idle. (marker must not start with '_':
     # the settings bridge strips those keys)
+    # Everything transcribed before 2.03 came from base.en, which on this
+    # library produced near-nothing and looped. Retire those transcripts so
+    # the better model rewrites them while idle.
+    if not SETTINGS.get("stt_reset_v203"):
+        try:
+            gone = 0
+            td = _thumb_dir(SETTINGS.get("output_dir", ""))
+            for fn in (os.listdir(td) if os.path.isdir(td) else []):
+                if fn.endswith(".stt.json"):
+                    try:
+                        os.remove(os.path.join(td, fn))
+                        gone += 1
+                    except OSError:
+                        pass
+            _persist_setting("stt_reset_v203", True)
+            SETTINGS["stt_reset_v203"] = True
+            _AI["index"] = None
+            if gone:
+                log(f"Cleared {gone} transcript(s) written by the old, weaker "
+                    f"model. They are being re-read with the accurate one.")
+        except Exception:
+            pass
     if not SETTINGS.get("hl_reset_v201"):
         try:
             gone = 0
@@ -7555,15 +7602,35 @@ def _ai_run(cmd, timeout, flags):
         _AI["proc"] = None
 
 
+#  Two models ship. base.en is small and quick but it is ENGLISH-ONLY and
+#  weak on accents: on this library it produced one usable line per two
+#  minutes of speech and fell into repetition loops ("...the same sentence
+#  forty times"). large-v3-turbo is multilingual, far more accurate on
+#  accented English, and measured only ~1.7x slower here (10.5x realtime
+#  against 17.6x) - worth every second.
+WHISPER_MODELS = {
+    "best": "ggml-large-v3-turbo-q5_0.bin",
+    "fast": "ggml-base.en-q5_1.bin",
+}
+
+
 def _whisper_paths():
     """(whisper-cli, model, vad-model) when the bundled transcriber is
-    present, else None. Lives in <app>/whisper (staged by the build)."""
+    present, else None. Lives in <app>/whisper (staged by the build).
+    Falls back to whichever model IS present, so a half-copied update
+    still transcribes instead of going quiet."""
     base = os.path.join(_here(), "whisper")
     cli = os.path.join(base, "Release", "whisper-cli.exe")
-    model = os.path.join(base, "ggml-base.en-q5_1.bin")
     vad = os.path.join(base, "ggml-silero-v5.1.2.bin")
-    if os.path.isfile(cli) and os.path.isfile(model):
-        return cli, model, (vad if os.path.isfile(vad) else None)
+    if not os.path.isfile(cli):
+        return None
+    want = str(SETTINGS.get("stt_quality", "best"))
+    order = [WHISPER_MODELS.get(want, WHISPER_MODELS["best"])]
+    order += [m for m in WHISPER_MODELS.values() if m not in order]
+    for name in order:
+        model = os.path.join(base, name)
+        if os.path.isfile(model):
+            return cli, model, (vad if os.path.isfile(vad) else None)
     return None
 
 
@@ -7604,8 +7671,13 @@ def _transcribe_one(video_path):
                              1800, flags)
         if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
             return False
+        # -mc 0: never feed the model its OWN previous text back as context.
+        # That carry-over is what turns one bad guess into the same sentence
+        # repeated for a minute. The entropy threshold + non-speech-token
+        # suppression catch the rest.
         cmd = [cli, "-m", model, "-f", wav, "-l", "en", "-t", "8",
-               "-oj", "-of", outb, "-np"]
+               "-oj", "-of", outb, "-np",
+               "-mc", "0", "--entropy-thold", "2.6", "--suppress-nst"]
         if vad:
             cmd += ["--vad", "-vm", vad]
         rc, _o, _e = _ai_run(cmd, 3600, flags)
