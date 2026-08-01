@@ -625,6 +625,24 @@ body.reduced .proj-glare::after{animation:none}
 .srow .ctl{flex:1;display:flex;align-items:center;gap:10px;font-family:var(--ui);min-width:0}
 .shint{font-size:10.5px;color:var(--ink-faint);font-style:italic;font-family:var(--serif);
   line-height:1.55;flex:0 0 auto}
+/* the reader's own little status plate - the only place the AI work is
+   visible while it happens (everything else about it is silent by design) */
+.aistat{margin:3px 0 5px;padding:9px 11px;border-radius:7px;flex:0 0 auto;
+  background:rgba(255,248,230,.34);border:1px solid rgba(110,88,50,.3)}
+.aistat .now{display:flex;align-items:center;gap:7px;font-size:12px;
+  color:var(--ink);font-family:var(--serif);min-width:0}
+.aistat .now span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aistat .dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto;
+  background:rgba(110,88,50,.45)}
+.aistat .dot.work{background:var(--gold);box-shadow:0 0 5px var(--gold);
+  animation:aipulse 1.9s ease-in-out infinite}
+@keyframes aipulse{0%,100%{opacity:.35}50%{opacity:1}}
+.aistat .bar{height:3px;border-radius:2px;margin:8px 0 6px;overflow:hidden;
+  background:rgba(90,70,40,.22)}
+.aistat .bar i{display:block;height:100%;border-radius:2px;width:0;
+  background:linear-gradient(90deg,#c79a45,var(--gold));transition:width .6s ease}
+.aistat .sub{font-size:10.5px;color:var(--ink-faint);font-style:italic;
+  font-family:var(--serif);line-height:1.5}
 .sdiv{display:flex;align-items:center;gap:10px;margin-top:6px;
   font-size:10px;letter-spacing:.3em;color:var(--ink-faint);text-transform:uppercase;flex:0 0 auto}
 .sdiv::after{content:"";flex:1;height:1px;background:linear-gradient(to right,rgba(90,70,40,.4),transparent)}
@@ -1335,7 +1353,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.0'};},
+      webhook:true,version:'2.01'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1347,6 +1365,9 @@ function makeMock(){
     clip:async()=>true, clip_discord:async()=>true,
     open_video:async()=>true,reveal:async()=>true,open_game_folder:async()=>true,
     search_words:async()=>[],highlights:async()=>[],transcript:async()=>[],
+    ai_status:async()=>({stt_on:true,hl_on:true,whisper:true,why:'',
+      busy:{kind:'stt',name:'mock_session_20260801.mp4'},
+      total:1757,stt_done:412,hl_done:380}),
     delete_video:async()=>({ok:true}),post_discord:async()=>true,
     edit_video:async()=>{window.__mockEd={pct:0,phase:'cutting',done:false,ok:false,name:'mock_edit.mp4'};return {ok:true,id:'m'};},
     edit_status:async()=>{const m=window.__mockEd;if(!m)return{done:true,ok:false,pct:0,phase:''};
@@ -1366,7 +1387,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.0'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.01'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -2069,6 +2090,67 @@ function row(c,label,ctl,small){
 function hint(c,t){c.append(el('div','shint',t));}
 function divider(c,t){c.append(el('div','sdiv',esc(t)));}
 
+/* The reader's status plate. The AI is deliberately silent - it only ever
+   works while you are away - so this is the one place that says what it is
+   doing, how far through the library it has read, and when it is resting,
+   WHY. It polls only while it is on screen: the count behind it is a walk
+   over every recording. */
+function aiStatusPlate(){
+  const box=el('div','aistat');
+  const now=el('div','now');const dot=el('span','dot');const txt=el('span');
+  txt.textContent='…';now.append(dot,txt);
+  const bar=el('div','bar');const fill=el('i');bar.append(fill);
+  const sub=el('div','sub','asking the tome…');
+  box.append(now,bar,sub);
+  const num=n=>Number(n||0).toLocaleString();
+  const paint=a=>{
+    if(!a)return;
+    if(!a.whisper){
+      dot.className='dot';bar.style.display='none';
+      txt.textContent='The reader is not installed';
+      sub.textContent='LORE cannot find its whisper folder, so nothing can be '
+        +'transcribed or searched. Reinstalling LORE puts it back.';
+      return;
+    }
+    if(a.busy){
+      dot.className='dot work';
+      txt.textContent=(a.busy.kind==='hl'?'Listening to ':'Reading ')
+        +String(a.busy.name||'').replace(/\.mp4$/i,'');
+    }else{
+      dot.className='dot';
+      const allRead=a.total&&(!a.stt_on||a.stt_done>=a.total)
+                            &&(!a.hl_on||a.hl_done>=a.total);
+      txt.textContent=a.why==='off'?'Both readers are off'
+        :a.why?a.why.charAt(0).toUpperCase()+a.why.slice(1)
+        :(allRead?'Every recording has been read':'Waiting for a quiet moment');
+    }
+    const tot=a.total||0;
+    bar.style.display=(tot&&(a.stt_on||a.hl_on))?'':'none';   /* no empty rail when both are off */
+    if(tot){const d=a.stt_on?(a.stt_done||0):(a.hl_done||0);
+      fill.style.width=Math.round(Math.min(d,tot)/tot*100)+'%';}
+    const parts=[];
+    if(a.stt_on)parts.push(`${num(a.stt_done)} of ${num(tot)} recordings read`);
+    if(a.hl_on)parts.push(`${num(a.hl_done)} listened to for loud moments`);
+    sub.textContent=parts.join(' · ')
+      ||'Turn one on and the tome reads whenever you are away from a game.';
+  };
+  let iv=null;
+  const ask=()=>{
+    if(!(api&&api.ai_status)){                 /* an older Lore.exe */
+      txt.textContent='This copy of LORE cannot report on the reader';
+      sub.textContent='';bar.style.display='none';
+      if(iv)clearInterval(iv);return;
+    }
+    try{api.ai_status().then(paint).catch(()=>{});}catch(e){}
+  };
+  iv=setInterval(()=>{
+    if(!document.body.contains(box)){clearInterval(iv);return;}   /* left the page */
+    ask();
+  },2500);
+  ask();
+  return box;
+}
+
 function listEditor(getList,save,placeholder,forceExe){
   const wrap=el('div','ledit');
   const rows=el('div','lrows');wrap.append(rows);
@@ -2218,6 +2300,7 @@ function renderSet(cL,cR,app,spreadIdx){
     divider(R,'The tome reads itself');
     row(R,'Transcribe recordings',ctlToggle('ai_transcribe'));
     row(R,'Mark loud moments',ctlToggle('ai_highlights'));
+    R.append(aiStatusPlate());
     hint(R,'All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
@@ -3044,6 +3127,9 @@ function applyState(st){
     const bits=[];
     if(st.converting)bits.push(`restoring ${st.converting.name.replace(/\.mp4$/,'')}${st.converting.pct?` — ${Math.round(st.converting.pct)}%`:''}`);
     else if(st.queued)bits.push(`${st.queued} restoration${st.queued>1?'s':''} awaiting idle`);
+    /* the reader at work - the one place it is visible without opening
+       Settings, so it says WHICH recording it has open */
+    if(st.ai)bits.push(`${st.ai.kind==='hl'?'listening to':'reading'} ${String(st.ai.name||'').replace(/\.mp4$/i,'')}`);
     if(st.hdr)bits.push('HDR eyes open');
     if(bits.length)sub=bits.join(' · ');
   }

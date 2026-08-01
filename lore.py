@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.0"
+APP_VERSION = "2.01"
 
 try:
     import psutil
@@ -8835,6 +8835,52 @@ class _JsApi:
                                      + base64.b64encode(fh.read()).decode("ascii"))
             except Exception:
                 pass
+        return out
+
+    def ai_status(self):
+        """What the reader is doing, and how far it has read. The Settings
+        page asks for this; state() must stay cheap, and a full library
+        stat-walk is not (two stats per video, thousands of videos), so the
+        walk is cached and never runs while a game is being recorded."""
+        ctl = self._ctl
+        busy = _AI.get("busy")
+        stt_on = bool(SETTINGS.get("ai_transcribe", True))
+        hl_on = bool(SETTINGS.get("ai_highlights", True))
+        have = _whisper_paths() is not None
+        # the same gates _ai_tick obeys, said in the reader's own words
+        why = ""
+        if not (stt_on or hl_on):
+            why = "off"
+        elif busy is None:
+            if ctl.session is not None:
+                why = "resting while you play"
+            elif ctl.saving > 0 or _FINISHING["busy"]:
+                why = "waiting for a recording to finish saving"
+            elif _TRIM_BUSY[0] > 0:
+                why = "waiting for your edit"
+            elif time.time() - _MEDIA.get("last_read", 0) < 20:
+                why = "waiting while you watch"
+        out = {"stt_on": stt_on, "hl_on": hl_on, "whisper": have, "why": why,
+               "busy": ({"kind": busy[0], "name": busy[1]} if busy else None)}
+        c = _AI.get("_read")
+        fresh = c and time.time() - c["t"] < 20
+        if not fresh and ctl.session is None:
+            total = stt = hl = 0
+            try:
+                for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                    for v in _scan_dir_mp4s(d, kind):
+                        total += 1
+                        if _ai_sidecar_fresh(v["path"], "stt"):
+                            stt += 1
+                        if _ai_sidecar_fresh(v["path"], "hl"):
+                            hl += 1
+            except Exception:
+                total = stt = hl = 0
+            c = {"total": total, "stt": stt, "hl": hl, "t": time.time()}
+            _AI["_read"] = c
+        if c:
+            out.update({"total": c["total"], "stt_done": c["stt"],
+                        "hl_done": c["hl"]})
         return out
 
     def search_words(self, query):
