@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.03"
+APP_VERSION = "2.04"
 
 try:
     import psutil
@@ -137,6 +137,10 @@ DEFAULTS = {
     # Transcription model: 'best' = large-v3-turbo (accurate, handles
     # accents), 'fast' = base.en (quick, English-only, much weaker).
     "stt_quality":       "best",      # best | fast
+    # Spoken language. 'auto' lets the model decide - but it decides ONCE per
+    # recording, so a sentence that switches mid-way still lands in whichever
+    # language won. 'en'/'ar' pin it.
+    "stt_language":      "auto",      # auto | en | ar
     "afk_pause":         True,
     "afk_minutes":       4,
     # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
@@ -490,6 +494,7 @@ def _sanitize_settings(d):
         "capture_backend": ("auto", "ddagrab"),
         "seek_step": ("frame", "1", "5", "10"),
         "stt_quality": ("best", "fast"),
+        "stt_language": ("auto", "en", "ar"),
     }
     # (hdr_mode is normalised by _migrate_settings_shape, which also maps legacy values)
     for k, allowed in ENUMS.items():
@@ -2872,6 +2877,51 @@ def build_wgc_cmd(w, h, fps, out_pattern, start_number=0):
     ]
 
 
+def _client_crop(hwnd, frame_w, frame_h):
+    """Where the window's CLIENT area sits inside a WGC frame, in frame
+    pixels: (x, y, w, h) - or None if anything looks off.
+
+    The frame is the window's physical surface; GetWindowRect/ClientToScreen
+    speak the process's coordinate space, which may be scaled by DPI. Taking
+    the ratio between the two removes that difference without needing to know
+    the scale factor, and it stays right on a mixed-DPI desktop."""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+
+        class _R(ctypes.Structure):
+            _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                        ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+        class _P(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        wr, cr, org = _R(), _R(), _P(0, 0)
+        if not u.GetWindowRect(hwnd, ctypes.byref(wr)):
+            return None
+        if not u.GetClientRect(hwnd, ctypes.byref(cr)):
+            return None
+        if not u.ClientToScreen(hwnd, ctypes.byref(org)):
+            return None
+        win_w, win_h = wr.r - wr.l, wr.b - wr.t
+        cli_w, cli_h = cr.r - cr.l, cr.b - cr.t
+        if win_w <= 0 or win_h <= 0 or cli_w <= 0 or cli_h <= 0:
+            return None
+        sx, sy = frame_w / float(win_w), frame_h / float(win_h)
+        x = int(round((org.x - wr.l) * sx))
+        y = int(round((org.y - wr.t) * sy))
+        w = int(round(cli_w * sx))
+        h = int(round(cli_h * sy))
+        # a borderless / fullscreen window is all client - nothing to trim
+        if x < 0 or y < 0 or w < 16 or h < 16:
+            return None
+        if x + w > frame_w or y + h > frame_h:
+            return None
+        return x, y, w, h
+    except Exception:
+        return None
+
+
 class _WGCFeed:
     """Windows Graphics Capture -> ffmpeg stdin. The WINDOW ITSELF is the
     source (not a screen region), which is the 2.0 upgrade: overlays,
@@ -2894,6 +2944,7 @@ class _WGCFeed:
         self.w = self.h = 0               # aligned encode size (first frame,
         self.fps = fps                    # width mod-8 / height even)
         self._raw_w = self._raw_h = 0     # the window's true physical size
+        self._ox = self._oy = 0           # client-area origin inside the frame
         self.stdin = None
         self.size_changed = False
         self.dead = False
@@ -2905,8 +2956,17 @@ class _WGCFeed:
         self._first = threading.Event()
         self._ctl = None
         self._ticker_t = None
+        self.hwnd = int(hwnd)
+        self._crop = None                 # (x, y, w, h) of the CLIENT area
         from windows_capture import WindowsCapture
-        cap = WindowsCapture(cursor_capture=False, window_hwnd=int(hwnd))
+        # draw_border=False removes the yellow highlight Windows paints around
+        # a captured window - it is part of the composed surface, so it lands
+        # IN the recording. Older Windows builds don't accept the argument.
+        try:
+            cap = WindowsCapture(cursor_capture=False, draw_border=False,
+                                 window_hwnd=self.hwnd)
+        except Exception:
+            cap = WindowsCapture(cursor_capture=False, window_hwnd=self.hwnd)
         feed = self
 
         @cap.event
@@ -2919,12 +2979,22 @@ class _WGCFeed:
                 return
             if not feed._first.is_set():
                 feed._raw_w, feed._raw_h = frame.width, frame.height
+                # WGC hands back the WHOLE window - title bar, buttons and
+                # frame included (measured: 39px of chrome above the client
+                # area). A game recording wants the game, so crop to the
+                # client area; that also takes the window's outer edge with
+                # it. Falls back to the full frame if the maths look wrong.
+                feed._crop = _client_crop(feed.hwnd, frame.width, frame.height)
+                cx, cy, cw, ch = (feed._crop if feed._crop
+                                  else (0, 0, frame.width, frame.height))
                 # the SAME alignment law as every other capture path: width
                 # mod-8, height even - AMF pads odd sizes up and the padding
                 # columns would appear as a garbage stripe in the video
-                feed.w = frame.width - (frame.width % 8)
-                feed.h = frame.height - (frame.height % 2)
-                buf = frame.frame_buffer[:feed.h, :feed.w].tobytes()
+                feed.w = cw - (cw % 8)
+                feed.h = ch - (ch % 2)
+                feed._ox, feed._oy = cx, cy
+                buf = frame.frame_buffer[cy:cy + feed.h,
+                                         cx:cx + feed.w].tobytes()
                 with feed._lock:
                     feed._last = buf
                 feed.frames_in += 1
@@ -2934,7 +3004,8 @@ class _WGCFeed:
                 feed.size_changed = True      # resize: the raw stream is over
                 feed._stopev.set()
                 return
-            buf = frame.frame_buffer[:feed.h, :feed.w].tobytes()  # crop+copy
+            buf = frame.frame_buffer[feed._oy:feed._oy + feed.h,
+                                     feed._ox:feed._ox + feed.w].tobytes()
             with feed._lock:
                 feed._last = buf
             feed.frames_in += 1
@@ -7124,7 +7195,13 @@ def _load_auto_game_names():
             # title takes over again and the next launch re-learns properly
             junk = {"tagame", "ue4game", "ue5game", "unrealwindow", "cryengine",
                     "unityplayer", "godot engine", "gameapp",
-                    "bootstrappackagedgame", "d3d11", "dx11", "main"}
+                    "bootstrappackagedgame", "d3d11", "dx11", "main",
+                    "battle.net", "battlenet", "blizzard battle.net",
+                    "blizzard entertainment", "steam", "valve", "epic games",
+                    "epic games launcher", "uplay", "ubisoft connect",
+                    "origin", "ea app", "ea desktop", "gog galaxy",
+                    "rockstar games", "riot client", "xbox", "game pass",
+                    "microsoft store"}
             healed = False
             for k, v in raw.items():
                 kk = _norm_game_key(k)
@@ -7193,7 +7270,20 @@ def _clean_game_display_title(title, raw_base=""):
     if re.search(r"[A-Za-z]:\\|/|https?://", s):
         return None
     # Drop pure technical tags but keep real subtitles such as ': Wings of Ruin'.
-    s = re.sub(r"\s*[\[(](?:dx\s*1[12]|directx\s*1[12]|vulkan|opengl|win64|x64|shipping|64-bit|steam|epic)[\])]\s*", " ", s, flags=re.I)
+    # A bracket is junk only when EVERY comma-separated part of it is a build
+    # tag - Rocket League titles its window "Rocket League (64-bit, DX11,
+    # Cooked)", and matching single-token brackets left all of that in place.
+    _TECH = {"dx11", "dx12", "dx 11", "dx 12", "directx11", "directx12",
+             "directx 11", "directx 12", "vulkan", "opengl", "win64", "win32",
+             "x64", "x86", "64-bit", "32-bit", "64 bit", "32 bit", "shipping",
+             "cooked", "development", "debug", "release", "retail", "final",
+             "test", "steam", "epic", "egs", "uwp"}
+
+    def _drop_tech(m):
+        parts = [x.strip().lower() for x in m.group(1).split(",")]
+        return " " if parts and all(x in _TECH for x in parts) else m.group(0)
+
+    s = re.sub(r"\s*[\[(]([^\[\]()]{1,60})[\])]\s*", _drop_tech, s)
     s = re.sub(r"\s+[-–—]\s+(?:dx\s*1[12]|directx\s*1[12]|vulkan|opengl|win64|x64|shipping|steam|epic)$", "", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip(" -_|—–")
     low = s.lower()
@@ -7203,7 +7293,16 @@ def _clean_game_display_title(title, raw_base=""):
                  # Rocket League's FileDescription is literally "TAGame"
                  "tagame", "ue4game", "ue5game", "unrealwindow", "cryengine",
                  "unityplayer", "godot engine", "gameapp",
-                 "bootstrappackagedgame", "d3d11", "dx11", "main"}
+                 "bootstrappackagedgame", "d3d11", "dx11", "main",
+                 # STOREFRONT BRANDS. These reach us through exe version
+                 # metadata - Blizzard stamps Hearthstone.exe "Battle.net" -
+                 # and would file every game of theirs under the shop's name.
+                 "battle.net", "battlenet", "blizzard battle.net",
+                 "blizzard entertainment", "steam", "valve",
+                 "epic games", "epic games launcher", "uplay",
+                 "ubisoft connect", "origin", "ea app", "ea desktop",
+                 "gog galaxy", "rockstar games", "riot client",
+                 "xbox", "game pass", "microsoft store"}
     # only the ENGINE's splash strings are junk - a bare "unreal " prefix
     # used to eat the actual Unreal Tournament titles
     if low in bad_exact or low.endswith(" launcher") or low.startswith(("unreal engine", "unreal editor")):
@@ -7675,7 +7774,12 @@ def _transcribe_one(video_path):
         # That carry-over is what turns one bad guess into the same sentence
         # repeated for a minute. The entropy threshold + non-speech-token
         # suppression catch the rest.
-        cmd = [cli, "-m", model, "-f", wav, "-l", "en", "-t", "8",
+        lang = str(SETTINGS.get("stt_language", "auto"))
+        if lang not in ("auto", "en", "ar"):
+            lang = "auto"
+        if os.path.basename(model).startswith("ggml-base.en"):
+            lang = "en"          # the small model only ever knew English
+        cmd = [cli, "-m", model, "-f", wav, "-l", lang, "-t", "8",
                "-oj", "-of", outb, "-np",
                "-mc", "0", "--entropy-thold", "2.6", "--suppress-nst"]
         if vad:

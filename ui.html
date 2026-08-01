@@ -833,7 +833,8 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 .vbtn:disabled,.vbtn:disabled:hover{opacity:.26;cursor:default;color:#e3cfa2;background:transparent}
 #vdel.arm{color:#ffd9d0;background:rgba(200,60,40,.30);width:auto;padding:0 10px;font-size:12px;font-weight:700;letter-spacing:.03em}
 #vseekwrap{position:relative;flex:1;min-width:240px;max-width:560px;display:flex;align-items:center}
-.hlmark{position:absolute;top:-7px;width:3px;height:7px;border-radius:1.5px;background:var(--gold);opacity:.85;cursor:pointer;z-index:3}
+.hlmark{position:absolute;top:-7px;width:2px;height:7px;border-radius:1px;
+  background:var(--gold);opacity:.85;cursor:pointer;z-index:3;box-sizing:border-box}
 .hlmark:hover{background:var(--gold-hi);height:9px;top:-9px}
 #tsearch{width:100%;box-sizing:border-box;margin:2px 0 8px;padding:7px 12px;border-radius:14px;border:1px solid rgba(140,110,70,.35);background:rgba(255,252,244,.6);color:#3a2c18;font:500 13px Georgia,serif;outline:none}
 #tsearch::placeholder{color:#9c8963;font-style:italic}
@@ -1388,7 +1389,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.03'};},
+      webhook:true,version:'2.04'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1416,7 +1417,7 @@ function makeMock(){
     edit_cancel:async()=>{const m=window.__mockEd;if(m){m.done=true;m.ok=false;m.why='cancelled';}return {ok:true};},
     get_settings:async()=>({settings:{output_dir:'C:/mock',framerate:60,bitrate_mbps:25,
       encoder:'auto',amf_quality:'balanced',monitor_index:0,safe_capture:false,
-      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,seek_step:'5',stt_quality:'best',
+      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,seek_step:'5',stt_quality:'best',stt_language:'auto',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',
@@ -1427,7 +1428,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.03'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.04'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -2341,8 +2342,9 @@ function renderSet(cL,cR,app,spreadIdx){
     row(R,'Transcribe recordings',ctlToggle('ai_transcribe'));
     row(R,'Mark loud moments',ctlToggle('ai_highlights'));
     row(R,'Reading accuracy',ctlSeg('stt_quality',[['best','Accurate'],['fast','Quick']]));
+    row(R,'Spoken language',ctlSeg('stt_language',[['auto','Detect'],['en','English'],['ar','العربية']]));
     R.append(aiStatusPlate());
-    hint(R,'Accurate uses a large multilingual model that handles accents properly — it is what makes the words trustworthy, and costs about 1.7x the time. Quick uses a small English-only model: faster, but on this library it produced almost nothing and repeated itself. All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
+    hint(R,'Accurate uses a large multilingual model that handles accents properly — it is what makes the words trustworthy, and costs about 1.7x the time. Quick uses a small English-only model: faster, but on this library it produced almost nothing and repeated itself. Detect works out the language itself, but it decides ONCE per recording — a sentence that switches between Arabic and English mid-way still lands in whichever language won, so pin it if your sessions lean one way. All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
@@ -3406,8 +3408,10 @@ async function openViewer(vid,seekTo){
 /* 2.0: the tome marks the moments worth rewatching - gold ticks above the
    seek bar, one per detected loud moment; click to jump there (2s early,
    so the lead-in is never missed). */
+let _hlPlace=null;      /* the current bar's placer, re-run on any resize */
 async function renderHlMarks(vid,req){
   document.querySelectorAll('.hlmark').forEach(m=>m.remove());
+  _hlPlace=null;
   let evs=[];try{evs=await api.highlights(vid.path)||[];}catch(e){}
   if(req!==_viewerReq||!evs.length)return;
   const vd=$('#vvideo'),wrap=$('#vseekwrap');
@@ -3417,20 +3421,32 @@ async function renderHlMarks(vid,req){
     const d=vd.duration;if(!d||!isFinite(d))return;
     /* NEVER a barcode. However many moments the sidecar holds (older ones
        hold hundreds), only the loudest survive, and no two land closer than
-       1.6% of the bar - about 8px - so every tick stays a tick you can aim at. */
-    const sep=d*0.016,keep=[];
+       2.5% of the bar - so every tick reads as its own mark, not a smear. */
+    const sep=d*0.025,keep=[];
     [...evs].sort((a,b)=>(b.z||0)-(a.z||0)).forEach(ev=>{
       if(keep.length<30&&keep.every(k=>Math.abs(k.t-ev.t)>=sep))keep.push(ev);});
+    /* WHOLE-PIXEL positions off the MEASURED bar. A percentage looked right
+       but drew each tick at a fractional x, so the browser smeared them to
+       different widths - and it ignored the 7px the range thumb is inset at
+       each end, which pushed the late marks past the end of the track. */
+    const W=wrap.getBoundingClientRect().width;
+    if(W<20)return;
+    const track=W-14;
     keep.sort((a,b)=>a.t-b.t).forEach(ev=>{
       const m=el('div','hlmark');
-      m.style.left='calc('+(Math.min(1,Math.max(0,ev.t/d))*100).toFixed(3)+'% - 1px)';
+      m.style.left=Math.round(7+Math.min(1,Math.max(0,ev.t/d))*track-1)+'px';
       m.title='a loud moment — jump there';
       m.addEventListener('click',()=>{try{vd.currentTime=Math.max(0,ev.t-2);}catch(e){}});
       wrap.append(m);
     });
   };
+  _hlPlace=place;
   if(vd.duration&&isFinite(vd.duration))place();
   else vd.addEventListener('loadedmetadata',place,{once:true});
+  if(!renderHlMarks._ro&&window.ResizeObserver){
+    renderHlMarks._ro=new ResizeObserver(()=>{if(_hlPlace)_hlPlace();});
+    renderHlMarks._ro.observe(wrap);
+  }
 }
 /* ---- WHAT WAS SAID: read the recording instead of scrubbing it ----
    The transcript sidecar the tome already wrote, laid out as a column.
@@ -3661,6 +3677,13 @@ function edPoll(){
    and the guess ran short, so flex overflow shoved the video over the gold
    ring, the details line, even toward the ✕. measure, don't guess. */
 function sizeViewer(){
+  /* the gold marks are placed in MEASURED pixels, so every relayout has to
+     re-place them. A ResizeObserver alone is not enough: its callbacks ride
+     the paint cycle, and this runs inside a frameless WebView2 that can go
+     long stretches without painting. sizeViewer is the app's own "geometry
+     changed" signal - window resize, theater in/out, the transcript column
+     opening - so hang the re-place off that too. */
+  if(typeof _hlPlace==='function'&&_hlPlace)_hlPlace();
   const vw=$('#viewer');
   if(!vw||document.body.classList.contains('vfull'))return;   /* theater has its own fixed geometry */
   const H=s=>{const n=$(s);return n?n.offsetHeight:0;};        /* display:none measures 0, conveniently */
