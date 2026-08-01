@@ -130,6 +130,7 @@ body.reduced #brand{animation:none}
 #winbtns button{width:32px;height:28px;border:0;background:transparent;border-radius:7px;
   color:#8a6f45;font-size:13px;cursor:pointer;transition:all .18s;line-height:1}
 #winbtns button:hover{color:var(--gold-hi);background:rgba(232,181,99,.12)}
+#winbtns button:focus{outline:none}  /* mouse-only chrome: no boot focus ring */
 #winbtns #btn-close:hover{color:#ff9d78;background:rgba(190,80,40,.18)}
 
 /* ---------------------------------------------------------------- pages */
@@ -955,9 +956,12 @@ body.reduced #intro{display:none}
   <div id="brand"><span>LORE</span></div>
 </div>
 <div id="winbtns">
-  <button id="btn-min" title="Minimize">–</button>
-  <button id="btn-max" title="Maximize / restore">▢</button>
-  <button id="btn-close" title="Rest in the tray">✕</button>
+  <!-- tabindex=-1: these are the FIRST focusable elements in the page, and
+       WebView2 hands them the initial focus on boot - the minimize button
+       wore a phantom "Minimize" highlight on every start. Mouse-only. -->
+  <button id="btn-min" tabindex="-1" title="Minimize">–</button>
+  <button id="btn-max" tabindex="-1" title="Maximize / restore">▢</button>
+  <button id="btn-close" tabindex="-1" title="Rest in the tray">✕</button>
 </div>
 
 <div id="pages">
@@ -3663,6 +3667,9 @@ function preIntro(){
          (irrelevant) visible case and whichever lands first wins. */
       let called=false;
       const go=()=>{ if(called)return; called=true;
+        /* whatever the initial focus walk landed on, nothing may wear a
+           focus highlight on the first frame the user ever sees */
+        try{document.activeElement&&document.activeElement.blur&&document.activeElement.blur();}catch(e){}
         try{api.first_paint&&api.first_paint();}catch(e){} };
       requestAnimationFrame(()=>requestAnimationFrame(go));
       setTimeout(go,60); };
