@@ -787,6 +787,16 @@ body.cinema .tabcol{opacity:0;pointer-events:none;transition:opacity .25s}
 .vbtn:disabled,.vbtn:disabled:hover{opacity:.26;cursor:default;color:#e3cfa2;background:transparent}
 #vdel.arm{color:#ffd9d0;background:rgba(200,60,40,.30);width:auto;padding:0 10px;font-size:12px;font-weight:700;letter-spacing:.03em}
 #vseekwrap{position:relative;flex:1;min-width:240px;max-width:560px;display:flex;align-items:center}
+.hlmark{position:absolute;top:-7px;width:3px;height:7px;border-radius:1.5px;background:var(--gold);opacity:.85;cursor:pointer;z-index:3}
+.hlmark:hover{background:var(--gold-hi);height:9px;top:-9px}
+#tsearch{width:100%;box-sizing:border-box;margin:2px 0 8px;padding:7px 12px;border-radius:14px;border:1px solid rgba(140,110,70,.35);background:rgba(255,252,244,.6);color:#3a2c18;font:500 13px Georgia,serif;outline:none}
+#tsearch::placeholder{color:#9c8963;font-style:italic}
+#tsearch:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(200,160,95,.25)}
+.sresrow{display:flex;flex-direction:column;gap:2px;padding:7px 10px;border-radius:10px;cursor:pointer}
+.sresrow:hover{background:rgba(200,160,95,.14)}
+.sresq{font:600 12.5px Georgia,serif;color:#4a3820}
+.sresq b{color:#8a5a18}
+.sresw{font:500 11px Inter,system-ui,sans-serif;color:#9c8963}
 #vseek{width:100%}
 /* multi-piece editor overlay on the seek bar */
 #vsegs{position:absolute;left:0;right:0;top:50%;height:15px;transform:translateY(-50%);pointer-events:none;display:none}
@@ -1325,7 +1335,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'1.11'};},
+      webhook:true,version:'2.0'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1336,6 +1346,7 @@ function makeMock(){
     pause_toggle:async()=>{st.status=st.status==='paused'?'recording':'paused';return true;},
     clip:async()=>true, clip_discord:async()=>true,
     open_video:async()=>true,reveal:async()=>true,open_game_folder:async()=>true,
+    search_words:async()=>[],highlights:async()=>[],transcript:async()=>[],
     delete_video:async()=>({ok:true}),post_discord:async()=>true,
     edit_video:async()=>{window.__mockEd={pct:0,phase:'cutting',done:false,ok:false,name:'mock_edit.mp4'};return {ok:true,id:'m'};},
     edit_status:async()=>{const m=window.__mockEd;if(!m)return{done:true,ok:false,pct:0,phase:''};
@@ -1344,7 +1355,7 @@ function makeMock(){
     edit_cancel:async()=>{const m=window.__mockEd;if(m){m.done=true;m.ok=false;m.why='cancelled';}return {ok:true};},
     get_settings:async()=>({settings:{output_dir:'C:/mock',framerate:60,bitrate_mbps:25,
       encoder:'auto',amf_quality:'balanced',monitor_index:0,safe_capture:false,
-      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',
+      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',
@@ -1355,7 +1366,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'1.11'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.0'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -1822,6 +1833,46 @@ function libTotalsSub(){
 function renderContents(cL,cR,spreadIdx){
   ptitle(cL,'the tome remembers','Recently Written',{c:'#8a6f42'});
   const bl=pbody(cL);
+  /* 2.0: the tome has READ its books - search the spoken word. Results
+     replace the recent list while a query is live; a click opens the video
+     AT that second. */
+  const sw=el('input');sw.id='tsearch';sw.type='text';
+  sw.placeholder='search everything ever said…';
+  sw.value=S.searchQ||'';
+  bl.append(sw);
+  const sres=el('div','rowlist');sres.style.display='none';bl.append(sres);
+  let list=null;   /* the recent-rows list; null while the library is empty */
+  let _st=null;
+  const runSearch=async q=>{
+    S.searchQ=q;
+    sres.innerHTML='';
+    if(!q||q.length<2){sres.style.display='none';if(list)list.style.display='';return;}
+    let hits=[];try{hits=await api.search_words(q)||[];}catch(e){}
+    if(S.searchQ!==q)return;              /* stale response */
+    if(list)list.style.display='none';sres.style.display='';
+    if(!hits.length){sres.append(el('div','vwhen','the tome finds no such words'));return;}
+    const byBase={};
+    sortedGames().forEach(g=>[...g.sessions,...g.clips].forEach(v=>{
+      const b=String(v.path).replace(/\\/g,'/').split('/').pop().replace(/\.mp4$/i,'');
+      byBase[b]={...v,gkey:g.key,gname:g.display};}));
+    hits.forEach(h=>{
+      const v=byBase[h.file];if(!v)return;
+      const r=el('div','sresrow');
+      const t=Math.max(0,h.t_ms/1000);
+      const mm=Math.floor(t/60),ss=String(Math.floor(t%60)).padStart(2,'0');
+      const qq=q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const qrow=el('div','sresq');
+      qrow.innerHTML='“'+String(h.text).split(new RegExp('('+qq+')','ig'))
+        .map((seg,i)=>i%2?'<b>'+esc(seg)+'</b>':esc(seg)).join('')+'”';
+      r.append(qrow);
+      r.append(el('div','sresw',esc(v.gname)+' · '+mm+':'+ss+' · '+esc(fmtWhen(v.mtime))));
+      r.addEventListener('click',()=>openViewer(v,t));
+      sres.append(r);
+    });
+    if(!sres.children.length)sres.append(el('div','vwhen','said in videos that are gone'));
+  };
+  sw.addEventListener('input',()=>{clearTimeout(_st);_st=setTimeout(()=>runSearch(sw.value.trim()),260);});
+  sw.addEventListener('keydown',e=>e.stopPropagation());   /* typing must not turn pages */
   /* fill the page: one .vrow is ~47px + 7px gap, the page body is the same
      measured height perPage() trusts - so fullscreen shows 12 memories, a
      small window shows what fully fits, and nothing ever clips */
@@ -1829,7 +1880,7 @@ function renderContents(cL,cR,spreadIdx){
   const rec=recentVids(Math.max(6,Math.min(12,rowsFit)));
   if(!rec.length){bl.append(emptyNote('sessions'));}
   else{
-    const list=el('div','rowlist');
+    list=el('div','rowlist');
     rec.forEach((v,i)=>{
       const r=el('div','vrow');
       const th=el('div','vthumb');const img=new Image();th.append(img);r.append(th);
@@ -1844,6 +1895,7 @@ function renderContents(cL,cR,spreadIdx){
       list.append(r);loadThumb(v.path,img,v.mtime);
     });
     bl.append(list);
+    if(S.searchQ&&S.searchQ.length>=2){runSearch(S.searchQ);}
   }
   folio(cL,spreadIdx,'l','contents');
 
@@ -2162,7 +2214,11 @@ function renderSet(cL,cR,app,spreadIdx){
     row(R,'Restore to standard colour after the session',ctlToggle('sdr_finish'));
     divider(R,'What is captured');
     row(R,'Capture',ctlSeg('capture_scope',[['screen','The whole screen'],['window','Only the game window']]));
-    hint(R,'Only-the-game-window is EXPERIMENTAL: the game’s window is recorded without the rest of your desktop — HDR included — and LORE follows it if you move it. Alt-tabbing or minimising just PAUSES the recording — even when the display flips mode and the capture itself drops — and it continues into the same video when you return. Resizing starts a fresh video (one file can’t change size midway). Anything covering the window is recorded too.');
+    hint(R,'Only-the-game-window is EXPERIMENTAL. On an SDR desktop LORE now captures the WINDOW ITSELF (Windows Graphics Capture — the OBS way): overlays, popups and Steam messages physically cannot appear in the video, and the recording follows the window anywhere. On an HDR desktop, or for very large windows, the proven screen-region capture takes over — HDR included — where things covering the window are recorded too. Alt-tabbing or minimising just PAUSES the recording; resizing starts a fresh video.');
+    divider(R,'The tome reads itself');
+    row(R,'Transcribe recordings',ctlToggle('ai_transcribe'));
+    row(R,'Mark loud moments',ctlToggle('ai_highlights'));
+    hint(R,'All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
@@ -2177,6 +2233,8 @@ function renderSet(cL,cR,app,spreadIdx){
     divider(L,'Sources');
     row(L,'System sound',ctlToggle('capture_system'));
     row(L,'Microphone',ctlToggle('capture_mic'));
+    row(L,'Game audio only',ctlToggle('game_audio_only'));
+    hint(L,'EXPERIMENTAL: record only the game’s own sound — Discord calls, Spotify and system dings stay out of your videos. If the game’s stream can’t be tapped, LORE falls back to normal system sound automatically.');
     const outs=[['','Default — follow Windows']].concat((st.devices.outputs||[]).map(o=>[o,o]));
     const mics=[['','Default microphone']].concat((st.devices.mics||[]).map(o=>[o,o]));
     row(L,'Game sound from',(()=>{const s=ctlSelect('audio_output_device',outs);
@@ -2269,6 +2327,9 @@ function renderSet(cL,cR,app,spreadIdx){
     divider(L,'Watching');
     row(L,'Game detection',ctlSeg('detection_mode',[['auto','Notice any game'],['list','Only my list']]));
     hint(L,'True game recognition: LORE asks Windows’ own game database and watches real 3D GPU load — the same signals ShadowPlay-style recorders use — so games record the moment they launch, even windowed, and a fullscreened chat app or browser never will. New games are learned on first sight; add anything niche below.');
+    row(L,'Pause when I’m away',ctlToggle('afk_pause'));
+    row(L,'…after how many minutes',ctlNum('afk_minutes',1,120));
+    hint(L,'No mouse, keyboard or controller input for this long and the recording pauses itself — the moment you’re back it continues into the same video. Controllers count: an idle stick won’t fool it, a real press wakes it.');
     row(L,'Always record these',listEditor(()=>S.settings.games,
       async l=>{const r=await api.set_games(l);S.settings.games=r||l;},'e.g. eldenring',false));
     divider(R,'Never record these');
@@ -3183,7 +3244,7 @@ async function viewerDelete(){
     if(req===_viewerReq&&V.cur&&V.cur.path===v.path)openViewer(v);
   }
 }
-async function openViewer(vid){
+async function openViewer(vid,seekTo){
   const vw=$('#viewer'),vd=$('#vvideo');
   const req=++_viewerReq;
   V.cur=vid;edReset();edUI(false);
@@ -3200,7 +3261,36 @@ async function openViewer(vid){
   if(!src)src=encodeURI('file:///'+String(vid.path).replace(/\\/g,'/'));
   vd.dataset.req=String(req);   /* stamp the src with its owning session - the error handler must ignore leftovers */
   vd.src=src;
+  if(seekTo>0){
+    const once=()=>{if(req!==_viewerReq)return;
+      try{vd.currentTime=Math.min(seekTo,(vd.duration||seekTo));}catch(e){}};
+    vd.addEventListener('loadedmetadata',once,{once:true});
+  }
   vd.play().catch(()=>{});
+  renderHlMarks(vid,req);
+}
+/* 2.0: the tome marks the moments worth rewatching - gold ticks above the
+   seek bar, one per detected loud moment; click to jump there (2s early,
+   so the lead-in is never missed). */
+async function renderHlMarks(vid,req){
+  document.querySelectorAll('.hlmark').forEach(m=>m.remove());
+  let evs=[];try{evs=await api.highlights(vid.path)||[];}catch(e){}
+  if(req!==_viewerReq||!evs.length)return;
+  const vd=$('#vvideo'),wrap=$('#vseekwrap');
+  const place=()=>{
+    if(req!==_viewerReq)return;
+    document.querySelectorAll('.hlmark').forEach(m=>m.remove());
+    const d=vd.duration;if(!d||!isFinite(d))return;
+    evs.forEach(ev=>{
+      const m=el('div','hlmark');
+      m.style.left='calc('+(Math.min(1,Math.max(0,ev.t/d))*100).toFixed(3)+'% - 1px)';
+      m.title='a loud moment — jump there';
+      m.addEventListener('click',()=>{try{vd.currentTime=Math.max(0,ev.t-2);}catch(e){}});
+      wrap.append(m);
+    });
+  };
+  if(vd.duration&&isFinite(vd.duration))place();
+  else vd.addEventListener('loadedmetadata',place,{once:true});
 }
 /* our own "fullscreen" is a plain body class, not the HTML Fullscreen API - the
    API half-worked on this frameless WebView2 and could strand a click-blocking
@@ -3244,6 +3334,7 @@ function clearIdleHide(){
   document.body.classList.remove('vidle');
 }
 function closeViewer(){
+  document.querySelectorAll('.hlmark').forEach(m=>m.remove());
   const vw=$('#viewer'),vd=$('#vvideo');
   _viewerReq++;
   exitTheater();                           /* never leave the video "fullscreen" after close */

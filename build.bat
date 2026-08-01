@@ -36,7 +36,7 @@ REM     pip freeze > requirements-lock.txt
 if exist requirements-lock.txt (
   %PYEXE% -m pip install -r requirements-lock.txt || goto :err
 ) else (
-  %PYEXE% -m pip install --upgrade pyinstaller psutil PyAudioWPatch pystray pillow pywebview || goto :err
+  %PYEXE% -m pip install --upgrade pyinstaller psutil PyAudioWPatch pystray pillow pywebview numpy windows-capture proc-tap || goto :err
 )
 
 echo.
@@ -69,10 +69,13 @@ if not exist known_games.txt echo   * known_games.txt not found - building witho
   --collect-all pystray ^
   --collect-all webview ^
   --collect-all clr_loader ^
+  --collect-all windows_capture ^
+  --collect-all proctap ^
   --hidden-import clr ^
   --hidden-import pystray._win32 ^
   --hidden-import PIL.Image ^
   --hidden-import psutil ^
+  --hidden-import numpy ^
   lore.py || goto :err
 
 set APP=dist\Lore
@@ -98,6 +101,19 @@ if not exist ffmpeg\bin\ffprobe.exe (
   goto :err
 )
 xcopy /e /i /y ffmpeg "%APP%\ffmpeg" >nul
+REM whisper is NOT optional in 2.0 - without it the tome cannot read itself
+REM (transcription + word search), so refuse to build a half-blind installer.
+if not exist whisper\Release\whisper-cli.exe (
+  echo   *** whisper\Release\whisper-cli.exe is missing. Put the whisper folder
+  echo       ^(Release\ + the two ggml model files^) next to build.bat.
+  goto :err
+)
+if not exist whisper\ggml-base.en-q5_1.bin (
+  echo   *** whisper\ggml-base.en-q5_1.bin is missing - whisper-cli alone can't
+  echo       transcribe. Put both model files in the whisper folder.
+  goto :err
+)
+xcopy /e /i /y whisper "%APP%\whisper" >nul
 if exist games.txt copy /y games.txt "%APP%\" >nul
 if exist app_launchers xcopy /e /i /y app_launchers "%APP%\" >nul
 

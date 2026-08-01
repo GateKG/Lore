@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.11"
+APP_VERSION = "2.0"
 
 try:
     import psutil
@@ -123,6 +123,26 @@ DEFAULTS = {
     # experimentally, only the game's own window - the SAME GPU capture cropped
     # at the source to the window's client rect, tracked as the window moves
     "capture_scope":     "screen",    # screen | window
+    # Window-scope transport: 'auto' uses Windows Graphics Capture (the OBS/
+    # Game-Bar API: the WINDOW itself is captured, so overlays and popups
+    # can't get in and alt-tab can't kill the feed) when the window is small
+    # enough for the raw-frame pipe and the desktop isn't HDR; 'ddagrab'
+    # forces the proven screen-region path everywhere.
+    "capture_backend":   "auto",      # auto | ddagrab
+    # AFK: no mouse/keyboard/controller input for this long -> the recording
+    # pauses by itself and resumes the moment input returns. 0 disables.
+    "afk_pause":         True,
+    "afk_minutes":       4,
+    # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
+    # loopback) instead of everything the speakers play - Discord and
+    # Spotify stay out of the video. Falls back to normal system audio
+    # if the game's stream can't be tapped.
+    "game_audio_only":   False,
+    # The tome's own intelligence, all local: transcribe recordings with
+    # whisper.cpp so the library is searchable by what was SAID, and mark
+    # loud moments as highlights on the timeline. Both run only while idle.
+    "ai_transcribe":     True,
+    "ai_highlights":     True,
     # Popups (Lore' own on-top notifications). Size scales with the watched
     # monitor; style picks the entrance animation (Settings > Replay > Popups).
     "popup_style":       "slide",     # slide | rise | pop | glow | sweep | off
@@ -447,7 +467,7 @@ def _sanitize_settings(d):
         "max_storage_gb": (0, 1000000), "sfx_volume": (0, 100),
         "clip_hotkey_seconds": (1, 3600), "discord_max_mb": (1, 1000),
         "discord_clip_seconds": (1, 3600), "discord_quality_mbps": (1, 1000),
-        "sdr_finish_max_min": (1, 600),
+        "sdr_finish_max_min": (1, 600), "afk_minutes": (1, 120),
     }
     for k, (lo, hi) in INT_BOUNDS.items():
         try:
@@ -461,6 +481,7 @@ def _sanitize_settings(d):
         "popup_style": ("slide", "rise", "pop", "glow", "sweep", "off"),
         "popup_size": ("small", "medium", "large", "huge"),
         "capture_scope": ("screen", "window"),
+        "capture_backend": ("auto", "ddagrab"),
     }
     # (hdr_mode is normalised by _migrate_settings_shape, which also maps legacy values)
     for k, allowed in ENUMS.items():
@@ -882,6 +903,143 @@ def _learn_game_exe(name):
     log(f"Learned a new game: {name} (recognised by GPU + fullscreen).")
 
 
+# ---------------------------------------------------------------------------
+#  AFK detection (Lore 2.0) - "is the user actually here?"
+#  Two signals, combined: GetLastInputInfo (keyboard+mouse; the OS's own idle
+#  clock) and XInput controller state diffs (pads do NOT touch the OS idle
+#  clock - a controller-only session would look AFK without this). Controller
+#  changes are dead-zone filtered: an untouched pad's stick jitter increments
+#  the packet counter forever and would defeat AFK pause entirely.
+# ---------------------------------------------------------------------------
+_PAD = {"xi": None, "tried": False, "last": {}, "conn": set(),
+        "rescan_t": 0.0, "active_t": 0.0}
+
+
+def _kbms_idle_ms():
+    """Milliseconds since the last keyboard/mouse input in this session.
+    0 (= active) on any failure - AFK must fail toward 'user is here'."""
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LII(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+        lii = LII()
+        lii.cbSize = ctypes.sizeof(LII)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0
+        return (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) & 0xFFFFFFFF
+    except Exception:
+        return 0
+
+
+def _pad_check():
+    """Note controller activity into _PAD['active_t']. Dead-zone filtered
+    (official XInput thresholds); connected pads polled every call, empty
+    slots rescanned every ~5s (Microsoft's own guidance - empty-slot probes
+    cost milliseconds each). Safe no-op when XInput is unavailable."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        if _PAD["xi"] is None and not _PAD["tried"]:
+            _PAD["tried"] = True
+            for dll in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+                try:
+                    _PAD["xi"] = ctypes.WinDLL(dll)
+                    break
+                except OSError:
+                    pass
+        xi = _PAD["xi"]
+        if xi is None:
+            return
+
+        class GP(ctypes.Structure):
+            _fields_ = [("wButtons", wintypes.WORD),
+                        ("bLeftTrigger", ctypes.c_ubyte),
+                        ("bRightTrigger", ctypes.c_ubyte),
+                        ("sThumbLX", ctypes.c_short), ("sThumbLY", ctypes.c_short),
+                        ("sThumbRX", ctypes.c_short), ("sThumbRY", ctypes.c_short)]
+
+        class ST(ctypes.Structure):
+            _fields_ = [("dwPacketNumber", wintypes.DWORD), ("Gamepad", GP)]
+        now = time.time()
+        rescan = now - _PAD["rescan_t"] > 5.0
+        if rescan:
+            _PAD["rescan_t"] = now
+        slots = range(4) if rescan else list(_PAD["conn"])
+        for i in slots:
+            st = ST()
+            if xi.XInputGetState(i, ctypes.byref(st)) == 0:
+                _PAD["conn"].add(i)
+                g, prev = st.Gamepad, _PAD["last"].get(i)
+                if prev is not None and (
+                        g.wButtons != prev[0]
+                        or g.bLeftTrigger > 30 or g.bRightTrigger > 30
+                        or abs(g.sThumbLX) > 7849 or abs(g.sThumbLY) > 7849
+                        or abs(g.sThumbRX) > 8689 or abs(g.sThumbRY) > 8689
+                        # a quick tap can start AND end between polls - the
+                        # packet counter still jumps far more than resting
+                        # stick jitter does over one poll interval
+                        or (st.dwPacketNumber - prev[3]) & 0xFFFFFFFF > 30):
+                    _PAD["active_t"] = now
+                _PAD["last"][i] = (g.wButtons, g.bLeftTrigger,
+                                   g.bRightTrigger, st.dwPacketNumber)
+            else:
+                _PAD["conn"].discard(i)
+                _PAD["last"].pop(i, None)
+    except Exception:
+        pass
+
+
+def _afk_idle_seconds():
+    """Seconds since the user last did ANYTHING - keyboard, mouse, or a real
+    (dead-zone-beating) controller input."""
+    _pad_check()
+    idle = _kbms_idle_ms() / 1000.0
+    pad_ago = time.time() - _PAD["active_t"] if _PAD["active_t"] else 1e9
+    return min(idle, pad_ago)
+
+
+def _afk_track(ctl, session, current):
+    """Auto-pause the recording when the user has been away for the set
+    time, and resume the moment they're back - hands-off, like the rest of
+    the tome. Reuses the pause/resume machinery (footage kept, same file).
+    Never pauses over the window-minimise auto-pause, and a USER pause is
+    never touched. Called once per watcher poll."""
+    if not SETTINGS.get("afk_pause", True):
+        return
+    try:
+        thresh = max(60, int(SETTINGS.get("afk_minutes", 4)) * 60)
+    except Exception:
+        thresh = 240
+    idle = _afk_idle_seconds()
+    if getattr(session, "afk_paused", False):
+        if idle < 5.0:
+            # They're back. ONLY clear the flag - the watcher's suspended
+            # branch owns the actual resume, because it re-aims the window
+            # first (the window may have vanished, moved screens, or the
+            # display flipped HDR while they were away). Resuming here
+            # skipped those checks and could record the wrong thing.
+            session.afk_paused = False
+            log("AFK: you're back - resuming.")
+        return
+    if session.suspended:
+        return                             # user/window pause: not ours
+    if idle >= thresh:
+        session.afk_paused = True
+        _loop_sound(ctl, "off")            # chime symmetry with the resume
+        session.suspend()
+        ctl.set_status("paused")
+        log(f"AFK for {int(idle // 60)} min - recording paused (it resumes "
+            "when you're back).")
+        ctl.notify("Recording paused",
+                   "You seem to be away - it continues when you're back.")
+
+
 def _exe_has_any_window(pname):
     """Does this process own ANY top-level window - visible or not? An
     alt-tabbed exclusive-fullscreen game HIDES its window (it still exists);
@@ -1261,9 +1419,11 @@ class AudioRecorder:
     """Captures system loopback (default playback device) and/or the mic to
     separate WAV files using WASAPI. No rerouting, no added latency."""
 
-    def __init__(self, tmp_dir, tag=""):
+    def __init__(self, tmp_dir, tag="", game_pid=None):
         self.tmp_dir = tmp_dir
         self.tag = tag                       # per-run suffix so pause/resume parts don't clash
+        self.game_pid = game_pid             # for the EXPERIMENTAL game-audio-only tap
+        self._sys_done = False
         self._pa = None
         self._streams = []
         self._threads = []
@@ -1355,9 +1515,15 @@ class AudioRecorder:
             target = int((now - ring["t_first"]) * rate)
             miss = target - ring["frames"] - nfr
             if miss > rate * 0.25:                      # engine starved: true silence
-                fill = int(min(miss, rate * 30))
-                _push(b"\x00" * (fill * frame_bytes))
-                ring["frames"] += fill
+                # fill the WHOLE gap (bounded pieces) - filling only 30s per
+                # callback scattered post-gap audio as blips every 30s when
+                # a source stayed silent for minutes
+                miss = int(min(miss, rate * 14400))
+                while miss > 0:
+                    n = int(min(miss, rate * 30))
+                    _push(b"\x00" * (n * frame_bytes))
+                    ring["frames"] += n
+                    miss -= n
             if nfr:
                 _push(in_data)
                 ring["frames"] += nfr
@@ -1398,12 +1564,182 @@ class AudioRecorder:
         self._threads.append(t)
         log(f"Audio: capturing {label} -> {channels}ch @ {rate}Hz")
 
+    def _open_process_tap(self, pid, path):
+        """EXPERIMENTAL game-audio-only: capture ONLY the given process tree's
+        sound via WASAPI process loopback (proc-tap) instead of everything the
+        speakers play - Discord/Spotify stay out of the video. Mirrors
+        _open_capture's contract exactly: int16 WAV, replay ring, wall-clock
+        silence-fill (process loopback delivers NOTHING while the game is
+        silent - unfilled, the track would drift early, the same starvation
+        bug the loopback path already solves). Returns True when the tap is
+        live; the caller falls back to normal loopback on False."""
+        try:
+            from proctap import ProcessAudioCapture
+            import numpy as np
+            from collections import deque
+            import queue
+        except Exception as e:
+            log(f"Game-audio tap unavailable ({e}); using system audio.")
+            return False
+        rate, channels = 48000, 2
+        frame_bytes = channels * 2
+        wf = wave.open(path, "wb")
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        ring = {"kind": "system", "rate": rate, "channels": channels,
+                "chunks": deque(), "bytes": 0,
+                "max": rate * channels * 2 * self._replay_seconds,
+                "t_first": None, "frames": 0, "push": None,
+                "frame_bytes": frame_bytes}
+        with self._ring_lock:
+            self.rings.append(ring)
+        q = queue.Queue(maxsize=4096)
+
+        def _push(data):
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+            with self._ring_lock:
+                ring["chunks"].append(data)
+                ring["bytes"] += len(data)
+                while ring["bytes"] > ring["max"] and len(ring["chunks"]) > 1:
+                    ring["bytes"] -= len(ring["chunks"].popleft())
+        ring["push"] = _push
+
+        def on_pcm(pcm, *_a):
+            # float32 [-1,1] -> int16, then the same clock-fill discipline
+            # as the WASAPI callback: the WAV timeline always equals wall
+            # time, however the tap starves.
+            now = time.time()
+            if ring.get("closed"):
+                return
+            fl = np.frombuffer(pcm, dtype=np.float32)
+            data = (np.clip(fl, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+            nfr = len(data) // frame_bytes
+            if ring["t_first"] is None:
+                if not nfr:
+                    return
+                ring["t_first"] = now - nfr / rate
+                ring["frames"] = 0
+            target = int((now - ring["t_first"]) * rate)
+            miss = target - ring["frames"] - nfr
+            if miss > rate * 0.25:
+                # whole-gap fill: a game can be silent for MINUTES (menus,
+                # cutscenes) and the resumed audio must land exactly at its
+                # wall-clock spot, not 30s at a time
+                miss = int(min(miss, rate * 14400))
+                while miss > 0:
+                    n = int(min(miss, rate * 30))
+                    _push(b"\x00" * (n * frame_bytes))
+                    ring["frames"] += n
+                    miss -= n
+            if nfr:
+                _push(data)
+                ring["frames"] += nfr
+
+        state = {"live": False, "err": None}
+
+        def tap_thread():
+            # dedicated clean thread: the tap initialises COM itself and must
+            # not inherit pywebview's apartment
+            tap = None
+            try:
+                tap = ProcessAudioCapture(int(pid), on_data=on_pcm)
+                tap.start()
+                # THE HONESTY CHECK: proctap's native layer silently falls
+                # back to SYSTEM-WIDE loopback when process activation fails
+                # (dead pid, protected process) - construction still
+                # succeeds. Recording everything while labelled "game only"
+                # is the exact opposite of the feature, so a non-specific
+                # tap is treated as a failure and LORE's own loopback path
+                # (which honours the user's device pick) takes over.
+                try:
+                    native = getattr(getattr(tap, "_backend", None),
+                                     "_native", None)
+                    if native is not None and hasattr(native,
+                                                      "is_process_specific"):
+                        if not native.is_process_specific():
+                            raise RuntimeError(
+                                "tap fell back to system-wide capture")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass          # introspection unavailable: trust the tap
+                state["live"] = True
+            except Exception as e:
+                state["err"] = e
+                try:
+                    if tap is not None:
+                        tap.stop()
+                        tap.close()
+                except Exception:
+                    pass
+                return
+            self._stop.wait()
+            try:
+                tap.stop()
+                tap.close()
+            except Exception:
+                pass
+        tt = threading.Thread(target=tap_thread, daemon=True)
+        tt.start()
+        self._threads.append(tt)
+        # commit only once start() ran and the tap proved process-specific
+        for _ in range(25):
+            if state["err"] is not None or state["live"]:
+                break
+            time.sleep(0.1)
+        if state["err"] is not None or not state["live"]:
+            log(f"Game-audio tap failed to start ({state['err']}); "
+                "using system audio.")
+            ring["closed"] = True      # a late-finishing tap must push nothing
+            with self._ring_lock:
+                try:
+                    self.rings.remove(ring)
+                except ValueError:
+                    pass
+            try:
+                wf.close()
+                os.remove(path)
+            except Exception:
+                pass
+            return False
+
+        def writer():
+            try:
+                while not self._stop.is_set() or not q.empty():
+                    try:
+                        wf.writeframes(q.get(timeout=0.3))
+                    except queue.Empty:
+                        continue
+            finally:
+                try:
+                    wf.close()
+                except Exception:
+                    pass
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        self._threads.append(t)
+        log(f"Audio: capturing the GAME's own sound only (pid {pid}).")
+        return True
+
     def start(self):
         import pyaudiowpatch as pyaudio
         self._pa = pyaudio.PyAudio()
         wasapi = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
 
-        if SETTINGS["capture_system"]:
+        if SETTINGS["capture_system"] and SETTINGS.get("game_audio_only") \
+                and getattr(self, "game_pid", None):
+            self.system_wav = os.path.join(
+                self.tmp_dir, f"system{('_' + self.tag) if self.tag else ''}.wav")
+            if self._open_process_tap(self.game_pid, self.system_wav):
+                self._sys_done = True
+            else:
+                self.system_wav = None      # fall through to normal loopback
+
+        if SETTINGS["capture_system"] and not getattr(self, "_sys_done", False):
             # Which playback device to listen to: the user's explicit pick from
             # Settings > Audio, or the Windows default. (It was always the default
             # before, which looked random to anyone who switches outputs.)
@@ -1529,7 +1865,26 @@ class AudioRecorder:
         # blocked appending to the ring while a long clip is assembled (that block was
         # causing capture drops exactly when the user saved a clip). Bytes chunks are
         # immutable, so the joined result is identical to joining under the lock.
+        # Top every ring up to NOW first: process-loopback (and starved
+        # WASAPI) delivers nothing while the source is silent, so the ring's
+        # newest bytes can be minutes old - a clip cut from that would lay
+        # stale audio over silent footage. Bounded to the clip length.
+        now = time.time()
+        cap = int(max(1, seconds) + 5)
         with self._ring_lock:
+            for r in self.rings:
+                try:
+                    if r.get("closed") or r["t_first"] is None or not r["push"]:
+                        continue
+                    miss = int((now - r["t_first"]) * r["rate"]) - r["frames"]
+                    miss = min(miss, r["rate"] * cap)
+                    while miss > 0:
+                        n = min(miss, r["rate"] * 5)
+                        r["push"](b"\x00" * (n * r["frame_bytes"]))
+                        r["frames"] += n
+                        miss -= n
+                except Exception:
+                    pass
             snap_refs = [(r["kind"], r["rate"], r["channels"], list(r["chunks"]),
                           r.get("t_first"), r.get("frames", 0))
                          for r in self.rings]
@@ -2167,6 +2522,25 @@ def _game_window_title(pname):
         return None
 
 
+def _pid_for_exe(pname):
+    """First live pid with this exe name, or None. Used to aim the
+    game-audio-only tap (process loopback captures the pid + its children,
+    so the main process is the right target even for launcher-spawned
+    games)."""
+    if not pname:
+        return None
+    try:
+        for pr in psutil.process_iter(["pid", "name"]):
+            try:
+                if (pr.info.get("name") or "").lower() == pname.lower():
+                    return pr.info["pid"]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
 def _screen_capture_wh(mon_idx):
     """Pixel size of the screen a screen-scope session records. A capture
     restart may only continue the SAME file while this is unchanged: the
@@ -2438,8 +2812,14 @@ def build_video_cmd(out_pattern, start_number=0, monitor_index=None,
         "-g", str(gop), *keyframes,
         # MP4 segments work for AV1 / HEVC / H.264 alike (MPEG-TS can't carry
         # AV1, which is what AMD GPUs pick by default - that broke saving).
+        # hybrid_fragmented (2.0): each segment is written as a fragmented
+        # file and converted to plain MP4 when it closes - a hard crash or
+        # power cut mid-segment now loses NOTHING (the tail segment stays a
+        # valid fMP4 the salvage weld reads normally). Finished segments are
+        # byte-identical plain MP4s, so nothing downstream changes.
         "-f", "segment", "-segment_time", str(seg),
         "-segment_format", "mp4", "-reset_timestamps", "1",
+        "-segment_format_options", "movflags=+hybrid_fragmented",
         "-segment_start_number", str(int(start_number)),
         out_pattern,
     ]
@@ -2450,6 +2830,174 @@ def build_video_cmd(out_pattern, start_number=0, monitor_index=None,
         "-map", "[v]",
         *tail,
     ]
+
+
+def build_wgc_cmd(w, h, fps, out_pattern, start_number=0):
+    """ffmpeg tail for the WGC (Windows Graphics Capture) transport: raw
+    BGRA frames arrive on stdin from _WGCFeed and everything downstream -
+    encoder flags, GOP, keyframes, 4s MP4 segments - matches
+    build_video_cmd exactly, so replay clips, pause/resume and the save
+    pipeline never know which transport recorded the footage. bgr0 goes
+    STRAIGHT into the AMF encoder (it accepts RGB natively) - the
+    BGRA->NV12 conversion happens on the GPU, not in Python or swscale."""
+    s = SETTINGS
+    enc = _current_encoder()
+    br = s["bitrate_mbps"]
+    safe = _ENC_SAFE[0]
+    seg = max(2, int(s.get("segment_seconds", 4)))
+    gop = max(1, fps * seg)
+    keyframes = [] if safe else ["-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
+    rc = (["-b:v", f"{br}M", "-maxrate", f"{br}M", "-bufsize", f"{br * 2}M"]
+          if safe else encoder_quality_flags(enc, br))
+    return [
+        s["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error", "-stats",
+        "-f", "rawvideo", "-pixel_format", "bgr0",
+        "-video_size", f"{w}x{h}", "-framerate", str(fps),
+        "-i", "pipe:0",
+        "-c:v", enc, *rc,
+        "-g", str(gop), *keyframes,
+        "-f", "segment", "-segment_time", str(seg),
+        "-segment_format", "mp4", "-reset_timestamps", "1",
+        "-segment_format_options", "movflags=+hybrid_fragmented",
+        "-segment_start_number", str(int(start_number)),
+        out_pattern,
+    ]
+
+
+class _WGCFeed:
+    """Windows Graphics Capture -> ffmpeg stdin. The WINDOW ITSELF is the
+    source (not a screen region), which is the 2.0 upgrade: overlays,
+    popups and Discord toasts physically cannot appear in the recording,
+    the feed follows the window wherever it moves, and alt-tab doesn't
+    kill anything - WGC keeps compositing an occluded window.
+
+    WGC only delivers frames when the window CHANGES, so a paused game
+    would starve the encoder; a 60Hz ticker therefore re-sends the last
+    frame whenever no fresh one arrived (constant frame rate, segment
+    maths stay exact). One write per frame on a raw (bufsize=0) pipe -
+    the single-syscall pattern the pipe can sustain at 2560x1440@60
+    (measured 90fps headroom on this machine).
+
+    A frame arriving at a DIFFERENT size means the window was resized:
+    feeding it would corrupt the raw stream, so the feed stops cleanly
+    and the watcher's existing resize law (split the chapter) takes over."""
+
+    def __init__(self, hwnd, fps):
+        self.w = self.h = 0               # aligned encode size (first frame,
+        self.fps = fps                    # width mod-8 / height even)
+        self._raw_w = self._raw_h = 0     # the window's true physical size
+        self.stdin = None
+        self.size_changed = False
+        self.dead = False
+        self.frames_in = 0
+        self.frames_out = 0
+        self._last = None                 # latest BGRA bytes (owned copy)
+        self._lock = threading.Lock()
+        self._stopev = threading.Event()
+        self._first = threading.Event()
+        self._ctl = None
+        self._ticker_t = None
+        from windows_capture import WindowsCapture
+        cap = WindowsCapture(cursor_capture=False, window_hwnd=int(hwnd))
+        feed = self
+
+        @cap.event
+        def on_frame_arrived(frame, capture_control):
+            if feed._stopev.is_set():
+                try:
+                    capture_control.stop()
+                except Exception:
+                    pass
+                return
+            if not feed._first.is_set():
+                feed._raw_w, feed._raw_h = frame.width, frame.height
+                # the SAME alignment law as every other capture path: width
+                # mod-8, height even - AMF pads odd sizes up and the padding
+                # columns would appear as a garbage stripe in the video
+                feed.w = frame.width - (frame.width % 8)
+                feed.h = frame.height - (frame.height % 2)
+                buf = frame.frame_buffer[:feed.h, :feed.w].tobytes()
+                with feed._lock:
+                    feed._last = buf
+                feed.frames_in += 1
+                feed._first.set()
+                return
+            if frame.width != feed._raw_w or frame.height != feed._raw_h:
+                feed.size_changed = True      # resize: the raw stream is over
+                feed._stopev.set()
+                return
+            buf = frame.frame_buffer[:feed.h, :feed.w].tobytes()  # crop+copy
+            with feed._lock:
+                feed._last = buf
+            feed.frames_in += 1
+
+        @cap.event
+        def on_closed():
+            feed.dead = True                     # window destroyed (game exit)
+            feed._stopev.set()
+        self._cap = cap
+
+    def begin(self, timeout=2.5):
+        """Start capturing; block until the first frame reveals the true
+        frame size. None on timeout (exclusive-fullscreen windows can be
+        invisible to WGC) - the caller then falls back to ddagrab."""
+        self._ctl = self._cap.start_free_threaded()
+        if not self._first.wait(timeout=timeout):
+            self.stop()
+            return None
+        return (self.w, self.h)
+
+    def attach(self, stdin):
+        self.stdin = stdin
+        t = threading.Thread(target=self._ticker, daemon=True)
+        t.start()
+        self._ticker_t = t
+
+    def _ticker(self):
+        period = 1.0 / self.fps
+        nxt = time.perf_counter()
+        while not self._stopev.is_set():
+            nxt += period
+            delay = nxt - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                nxt = time.perf_counter()        # fell behind: re-anchor
+            with self._lock:
+                buf = self._last
+            if buf is None:
+                continue                          # nothing captured yet
+            try:
+                self.stdin.write(buf)             # ONE WriteFile, GIL released
+                self.frames_out += 1
+            except Exception:
+                self.dead = True                  # encoder went away
+                break
+        try:
+            self.stdin.close()                    # EOF -> ffmpeg finalises
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stopev.set()
+        try:
+            if self._ctl is not None:
+                self._ctl.stop()
+        except Exception:
+            pass
+        try:
+            if self._ticker_t is not None:
+                self._ticker_t.join(timeout=3)
+        except Exception:
+            pass
+
+
+def _wgc_available():
+    try:
+        import windows_capture  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def _work_dir():
@@ -2769,7 +3317,10 @@ def _sweep_orphan_temp():
         for d in dirs:
             if os.path.isdir(d):
                 for name in os.listdir(d):
-                    if ".__sdr__." in name or ".__tmp" in name:
+                    if ".__sdr__." in name or ".__tmp" in name \
+                            or (name.startswith("stt_")
+                                and (name.endswith(".wav")
+                                     or name.endswith("_out.json"))):
                         p = os.path.join(d, name)
                         try:
                             if now - os.path.getmtime(p) > 600:
@@ -3483,9 +4034,12 @@ class Session:
         self._rotating = False         # mid rotate-run swap (blocks replay clips)
         self._gone_polls = 0           # consecutive polls the game looked closed
         self._pause_toasted = False    # auto-pause toast shown (once per session)
+        self.afk_paused = False        # auto-paused: the user is away
         self.cap_wh = None             # frame size this file is locked to
+        self.file_hdr = None           # HDR mode this file is locked to
         self._restart_streak = 0       # capture restarts, decayed (see _note_restart)
         self._last_restart = 0.0
+        self._wgc = None               # live _WGCFeed when WGC transports this run
         self._first_frame = threading.Event()
         self._err = bytearray()        # rolling tail of the encoder's stderr
         self._replay_lock = threading.Lock()
@@ -3514,6 +4068,19 @@ class Session:
                                       and _enc_supports_10bit(enc_now)):
             strat = None
         self._hdr_used = bool(strat and _HDR_LEVEL[0] < 1)
+        # THE FILE'S LAWS, enforced at the ONE door every transport uses:
+        # a file with committed segments never accepts a run of a different
+        # frame size or HDR mode - the -c copy weld would produce a broken
+        # video reported as 'Saved'. Raising here makes resume/restart FAIL,
+        # which the watcher's health check turns into a clean chapter split.
+        if _list_segments(self.tmp):
+            if (self.file_hdr is not None
+                    and self._hdr_used != self.file_hdr):
+                raise RuntimeError(
+                    "HDR mode changed mid-session; this file is "
+                    f"{'HDR' if self.file_hdr else 'SDR'}")
+        else:
+            self.file_hdr = self._hdr_used
         # AUDIO FIRST: the microphone and system streams open in well under a
         # second, while ffmpeg takes 1-3s to produce its first frame. Starting
         # audio first means the opening seconds of the game are never lost, and
@@ -3523,7 +4090,26 @@ class Session:
         self.audio = None
         if SETTINGS["capture_system"] or SETTINGS["capture_mic"]:
             try:
-                self.audio = AudioRecorder(self.tmp, tag=f"{self._run_index:02d}")
+                # re-resolve the tap target EVERY run: a crash-relaunched
+                # game keeps its exe name (same session) but a new pid
+                if SETTINGS.get("game_audio_only") and SETTINGS.get("capture_system"):
+                    try:
+                        pid_now = None
+                        if self.win and self.win.get("hwnd"):
+                            import ctypes as _ct
+                            from ctypes import wintypes as _wt
+                            _p = _wt.DWORD()
+                            _ct.windll.user32.GetWindowThreadProcessId(
+                                self.win["hwnd"], _ct.byref(_p))
+                            pid_now = _p.value or None
+                        if not pid_now and self.game.lower() != "screen":
+                            pid_now = _pid_for_exe(self.game)
+                        if pid_now:
+                            self.game_pid = pid_now
+                    except Exception:
+                        pass
+                self.audio = AudioRecorder(self.tmp, tag=f"{self._run_index:02d}",
+                                           game_pid=getattr(self, "game_pid", None))
                 self.audio.start()
             except Exception as e:
                 log(f"Audio init failed ({e}); recording video only.")
@@ -3536,16 +4122,73 @@ class Session:
                 except Exception:
                     pass
                 self.audio = None
-        self.vproc = subprocess.Popen(
-            build_video_cmd(self.seg_pattern, start_number=self._seg_start,
-                            monitor_index=(self.win["mon"] if self.win
-                                           else self.monitor_idx),
-                            window_rect=((self.win["x"], self.win["y"],
-                                          self.win["w"], self.win["h"])
-                                         if self.win else None)),
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, creationflags=flags,
-        )
+        # LORE 2.0: window scope prefers Windows Graphics Capture - the
+        # WINDOW is the source, so overlays can't appear, the feed follows
+        # the window anywhere, and alt-tab can't kill it. Falls back to the
+        # proven ddagrab subrect when: forced by setting, the desktop is HDR
+        # (WGC is SDR-only; ddagrab keeps the float16 HDR path), the window
+        # is too large for the raw pipe (>4.2MP measured ceiling), the
+        # module is missing, or WGC never shows a first frame (exclusive
+        # fullscreen). A resumed run must match the file's locked size.
+        self._wgc = None
+        if (self.win and self.win.get("hwnd")
+                and str(SETTINGS.get("capture_backend", "auto")) == "auto"
+                and _wgc_available() and not _hdr_active()
+                and self.win["w"] * self.win["h"] <= 4_200_000):
+            try:
+                feed = _WGCFeed(self.win["hwnd"], int(SETTINGS["framerate"]))
+                size = feed.begin()
+                if size and size[0] * size[1] <= 4_200_000 and (
+                        self.cap_wh is None or not _list_segments(self.tmp)
+                        or (size[0], size[1]) == tuple(self.cap_wh)):
+                    self.vproc = subprocess.Popen(
+                        build_wgc_cmd(size[0], size[1],
+                                      int(SETTINGS["framerate"]),
+                                      self.seg_pattern,
+                                      start_number=self._seg_start),
+                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE, creationflags=flags,
+                        bufsize=0,
+                    )
+                    feed.attach(self.vproc.stdin)
+                    self._wgc = feed
+                    self.cap_wh = (size[0], size[1])
+                    self._hdr_used = False        # WGC frames are SDR
+                    log(f"Window capture via Windows Graphics Capture: "
+                        f"{size[0]}x{size[1]} (overlay-proof).")
+                elif size:
+                    feed.stop()
+                    log("WGC size differs from this file's format; using the "
+                        "screen-region capture for this run.")
+                else:
+                    log("WGC saw no frames from this window (exclusive "
+                        "fullscreen?); using the screen-region capture.")
+            except Exception as e:
+                log(f"WGC unavailable ({e}); using the screen-region capture.")
+                try:
+                    feed.stop()        # a live capture session must not linger
+                except Exception:
+                    pass
+                self._wgc = None
+        if self._wgc is None:
+            if _list_segments(self.tmp) and self.cap_wh:
+                intend = ((self.win["w"], self.win["h"]) if self.win
+                          else _screen_capture_wh(self.monitor_idx))
+                if intend and tuple(intend) != tuple(self.cap_wh):
+                    # a WGC-recorded file must not continue at ddagrab's
+                    # (differently-aligned) size - end the chapter instead
+                    raise RuntimeError(
+                        f"capture size changed ({intend} vs {self.cap_wh})")
+            self.vproc = subprocess.Popen(
+                build_video_cmd(self.seg_pattern, start_number=self._seg_start,
+                                monitor_index=(self.win["mon"] if self.win
+                                               else self.monitor_idx),
+                                window_rect=((self.win["x"], self.win["y"],
+                                              self.win["w"], self.win["h"])
+                                             if self.win else None)),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, creationflags=flags,
+            )
         threading.Thread(target=_drain_stderr,
                          args=(self.vproc, self._first_frame, self._err),
                          daemon=True).start()
@@ -3563,7 +4206,14 @@ class Session:
         v_end_wall = None
         if self.audio:
             self.audio.signal_stop()
-        if self.vproc and self.vproc.poll() is None:
+        if getattr(self, "_wgc", None) is not None:
+            try:
+                self._wgc.stop()           # stops capture, closes stdin -> EOF
+                v_end_wall = time.time()
+            except Exception:
+                pass
+            self._wgc = None
+        elif self.vproc and self.vproc.poll() is None:
             try:
                 self.vproc.stdin.write(b"q")
                 self.vproc.stdin.flush()
@@ -3647,6 +4297,22 @@ class Session:
                 log("Window capture: waiting for the game's window before "
                     "recording (no desktop is captured).")
         log(f"Detected '{self.game}'. Recording -> {self.final}")
+        # who to tap for game-audio-only: the window's owner when we have it
+        # (exact), else the first process wearing the game's name
+        self.game_pid = None
+        if SETTINGS.get("game_audio_only") and SETTINGS.get("capture_system"):
+            try:
+                if self.win and self.win.get("hwnd"):
+                    import ctypes
+                    from ctypes import wintypes
+                    _p = wintypes.DWORD()
+                    ctypes.windll.user32.GetWindowThreadProcessId(
+                        self.win["hwnd"], ctypes.byref(_p))
+                    self.game_pid = _p.value or None
+                if not self.game_pid and self.game.lower() != "screen":
+                    self.game_pid = _pid_for_exe(self.game)
+            except Exception:
+                self.game_pid = None
         # the frame size this file is locked to: every later run must match
         # it, or a capture restart would splice two sizes into one stream
         self.cap_wh = ((self.win["w"], self.win["h"]) if self.win
@@ -3761,6 +4427,12 @@ class Session:
     def discard(self):
         """Stop capture and throw the whole recording away - no file saved."""
         log("Discarding current recording.")
+        if getattr(self, "_wgc", None) is not None:
+            try:
+                self._wgc.stop()
+            except Exception:
+                pass
+            self._wgc = None
         if self.audio:
             try:
                 self.audio.signal_stop()
@@ -4948,6 +5620,9 @@ def _window_track(ctl, session, current):
         return None                    # still moving; wait for it to settle
     session._win_pend = None
     if (w["w"], w["h"]) == (cur["w"], cur["h"]):
+        if getattr(session, "_wgc", None) is not None:
+            session.win = w            # WGC tracks the window itself - the
+            return None                # rect is bookkeeping, nothing to rotate
         log(f"Window capture: following the window to +{w['x']},+{w['y']} "
             f"on screen #{w['mon'] + 1}.")
         session.win = w
@@ -5230,6 +5905,9 @@ def _watch_core(ctl):
     log("Audio: " + (" + ".join(parts) if parts else "none") +
         (f"  [{SETTINGS['audio_mode']}]" if len(parts) == 2 else ""))
 
+    if SETTINGS.get("ai_transcribe", True) and _whisper_paths() is None:
+        log("The tome's reader (whisper) isn't installed next to the app; "
+            "transcription and word-search stay quietly off.")
     if not _ffmpeg_ok():
         log("ffmpeg health check failed: the video tool did not run.")
         ctl.notify("Lore can't find its video tool",
@@ -5299,7 +5977,8 @@ def _watch_core(ctl):
                 # not finalise a recording whose game is merely minimised.
                 session._gone_polls = session._gone_polls + 1 if game_gone else 0
                 if not game_gone:
-                    if not session.win_paused:
+                    _afk_track(ctl, session, current)   # resumes an AFK pause
+                    if not session.win_paused and not session.afk_paused:
                         if session.win:
                             # Re-aim before resuming: the window may have
                             # moved - or the display mode changed - while
@@ -5342,7 +6021,7 @@ def _watch_core(ctl):
                                     manual = False
                                 _interruptible_sleep(ctl, 0.3)
                                 continue
-                    if not session.win_paused:
+                    if not session.win_paused and not session.afk_paused:
                         try:
                             session.resume()
                         except Exception as e:
@@ -5384,8 +6063,10 @@ def _watch_core(ctl):
                 auto = bool(g) and g != ctl.suppressed_game and not ctl.force_record.is_set()
                 if not g and not ctl.force_record.is_set():
                     _sdr_finish_tick(ctl)      # truly idle: chip away at HDR->SDR queue
+                    _ai_tick(ctl)              # ...and let the tome read its books
                 if auto:
                     _sdr_finish_abort()        # game first - the GPU is theirs now
+                    _ai_abort()                # the tome stops reading too
                     session = Session(g)
                     ctl.set_status("starting")     # honest "warming up" while ffmpeg spins up
                     if not _safe_start(session, ctl):
@@ -5420,6 +6101,7 @@ def _watch_core(ctl):
                     name = gg or "Screen"
                     ctl.suppressed_game = None
                     _sdr_finish_abort()        # manual record also outranks conversions
+                    _ai_abort()
                     session = Session(name)
                     ctl.set_status("starting")     # honest "warming up" while ffmpeg spins up
                     if not _safe_start(session, ctl):
@@ -5767,6 +6449,10 @@ def _watch_core(ctl):
                 else:
                     gone = 0
                     enc_fails = 0   # healthy: encoder alive and the game is running
+                    _afk_track(ctl, session, current)
+                    if session.suspended:              # AFK pause just landed
+                        _interruptible_sleep(ctl, SETTINGS["poll_interval"])
+                        continue
                     act = _window_track(ctl, session, current)
                     if act:
                         # The game window was RESIZED (or lost for good): a
@@ -5795,6 +6481,7 @@ def _watch_core(ctl):
             _interruptible_sleep(ctl, 1.0)
     finally:
         _sdr_finish_abort()       # never leave an orphan converter running after quit
+        _ai_abort()
         if session:
             session.stop()        # finish the active recording (synchronous on quit)
         with ctl.lock:
@@ -6785,6 +7472,411 @@ def _thumb_dir(out):
     return os.path.join(SETTINGS.get("output_dir", "") or out, ".lore_thumbs")
 
 
+# ---------------------------------------------------------------------------
+#  The tome's intelligence (Lore 2.0) - all LOCAL, all idle-time:
+#    * whisper.cpp transcribes every recording (CPU, BELOW_NORMAL, ~20x
+#      realtime on this machine) -> the library is searchable by what was
+#      actually SAID, and a hit jumps playback to that second.
+#    * a numpy loudness pass marks the moments worth rewatching (fights,
+#      shouts, explosions) as gold ticks on the player's timeline.
+#  Sidecars live next to the thumbnails (.lore_thumbs/<video>.stt.json /
+#  .hl.json), keyed by filename + source mtime so an edited/replaced video
+#  is re-analysed and a deleted one leaves nothing behind but two tiny
+#  orphan files the cache sweep can clear.
+# ---------------------------------------------------------------------------
+_AI = {"busy": None, "t_last": 0.0, "index": None, "index_t": 0.0,
+       "proc": None, "abort": False, "failed": {}}
+
+
+def _ai_abort():
+    """A game just appeared: stop the current AI job NOW (the whisper /
+    ffmpeg child is terminated; the sidecar stays missing and the job
+    simply re-runs at the next idle stretch)."""
+    _AI["abort"] = True
+    pr = _AI.get("proc")
+    if pr is not None:
+        try:
+            pr.terminate()
+        except Exception:
+            pass
+
+
+def _ai_run(cmd, timeout, flags):
+    """subprocess.run, but abortable via _ai_abort() - the handle is
+    published so a starting game can kill the child instantly."""
+    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, creationflags=flags)
+    _AI["proc"] = pr
+    if _AI["abort"]:
+        try:                       # abort landed between gate and spawn -
+            pr.terminate()         # close that window immediately
+        except Exception:
+            pass
+    try:
+        out, err = pr.communicate(timeout=timeout)
+        return pr.returncode, out, err
+    except subprocess.TimeoutExpired:
+        # communicate() does NOT kill on timeout - without this the child
+        # runs orphaned (even through the next game session) while holding
+        # the temp files other jobs want
+        try:
+            pr.kill()
+            pr.communicate()
+        except Exception:
+            pass
+        return -1, b"", b"timeout"
+    finally:
+        _AI["proc"] = None
+
+
+def _whisper_paths():
+    """(whisper-cli, model, vad-model) when the bundled transcriber is
+    present, else None. Lives in <app>/whisper (staged by the build)."""
+    base = os.path.join(_here(), "whisper")
+    cli = os.path.join(base, "Release", "whisper-cli.exe")
+    model = os.path.join(base, "ggml-base.en-q5_1.bin")
+    vad = os.path.join(base, "ggml-silero-v5.1.2.bin")
+    if os.path.isfile(cli) and os.path.isfile(model):
+        return cli, model, (vad if os.path.isfile(vad) else None)
+    return None
+
+
+def _ai_sidecar(video_path, kind):
+    """Path of a video's transcript ('stt') or highlights ('hl') sidecar."""
+    name = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(_thumb_dir(SETTINGS.get("output_dir", "")),
+                        f"{name}.{kind}.json")
+
+
+def _ai_sidecar_fresh(video_path, kind):
+    sp = _ai_sidecar(video_path, kind)
+    try:
+        return (os.path.isfile(sp)
+                and os.path.getmtime(sp) >= os.path.getmtime(video_path))
+    except OSError:
+        return False
+
+
+def _transcribe_one(video_path):
+    """whisper.cpp over one recording -> .stt.json sidecar. Runs at
+    BELOW_NORMAL with 8 threads (the 5900X sweet spot); VAD skips silence
+    and stops the model hallucinating lyrics into music-only stretches."""
+    wp = _whisper_paths()
+    if wp is None:
+        return False
+    cli, model, vad = wp
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    wav = os.path.join(_work_dir(), f"stt_{os.getpid()}_{threading.get_ident()}.wav")
+    outb = os.path.join(_work_dir(), f"stt_{os.getpid()}_{threading.get_ident()}_out")
+    _source_busy_add(video_path)   # delete/edit must know we hold this file
+    try:
+        rc, _o, _e = _ai_run([SETTINGS["ffmpeg_path"], "-y", "-loglevel",
+                              "error", "-i", video_path, "-vn", "-ac", "1",
+                              "-ar", "16000", "-c:a", "pcm_s16le", wav],
+                             1800, flags)
+        if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
+            return False
+        cmd = [cli, "-m", model, "-f", wav, "-l", "en", "-t", "8",
+               "-oj", "-of", outb, "-np"]
+        if vad:
+            cmd += ["--vad", "-vm", vad]
+        rc, _o, _e = _ai_run(cmd, 3600, flags)
+        jf = outb + ".json"
+        if rc != 0 or not os.path.isfile(jf) or _AI["abort"]:
+            return False
+        with open(jf, encoding="utf-8") as fh:
+            data = json.load(fh)
+        segs = []
+        for seg in data.get("transcription", []):
+            txt = (seg.get("text") or "").strip()
+            off = seg.get("offsets") or {}
+            if txt and isinstance(off.get("from"), int):
+                segs.append({"a": off["from"], "b": off.get("to", off["from"]),
+                             "t": txt})
+        os.makedirs(os.path.dirname(_ai_sidecar(video_path, "stt")),
+                    exist_ok=True)
+        _atomic_write_json(_ai_sidecar(video_path, "stt"),
+                           {"v": 1, "model": os.path.basename(model),
+                            "segments": segs})
+        _AI["index"] = None                     # search index: rebuild lazily
+        log(f"Transcribed {os.path.basename(video_path)}: {len(segs)} lines.")
+        return True
+    except Exception as e:
+        log(f"Transcribe failed for {os.path.basename(video_path)}: {e}")
+        return False
+    finally:
+        _source_busy_done(video_path)
+        for p in (wav, outb + ".json"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def _highlights_one(video_path):
+    """Loudness-burst highlight pass -> .hl.json sidecar. 8kHz mono PCM is
+    streamed straight out of ffmpeg (no temp file), a 50ms RMS envelope is
+    z-scored against a rolling baseline, and sustained loud bursts with a
+    fast rise become events (min 8s apart). Pure numpy; a 2h video takes
+    seconds."""
+    import numpy as np
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    SR, FRAME, HOP = 8000, 400, 200            # 50ms window, 25ms hop
+    _source_busy_add(video_path)
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [SETTINGS["ffmpeg_path"], "-loglevel", "error", "-i", video_path,
+             "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=flags)
+        _AI["proc"] = proc
+        if _AI["abort"]:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return False
+        env = []
+        carry = np.zeros(0, dtype=np.float32)
+        while True:
+            chunk = proc.stdout.read(SR * 2 * 30)      # 30s per read
+            if not chunk:
+                break
+            x = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            x = np.concatenate([carry, x])
+            n = (len(x) - FRAME) // HOP
+            if n <= 0:
+                carry = x
+                continue
+            idx = np.arange(n)[:, None] * HOP + np.arange(FRAME)[None, :]
+            pw = (x[idx] ** 2).mean(axis=1)
+            env.append(10.0 * np.log10(pw + 1e-10))
+            carry = x[n * HOP:]
+        proc.wait(timeout=30)
+        _AI["proc"] = None
+        if not env or _AI["abort"]:
+            return False
+        e = np.concatenate(env)
+        if len(e) < 400:                       # < ~10s of audio: nothing to mark
+            os.makedirs(os.path.dirname(_ai_sidecar(video_path, "hl")),
+                        exist_ok=True)
+            _atomic_write_json(_ai_sidecar(video_path, "hl"),
+                               {"v": 1, "events": []})
+            return True
+        # smooth 0.5s; robust baseline = rolling median approximated by a
+        # coarse percentile grid (windows of 30s, recomputed each window)
+        k = np.ones(20, dtype=np.float32) / 20.0
+        es = np.convolve(e, k, mode="same")
+        W = 1200
+        med = np.empty_like(es)
+        mad = np.empty_like(es)
+        for i in range(0, len(es), W // 4):
+            a, b = max(0, i - W // 2), min(len(es), i + W // 2)
+            seg = es[a:b]
+            m = np.median(seg)
+            med[i:i + W // 4] = m
+            mad[i:i + W // 4] = np.median(np.abs(seg - m)) + 1e-6
+        z = (es - med) / (1.4826 * mad)
+        floor = np.percentile(es, 10) + 12.0
+        rise = np.concatenate([np.zeros(20), es[20:] - es[:-20]])
+        hot = (z >= 2.5) & (es >= -35.0) & (es >= floor) & (rise >= 6.0)
+        # sustained 0.3s (12 hops) -> candidate; then 8s min gap, best-z wins
+        events = []
+        run = 0
+        last_t = -1e9
+        for i in range(len(hot)):
+            run = run + 1 if hot[i] else 0
+            if run == 12:
+                t = i * HOP / SR
+                if t - last_t >= 8.0:
+                    events.append({"t": round(max(0.0, t - 0.3), 2),
+                                   "z": round(float(z[i]), 2)})
+                    last_t = t
+        events = events[:200]
+        os.makedirs(os.path.dirname(_ai_sidecar(video_path, "hl")),
+                    exist_ok=True)
+        _atomic_write_json(_ai_sidecar(video_path, "hl"),
+                           {"v": 1, "events": events})
+        log(f"Highlights for {os.path.basename(video_path)}: "
+            f"{len(events)} moment(s).")
+        return True
+    except Exception as e:
+        log(f"Highlight pass failed for {os.path.basename(video_path)}: {e}")
+        return False
+    finally:
+        _source_busy_done(video_path)
+        _AI["proc"] = None
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def _ai_tick(ctl):
+    """One idle beat of the tome's intelligence: pick the newest recording
+    missing a sidecar and process it. Same discipline as the SDR queue -
+    never while recording, saving, or while the user is watching. One video
+    per tick keeps every pause instant."""
+    if not (SETTINGS.get("ai_transcribe", True)
+            or SETTINGS.get("ai_highlights", True)):
+        return
+    if _AI["busy"] is not None:
+        return
+    if ctl.session is not None or ctl.saving > 0 or _FINISHING["busy"]:
+        return
+    if _TRIM_BUSY[0] > 0:
+        return                      # never open a source mid-edit
+    if time.time() - _MEDIA.get("last_read", 0) < 20:
+        return
+    if time.time() - _AI["t_last"] < 5:
+        return
+    _AI["t_last"] = time.time()
+    out = SETTINGS.get("output_dir", "")
+    if not out or not os.path.isdir(out):
+        return
+    vids = []
+    try:
+        for d, kind in _library_dirs(out):
+            for v in _scan_dir_mp4s(d, kind):
+                vids.append((v["path"], v.get("mtime") or 0))
+        vids.sort(key=lambda pm: -pm[1])
+        vids = [p for p, _m in vids]
+    except Exception:
+        return
+    do_stt = SETTINGS.get("ai_transcribe", True) and _whisper_paths()
+    do_hl = SETTINGS.get("ai_highlights", True)
+    def _spawn(kind, path, mt):
+        # WORKER THREAD - a transcription can take minutes and the watcher
+        # must keep detecting games throughout; _ai_abort() kills the job
+        # the instant one appears.
+        _AI["busy"] = (kind, os.path.basename(path))
+        _AI["abort"] = False
+
+        def work():
+            ok = False
+            try:
+                if kind == "hearing":
+                    ok = _transcribe_one(path)
+                else:
+                    ok = _highlights_one(path)
+            finally:
+                if not ok and not _AI["abort"]:
+                    _AI["failed"][path] = mt   # skip until the file changes
+                _AI["busy"] = None
+        threading.Thread(target=work, daemon=True).start()
+
+    for p in vids:
+        if _queued_finish_badge(p):
+            continue                       # HDR master still awaiting SDR
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        # a video that failed analysis is left alone until it CHANGES -
+        # without this memo one corrupt file respawns ffmpeg forever and
+        # starves every older video behind it
+        if _AI["failed"].get(p) == mt:
+            continue
+        veto = _AI.get("veto")
+        if veto and veto[0] == os.path.basename(p) \
+                and time.time() - veto[1] < 15:
+            continue               # a delete/edit is working on this file
+        if do_stt and not _ai_sidecar_fresh(p, "stt"):
+            _spawn("hearing", p, mt)
+            return                          # one job per tick
+        if do_hl and not _ai_sidecar_fresh(p, "hl"):
+            _spawn("marking", p, mt)
+            return
+
+
+def _queued_finish_badge(path):
+    try:
+        if not SETTINGS.get("sdr_finish", True):
+            return False       # a disabled queue never drains - don't let it
+        ap = os.path.normcase(os.path.abspath(path))   # gate the AI forever
+        return any(os.path.normcase(os.path.abspath(it.get("path", ""))) == ap
+                   for it in _load_finish_queue())
+    except Exception:
+        return False
+
+
+def _ai_pending_counts():
+    """(transcripts pending, highlights pending) - cheap enough for state()
+    consumers to poll occasionally; cached 30s."""
+    now = time.time()
+    c = _AI.get("_counts")
+    if c and now - c[2] < 30:
+        return c[0], c[1]
+    out = SETTINGS.get("output_dir", "")
+    stt = hl = 0
+    try:
+        for d, kind in _library_dirs(out):
+            for v in _scan_dir_mp4s(d, kind):
+                if not _ai_sidecar_fresh(v["path"], "stt"):
+                    stt += 1
+                if not _ai_sidecar_fresh(v["path"], "hl"):
+                    hl += 1
+    except Exception:
+        pass
+    _AI["_counts"] = (stt, hl, now)
+    return stt, hl
+
+
+def _search_index():
+    """{video_path: [(ms, text_lower, text)]} built from every .stt.json,
+    cached until a new transcript lands. A few thousand lines of text -
+    substring search over it is instant."""
+    if _AI["index"] is not None and time.time() - _AI["index_t"] < 300:
+        return _AI["index"]
+    idx = {}
+    tdir = _thumb_dir(SETTINGS.get("output_dir", ""))
+    try:
+        for name in os.listdir(tdir):
+            if not name.endswith(".stt.json"):
+                continue
+            try:
+                with open(os.path.join(tdir, name), encoding="utf-8") as fh:
+                    data = json.load(fh)
+                base = name[:-len(".stt.json")]
+                rows = [(s["a"], s["t"].lower(), s["t"])
+                        for s in data.get("segments", []) if s.get("t")]
+                if rows:
+                    idx[base] = rows
+            except Exception:
+                pass
+    except OSError:
+        pass
+    _AI["index"] = idx
+    _AI["index_t"] = time.time()
+    return idx
+
+
+def _search_words(query, limit=40):
+    """Substring search over every transcript; newest videos first. Returns
+    [{file, t_ms, text}] - the UI matches `file` against its own library
+    model (same basenames) and jumps playback to t_ms."""
+    q = (query or "").strip().lower()
+    if len(q) < 2:
+        return []
+    idx = _search_index()
+    hits = []
+    for base, rows in idx.items():
+        for ms, low, txt in rows:
+            if q in low:
+                hits.append({"file": base, "t_ms": ms, "text": txt})
+                if len(hits) >= 400:
+                    break
+    hits.sort(key=lambda h: h["file"], reverse=True)   # stamped names = newest first
+    return hits[:limit]
+
+
 def _probe_color_trc(path):
     """The video stream's transfer characteristic ('smpte2084' for PQ/HDR10,
     'arib-std-b67' for HLG, '' when unknown/SDR)."""
@@ -7674,9 +8766,12 @@ class _JsApi:
                 size_mb = sum(os.path.getsize(p) for p in _list_segments(sess.tmp)) / 1e6
             except Exception:
                 pass
+        ai_busy = _AI.get("busy")
         return {"status": s, "game": game, "elapsed": elapsed,
                 "saving": getattr(ctl, "saving", 0) > 0,
                 "binding": binding,
+                "ai": ({"kind": ai_busy[0], "name": ai_busy[1]}
+                       if ai_busy else None),
                 "converting": conv,
                 "queued": len(_queued_finish_paths()),
                 "encoder": _friendly_codec(SETTINGS.get("_encoder_resolved")),
@@ -7741,6 +8836,41 @@ class _JsApi:
             except Exception:
                 pass
         return out
+
+    def search_words(self, query):
+        """Search every transcript for the words - the tome's AI search.
+        Returns [{file, t_ms, text}]; the UI maps `file` (basename, no
+        extension) onto its own library entries and jumps to t_ms."""
+        try:
+            return _search_words(str(query or ""))
+        except Exception:
+            return []
+
+    def highlights(self, path):
+        """This video's marked moments: [{t, z}] seconds from start."""
+        p = self._safe_path(path)
+        if not p:
+            return []
+        try:
+            if _ai_sidecar_fresh(p, "hl"):
+                with open(_ai_sidecar(p, "hl"), encoding="utf-8") as fh:
+                    return json.load(fh).get("events", [])
+        except Exception:
+            pass
+        return []
+
+    def transcript(self, path):
+        """This video's transcript segments: [{a, b, t}] (ms)."""
+        p = self._safe_path(path)
+        if not p:
+            return []
+        try:
+            if _ai_sidecar_fresh(p, "stt"):
+                with open(_ai_sidecar(p, "stt"), encoding="utf-8") as fh:
+                    return json.load(fh).get("segments", [])
+        except Exception:
+            pass
+        return []
 
     def meta(self, paths):
         """Durations for the videos on the open page (cached probes)."""
@@ -7871,6 +9001,22 @@ class _JsApi:
             log(f"open game folder failed: {e}")
             return False
 
+    def _ai_release(self, p):
+        """If the AI worker is holding this very file, abort it and give it
+        a beat to let go - a delete or edit-commit must never lose to a
+        background transcription's open handle."""
+        try:
+            _AI["veto"] = (os.path.basename(p), time.time())  # keep the tick
+            busy = _AI.get("busy")                            # off this file
+            if busy and os.path.basename(p) == busy[1]:
+                _ai_abort()
+                for _ in range(20):
+                    if _AI.get("busy") is None:
+                        break
+                    time.sleep(0.1)
+        except Exception:
+            pass
+
     def delete_video(self, path):
         """Burn a memory reliably: validate the path, release/avoid in-use
         files, retry transient Windows locks, then forget manifest/queue/thumb/
@@ -7883,9 +9029,16 @@ class _JsApi:
                 return {"ok": False, "why": "bad-path"}
         except Exception:
             return {"ok": False, "why": "bad-path"}
+        self._ai_release(p)     # an in-flight transcription must let go first
         ap = os.path.normcase(os.path.abspath(p))
 
         def _forget():
+            for kind in ("stt", "hl"):
+                try:
+                    os.remove(_ai_sidecar(p, kind))
+                except OSError:
+                    pass
+            _AI["index"] = None            # ghost transcripts must not linger
             try:
                 with _MANIFEST_LOCK:
                     owned, existed = _load_manifest()
@@ -8350,6 +9503,7 @@ class _JsApi:
                     if replace:
                         # the player may still hold the source open - retry
                         # briefly; the tome releases it within a moment
+                        self._ai_release(path)
                         for _try in range(25):
                             try:
                                 os.replace(tmp, out)
@@ -8367,12 +9521,20 @@ class _JsApi:
                         except Exception:
                             pass
                         # its face changed: refresh the cached thumbnail
+                        # AND the AI sidecars - the old transcript/highlight
+                        # timestamps belong to footage that no longer exists
                         try:
                             tp = os.path.join(
                                 _thumb_dir(os.path.dirname(out)),
                                 os.path.splitext(os.path.basename(out))[0] + ".jpg")
                             if os.path.isfile(tp):
                                 os.remove(tp)
+                            for kind in ("stt", "hl"):
+                                try:
+                                    os.remove(_ai_sidecar(out, kind))
+                                except OSError:
+                                    pass
+                            _AI["index"] = None
                         except Exception:
                             pass
                         log(f"Trimmed in place ({dur:.1f}s): {out}")
@@ -8570,6 +9732,7 @@ class _JsApi:
                 _EDIT_JOB["phase"] = "saving"
                 _EDIT_JOB["pct"] = 97
                 if replace:
+                    self._ai_release(path)
                     for _try in range(25):
                         try:
                             os.replace(tmp_final, out)
@@ -8595,6 +9758,12 @@ class _JsApi:
                             os.path.splitext(os.path.basename(out))[0] + ".jpg")
                         if os.path.isfile(tp):
                             os.remove(tp)
+                        for kind in ("stt", "hl"):
+                            try:
+                                os.remove(_ai_sidecar(out, kind))
+                            except OSError:
+                                pass
+                        _AI["index"] = None
                         log(f"Edited in place ({total:.1f}s, {len(segs)} piece(s)): {out}")
                         ctl.notify("Saved ✓", os.path.basename(out) + " now holds your edit.")
                     else:
