@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.1"
+APP_VERSION = "1.11"
 
 try:
     import psutil
@@ -2167,6 +2167,45 @@ def _game_window_title(pname):
         return None
 
 
+def _screen_capture_wh(mon_idx):
+    """Pixel size of the screen a screen-scope session records. A capture
+    restart may only continue the SAME file while this is unchanged: the
+    runs are joined with -c copy, and two frame sizes in one stream make an
+    unplayable video. Ranked by display number, the ddagrab output_idx
+    contract. None when it can't be determined (caller then plays safe)."""
+    # Retried: this is asked precisely WHILE the display mode is changing,
+    # and a single failed enumeration then would read as "the screen changed
+    # shape" and split the recording - the exact symptom being fixed.
+    for attempt in range(3):
+        try:
+            mons = sorted(_enumerate_active_monitors(), key=lambda m: m["num"])
+            if mons:
+                m = mons[min(max(0, int(mon_idx or 0)), len(mons) - 1)]
+                r = m["rect"]
+                return (r[2] - r[0], r[3] - r[1])
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(0.2)
+    return None
+
+
+def _hdr_run_flag():
+    """Will the NEXT capture run record true HDR? Mirrors build_video_cmd's
+    gate exactly (float16 only rides a 10-bit-capable AMF encoder). A
+    restart may only continue the same file while this is unchanged - an
+    HDR run and an SDR run cannot be concatenated by stream copy."""
+    try:
+        strat = _hdr_strategy()
+        enc_now = _current_encoder()
+        if strat == "native" and not (enc_now.endswith("_amf")
+                                      and _enc_supports_10bit(enc_now)):
+            strat = None
+        return bool(strat and _HDR_LEVEL[0] < 1)
+    except Exception:
+        return False
+
+
 def _game_window_rect(pname, hwnd=None):
     """Where the given game's window is RIGHT NOW, as a capture rect:
         {"hwnd", "mon" (ddagrab output index), "x", "y", "w", "h"}
@@ -3444,6 +3483,9 @@ class Session:
         self._rotating = False         # mid rotate-run swap (blocks replay clips)
         self._gone_polls = 0           # consecutive polls the game looked closed
         self._pause_toasted = False    # auto-pause toast shown (once per session)
+        self.cap_wh = None             # frame size this file is locked to
+        self._restart_streak = 0       # capture restarts, decayed (see _note_restart)
+        self._last_restart = 0.0
         self._first_frame = threading.Event()
         self._err = bytearray()        # rolling tail of the encoder's stderr
         self._replay_lock = threading.Lock()
@@ -3605,6 +3647,10 @@ class Session:
                 log("Window capture: waiting for the game's window before "
                     "recording (no desktop is captured).")
         log(f"Detected '{self.game}'. Recording -> {self.final}")
+        # the frame size this file is locked to: every later run must match
+        # it, or a capture restart would splice two sizes into one stream
+        self.cap_wh = ((self.win["w"], self.win["h"]) if self.win
+                       else _screen_capture_wh(self.monitor_idx))
         if self.suspended:
             return                     # born paused: no capture run yet
         if not self.win:
@@ -3661,6 +3707,16 @@ class Session:
                 rfin = os.path.join(self.tmp, f"_runf{k}.mp4")
                 if self._assemble(rsegs, run["sys"], run["mic"], rfin, run):
                     run_finals.append(rfin)
+                else:
+                    # A run that won't assemble is silently missing from the
+                    # finished video (and from the length check below, which
+                    # only measures the runs that DID make it) - say so loudly
+                    # so lost footage is never invisible. Sessions now gain a
+                    # run on every alt-tab, so this path matters.
+                    lost = sum((_probe_duration(s) or 0) for s in rsegs)
+                    log(f"Run {k + 1} of {len(self.runs)} could not be "
+                        f"assembled - about {lost:.0f}s is missing from this "
+                        f"recording (the rest is saved normally).")
             if len(run_finals) == 1:
                 try:
                     os.replace(run_finals[0], self.final)
@@ -3786,7 +3842,13 @@ class Session:
                     if adur is None:
                         return user_ms
                     o = int(round((ends[kind] - adur - v_t0) * 1000)) + user_ms
-                    return max(lo, min(8000, o))
+                    # The ceiling must clear the whole clip: when the capture
+                    # restarted part-way through (alt-tab), this run's audio
+                    # legitimately belongs tens of seconds in, and the old
+                    # flat 8s cap dropped it near the start - sound from
+                    # after the alt-tab laid over footage from before it.
+                    # (_assemble raised the same ceiling for this reason.)
+                    return max(lo, min(max(8000, int(d * 1000) + 2000), o))
                 off_sys = _off(sys_wav, "system")
                 off_mic = _off(mic_wav, "mic")
                 if sys_wav or mic_wav:
@@ -4908,6 +4970,21 @@ def _window_track(ctl, session, current):
     return "restart"
 
 
+def _note_restart(session):
+    """Count a capture restart, with a 60-second decay, and return the new
+    streak. The decay is the whole point: restarts minutes apart are separate
+    incidents (one alt-tab each) and must never add up to 'this encoder is
+    broken', while restarts seconds apart really are a failing capture and
+    must be allowed to reach the encoder ladder. Living on the SESSION also
+    means a previous game's trouble can't hobble the next one."""
+    now = time.time()
+    if now - getattr(session, "_last_restart", 0.0) > 60.0:
+        session._restart_streak = 0
+    session._restart_streak = getattr(session, "_restart_streak", 0) + 1
+    session._last_restart = now
+    return session._restart_streak
+
+
 def _apply_track_act(ctl, session, current, act):
     """End the current chapter on _window_track's orders ('split' = save it,
     'restart' = a seconds-old head, discard it) and immediately re-attach to
@@ -5116,6 +5193,25 @@ def _watch_core(ctl):
     """Detection + record loop, driven by ctl events. Used by the tray app
     and by the legacy console mode."""
     load_settings()
+    # ONE-TIME REPAIR: compatible ('safe') capture mode used to be switched on
+    # and remembered whenever a capture died mid-run - and the commonest cause
+    # of that was never the encoder at all, it was alt-tabbing out of an
+    # exclusive-fullscreen game (see the capture-restart branch below). Safe
+    # mode drags every frame through system memory instead of staying on the
+    # GPU, which on a 5120x1440/60 capture is a heavy, pointless tax. Clear it
+    # once so the setting has to re-earn itself; a genuine encoder failure
+    # switches it straight back on.
+    # (no leading underscore: the settings bridge strips those, and the marker
+    #  has to survive the user pressing Save or this repeats forever)
+    if SETTINGS.get("safe_capture") and not SETTINGS.get("safe_reset_v11"):
+        try:
+            _persist_setting("safe_capture", False)
+            _persist_setting("safe_reset_v11", True)
+            SETTINGS["safe_capture"] = False
+            log("Compatible capture mode cleared: it was set by the old "
+                "alt-tab misdiagnosis. Full-speed GPU capture is back.")
+        except Exception:
+            pass
     _ENC_SAFE[0] = bool(SETTINGS.get("safe_capture", False))
     _migrate_library_layout() # shelve any flat legacy recordings first
     _sweep_orphan_temp()      # clear scratch left by a crash/force-kill last time
@@ -5145,7 +5241,6 @@ def _watch_core(ctl):
     enc_fails = 0           # consecutive encoder-died restarts (to stop looping)
     start_fails = 0         # consecutive start failures (spawn / output-folder errors)
     gone = 0                # consecutive polls the game looked closed (debounce)
-    win_deaths = 0          # consecutive window-scope capture deaths (rect vs encoder)
     safe_persisted = False  # have we saved a discovered safe-capture mode yet
     try:
         while not ctl.quit.is_set():
@@ -5306,8 +5401,7 @@ def _watch_core(ctl):
                     current = g
                     manual = False
                     start_fails = 0
-                    win_deaths = 0          # fresh game: the salvage counter
-                    with ctl.lock:          # from any prior game does not carry
+                    with ctl.lock:
                         ctl.session = session
                     # a window-scope session born while the game is minimised
                     # starts PAUSED - saying "recording" would be a lie
@@ -5341,7 +5435,6 @@ def _watch_core(ctl):
                     current = gg
                     manual = True
                     start_fails = 0
-                    win_deaths = 0          # fresh attach: reset the salvage counter
                     with ctl.lock:
                         ctl.session = session
                     ctl.set_status("recording")
@@ -5368,21 +5461,80 @@ def _watch_core(ctl):
                 # suspended=False - that dead-video state must enter recovery too,
                 # or audio records to nowhere until the user notices.
                 if not session.vproc or session.vproc.poll() is not None:
-                    # Window-scope deaths FIRST - they are usually the RECT's
-                    # fault, not the encoder's: a display-mode switch shrinks
-                    # the desktop under the pinned subrect and ddagrab errors
-                    # out. Salvage the chapter and re-attach at a freshly-
-                    # resolved rect; only if that ALSO dies twice does the
-                    # encoder ladder below get its turn (a fresh rect that
-                    # still can't encode IS an encoder/HDR problem).
-                    if getattr(session, "win", None) and win_deaths < 2:
-                        err = session.err_text()
-                        for ln in err.splitlines()[-3:]:
+                    # Window-scope deaths FIRST - almost never the encoder's
+                    # fault. Alt-tabbing out of an exclusive-fullscreen game
+                    # flips the display mode and Windows tears down the
+                    # desktop duplication ddagrab reads, so ffmpeg exits with
+                    # a generic external error. This is COMMON - measured 104
+                    # times in one day - so it must cost nothing: keep the
+                    # session and the file, and only end the chapter when the
+                    # window genuinely comes back a different SIZE (one file
+                    # can never hold two frame sizes).
+                    if (getattr(session, "win", None)
+                            and getattr(session, "_restart_streak", 0) < 6):
+                        _note_restart(session)
+                        for ln in session.err_text().splitlines()[-2:]:
                             if ln.strip():
                                 log("  ffmpeg: " + ln.strip())
-                        log("Window capture: the recorder stopped mid-run; "
-                            "re-attaching at the window's current position.")
-                        win_deaths += 1
+                        proven = False
+                        for _sp in _list_segments(session.tmp):
+                            try:
+                                if os.path.getsize(_sp) > 4096:
+                                    proven = True
+                                    break
+                            except OSError:
+                                pass
+                        game_alive = (current in running_process_names()
+                                      if current else bool(manual))
+                        try:
+                            fresh = _game_window_rect(
+                                current or session.game,
+                                hwnd=session.win.get("hwnd"))
+                        except Exception:
+                            fresh = None
+                        if proven and game_alive:
+                            if fresh is None or fresh.get("iconic"):
+                                # the window is away right now (that IS the
+                                # alt-tab): pause and let the tracker resume
+                                # into this same file when it comes back
+                                session.win_paused = True
+                                session._win_pend = None
+                                session._win_lost = time.time()
+                                session.suspend()
+                                ctl.set_status("paused")
+                                log("Window capture stopped and the window is "
+                                    "away - paused; the same recording "
+                                    "continues when it returns.")
+                                if not getattr(session, "_pause_toasted", False):
+                                    session._pause_toasted = True
+                                    ctl.notify("Recording paused",
+                                               f"{current or session.game}'s window "
+                                               "went away - recording continues "
+                                               "when it returns.")
+                                _interruptible_sleep(ctl, 0.4)
+                                continue
+                            if ((fresh["w"], fresh["h"]) == (session.win["w"],
+                                                             session.win["h"])
+                                    and _hdr_run_flag() == getattr(
+                                        session, "_hdr_used", False)):
+                                # same size AND same HDR mode: start
+                                # capturing again into the SAME file (a new
+                                # run, exactly like Continue after a pause)
+                                session.win = fresh
+                                log("Window capture stopped mid-run (display "
+                                    "change) - continuing the same recording.")
+                                session._rotating = True   # a clip must not
+                                try:                       # race the swap
+                                    session._stop_run()
+                                    session._start_run()
+                                except Exception as e:
+                                    log(f"Capture restart failed: {e}")
+                                finally:
+                                    session._rotating = False
+                                _interruptible_sleep(ctl, 0.4)
+                                continue
+                            log("Window capture: the window came back a "
+                                "different size - saving this chapter.")
                         act = ("split"
                                if len(_list_segments(session.tmp)) >= 4
                                else "restart")
@@ -5397,9 +5549,16 @@ def _watch_core(ctl):
                     # machine - NOT a bad encoder. Fall back to plain capture and
                     # re-record right away, so HDR can never leave you with no
                     # recording at all.
+                    # ...but only when HDR has NEVER produced a frame here (or
+                    # after the capture-restart budget below is spent). If
+                    # earlier runs in this session recorded fine, HDR clearly
+                    # works on this machine and an empty run is the display
+                    # flipping mode (alt-tab), not an HDR capability failure.
                     if (getattr(session, "_hdr_used", False) and _HDR_LEVEL[0] < 1
                             and len(_list_segments(session.tmp))
-                                <= getattr(session, "_run_vstart", 0)):
+                                <= getattr(session, "_run_vstart", 0)
+                            and (not _list_segments(session.tmp)
+                                 or getattr(session, "_restart_streak", 0) >= 6)):
                         err = session.err_text()
                         for ln in err.splitlines()[-4:]:
                             if ln.strip():
@@ -5456,6 +5615,88 @@ def _watch_core(ctl):
                         if ctl.saving <= 0:
                             ctl.set_status("watching")
                         _interruptible_sleep(ctl, 1.0)
+                        continue
+                    # THE ALT-TAB FIX (screen scope). The capture stopped, but
+                    # this run HAD been writing frames and the game is still
+                    # here - so the encoder is provably fine. What kills a
+                    # healthy capture mid-run is the DESKTOP changing under
+                    # it: alt-tabbing out of an exclusive-fullscreen game
+                    # flips the display mode and Windows tears down the
+                    # duplication ddagrab reads from, so ffmpeg exits.
+                    # Blaming the encoder for that (what used to happen) saved
+                    # the video, opened a new one, and permanently demoted the
+                    # encoder to compatible mode - which is why one session
+                    # became a pile of files and why capture got slow.
+                    # Instead: keep the session and start a fresh capture run.
+                    # The footage continues in the SAME file, exactly like
+                    # Continue after a pause.
+                    # SESSION-level frames, not this run's: a run that dies
+                    # empty moments after a good one is the same display
+                    # transition, and the encoder has already proven itself.
+                    # 'proven' means real footage exists - a zero-byte stub
+                    # from an encoder that died on its first frame must not
+                    # buy six retries and turn a clean discard into a doomed
+                    # salvage, so the bytes have to be there.
+                    def _has_footage(sess):
+                        for sp in _list_segments(sess.tmp):
+                            try:
+                                if os.path.getsize(sp) > 4096:
+                                    return True
+                            except OSError:
+                                pass
+                        return False
+                    proven = _has_footage(session)
+                    # A manual desktop recording has no game to be alive -
+                    # it must still survive a display-mode change (it used to
+                    # fall through and re-persist compatible mode).
+                    game_alive = (current in running_process_names()
+                                  if current else bool(manual))
+                    # ...but ONLY while the capture would come back identical.
+                    # The very event that kills it (a display-mode change) can
+                    # also change the desktop resolution, and stream-copying a
+                    # 1080p run onto a 1440p one makes an unplayable file.
+                    # (window-scope sessions are handled by their own branch
+                    #  above; comparing a window size against a screen size
+                    #  here would always read as "changed")
+                    now_wh = (None if getattr(session, "win", None)
+                              else _screen_capture_wh(session.monitor_idx))
+                    same_shape = (
+                        getattr(session, "cap_wh", None) is not None
+                        and now_wh is not None
+                        and now_wh == session.cap_wh
+                        and _hdr_run_flag() == getattr(session, "_hdr_used", False))
+                    if (proven and game_alive and same_shape
+                            and getattr(session, "_restart_streak", 0) < 6):
+                        _note_restart(session)
+                        for ln in session.err_text().splitlines()[-2:]:
+                            if ln.strip():
+                                log("  ffmpeg: " + ln.strip())
+                        log("Capture stopped mid-run (display-mode change or "
+                            "lost desktop duplication) - continuing this same "
+                            "recording.")
+                        session._rotating = True    # a clip must not race it
+                        try:
+                            session._stop_run()     # banks the footage so far
+                            session._start_run()    # same file, next run
+                        except Exception as e:
+                            log(f"Capture restart failed: {e}")
+                        finally:
+                            session._rotating = False
+                        _interruptible_sleep(ctl, 0.4)
+                        continue
+                    if proven and game_alive and not same_shape:
+                        # the screen itself changed shape: this file is
+                        # finished, and the next session records the new one
+                        log("The screen's capture format changed - saving "
+                            "this chapter and starting a fresh one.")
+                        session = _apply_track_act(
+                            ctl, session, current,
+                            "split" if len(_list_segments(session.tmp)) >= 4
+                            else "restart")
+                        if session is None:
+                            current = None
+                            manual = False
+                        _interruptible_sleep(ctl, 0.3)
                         continue
                     # The encoder died mid-capture. Log WHY, then recover: first
                     # retry the SAME encoder on the most-compatible path ('safe'
@@ -5526,7 +5767,6 @@ def _watch_core(ctl):
                 else:
                     gone = 0
                     enc_fails = 0   # healthy: encoder alive and the game is running
-                    win_deaths = 0
                     act = _window_track(ctl, session, current)
                     if act:
                         # The game window was RESIZED (or lost for good): a
