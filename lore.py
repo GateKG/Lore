@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.01"
+APP_VERSION = "2.02"
 
 try:
     import psutil
@@ -131,6 +131,9 @@ DEFAULTS = {
     "capture_backend":   "auto",      # auto | ddagrab
     # AFK: no mouse/keyboard/controller input for this long -> the recording
     # pauses by itself and resumes the moment input returns. 0 disables.
+    # Player: how far ArrowLeft/ArrowRight jump. 'frame' steps a single
+    # frame (and pauses); the rest are seconds. Shift multiplies by 10.
+    "seek_step":         "5",         # frame | 1 | 5 | 10
     "afk_pause":         True,
     "afk_minutes":       4,
     # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
@@ -482,6 +485,7 @@ def _sanitize_settings(d):
         "popup_size": ("small", "medium", "large", "huge"),
         "capture_scope": ("screen", "window"),
         "capture_backend": ("auto", "ddagrab"),
+        "seek_step": ("frame", "1", "5", "10"),
     }
     # (hdr_mode is normalised by _migrate_settings_shape, which also maps legacy values)
     for k, allowed in ENUMS.items():
@@ -5887,6 +5891,28 @@ def _watch_core(ctl):
                 "alt-tab misdiagnosis. Full-speed GPU capture is back.")
         except Exception:
             pass
+    # The first highlight pass marked every burst 8s apart - a seek bar of
+    # solid gold. The picker is fixed; drop the sidecars it already wrote so
+    # they are rebuilt properly on idle. (marker must not start with '_':
+    # the settings bridge strips those keys)
+    if not SETTINGS.get("hl_reset_v201"):
+        try:
+            gone = 0
+            td = _thumb_dir(SETTINGS.get("output_dir", ""))   # ONE cache root
+            for fn in (os.listdir(td) if os.path.isdir(td) else []):
+                if fn.endswith(".hl.json"):
+                    try:
+                        os.remove(os.path.join(td, fn))
+                        gone += 1
+                    except OSError:
+                        pass
+            _persist_setting("hl_reset_v201", True)
+            SETTINGS["hl_reset_v201"] = True
+            if gone:
+                log(f"Cleared {gone} old highlight file(s): the marks were "
+                    f"far too dense. They rebuild themselves while idle.")
+        except Exception:
+            pass
     _ENC_SAFE[0] = bool(SETTINGS.get("safe_capture", False))
     _migrate_library_layout() # shelve any flat legacy recordings first
     _sweep_orphan_temp()      # clear scratch left by a crash/force-kill last time
@@ -7697,7 +7723,24 @@ def _highlights_one(video_path):
                     events.append({"t": round(max(0.0, t - 0.3), 2),
                                    "z": round(float(z[i]), 2)})
                     last_t = t
-        events = events[:200]
+        # A REEL, NOT A BARCODE. Every burst 8s apart used to survive (up to
+        # 200 of them), which on a 2h session painted the whole seek bar gold
+        # and marked nothing in particular. Keep only the strongest moments,
+        # spaced out in proportion to the video's length: the loudest first,
+        # each at least MINGAP from one already kept.
+        dur = len(es) * HOP / float(SR)
+        keep_n = int(min(30, max(5, round(dur / 300.0))))     # ~1 per 5 min
+        # spacing grows with the video but never below the 8s the
+        # candidates already honour - a flat 20s floor threw away real
+        # moments in short clips (proved by the 3-burst battery)
+        min_gap = max(8.0, min(60.0, dur / 120.0))
+        chosen = []
+        for ev in sorted(events, key=lambda e: -e["z"]):
+            if len(chosen) >= keep_n:
+                break
+            if all(abs(ev["t"] - c["t"]) >= min_gap for c in chosen):
+                chosen.append(ev)
+        events = sorted(chosen, key=lambda e: e["t"])
         os.makedirs(os.path.dirname(_ai_sidecar(video_path, "hl")),
                     exist_ok=True)
         _atomic_write_json(_ai_sidecar(video_path, "hl"),

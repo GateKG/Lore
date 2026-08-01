@@ -1353,7 +1353,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.01'};},
+      webhook:true,version:'2.02'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1376,7 +1376,7 @@ function makeMock(){
     edit_cancel:async()=>{const m=window.__mockEd;if(m){m.done=true;m.ok=false;m.why='cancelled';}return {ok:true};},
     get_settings:async()=>({settings:{output_dir:'C:/mock',framerate:60,bitrate_mbps:25,
       encoder:'auto',amf_quality:'balanced',monitor_index:0,safe_capture:false,
-      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,
+      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,seek_step:'5',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',
@@ -1387,7 +1387,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.01'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.02'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -2420,6 +2420,9 @@ function renderSet(cL,cR,app,spreadIdx){
       c.append(listEditor(()=>S.settings.ignore,
         async l=>{const r=await api.set_ignore(l);S.settings.ignore=r||l;},'e.g. photoshop.exe',true));
       w.append(c);return w;})());
+    divider(R,'In the player');
+    row(R,'← and → jump',ctlSeg('seek_step',[['frame','Frame'],['1','1s'],['5','5s'],['10','10s']]));
+    hint(R,'How far the arrow keys scrub while you are watching. Hold Shift for ten times the jump — so on 1s, Shift+→ moves ten seconds. Frame steps pause the video first.');
     divider(R,'Whispers (popups)');
     row(R,'Arrival',ctlSelect('popup_style',(st.popup_styles||[]).map(([k,l])=>[k,l])));
     row(R,'Size',ctlSeg('popup_size',[['small','S'],['medium','M'],['large','L'],['huge','XL']]));
@@ -2855,7 +2858,9 @@ function turnTo(target){requestTurn(target);}   /* legacy callers */
 let _notchUnit=0;
 function onWheelNotches(e){
   const mag=Math.abs(e.deltaY);if(mag<6)return;
-  const dir=e.deltaY>0?1:-1;
+  /* wheel UP carries you FORWARD through the book, wheel DOWN back - you are
+     pushing the top of the sheet away from you, the way a real page turns */
+  const dir=e.deltaY>0?-1:1;
   let n;
   if(e.deltaMode!==0){n=Math.max(1,Math.round(mag));}       /* lines / pages */
   else{if(mag>=50&&(_notchUnit===0||mag<_notchUnit))_notchUnit=Math.min(240,mag);
@@ -3367,7 +3372,13 @@ async function renderHlMarks(vid,req){
     if(req!==_viewerReq)return;
     document.querySelectorAll('.hlmark').forEach(m=>m.remove());
     const d=vd.duration;if(!d||!isFinite(d))return;
-    evs.forEach(ev=>{
+    /* NEVER a barcode. However many moments the sidecar holds (older ones
+       hold hundreds), only the loudest survive, and no two land closer than
+       1.6% of the bar - about 8px - so every tick stays a tick you can aim at. */
+    const sep=d*0.016,keep=[];
+    [...evs].sort((a,b)=>(b.z||0)-(a.z||0)).forEach(ev=>{
+      if(keep.length<30&&keep.every(k=>Math.abs(k.t-ev.t)>=sep))keep.push(ev);});
+    keep.sort((a,b)=>a.t-b.t).forEach(ev=>{
       const m=el('div','hlmark');
       m.style.left='calc('+(Math.min(1,Math.max(0,ev.t/d))*100).toFixed(3)+'% - 1px)';
       m.title='a loud moment — jump there';
@@ -3621,6 +3632,23 @@ function wireViewer(){
       else if(document.body.classList.contains('vfull'))exitTheater();
       else closeViewer();}
     if(e.key===' '){e.preventDefault();vd.paused?vd.play().catch(()=>{}):vd.pause();}
+    /* ←/→ scrub. The step is yours (Settings ▸ General ▸ In the player):
+       a single frame, or 1/5/10 seconds. Hold Shift for ten times the jump.
+       Frame steps pause first - a frame you cannot see is no use. */
+    if(e.key==='ArrowRight'||e.key==='ArrowLeft'){
+      e.preventDefault();e.stopImmediatePropagation();
+      const step=String((S.settings&&S.settings.settings&&S.settings.settings.seek_step)||'5');
+      let jump;
+      /* one frame at the rate we record at - `st` is a local of renderSet,
+         it does NOT exist out here (reading it threw and ate the keypress) */
+      if(step==='frame'){vd.pause();
+        jump=1/((S.settings&&S.settings.settings&&+S.settings.settings.framerate)||60);}
+      else jump=(parseFloat(step)||5)*(e.shiftKey?10:1);
+      const d=isFinite(vd.duration)?vd.duration:null;
+      let t=(vd.currentTime||0)+(e.key==='ArrowLeft'?-jump:jump);
+      t=Math.max(0,d!==null?Math.min(t,Math.max(0,d-0.02)):t);
+      try{vd.currentTime=t;}catch(err){}
+    }
   },true);
   /* --- editor --- */
   $('#vtrim').addEventListener('click',()=>{
