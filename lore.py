@@ -9172,13 +9172,25 @@ def lore_app(show_window=True):
             time.sleep(0.1)
         # The TASKBAR shows the RUNNING window's icon, not the exe resource -
         # and pywebview never sets one, so the button wore whatever stale mark
-        # Windows had cached. Stamp the form with lore.ico directly: the live
-        # button always shows the current grimoire.
+        # Windows had cached. Stamp the form with the DRAWN grimoire: rendered
+        # fresh from _tome_mark into a temp .ico, so a stale lore.ico file in
+        # the install folder (the update bat didn't ship it for a while) can
+        # never put the old art on the button again. lore.ico is the fallback.
         try:
             import webview.platforms.winforms as _wf
             from System.Drawing import Icon as _NIcon
             from System import Action as _NAction
             ip = os.path.join(_here(), "lore.ico")
+            try:
+                import tempfile
+                drawn = os.path.join(tempfile.gettempdir(), "lore_mark.ico")
+                _tome_mark(256).save(
+                    drawn, format="ICO",
+                    sizes=[(16, 16), (24, 24), (32, 32), (48, 48),
+                           (64, 64), (128, 128), (256, 256)])
+                ip = drawn
+            except Exception:
+                pass
             if os.path.isfile(ip):
                 for _form in list(getattr(_wf.BrowserView, "instances", {}).values()):
                     def _seticon(f=_form):
