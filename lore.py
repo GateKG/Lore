@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "1.04"
+APP_VERSION = "1.1"
 
 try:
     import psutil
@@ -82,7 +82,7 @@ DEFAULTS = {
                                        # encoder fails to start (e.g. some AMD/4K setups)
 
     # Detection
-    "detection_mode":    "auto",      # "auto" (fullscreen games) or "list"
+    "detection_mode":    "auto",      # "auto" (game recognition) or "list"
     "poll_interval":     3,
 
     # Audio (WASAPI - no rerouting, no delay)
@@ -702,6 +702,365 @@ def _watched_monitor_rect():
         return None
 
 
+# ---------------------------------------------------------------------------
+#  Game recognition v2 (Lore 1.1) - ShadowPlay-style, three signals instead of
+#  one guess:
+#    1. the WINDOW  - a real, visible, decent-sized top-level window
+#    2. the OS      - Windows' own game database (GameConfigStore: the Game
+#                     Bar has watched every game launch for years; 142 titles
+#                     strong on the dev machine, zero chat apps or browsers)
+#    3. the GPU     - sustained per-process 3D-engine load via PDH counters
+#                     (the same numbers Task Manager's GPU column shows; games
+#                     render at 30-100%, Claude/Discord/browsers idle at ~0-1%)
+#  A window whose exe Windows already knows as a game records at once -
+#  windowed or fullscreen, any monitor. An UNKNOWN exe must earn it:
+#  fullscreen on the watched screen AND real 3D load on consecutive polls -
+#  then it's learned, so the next launch is instant. Fullscreen alone never
+#  starts a recording again (that's what recorded a fullscreened chat app).
+# ---------------------------------------------------------------------------
+_GAMEDB = {"set": None, "t": 0.0}
+
+
+def _windows_game_db():
+    """Exe basenames Windows itself has recognised as games - read from
+    HKCU\\System\\GameConfigStore\\Children (each entry's MatchedExeFullPath;
+    the Game Bar writes one per game it detects). Cached for 5 minutes.
+    Crash-handler style entries are filtered; the user's ignore list still
+    outranks whatever remains."""
+    now = time.time()
+    if _GAMEDB["set"] is not None and now - _GAMEDB["t"] < 300:
+        return _GAMEDB["set"]
+    names = set()
+    try:
+        import winreg
+        root = r"System\GameConfigStore\Children"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root) as k:
+            count = winreg.QueryInfoKey(k)[0]
+            for i in range(count):
+                try:
+                    sub = winreg.EnumKey(k, i)
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                        root + "\\" + sub) as sk:
+                        p, _ = winreg.QueryValueEx(sk, "MatchedExeFullPath")
+                except OSError:
+                    continue
+                b = os.path.basename(str(p)).strip().lower()
+                if not b.endswith(".exe"):
+                    continue
+                # junk that rides along in the store: crash reporters put up
+                # small dialogs and must never look like the game itself
+                if any(t in b for t in ("crash", "crs-handler", "report",
+                                        "helper", "launcher", "setup",
+                                        "unins", "redist")):
+                    continue
+                names.add(b)
+    except Exception:
+        pass
+    if names or _GAMEDB["set"] is None:
+        _GAMEDB["set"] = names
+        _GAMEDB["t"] = now
+        if names:
+            log(f"Windows game database: {len(names)} titles recognised.")
+    return _GAMEDB["set"] or set()
+
+
+_GPU_PDH = {"q": None, "c": None, "t": 0.0, "map": {}}
+
+
+def _gpu3d_usage(max_age=2.0):
+    """{pid: percent} of 3D-engine GPU utilization, summed over a process's
+    3D engine instances - via PDH 'GPU Engine' counters on pdh.dll (pure
+    ctypes, no dependencies; exactly what Task Manager's GPU column reads).
+    ONE query is kept open for the app's lifetime: PDH rates are deltas
+    between collects, so each call measures activity since the previous call
+    (results younger than max_age are served from cache). Any PDH hiccup
+    closes the query and self-heals on the next call; failures mean {} -
+    the caller then simply can't confirm a GPU signal, never crashes."""
+    now = time.time()
+    if _GPU_PDH["q"] is not None and now - _GPU_PDH["t"] < max_age:
+        return _GPU_PDH["map"]
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pdh = ctypes.windll.pdh
+
+        class _FMT(ctypes.Structure):
+            _fields_ = [("CStatus", wintypes.DWORD), ("pad", wintypes.DWORD),
+                        ("doubleValue", ctypes.c_double)]
+
+        class _ITEM(ctypes.Structure):
+            _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _FMT)]
+
+        if _GPU_PDH["q"] is None:
+            q = ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+                return {}
+            c = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(
+                    q, r"\GPU Engine(*engtype_3D)\Utilization Percentage",
+                    None, ctypes.byref(c)) != 0:
+                pdh.PdhCloseQuery(q)
+                return {}
+            pdh.PdhCollectQueryData(q)      # baseline; rates need two collects
+            _GPU_PDH.update({"q": q, "c": c, "t": now, "map": {}})
+            return {}
+        q, c = _GPU_PDH["q"], _GPU_PDH["c"]
+        if pdh.PdhCollectQueryData(q) != 0:
+            raise OSError("collect failed")
+        sz = wintypes.DWORD(0)
+        cnt = wintypes.DWORD(0)
+        r = pdh.PdhGetFormattedCounterArrayW(
+            c, 0x00000200, ctypes.byref(sz), ctypes.byref(cnt), None) & 0xFFFFFFFF
+        if r != 0x800007D2:                 # PDH_MORE_DATA
+            raise OSError(f"size {r:#x}")
+        buf = (ctypes.c_byte * sz.value)()
+        if pdh.PdhGetFormattedCounterArrayW(
+                c, 0x00000200, ctypes.byref(sz), ctypes.byref(cnt), buf) != 0:
+            raise OSError("array failed")
+        items = ctypes.cast(buf, ctypes.POINTER(_ITEM * cnt.value)).contents
+        per = {}
+        for it in items:
+            name = it.szName or ""
+            if it.FmtValue.CStatus not in (0, 1):
+                continue
+            i = name.find("pid_")
+            if i < 0:
+                continue
+            j = name.find("_", i + 4)
+            try:
+                pid = int(name[i + 4:j])
+            except Exception:
+                continue
+            per[pid] = per.get(pid, 0.0) + it.FmtValue.doubleValue
+        _GPU_PDH["map"] = per
+        _GPU_PDH["t"] = now
+        return per
+    except Exception:
+        try:
+            if _GPU_PDH["q"] is not None:
+                ctypes.windll.pdh.PdhCloseQuery(_GPU_PDH["q"])
+        except Exception:
+            pass
+        _GPU_PDH.update({"q": None, "c": None, "map": {}})
+        return {}
+
+
+_LEARNED = {"set": None}
+
+
+def _learned_games_path():
+    return os.path.join(_data_dir(), "learned_games.json")
+
+
+def _learned_games():
+    """Exes the GPU+fullscreen heuristic has already proven to be games -
+    persisted, so every future launch records instantly (windowed too),
+    exactly how ShadowPlay 'knows' your library. Ignore-listed names are
+    dropped on load, so un-learning is one Settings click away."""
+    if _LEARNED["set"] is None:
+        s = set()
+        try:
+            with open(_learned_games_path(), encoding="utf-8") as fh:
+                s = {str(x).lower() for x in json.load(fh) if str(x).strip()}
+        except Exception:
+            pass
+        _LEARNED["set"] = s
+    return _LEARNED["set"] - load_ignore_list()
+
+
+def _learn_game_exe(name):
+    name = (name or "").strip().lower()
+    if not name or name in _learned_games():
+        return
+    s = _LEARNED["set"] if _LEARNED["set"] is not None else set()
+    s.add(name)
+    _LEARNED["set"] = s
+    try:
+        _atomic_write_json(_learned_games_path(), sorted(s))
+    except Exception:
+        pass
+    log(f"Learned a new game: {name} (recognised by GPU + fullscreen).")
+
+
+def _exe_has_any_window(pname):
+    """Does this process own ANY top-level window - visible or not? An
+    alt-tabbed exclusive-fullscreen game HIDES its window (it still exists);
+    a wedged crash or exit-to-tray resident has none. The gone-pause
+    backstop uses this to tell 'long alt-tab, keep waiting' apart from
+    'never coming back, save the footage'. Errors report False, so footage
+    is saved rather than held hostage."""
+    if os.name != "nt" or not pname:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        pids = set()
+        for pr in psutil.process_iter(["pid", "name"]):
+            try:
+                if (pr.info.get("name") or "").lower() == pname.lower():
+                    pids.add(pr.info["pid"])
+            except Exception:
+                pass
+        if not pids:
+            return False
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum(h, _l):
+            try:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                if pid.value in pids:
+                    if not (user32.GetWindowLongW(h, -20) & 0x00000080):
+                        found.append(h)     # any non-tool top-level counts
+                        return 0
+            except Exception:
+                pass
+            return 1
+        user32.EnumWindows(_enum, 0)
+        return bool(found)
+    except Exception:
+        return False
+
+
+_GPU_HITS = {}   # exe -> (streak, last-hit wallclock) for the unknown-exe path
+
+
+def detect_game_smart():
+    """The auto-detection heart of Lore 1.1 (see the banner comment above).
+    Returns the exe name to record, or None. The user/builtin lists are
+    checked by find_active_game BEFORE this runs - this function decides
+    about what's on screen right now. LEARNED games are checked here (not
+    by process presence): a machine-curated entry must show a real window,
+    or a lingering background process would claim recordings forever."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        # Prune stale GPU streaks FIRST - before any early return can skip
+        # it. A streak only counts as 'consecutive' if its last hit is
+        # within ~two polls; anything older is a dead spike, not a game.
+        try:
+            poll = float(SETTINGS.get("poll_interval", 3) or 3)
+        except Exception:
+            poll = 3.0
+        now = time.time()
+        for k in list(_GPU_HITS):
+            if now - _GPU_HITS[k][1] > max(8.0, poll * 2.5):
+                del _GPU_HITS[k]
+        ignore = load_ignore_list()
+        gamedb = _windows_game_db() | _learned_games()
+        watched = _watched_monitor_rect()
+        cands = []                   # (exe, pid, fullscreen-ish, on_watched)
+
+        def _consider(h):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if not pid.value or pid.value == os.getpid():
+                return
+            try:
+                if user32.GetWindow(h, 4):                    # GW_OWNER
+                    return
+                ex = user32.GetWindowLongW(h, -20)            # GWL_EXSTYLE
+                if ex & 0x00000080:                           # TOOLWINDOW
+                    return
+                buf = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, buf, 64)
+                if buf.value in ("Progman", "WorkerW", "Shell_TrayWnd",
+                                 "Windows.UI.Core.CoreWindow"):
+                    return
+                cloaked = ctypes.c_int(0)
+                if ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                        h, 14, ctypes.byref(cloaked),
+                        ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+                    return
+                r = wintypes.RECT()
+                user32.GetWindowRect(h, ctypes.byref(r))
+                w, hh = r.right - r.left, r.bottom - r.top
+                if w < 480 or hh < 320:
+                    return                                    # dialogs, stubs
+                mrect = _window_monitor_rect(h)
+                fs = False
+                if mrect:
+                    mw, mh = mrect[2] - mrect[0], mrect[3] - mrect[1]
+                    caption = user32.GetWindowLongW(h, -16) & 0x00C00000
+                    fs = (not caption and w >= mw - 2 and hh >= mh - 2)
+                on_watched = (watched is None
+                              or (mrect is not None and tuple(mrect) == watched))
+                try:
+                    exe = psutil.Process(pid.value).name().lower()
+                except psutil.Error:
+                    return
+                if exe in ignore:
+                    return
+                cands.append((exe, pid.value, fs, on_watched))
+            except Exception:
+                pass
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum(h, _l):
+            try:
+                if user32.IsWindowVisible(h) and not user32.IsIconic(h):
+                    _consider(h)
+            except Exception:
+                pass
+            return 1
+        user32.EnumWindows(_enum, 0)
+
+        # Signal 2: the OS already calls it a game -> record, windowed or
+        # not, whatever monitor it's on (window scope follows it there).
+        for exe, pid, fs, onw in cands:
+            if exe in gamedb:
+                return exe
+
+        # Unknown exe: it must EARN recording. Fullscreen-ish on the watched
+        # screen AND real 3D load across two consecutive polls -> game;
+        # remember it so next time it's instant. (QUNS_RUNNING_D3D_FULL_SCREEN
+        # marks exclusive fullscreen even when the window rect lies.)
+        excl = None
+        try:
+            state = ctypes.c_int(0)
+            ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+            if state.value == 3:
+                fh = user32.GetForegroundWindow()
+                fp = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(fh, ctypes.byref(fp))
+                if fp.value and fp.value != os.getpid():
+                    try:
+                        e = psutil.Process(fp.value).name().lower()
+                        if e not in ignore:
+                            excl = (e, fp.value)
+                    except psutil.Error:
+                        pass
+        except Exception:
+            pass
+        hopefuls = {}
+        for exe, pid, fs, onw in cands:
+            if fs and onw:
+                hopefuls[exe] = pid
+        if excl and excl[0] not in hopefuls:
+            hopefuls[excl[0]] = excl[1]
+        if hopefuls:
+            # cache no longer than the poll gap, or two 'consecutive' polls
+            # would read the SAME GPU sample and one spike could pass for two
+            usage = _gpu3d_usage(max_age=min(2.0, max(0.5, poll * 0.8)))
+            for exe, pid in hopefuls.items():
+                if usage.get(pid, 0.0) >= 12.0:
+                    n = _GPU_HITS.get(exe, (0, 0.0))[0] + 1
+                    _GPU_HITS[exe] = (n, now)
+                    if n >= 2:
+                        _learn_game_exe(exe)
+                        return exe
+                else:
+                    _GPU_HITS.pop(exe, None)   # streak broke: GPU went idle
+    except Exception:
+        return None
+    return None
+
+
 def detect_fullscreen_game():
     if os.name != "nt":
         return None
@@ -867,7 +1226,7 @@ def load_builtin_games():
 
 def find_active_game():
     # The games.txt list is ALWAYS honored - this catches windowed games like
-    # Hearthstone that fullscreen detection would miss.
+    # Hearthstone that window detection would miss.
     listed = load_game_list()
     running = None
     if listed:
@@ -886,8 +1245,13 @@ def find_active_game():
         hit = (builtin & running) - load_ignore_list()
         if hit:
             return sorted(hit)[0]
-    # ...and fullscreen detection catches everything else.
-    return detect_fullscreen_game()
+    # ...and real game RECOGNITION catches everything else: Windows' own
+    # game database + games the GPU heuristic learned + sustained 3D GPU
+    # load for the rest. Learned games are checked THERE (with a real
+    # window required), never by bare process presence - a lingering
+    # background process must not claim recordings. Fullscreen alone no
+    # longer starts a recording (it used to record any fullscreened app).
+    return detect_game_smart()
 
 
 # ---------------------------------------------------------------------------
@@ -2139,25 +2503,47 @@ def _salvage_interrupted():
                 final = os.path.join(out, name + "_recovered.mp4")
             tmp = final + ".__assembling__.mp4"
             try:
-                wavs = [os.path.join(d, w) for w in sorted(os.listdir(d))
-                        if w.endswith(".wav")
-                        and os.path.getsize(os.path.join(d, w)) > 64_000]
+                # WAVs are tagged per RUN (system_00/mic_00, system_01/...):
+                # a session that auto-paused even once has 2+ runs, and the
+                # old blind sorted()[:2] then amixed mic_00 with mic_01 -
+                # two mic tracks, game audio discarded. Group by KIND in run
+                # order: runs are sequential in time exactly like the video
+                # segments, so same-kind WAVs concat, then the kinds amix.
+                allw = sorted(w for w in os.listdir(d)
+                              if w.endswith(".wav")
+                              and os.path.getsize(os.path.join(d, w)) > 64_000)
+                sysw = [os.path.join(d, w) for w in allw if w.startswith("system")]
+                micw = [os.path.join(d, w) for w in allw if w.startswith("mic")]
+                if not sysw and not micw:      # unexpected names: best effort
+                    sysw = [os.path.join(d, w) for w in allw[:1]]
                 lst = os.path.join(d, "concat.txt")
                 with open(lst, "w", encoding="utf-8") as fh:
                     for s in segs:
                         fh.write("file '" + s.replace("'", "'\\''") + "'\n")
                 cmd = [ff, "-y", "-hide_banner", "-loglevel", "error",
                        "-f", "concat", "-safe", "0", "-i", lst]
-                for w in wavs[:2]:
+                for w in sysw + micw:
                     cmd += ["-i", w]
                 cmd += ["-map", "0:v", "-c:v", "copy"]
-                if wavs:
-                    if len(wavs) >= 2:
-                        cmd += ["-filter_complex",
-                                "[1:a][2:a]amix=inputs=2:duration=longest[a]",
-                                "-map", "[a]"]
+                if sysw or micw:
+                    fg, k = [], 1
+                    if len(sysw) > 1:
+                        fg.append("".join(f"[{k + i}:a]" for i in range(len(sysw)))
+                                  + f"concat=n={len(sysw)}:v=0:a=1[sa]")
+                    elif sysw:
+                        fg.append(f"[{k}:a]anull[sa]")
+                    k += len(sysw)
+                    if len(micw) > 1:
+                        fg.append("".join(f"[{k + i}:a]" for i in range(len(micw)))
+                                  + f"concat=n={len(micw)}:v=0:a=1[ma]")
+                    elif micw:
+                        fg.append(f"[{k}:a]anull[ma]")
+                    if sysw and micw:
+                        fg.append("[sa][ma]amix=inputs=2:duration=longest[a]")
+                        out_lbl = "[a]"
                     else:
-                        cmd += ["-map", "1:a"]
+                        out_lbl = "[sa]" if sysw else "[ma]"
+                    cmd += ["-filter_complex", ";".join(fg), "-map", out_lbl]
                     cmd += ["-c:a", "aac", "-b:a", "192k"]
                 cmd += ["-movflags", "+faststart", tmp]
                 flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -3057,6 +3443,7 @@ class Session:
         self._win_lost = 0.0           # when the game's window first went missing
         self._rotating = False         # mid rotate-run swap (blocks replay clips)
         self._gone_polls = 0           # consecutive polls the game looked closed
+        self._pause_toasted = False    # auto-pause toast shown (once per session)
         self._first_frame = threading.Event()
         self._err = bytearray()        # rolling tail of the encoder's stderr
         self._replay_lock = threading.Lock()
@@ -4373,11 +4760,11 @@ def _window_track(ctl, session, current):
       * minimised          -> pause the run (footage kept); resumes on
                               restore AT THE SAME SIZE (a window that comes
                               back resized ends the chapter instead)
-      * window gone        -> grace period (display-mode switches destroy
-                              and recreate windows; 12s live, 60s while
-                              paused), then end the chapter - the follow-up
-                              session decides its own scope from whatever
-                              exists then
+      * window gone        -> pause too: exclusive-fullscreen games HIDE
+                              their window on alt-tab, and display-mode
+                              switches destroy/recreate it - both come back,
+                              so the recording waits and continues into the
+                              SAME file (never one file per alt-tab)
       * moved / new screen -> rotate the capture onto the new rect: same
                               file, segment numbering continues
       * RESIZED            -> return 'split' (save the chapter; the watcher
@@ -4399,25 +4786,45 @@ def _window_track(ctl, session, current):
     except Exception:
         w = None
     if w is None:
-        # Window missing entirely (destroyed, hidden, or hunt failure).
-        now = time.time()
+        # Window missing entirely: exclusive-fullscreen games HIDE their
+        # window on alt-tab (not iconify), display-mode switches destroy and
+        # recreate it, and hunts can transiently fail. Every one of these
+        # comes BACK - so after one grace poll, just PAUSE and wait, exactly
+        # like minimise. (The old behaviour saved the chapter after 12s,
+        # which chopped a session into one file per alt-tab.) The recording
+        # resumes into the SAME file when the window returns at the same
+        # size; the game actually exiting is retired by the game-gone check.
+        if session.win_paused or session.suspended:
+            # BACKSTOP: a window that has been gone for many minutes while a
+            # same-name process lingers (a wedged crash, an exit-to-tray
+            # resident) is never coming back - without this, the footage
+            # would sit paused forever AND the busy session would block every
+            # future recording. Alt-tabs resume long before this fires.
+            if (session.win_paused and session._win_lost
+                    and time.time() - session._win_lost > 300
+                    and _list_segments(session.tmp)
+                    and not _exe_has_any_window(current or session.game)):
+                log("Window capture: the game's window never came back - "
+                    "saving what was recorded.")
+                session.win_paused = False   # stays suspended; stop() copes
+                return ("split"
+                        if len(_list_segments(session.tmp)) >= 4 else "restart")
+            return None
         if not session._win_lost:
-            session._win_lost = now
-            return None
-        # Nothing captured yet (born paused - the window never arrived, or a
-        # windowless-but-alive process): keep waiting QUIETLY. There is no
-        # chapter to end, and discarding+recreating the empty session every
-        # grace period would just churn tmp folders. The process-gone check
-        # retires it once the game actually exits.
-        if not _list_segments(session.tmp):
-            return None
-        grace = 60.0 if session.win_paused else 12.0
-        if now - session._win_lost <= grace:
-            return None
-        log("Window capture: the game's window is gone; saving this chapter.")
-        session.win_paused = False     # (if paused: stays suspended - the
-        return ("split"                # finaliser handles that fine)
-                if len(_list_segments(session.tmp)) >= 4 else "restart")
+            session._win_lost = time.time()
+            return None                # one poll of grace: re-hunt first
+        session.win_paused = True
+        session._win_pend = None
+        session.suspend()
+        ctl.set_status("paused")
+        log("Window capture: the game's window went away (alt-tab or a "
+            "display switch) - paused until it returns.")
+        if not getattr(session, "_pause_toasted", False):
+            session._pause_toasted = True     # once per session - alt-tabbing
+            ctl.notify("Recording paused",    # a lot must not toast a storm
+                       f"{current or session.game}'s window went away - "
+                       "recording continues when it returns.")
+        return None
     session._win_lost = 0.0
     if w.get("iconic"):
         if not session.win_paused and not session.suspended:
@@ -4425,9 +4832,13 @@ def _window_track(ctl, session, current):
             session._win_pend = None
             session.suspend()
             ctl.set_status("paused")
-            ctl.notify("Recording paused",
-                       f"{current or session.game} is minimised - recording "
-                       "continues when it returns.")
+            log("Window capture: the game is minimised - paused until it "
+                "returns.")
+            if not getattr(session, "_pause_toasted", False):
+                session._pause_toasted = True
+                ctl.notify("Recording paused",
+                           f"{current or session.game} is minimised - "
+                           "recording continues when it returns.")
         return None
     if session.win_paused:
         # The window is back. Continue this file only at the SAME size (or
@@ -4807,19 +5218,20 @@ def _watch_core(ctl):
                                     hwnd=session.win.get("hwnd"))
                             except Exception:
                                 fresh = None
-                            if fresh and fresh.get("iconic"):
-                                # The game is minimised right now, so honour
-                                # the Continue by handing to the auto-pause
-                                # (it resumes itself on restore) and say why
-                                # the pill stays paused. Consume the click's
-                                # start-beep flag so it can't later swallow a
-                                # genuine recording-start chime.
+                            if fresh is None or fresh.get("iconic"):
+                                # The game's window is minimised or hidden
+                                # (alt-tabbed exclusive fullscreen) right
+                                # now: honour the Continue by handing to the
+                                # auto-pause - it resumes itself, into the
+                                # same file, the moment the window returns.
+                                # Consume the click's start-beep flag so it
+                                # can't later swallow a genuine start chime.
                                 session.win_paused = True
                                 ctl.skip_loop_on = False
-                                ctl.notify("Lore", "Paused because the game is "
-                                           "minimised - it continues when the "
-                                           "window returns.")
-                            elif fresh and (
+                                ctl.notify("Lore", "Paused because the game's "
+                                           "window is away - it continues "
+                                           "when the window returns.")
+                            elif (
                                     not _list_segments(session.tmp)
                                     or (fresh["w"], fresh["h"])
                                     == (session.win["w"], session.win["h"])):
@@ -6149,7 +6561,7 @@ def _probe_color_trc(path):
         return ""
 
 
-def _ensure_thumb(video_path, tdir):
+def _ensure_thumb(video_path, tdir, generate=True):
     """Return a cached JPG thumbnail for a video, generating it with ffmpeg the
     first time. The frame is normally taken from the MIDDLE of the clip (the
     start is often a black loading screen), and HDR recordings go through the
@@ -6180,7 +6592,15 @@ def _ensure_thumb(video_path, tdir):
                 return tp
         except Exception:
             pass
+        if not generate:
+            return None     # cache-only mode: a recording is live, and thumb
+                            # generation software-decodes 5120x1440 HEVC -
+                            # that fight with the capture pipeline WAS the lag
+        # BELOW_NORMAL: thumbnails are decoration; they must never steal CPU
+        # from a game or an active encode.
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
         dur = _probe_duration(video_path) or 0
         trc = _probe_color_trc(video_path)
         # -2 keeps the height EVEN: zscale/zimg refuses odd 4:2:0 dimensions
@@ -6618,6 +7038,17 @@ def _show_toast(root, title, sub):
         key_rgb = _hex_rgb(KEY if transparent else LORE_INK)
         cv = tk.Canvas(top, width=W, height=H, bg=KEY, highlightthickness=0, bd=0)
         cv.pack()
+        # The card must never appear IN a recording: exclude it from every
+        # capture path (WDA_EXCLUDEFROMCAPTURE, Win10 2004+) - the user sees
+        # it, the video doesn't. Same trick OBS and the Discord overlay use.
+        try:
+            import ctypes
+            top.update_idletasks()
+            _h = ctypes.windll.user32.GetAncestor(top.winfo_id(), 2)  # GA_ROOT
+            if _h:
+                ctypes.windll.user32.SetWindowDisplayAffinity(_h, 0x11)
+        except Exception:
+            pass
 
         def _dismiss(_e=None):
             try:
@@ -7021,13 +7452,23 @@ class _JsApi:
     def library(self):
         return scan_library()
 
+    def _thumbs_may_generate(self):
+        """Cache-only while a capture is actually rolling: generating a thumb
+        software-decodes 5120x1440 HEVC + HDR-tonemaps it, and a page of new
+        recordings meant DOZENS of those at full priority fighting the live
+        ddagrab/AMF pipeline and the game - the lag. Paused sessions don't
+        encode, so browsing while auto-paused still fills the cache."""
+        sess = self._ctl.session
+        return sess is None or getattr(sess, "suspended", False)
+
     def thumb(self, path):
         """Base64 data-URL thumbnail for one video (generated on first ask).
         Data-URLs keep the tome origin-clean - no file:// fetch rules apply."""
         p = self._safe_path(path)
         if not p:
             return None
-        tp = _ensure_thumb(p, _thumb_dir(SETTINGS.get("output_dir", "")))
+        tp = _ensure_thumb(p, _thumb_dir(SETTINGS.get("output_dir", "")),
+                           generate=self._thumbs_may_generate())
         if not tp:
             return None
         try:
@@ -7046,12 +7487,13 @@ class _JsApi:
         import base64
         out = {}
         tdir = _thumb_dir(SETTINGS.get("output_dir", ""))
+        gen = self._thumbs_may_generate()
         for path in (paths or [])[:60]:
             p = self._safe_path(path)
             if not p:
                 continue
             try:
-                tp = _ensure_thumb(p, tdir)
+                tp = _ensure_thumb(p, tdir, generate=gen)
                 if tp:
                     with open(tp, "rb") as fh:
                         out[path] = ("data:image/jpeg;base64,"
@@ -7093,11 +7535,12 @@ class _JsApi:
             with ctl.lock:
                 sess = ctl.session
             if sess is not None and getattr(sess, "win_paused", False):
-                # window-minimise auto-pause: already suspended, and it
+                # window auto-pause (minimised OR alt-tabbed away - exclusive
+                # fullscreen hides its window): already suspended, and it
                 # resumes by itself when the window returns - a 'Continue'
                 # click here must not turn into a sticky manual pause
-                ctl.notify("Lore", "Paused because the game is minimised - "
-                           "it continues when the window returns.")
+                ctl.notify("Lore", "Paused because the game's window is away "
+                           "- it continues when the window returns.")
                 return True
             ctl.click_feedback("off", "paused")
             ctl.watching.clear()
@@ -8078,7 +8521,14 @@ def _request_quit(ctl, api, win):
     api._quitting[0] = True
 
     def work():
-        busy = ctl.saving > 0 or ctl.session is not None or _TRIM_BUSY[0] > 0
+        with ctl.lock:
+            sess = ctl.session
+        # a session still WAITING for its game's window (born paused, zero
+        # segments) has nothing to finish - don't promise a save on quit
+        empty_wait = (sess is not None and getattr(sess, "win_paused", False)
+                      and not _list_segments(sess.tmp))
+        busy = (ctl.saving > 0 or _TRIM_BUSY[0] > 0
+                or (sess is not None and not empty_wait))
         if busy:
             try:
                 ctl.set_status("saving")
@@ -8135,7 +8585,15 @@ def _start_tray(ctl, api, show_cb):
     def toggle_label(*_):
         if not ctl.watching.is_set():
             return "Continue recording"
-        return "Pause recording" if ctl.status == "recording" else "Pause watching"
+        if ctl.status == "recording":
+            return "Pause recording"
+        # window auto-pause: the click is answered by pause_toggle's
+        # explanation, so the label must not promise a pause it won't do
+        with ctl.lock:
+            sess = ctl.session
+        if sess is not None and getattr(sess, "win_paused", False):
+            return "Paused - waiting for the game's window"
+        return "Pause watching"
 
     def on_open(icon=None, item=None):
         show_cb()
