@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.04"
+APP_VERSION = "2.05"
 
 try:
     import psutil
@@ -8377,9 +8377,9 @@ def _popup_key(label):
 
 
 def _toast_metrics():
-    """Popup size scaled to the WATCHED monitor's work area (a fixed 432px card
+    """Popup size scaled to the MAIN monitor's work area (a fixed 432px card
     reads as a speck on a 5120px ultrawide). Width by the Size setting."""
-    wa = _watched_monitor_workarea()
+    wa = _popup_workarea()
     ww = (wa[2] - wa[0]) if wa else 1920
     frac = {"small": 0.13, "medium": 0.17, "large": 0.21, "huge": 0.26}.get(
         str(SETTINGS.get("popup_size", "large")).lower(), 0.21)
@@ -8529,17 +8529,24 @@ def _toast_flat(card_rgba, key_rgb, scale=1.0, dx=0, dy=0):
     return base
 
 
-def _watched_monitor_workarea():
-    """Work area of the monitor LORE is set to RECORD. Pop-ups are pinned
-    there - where the game is - instead of wandering onto another screen.
-    Returns None to fall back to the primary work area."""
+def _popup_workarea():
+    """Work area of the PRIMARY monitor - where the pop-ups belong.
+
+    They used to follow the RECORDED monitor, on the theory that they should
+    appear where the game is. That is wrong on this desk: Windows' "Display 1"
+    is not necessarily the primary one (here DISPLAY1 is the small secondary
+    screen and DISPLAY2 is the main ultrawide), so cards kept appearing on the
+    second monitor. The main screen is the one being looked at; pin them there.
+    Returns None to fall back to the primary work area anyway."""
     try:
         mons = _enumerate_active_monitors()
         if not mons:
             return None
+        for m in mons:
+            if m.get("primary"):
+                return tuple(m.get("work") or m["rect"])
         mons.sort(key=lambda m: m["num"])
-        idx = min(max(0, _resolve_capture_monitor()), len(mons) - 1)
-        return tuple(mons[idx].get("work") or mons[idx]["rect"])
+        return tuple(mons[0].get("work") or mons[0]["rect"])
     except Exception:
         return None
 
@@ -8657,7 +8664,7 @@ def _show_toast(root, title, sub):
             seq = [settled_img]
             frame_ms = 0
 
-        wl, wt, wr, wb = _watched_monitor_workarea() or _screen_workarea(top)
+        wl, wt, wr, wb = _popup_workarea() or _screen_workarea(top)
         m = max(18, int(H * 0.28))
         fx, fy = max(wl, wr - W - m), max(wt, wb - H - m)
         top.geometry(f"{W}x{H}+{fx}+{fy}")
