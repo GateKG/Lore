@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.05"
+APP_VERSION = "2.06"
 
 try:
     import psutil
@@ -141,6 +141,10 @@ DEFAULTS = {
     # recording, so a sentence that switches mid-way still lands in whichever
     # language won. 'en'/'ar' pin it.
     "stt_language":      "auto",      # auto | en | ar
+    # Where in-progress recordings are staged. 'auto' puts them on a solid
+    # state drive when the library lives on a spinning one - that is the whole
+    # difference between a save that crawls and one that streams.
+    "scratch_dir":       "auto",
     "afk_pause":         True,
     "afk_minutes":       4,
     # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
@@ -3079,18 +3083,148 @@ def _wgc_available():
         return False
 
 
+_SPIN_CACHE = {}
+
+
+def _drive_has_seek_penalty(path):
+    """True if `path` lives on a SPINNING disk, False for solid state, None
+    when it cannot be told. Asks the volume itself via the storage device's
+    seek-penalty property - no WMI, no admin rights."""
+    try:
+        root = os.path.splitdrive(os.path.abspath(path))[0].upper()
+        if not root:
+            return None
+        if root in _SPIN_CACHE:
+            return _SPIN_CACHE[root]
+        import ctypes
+        from ctypes import wintypes
+        GENERIC_READ = 0            # query-only: no rights needed, so this
+        OPEN_EXISTING = 3           # works without running as administrator
+        IOCTL = 0x2D1400            # IOCTL_STORAGE_QUERY_PROPERTY
+
+        class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+            _fields_ = [("PropertyId", wintypes.DWORD),
+                        ("QueryType", wintypes.DWORD),
+                        ("AdditionalParameters", ctypes.c_byte * 1)]
+
+        class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+            _fields_ = [("Version", wintypes.DWORD),
+                        ("Size", wintypes.DWORD),
+                        ("IncursSeekPenalty", ctypes.c_byte)]
+
+        h = ctypes.windll.kernel32.CreateFileW(
+            rf"\\.\{root}", GENERIC_READ, 3, None, OPEN_EXISTING, 0, None)
+        if h == -1 or h == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            q = STORAGE_PROPERTY_QUERY(7, 0, (ctypes.c_byte * 1)())  # SeekPenalty
+            d = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+            got = wintypes.DWORD()
+            ok = ctypes.windll.kernel32.DeviceIoControl(
+                h, IOCTL, ctypes.byref(q), ctypes.sizeof(q),
+                ctypes.byref(d), ctypes.sizeof(d), ctypes.byref(got), None)
+            res = bool(d.IncursSeekPenalty) if ok else None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+        _SPIN_CACHE[root] = res
+        return res
+    except Exception:
+        return None
+
+
+def _free_bytes(path):
+    try:
+        return shutil.disk_usage(path).free
+    except Exception:
+        return 0
+
+
 def _work_dir():
-    """A SINGLE hidden parent folder for in-progress capture scratch (segments +
-    wavs), kept on the same drive as the output so the final assemble is a fast
-    local read. One tidy folder instead of a litter of '.tmp_*' folders sitting
-    next to the user's finished videos."""
-    d = os.path.join(SETTINGS.get("output_dir", "") or _data_dir(), ".lore_cache")
+    """A SINGLE hidden parent folder for in-progress capture scratch (segments
+    + wavs).
+
+    It used to live beside the recordings "so the final assemble is a fast
+    local read". On a spinning library drive that reasoning is backwards: the
+    save then READS the segments and WRITES the finished file through the same
+    head, and a paused session is welded twice (segments -> one file per run ->
+    one final file), so a 48 GB recording moves about 240 GB through one disk.
+    Measured on this machine: 16-27 MB/s.
+
+    So when the library is on a spinning disk and a solid-state drive has room,
+    the scratch goes THERE: the save becomes a fast read plus one clean
+    sequential write, with no head fighting itself. 'scratch_dir' overrides."""
+    out = SETTINGS.get("output_dir", "") or _data_dir()
+    want = str(SETTINGS.get("scratch_dir", "auto") or "auto").strip()
+    if want and want.lower() != "auto":
+        d = os.path.join(want, ".lore_cache")
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            pass                      # unreachable drive: fall through to auto
+    elif _drive_has_seek_penalty(out) is True:
+        best, best_free = None, 0
+        for cand in _scratch_candidates():
+            if _drive_has_seek_penalty(cand) is not False:
+                continue              # only trust a KNOWN solid-state drive
+            free = _free_bytes(cand)
+            # a long session needs the segments AND the per-run welds at once
+            if free > best_free and free >= 120 * (1 << 30):
+                best, best_free = cand, free
+        if best:
+            d = os.path.join(best, ".lore_cache")
+            try:
+                os.makedirs(d, exist_ok=True)
+                return d
+            except Exception:
+                pass
+    d = os.path.join(out, ".lore_cache")
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
         d = os.path.join(_data_dir(), ".lore_cache")
         os.makedirs(d, exist_ok=True)
     return d
+
+
+def _work_dirs_all():
+    """Every folder that could be holding in-progress footage: the scratch in
+    use now PLUS the legacy one beside the library. Moving the scratch to a
+    solid state drive must never strand a crashed session's segments on the
+    old drive - salvage and sweeping both walk this list."""
+    seen, out = set(), []
+    for d in (_work_dir(),
+              os.path.join(SETTINGS.get("output_dir", "") or _data_dir(),
+                           ".lore_cache"),
+              os.path.join(_data_dir(), ".lore_cache")):
+        k = os.path.normcase(os.path.abspath(d))
+        if k in seen or not os.path.isdir(d):
+            continue
+        seen.add(k)
+        out.append(d)
+    return out
+
+
+def _scratch_candidates():
+    """Fixed local drive roots that could host the scratch folder, best first."""
+    out = []
+    if os.name != "nt":
+        return out
+    try:
+        import ctypes
+        bits = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if not (bits >> i) & 1:
+                continue
+            root = f"{chr(65 + i)}:\\"
+            # 3 == DRIVE_FIXED: never a USB stick or a network share
+            if ctypes.windll.kernel32.GetDriveTypeW(root) != 3:
+                continue
+            out.append(root)
+    except Exception:
+        return []
+    out.sort(key=lambda r: -_free_bytes(r))
+    return out
 
 
 def _salvage_interrupted():
@@ -3156,7 +3290,7 @@ def _salvage_interrupted():
                 log(f"Salvage skipped for {name}: {e}")
     # 2) orphaned session folders with real segments -> best-effort weld
     try:
-        cache = _work_dir()
+      for cache in _work_dirs_all():
         for name in list(os.listdir(cache)):
             d = os.path.join(cache, name)
             if not os.path.isdir(d) or name == "lost":
@@ -3361,7 +3495,8 @@ def _sweep_orphan_temp():
     threading.Thread(target=_salvage_interrupted, daemon=True).start()
     removed = 0
     try:
-        cache = _work_dir()
+      now0 = time.time()
+      for cache in _work_dirs_all():
         for name in os.listdir(cache):
             if name == "lost":
                 continue          # parked salvage evidence - never touch
@@ -3369,6 +3504,16 @@ def _sweep_orphan_temp():
             if os.path.isdir(p) and not _list_segments(p):
                 shutil.rmtree(p, ignore_errors=True)
                 removed += 1
+            # transcription scratch is written HERE, not in the library - the
+            # old sweep looked for it beside the videos and never found it
+            elif (os.path.isfile(p) and name.startswith("stt_")
+                    and (name.endswith(".wav") or name.endswith("_out.json"))):
+                try:
+                    if now0 - os.path.getmtime(p) > 600:
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    pass
     except Exception:
         pass
     # legacy location: '.tmp_<game>_<stamp>' folders directly in the output dir
@@ -3423,6 +3568,56 @@ def _list_segments(seg_dir):
     return [os.path.join(seg_dir, f) for f in sorted(names)]
 
 
+def _watch_concat_progress(out_path, want_bytes):
+    """Publish a stream-copy's progress by watching the output file grow.
+    ffmpeg's -progress needs a decode pipeline to report against; a pure
+    `-c copy` concat has none, but the file size IS the progress."""
+    _CONCAT_WATCH["stop"] = True          # retire any previous watcher
+    if want_bytes <= 0:
+        return
+    stop = threading.Event()
+    _CONCAT_WATCH["stop"] = False
+    _CONCAT_WATCH["ev"] = stop
+    name = os.path.basename(out_path).replace(".__assembling__.mp4", "")
+    _BINDING.update({"name": name, "pct": 0, "eta": None, "mbps": None,
+                     "t0": time.time(), "total": want_bytes / 1e6})
+
+    def _run():
+        last_sz, last_t = 0, time.time()
+        while not stop.is_set():
+            stop.wait(1.0)
+            if stop.is_set():
+                break
+            try:
+                sz = os.path.getsize(out_path)
+            except OSError:
+                continue
+            now = time.time()
+            pct = max(0, min(99, int(sz * 100 / want_bytes)))
+            spent = now - _BINDING["t0"]
+            _BINDING["pct"] = pct
+            if pct > 0 and spent > 2:
+                _BINDING["eta"] = max(0, int(spent * (100 - pct) / pct))
+            if now > last_t:
+                _BINDING["mbps"] = max(0.0, (sz - last_sz) / 1e6 / (now - last_t))
+            last_sz, last_t = sz, now
+            try:
+                if _TRAY_ICON[0] is not None:
+                    _TRAY_ICON[0].title = f"Lore - saving {name} ({pct}%)"
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _stop_concat_progress():
+    ev = _CONCAT_WATCH.get("ev")
+    _CONCAT_WATCH["stop"] = True
+    if ev is not None:
+        ev.set()
+    _CONCAT_WATCH["ev"] = None
+
+
 def _concat_copy(ffmpeg, seg_files, out_path):
     """Concatenate segments into out_path with no re-encode (instant). If the
     join fails - which usually means the final segment was truncated by a crash
@@ -3443,6 +3638,17 @@ def _concat_copy(ffmpeg, seg_files, out_path):
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path]
+        # The stitch of a PAUSED recording lands here, and for a long session
+        # that is tens of gigabytes moving for many minutes. It used to run
+        # blind - nothing in the tome, nothing in the tray, no way to tell
+        # whether it was working or wedged. Report it like every other bind.
+        want_bytes = 0
+        for f in files:
+            try:
+                want_bytes += os.path.getsize(f)
+            except OSError:
+                pass
+        _watch_concat_progress(out_path, want_bytes)
         try:
             r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, creationflags=flags,
@@ -3450,6 +3656,8 @@ def _concat_copy(ffmpeg, seg_files, out_path):
         except Exception as e:
             log(f"Concat error: {e}")
             r = None
+        finally:
+            _stop_concat_progress()      # every exit, or the card hangs at 99%
         try:
             os.remove(list_path)
         except Exception:
@@ -3712,6 +3920,7 @@ _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
 # the completion log line records wall time, size and speed for every bind.
 _BINDING = {"name": None, "pct": None, "eta": None, "mbps": None,
             "t0": 0.0, "total": 0.0}
+_CONCAT_WATCH = {"stop": True, "ev": None}   # the stream-copy progress watcher
 _TRAY_ICON = [None]    # the pystray icon, stashed so the bind loop can whisper
                        # progress into the tooltip without threading ctl through
 _FINISH_FAILS = {}     # path -> genuine failure count (interruptions don't count)
@@ -6031,6 +6240,22 @@ def _watch_core(ctl):
                     f"far too dense. They rebuild themselves while idle.")
         except Exception:
             pass
+    # Say where footage is staged and why - a save's speed is decided here.
+    try:
+        _wd = _work_dir()
+        _lib = SETTINGS.get("output_dir", "") or ""
+        if os.path.splitdrive(_wd)[0].upper() != os.path.splitdrive(_lib)[0].upper():
+            log(f"Staging recordings on {os.path.splitdrive(_wd)[0]} "
+                f"({_free_bytes(_wd) / (1 << 30):.0f} GB free): the library "
+                f"drive spins, so saving from a solid-state scratch is far "
+                f"faster and never fights the game for the disk.")
+        elif _drive_has_seek_penalty(_lib) is True:
+            log("Recordings are staged on the same spinning drive they are "
+                "saved to, so saving reads and writes through one head. A "
+                "solid-state drive with 120+ GB free would speed this up a "
+                "lot (Settings keeps a 'scratch_dir' override).")
+    except Exception:
+        pass
     _ENC_SAFE[0] = bool(SETTINGS.get("safe_capture", False))
     _migrate_library_layout() # shelve any flat legacy recordings first
     _sweep_orphan_temp()      # clear scratch left by a crash/force-kill last time
