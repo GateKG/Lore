@@ -925,6 +925,8 @@ body.vfull #vover{height:12px}
 #vsegs{position:absolute;left:0;right:0;top:50%;height:15px;transform:translateY(-50%);pointer-events:none;display:none}
 #vsegs.on{display:block}
 .edseg{position:absolute;top:0;height:100%;border-radius:3px;pointer-events:auto;cursor:pointer;box-sizing:border-box;border:1px solid transparent}
+.edseg.mutey{background:rgba(120,180,255,.42);border-color:rgba(150,200,255,.85)}
+.edseg.ghost{opacity:.34;pointer-events:none;z-index:1}
 .edseg.keep{background:rgba(120,205,120,.32);border-color:rgba(150,230,150,.75)}
 .edseg.cut{background:rgba(222,92,72,.34);border-color:rgba(242,120,100,.8)}
 .edseg.sel{box-shadow:0 0 0 1px #fff,0 0 9px rgba(255,255,255,.45);z-index:3}
@@ -1205,7 +1207,10 @@ body.reduced #intro{display:none}
     <div class="edmode">
       <button id="vedkeep" class="on" title="The pieces you mark are what you KEEP; everything else is dropped">✓ Keep marked</button>
       <button id="vedcut" title="The pieces you mark are CUT OUT; the rest is kept and stitched">✂ Remove marked</button>
-      <button id="vedmute" title="The pieces you mark keep their picture and LOSE THEIR SOUND — nothing is cut">🔇 Silence marked</button>
+    </div>
+    <div class="edmode" id="vedlayers">
+      <button id="vedlcut" class="on" title="Mark what to keep or cut">✂ Cutting</button>
+      <button id="vedlmute" title="Mark stretches to SILENCE — they stay in the video, they just lose their sound">🔇 Silencing</button>
     </div>
     <div class="sep"></div>
     <button class="wbtn" id="vedadd" title="Add another piece at the playhead">＋ piece</button>
@@ -3867,6 +3872,24 @@ function closeViewer(){
   sendShape();                             /* the ribbons return */
 }
 /* ---- the editing table: mark pieces, KEEP or REMOVE them, stitch, save ---- */
+/* The edit has TWO layers: what to CUT, and what to SILENCE. They are
+   independent questions about the same clip - cut a highlight out of a
+   session AND drop the swearing inside it - so they cannot be modes taking
+   turns. V.ed.segs is whichever layer you are marking; the other waits in
+   V.ed.other and is drawn behind, dimmed. */
+function edCuts(){ return (V.ed.layer==='silence')?(V.ed.other||[]):(V.ed.segs||[]); }
+function edMutes(){ return (V.ed.layer==='silence')?(V.ed.segs||[]):(V.ed.other||[]); }
+function edLayer(which){
+  if(!V.ed||V.ed.layer===which)return;
+  const keep=V.ed.segs||[];
+  V.ed.segs=(V.ed.other||[]).slice();
+  V.ed.other=keep.slice();
+  V.ed.layer=which; V.ed.sel=0; V.ed.preview=false;
+  layEd();
+  whisper(which==='silence'
+    ? 'marking what falls silent — the cut is untouched'
+    : 'marking what to keep or cut');
+}
 function edReset(){
   /* tearing down (close/reopen): stop a running backend edit and kill any pending
      poll timer, or a ghost poll would fire on the fresh V.ed and hijack whatever
@@ -3874,7 +3897,7 @@ function edReset(){
   try{ if(V.ed){ if(V.ed.busy){try{api.edit_cancel();}catch(_){}
         whisper('export cancelled — nothing was saved');   /* navigating away silently killed a Save-new; at least SAY so */ }
       if(V.ed._pt)clearTimeout(V.ed._pt); } }catch(_){}
-  V.ed={on:false,mode:'keep',segs:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
+  V.ed={on:false,mode:'keep',layer:'cut',segs:[],other:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
 }
 function edDetach(){
   /* Closing the player must NOT kill a running export. This is edReset with
@@ -3886,7 +3909,7 @@ function edDetach(){
         if(V.ed._pt)clearTimeout(V.ed._pt);
         if(V.ed.busy)whisper('still cutting — follow it on Working');
       } }catch(_){}
-  V.ed={on:false,mode:'keep',segs:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
+  V.ed={on:false,mode:'keep',layer:'cut',segs:[],other:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
 }
 function edDur(){ const d=$('#vvideo').duration; return (d&&isFinite(d))?d:0; }
 /* ================= the timeline ==================
@@ -3956,10 +3979,11 @@ function edMerge(list){
   return m;
 }
 function editKeeps(){
-  /* silencing keeps EVERYTHING - the marked pieces are what loses its sound,
-     not its place - so the kept range is the whole recording */
-  if(V.ed&&V.ed.mode==='mute')return [{a:0,b:edDur()}];
-  const dur=edDur(),marked=edMerge(V.ed.segs);
+  /* the CUT layer decides what survives, never the silence layer - and with
+     nothing cut, "keep it all" is the honest answer, so a silence-only edit
+     works on the whole recording */
+  if(!edCuts().length)return [{a:0,b:edDur()}];
+  const dur=edDur(),marked=edMerge(edCuts());
   if(V.ed.mode==='keep')return marked;
   const keeps=[]; let cur=0;                                  /* remove mode: keep the gaps */
   for(const s of marked){ if(s.a-cur>=0.2)keeps.push({a:cur,b:s.a}); cur=Math.max(cur,s.b); }
@@ -3979,8 +4003,18 @@ function edUI(on){
 function layEd(){
   const box=$('#vsegs'); if(!box)return; box.innerHTML='';
   if(!edDur())return;
+  /* the layer you are NOT marking, shown so you can aim against it */
+  (V.ed.other||[]).forEach(o=>{
+    const g=el('div','edseg ghost'+(V.ed.layer==='silence'?' keep':' mutey'));
+    const x=edPx(o.a); g.style.left=x+'px';
+    g.style.width=Math.max(2,edPx(o.b)-x)+'px';
+    g.title=(V.ed.layer==='silence'?'kept piece: ':'silenced: ')
+      +fmtT(o.a)+' \u2192 '+fmtT(o.b);
+    box.append(g);
+  });
   V.ed.segs.forEach((s,i)=>{
-    const b=el('div','edseg '+(V.ed.mode==='keep'?'keep':'cut')+(i===V.ed.sel?' sel':''));
+    const b=el('div','edseg '+(V.ed.layer==='silence'?'mutey'
+                 :(V.ed.mode==='keep'?'keep':'cut'))+(i===V.ed.sel?' sel':''));
     const x=edPx(s.a),y=edPx(s.b);
     b.style.left=x+'px'; b.style.width=Math.max(2,y-x)+'px';
     b.title=fmtT(s.a)+' \u2192 '+fmtT(s.b)+'  \u00b7  '+fmtT(s.b-s.a)
@@ -3997,14 +4031,27 @@ function layEd(){
       const seg=V.ed.segs[i], x0=ev.clientX, a0=seg.a, len=seg.b-seg.a;
       const wrapW=Math.max(1,$('#vseekwrap').getBoundingClientRect().width-14);
       const bb=b;                       /* the node that got the pointerdown */
+      /* CLICK and DRAG are different gestures and must stay different: a
+         press-and-release inside a piece means "show me this bit", a
+         press-hold-move means "move the piece". Nothing shifts until the
+         pointer has actually travelled, so a click never nudges an edge. */
+      let moved=false;
       const move=e2=>{
+        if(!moved&&Math.abs(e2.clientX-x0)<4)return;
+        moved=true;
         const dt=((e2.clientX-x0)/wrapW)*tlWin().len;
         seg.a=clamp(a0+dt,0,Math.max(0,edDur()-len)); seg.b=seg.a+len;
         edRepos();
         if(bb)bb.title=fmtT(seg.a)+' \u2192 '+fmtT(seg.b)+'  \u00b7  '+fmtT(len)+' long';
         edLabel();};
-      const up=()=>{ try{bb.releasePointerCapture(ev.pointerId);}catch(_){}
+      const up=e3=>{ try{bb.releasePointerCapture(ev.pointerId);}catch(_){}
         bb.removeEventListener('pointermove',move);bb.removeEventListener('pointerup',up);
+        if(!moved){
+          const vdd=$('#vvideo');
+          try{vdd.currentTime=tlTimeAt((e3&&e3.clientX!=null)?e3.clientX:x0);}catch(_){}
+          V.ed.preview=false;          /* looking, not replaying the piece */
+          tlFollow(); tlPaint();
+        }
         layEd(); };
       try{bb.setPointerCapture(ev.pointerId);}catch(_){}
       bb.addEventListener('pointermove',move); bb.addEventListener('pointerup',up);
@@ -4019,7 +4066,9 @@ function layEd(){
   edLabel();
   $('#vedkeep').classList.toggle('on',V.ed.mode==='keep');
   $('#vedcut').classList.toggle('on',V.ed.mode==='remove');
-  const mb=$('#vedmute'); if(mb)mb.classList.toggle('on',V.ed.mode==='mute');
+  const lc=$('#vedlcut'), lm=$('#vedlmute');
+  if(lc)lc.classList.toggle('on',V.ed.layer!=='silence');
+  if(lm)lm.classList.toggle('on',V.ed.layer==='silence');
 }
 /* reposition the EXISTING band + handle nodes during a drag - must NOT rebuild
    #vsegs (innerHTML wipe would delete the handle mid-drag and kill pointermove) */
@@ -4061,19 +4110,18 @@ function edLabel(){
   edSyncOut(tot);
   const out=$('#vedsurv'); if(!out)return;
   if(!n||!sg){ out.textContent='nothing marked yet - press start, then end'; return; }
-  const silent=(V.ed.mode==='mute')
-    ? V.ed.segs.reduce((q,x)=>q+(x.b-x.a),0) : 0;
+  const silent=edMutes().reduce((q,x)=>q+(x.b-x.a),0);
   out.textContent=fmtT(sg.a)+' \u2192 '+fmtT(sg.b)+' \u00b7 '+fmtT(sg.b-sg.a)
     +(n>1?'  (piece '+(V.ed.sel+1)+'/'+n+')':'')
-    +(V.ed.mode==='mute'
-      ? '   \u00b7   silencing '+fmtT(silent)+' of '+fmtT(edDur())
-      : '   \u00b7   result '+fmtT(tot));
+    +'   \u00b7   result '+fmtT(tot)
+    +(silent>0?'  ('+fmtT(silent)+' silenced)':'');
 }
 function edPreviewSeg(){ const vd=$('#vvideo'),s=V.ed.segs[V.ed.sel]; if(!s)return; V.ed.preview=true;
   try{vd.currentTime=s.a;vd.play().catch(()=>{});}catch(e){} }
 function edValid(keeps){
-  if(V.ed&&V.ed.mode==='mute'&&!(V.ed.segs||[]).length){
-    whisper('mark what should fall silent first'); return false; }
+  if(!edCuts().length&&!edMutes().length){
+    whisper('mark something first — a piece to keep, or a stretch to silence');
+    return false; }
   if(!keeps||!keeps.length){ whisper('nothing would be kept — adjust your pieces'); return false; }
   if(keeps.reduce((n,s)=>n+(s.b-s.a),0)<0.25){ whisper('the result would be empty'); return false; }
   return true;
@@ -4099,8 +4147,7 @@ function edStart(replace,toDiscord){
                       edit_video is in flight must not pop the editor open on the
                       NEXT viewing session */
   const capMB=+(($('#vedqual')||{}).value||0);
-  const muted=(V.ed.mode==='mute')
-    ? V.ed.segs.map(x=>[+x.a.toFixed(3),+x.b.toFixed(3)]) : [];
+  const muted=edMerge(edMutes()).map(x=>[+x.a.toFixed(3),+x.b.toFixed(3)]);
   Promise.resolve(api.edit_video(c.path,segs,!!replace,!!toDiscord,capMB,muted)).then(r=>{
     if(ed!==V.ed)return;
     if(!(r&&r.ok)){ edFail((r&&r.why)||'could not start'); return; }
@@ -4391,8 +4438,8 @@ function wireViewer(){
     whisper('play to the start and press start, then to the end and press end');});
   $('#vedkeep').addEventListener('click',()=>{V.ed.mode='keep';layEd();});
   $('#vedcut').addEventListener('click',()=>{V.ed.mode='remove';layEd();});
-  $('#vedmute').addEventListener('click',()=>{V.ed.mode='mute';layEd();
-    whisper('marked pieces keep their picture and lose their sound');});
+  $('#vedlcut').addEventListener('click',()=>edLayer('cut'));
+  $('#vedlmute').addEventListener('click',()=>edLayer('silence'));
   $('#vedadd').addEventListener('click',()=>{
     const t=vd.currentTime||0, d=vd.duration||0;
     /* sized against what the BAR shows, so a new piece is always something you
