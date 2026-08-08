@@ -760,7 +760,8 @@ body.vfull #vclose{z-index:97}
 /* keep the editor controls reachable in fullscreen - they used to sit behind the
    fullscreen video, so the cutting tool was unusable in theater (his complaint) */
 body.vfull #vedrow.on,body.vfull #vedprog.on,body.vfull #vedconfirm.on{
-  position:fixed;left:50%;bottom:78px;transform:translateX(-50%);z-index:98;max-width:94vw}
+  position:fixed;left:50%;bottom:80px;transform:translateX(-50%);z-index:98;
+  width:96vw;max-width:none;box-sizing:border-box;justify-content:center}
 /* in EITHER fullscreen, auto-hide the controls + cursor once the mouse sits
    still, and bring them back on any move - like a normal video player */
 #vbar,#vclose,#vtitle{transition:opacity .3s}
@@ -833,7 +834,7 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 .vbtn:disabled,.vbtn:disabled:hover{opacity:.26;cursor:default;color:#e3cfa2;background:transparent}
 #vdel.arm{color:#ffd9d0;background:rgba(200,60,40,.30);width:auto;padding:0 10px;font-size:12px;font-weight:700;letter-spacing:.03em}
 #vseekcol{flex:1;min-width:240px;max-width:560px;display:flex;flex-direction:column;gap:3px}
-#vseekwrap{position:relative;width:100%;display:flex;align-items:center}
+#vseekwrap{position:relative;width:100%;display:block;line-height:0}
 /* THE OVERVIEW: the whole recording as one thin strip, always. The lit box is
    the slice the big bar below is showing, so a 7-hour session never loses its
    "where am I" while the bar is zoomed into 30 seconds of it. */
@@ -867,7 +868,10 @@ body.vfull #vover{height:12px}
 .sresq{font:600 12.5px Georgia,serif;color:#4a3820}
 .sresq b{color:#8a5a18}
 .sresw{font:500 11px Inter,system-ui,sans-serif;color:#9c8963}
-#vseek{width:100%}
+/* max-width:210px on EVERY range (written for the volume slider) was
+   silently capping the seek bar too - width:100% can never beat it, so
+   the timeline stayed 210px no matter how wide its row grew. */
+#vseek{display:block;width:100%;max-width:none;min-width:0;box-sizing:border-box}
 /* multi-piece editor overlay on the seek bar */
 #vsegs{position:absolute;left:0;right:0;top:50%;height:15px;transform:translateY(-50%);pointer-events:none;display:none}
 #vsegs.on{display:block}
@@ -1422,7 +1426,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.07'};},
+      webhook:true,version:'2.08'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1461,7 +1465,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.07'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.08'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
