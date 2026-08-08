@@ -1623,6 +1623,8 @@ function sortedGames(){
   if(mode==='az')arr.sort((a,b)=>(a.display||'').localeCompare(b.display||'',undefined,{sensitivity:'base'}));
   else if(mode==='za')arr.sort((a,b)=>(b.display||'').localeCompare(a.display||'',undefined,{sensitivity:'base'}));
   else if(mode==='fewest')arr.sort((a,b)=>(a.count-b.count)||(b.latest-a.latest));
+  else if(mode==='newest')arr.sort((a,b)=>(b.latest-a.latest));   /* most recently played first */
+  else if(mode==='oldest')arr.sort((a,b)=>(a.latest-b.latest));
   else arr.sort((a,b)=>(b.count-a.count)||(b.latest-a.latest));   /* 'count' = most first */
   return arr;
 }
@@ -2026,7 +2028,7 @@ function renderContents(cL,cR,spreadIdx){
   const br=pbody(cR);
   const sortRow=el('div','gsort');
   sortRow.append(el('span','gsortlbl','sort'));
-  [['count','Most'],['fewest','Fewest'],['az','A–Z'],['za','Z–A']].forEach(([m,lbl])=>{
+  [['count','Most'],['fewest','Fewest'],['newest','Newest'],['oldest','Oldest'],['az','A–Z'],['za','Z–A']].forEach(([m,lbl])=>{
     const b=el('button','gsortb'+((S.gameSort||'count')===m?' on':''),lbl);
     b.addEventListener('click',()=>setGameSort(m));
     sortRow.append(b);

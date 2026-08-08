@@ -10118,7 +10118,11 @@ class _JsApi:
         ctl = self._ctl
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         raw = _parse_clip_name(os.path.basename(p))
-        base = raw.replace(" ", "")
+        # Keep the game's real spacing. Stripping it made "big walk" cut a
+        # file named "bigwalk_edit_...", and the library reads the FILENAME to
+        # decide whose shelf a video belongs on - so one game became two:
+        # "Big Walk" holding the session, "Bigwalk" holding the clip.
+        base = raw
         out_dir = os.path.dirname(p) if replace else _game_shelf(raw, "edit")
         out = p if replace else os.path.join(out_dir, f"{base}_edit_{stamp}.mp4")
         job_id = f"edit_{stamp}"
@@ -10171,12 +10175,23 @@ class _JsApi:
                     parts.append(part)
                     _EDIT_JOB["phase"] = (f"cutting piece {i + 1} of {len(segs)}"
                                           if len(segs) > 1 else "cutting")
+                    # COPY, don't re-encode. Cutting a piece out of a
+                    # recording does not change a single pixel, so decoding
+                    # 5120x1440 AV1 and encoding it again - which is what this
+                    # did - costs half an hour for ten minutes of video and
+                    # loses quality on the way. LORE forces a keyframe every
+                    # 4 seconds while recording, so a copy can start on one:
+                    # instant, lossless, at most a few seconds of lead-in.
+                    # An HDR piece still needs the tone-map, so that re-encodes.
+                    enc_args = ["-vf", vf0, "-c:v", enc,
+                                *encoder_quality_flags(enc, br),
+                                "-c:a", "aac", "-b:a", "192k"]
+                    copy_args = ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+                    can_copy = (vf0 == "format=nv12")
                     cmd = [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
                            "-loglevel", "error",
                            "-ss", f"{s:.3f}", "-i", p, "-t", f"{seg_dur:.3f}",
-                           "-vf", vf0, "-c:v", enc,
-                           *encoder_quality_flags(enc, br),
-                           "-c:a", "aac", "-b:a", "192k",
+                           *(copy_args if can_copy else enc_args),
                            "-progress", "pipe:1", "-nostats", part]
                     pr = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                           stderr=subprocess.DEVNULL,
@@ -10197,8 +10212,33 @@ class _JsApi:
                             except Exception:
                                 pass
                     pr.wait()
-                    if pr.returncode != 0 or not (os.path.isfile(part)
-                                                  and os.path.getsize(part) > 10_000):
+                    good = (pr.returncode == 0 and os.path.isfile(part)
+                            and os.path.getsize(part) > 10_000)
+                    if not good and can_copy:
+                        # some sources refuse a clean copy (odd edit lists, a
+                        # broken tail). Re-encode that piece rather than fail.
+                        log(f"Piece {i + 1} would not copy; re-encoding it.")
+                        _EDIT_JOB["phase"] = f"re-encoding piece {i + 1}"
+                        cmd = [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
+                               "-loglevel", "error",
+                               "-ss", f"{s:.3f}", "-i", p, "-t", f"{seg_dur:.3f}",
+                               *enc_args, "-progress", "pipe:1", "-nostats", part]
+                        pr = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                              stderr=subprocess.DEVNULL,
+                                              creationflags=flags, text=True,
+                                              bufsize=1)
+                        for line in pr.stdout:
+                            if _EDIT_JOB["cancel"]:
+                                try:
+                                    pr.kill()
+                                    pr.wait(timeout=5)
+                                except Exception:
+                                    pass
+                                raise _EditCancelled()
+                        pr.wait()
+                        good = (pr.returncode == 0 and os.path.isfile(part)
+                                and os.path.getsize(part) > 10_000)
+                    if not good:
                         raise RuntimeError(f"piece {i + 1} failed to encode")
                     done_dur += seg_dur
                 if _EDIT_JOB["cancel"]:
