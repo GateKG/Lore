@@ -1506,7 +1506,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.26'};},
+      webhook:true,version:'2.27'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1548,7 +1548,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.26'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.27'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3686,7 +3686,9 @@ async function renderHlMarks(vid,req){
    with it. Peaks are where the shouting is. */
 let _lvl=null,_lvlPath=null;
 async function loadLevels(v){
-  if(_lvlPath===v.path)return _lvl;
+  /* never cache a MISS: curves land in the background all the time, so a
+     video that had none when you first opened it may well have one now */
+  if(_lvlPath===v.path&&_lvl)return _lvl;
   _lvlPath=v.path; _lvl=null;
   try{ if(api.levels)_lvl=await api.levels(v.path); }catch(e){ _lvl=null; }
   return _lvl;
