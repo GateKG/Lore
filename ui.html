@@ -3771,7 +3771,7 @@ function closeViewer(){
   const vw=$('#viewer'),vd=$('#vvideo');
   _viewerReq++;
   exitTheater();                           /* never leave the video "fullscreen" after close */
-  V.cur=null;edReset();edUI(false);
+  edDetach();V.cur=null;edUI(false);
   try{vd.pause();}catch(e){}
   vd.removeAttribute('src');vd.load();
   peekHide();
@@ -3791,6 +3791,18 @@ function edReset(){
   try{ if(V.ed){ if(V.ed.busy){try{api.edit_cancel();}catch(_){}
         whisper('export cancelled — nothing was saved');   /* navigating away silently killed a Save-new; at least SAY so */ }
       if(V.ed._pt)clearTimeout(V.ed._pt); } }catch(_){}
+  V.ed={on:false,mode:'keep',segs:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
+}
+function edDetach(){
+  /* Closing the player must NOT kill a running export. This is edReset with
+     the cancel taken out: the poll timer still dies and V.ed is still SWAPPED
+     for a fresh object, so the in-flight edit_status continuation is orphaned
+     by its generation check and can never reopen the viewer or slam the next
+     one shut. The export keeps going and shows up on Working, with a Stop. */
+  try{ if(V.ed){
+        if(V.ed._pt)clearTimeout(V.ed._pt);
+        if(V.ed.busy)whisper('still cutting — follow it on Working');
+      } }catch(_){}
   V.ed={on:false,mode:'keep',segs:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
 }
 function edDur(){ const d=$('#vvideo').duration; return (d&&isFinite(d))?d:0; }
