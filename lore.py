@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.25"
+APP_VERSION = "2.26"
 
 try:
     import psutil
@@ -3227,6 +3227,32 @@ def _scratch_candidates():
     return out
 
 
+def _already_saved(base):
+    """Is '<base>.mp4' already in the library - on ANY shelf?
+
+    Salvage used to ask only whether output_dir/<base>.mp4 existed. Real
+    recordings live at output_dir/<Game>/Videos/<base>.mp4, so the answer was
+    always no, and every launch rebuilt sessions that had finished weeks ago:
+    a half-hour concat per orphan, timing out, holding its temp open, blocking
+    its own promote, and leaving tens of gigabytes of duplicate welds behind.
+    Three of the five stuck files on this machine were already saved."""
+    want = (base + ".mp4").lower()
+    out = SETTINGS.get("output_dir", "") or ""
+    try:
+        if os.path.isfile(os.path.join(out, base + ".mp4")):
+            return True
+        for d, _kind in _library_dirs(out):
+            try:
+                for fn in os.listdir(d):
+                    if fn.lower() == want:
+                        return True
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def _salvage_interrupted():
     """A previous run died mid-save (force-kill, crash, power cut). NEVER
     just sweep its remains - they are the user's footage:
@@ -3276,6 +3302,11 @@ def _salvage_interrupted():
                 continue
             final = os.path.join(d, name[:-len(".__assembling__.mp4")])
             try:
+                base0 = os.path.splitext(os.path.basename(final))[0]
+                if _already_saved(base0):
+                    os.remove(p)         # a duplicate of a shelved recording
+                    log(f"Cleared a duplicate rebuild: {name}")
+                    continue
                 if (_probe_duration(p) or 0) > 1.0 and not os.path.exists(final):
                     os.replace(p, final)
                     _record_made_file(final)
@@ -3302,8 +3333,22 @@ def _salvage_interrupted():
             try:
                 done = os.path.join(out, name + ".mp4.__assembling__.mp4")
                 fin = os.path.join(out, name + ".mp4")
-                if (not os.path.exists(fin) and os.path.isfile(done)
-                        and (_probe_duration(done) or 0) > 1.0):
+                if _already_saved(name):
+                    # finished long ago and shelved - the leftovers are just
+                    # leftovers. Clear them instead of rebuilding the film.
+                    for junk in (done, os.path.join(out, name + ".mp4.__tmp.mp4")):
+                        try:
+                            if os.path.isfile(junk):
+                                sz = os.path.getsize(junk)
+                                os.remove(junk)
+                                log(f"Cleared a duplicate rebuild of {name} "
+                                    f"({sz / (1 << 30):.1f} GB) - it was saved "
+                                    f"already.")
+                        except OSError:
+                            pass
+                    shutil.rmtree(d, ignore_errors=True)
+                    continue
+                if os.path.isfile(done) and (_probe_duration(done) or 0) > 1.0:
                     os.replace(done, fin)
                     _record_made_file(fin)
                     log(f"Recovered an interrupted save: {name}.mp4")
