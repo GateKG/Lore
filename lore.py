@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.24"
+APP_VERSION = "2.25"
 
 try:
     import psutil
@@ -3295,6 +3295,25 @@ def _salvage_interrupted():
             d = os.path.join(cache, name)
             if not os.path.isdir(d) or name == "lost":
                 continue
+            # A weld that already finished is sitting right there. Re-running
+            # it costs half an hour of disk, times out, holds the file open,
+            # and blocks the promote that would have finished the job - every
+            # single launch. Look before rebuilding.
+            try:
+                done = os.path.join(out, name + ".mp4.__assembling__.mp4")
+                fin = os.path.join(out, name + ".mp4")
+                if (not os.path.exists(fin) and os.path.isfile(done)
+                        and (_probe_duration(done) or 0) > 1.0):
+                    os.replace(done, fin)
+                    _record_made_file(fin)
+                    log(f"Recovered an interrupted save: {name}.mp4")
+                    continue
+            except Exception:
+                pass
+            # and a folder that has already refused twice is not going to
+            # start working on the third launch - leave it for the sweep
+            if _SALVAGE_FAILS.get(name, 0) >= 2:
+                continue
             segs = _list_segments(d)
             if not segs or _fresh(segs[-1]):
                 continue
@@ -3921,6 +3940,7 @@ _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
 _BINDING = {"name": None, "pct": None, "eta": None, "mbps": None,
             "t0": 0.0, "total": 0.0}
 _CONCAT_WATCH = {"stop": True, "ev": None}   # the stream-copy progress watcher
+_SALVAGE_FAILS = {}    # session folder -> how many launches its re-weld failed
 _TRAY_ICON = [None]    # the pystray icon, stashed so the bind loop can whisper
                        # progress into the tooltip without threading ctl through
 _FINISH_FAILS = {}     # path -> genuine failure count (interruptions don't count)
@@ -6459,7 +6479,8 @@ def _watch_core(ctl):
                     _ai_tick(ctl)              # ...and let the tome read its books
                 if auto:
                     _sdr_finish_abort()        # game first - the GPU is theirs now
-                    _ai_abort()                # the tome stops reading too
+                    # ...but a recording you asked for BY NAME keeps going
+                    _ai_abort(force_too=False)
                     session = Session(g)
                     ctl.set_status("starting")     # honest "warming up" while ffmpeg spins up
                     if not _safe_start(session, ctl):
@@ -6494,7 +6515,7 @@ def _watch_core(ctl):
                     name = gg or "Screen"
                     ctl.suppressed_game = None
                     _sdr_finish_abort()        # manual record also outranks conversions
-                    _ai_abort()
+                    _ai_abort(force_too=False)
                     session = Session(name)
                     ctl.set_status("starting")     # honest "warming up" while ffmpeg spins up
                     if not _safe_start(session, ctl):
@@ -7914,10 +7935,15 @@ _AI = {"busy": None, "t_last": 0.0, "index": None, "index_t": 0.0,
        "proc": None, "abort": False, "failed": {}}
 
 
-def _ai_abort():
+def _ai_abort(force_too=True):
     """A game just appeared: stop the current AI job NOW (the whisper /
     ffmpeg child is terminated; the sidecar stays missing and the job
-    simply re-runs at the next idle stretch)."""
+    simply re-runs at the next idle stretch).
+
+    force_too=False spares a job you ASKED for by name - a game starting is
+    not a reason to abandon the one recording you pointed at."""
+    if not force_too and _AI.get("force"):
+        return
     _AI["abort"] = True
     pr = _AI.get("proc")
     if pr is not None:
@@ -8222,12 +8248,20 @@ def _ai_tick(ctl):
         return
     if _AI["busy"] is not None:
         return
-    if ctl.session is not None or ctl.saving > 0 or _FINISHING["busy"]:
-        return
+    # ASKED FOR means asked for. The idle rules below exist so the reader
+    # never steals a frame from a game you did not ask it to interrupt - but
+    # when you point at one recording and say do this now, waiting for a quiet
+    # moment is just the silence again. A forced job ignores them and runs
+    # while you record, watch or save. It still runs BELOW NORMAL, so the game
+    # keeps the CPU it needs.
+    forced_now = bool(_AI.get("force"))
+    if not forced_now:
+        if ctl.session is not None or ctl.saving > 0 or _FINISHING["busy"]:
+            return
+        if time.time() - _MEDIA.get("last_read", 0) < 20:
+            return
     if _TRIM_BUSY[0] > 0:
-        return                      # never open a source mid-edit
-    if time.time() - _MEDIA.get("last_read", 0) < 20:
-        return
+        return                      # never open a source mid-edit, ever
     if time.time() - _AI["t_last"] < 5:
         return
     _AI["t_last"] = time.time()
