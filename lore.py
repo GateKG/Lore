@@ -6222,6 +6222,25 @@ def _watch_core(ctl):
                     f"model. They are being re-read with the accurate one.")
         except Exception:
             pass
+    # the loudness curve arrived with 2.20 and is written by the highlight
+    # pass, so retire those sidecars once more to grow one for every recording
+    if not SETTINGS.get("lvl_reset_v220"):
+        try:
+            gone = 0
+            td = _thumb_dir(SETTINGS.get("output_dir", ""))
+            for fn in (os.listdir(td) if os.path.isdir(td) else []):
+                if fn.endswith(".hl.json"):
+                    try:
+                        os.remove(os.path.join(td, fn))
+                        gone += 1
+                    except OSError:
+                        pass
+            _persist_setting("lvl_reset_v220", True)
+            SETTINGS["lvl_reset_v220"] = True
+            if gone:
+                log(f"Re-listening to {gone} recording(s) to draw their sound.")
+        except Exception:
+            pass
     if not SETTINGS.get("hl_reset_v201"):
         try:
             gone = 0
@@ -8156,6 +8175,26 @@ def _highlights_one(video_path):
                     exist_ok=True)
         _atomic_write_json(_ai_sidecar(video_path, "hl"),
                            {"v": 1, "events": events})
+        # THE LOUDNESS CURVE, free: the envelope is already in hand from the
+        # pass above, so drawing it costs one more sidecar and no more work.
+        # Squeezed to ~1800 points (a seven-hour session is a million) by
+        # taking the PEAK of each bucket - averaging would flatten exactly the
+        # spikes worth seeing - and stored as whole dB.
+        try:
+            pts = 1800
+            n = len(es)
+            if n:
+                idx = np.linspace(0, n, pts + 1).astype(int)
+                buckets = [es[idx[i]:max(idx[i] + 1, idx[i + 1])]
+                           for i in range(pts)]
+                curve = [int(round(float(b.max()))) for b in buckets if len(b)]
+                _atomic_write_json(_ai_sidecar(video_path, "lvl"),
+                                   {"v": 1, "dur": round(dur, 2),
+                                    "floor": int(round(float(np.percentile(es, 5)))),
+                                    "peak": int(round(float(es.max()))),
+                                    "db": curve})
+        except Exception:
+            pass
         log(f"Highlights for {os.path.basename(video_path)}: "
             f"{len(events)} moment(s).")
         return True
@@ -9353,6 +9392,21 @@ class _JsApi:
         except Exception:
             return []
 
+    def levels(self, path):
+        """The recording's loudness curve: {dur, floor, peak, db[]} where db is
+        ~1800 evenly spaced peak readings in dBFS. Drawn under the timeline so
+        you can SEE where the shouting is."""
+        p = self._safe_path(path)
+        if not p:
+            return None
+        try:
+            if _ai_sidecar_fresh(p, "lvl"):
+                with open(_ai_sidecar(p, "lvl"), encoding="utf-8") as fh:
+                    return json.load(fh)
+        except Exception:
+            pass
+        return None
+
     def highlights(self, path):
         """This video's marked moments: [{t, z}] seconds from start."""
         p = self._safe_path(path)
@@ -9540,7 +9594,7 @@ class _JsApi:
         ap = os.path.normcase(os.path.abspath(p))
 
         def _forget():
-            for kind in ("stt", "hl"):
+            for kind in ("stt", "hl", "lvl"):
                 try:
                     os.remove(_ai_sidecar(p, kind))
                 except OSError:
@@ -10036,7 +10090,7 @@ class _JsApi:
                                 os.path.splitext(os.path.basename(out))[0] + ".jpg")
                             if os.path.isfile(tp):
                                 os.remove(tp)
-                            for kind in ("stt", "hl"):
+                            for kind in ("stt", "hl", "lvl"):
                                 try:
                                     os.remove(_ai_sidecar(out, kind))
                                 except OSError:
@@ -10081,7 +10135,7 @@ class _JsApi:
         return {"ok": True, "name": os.path.basename(out)}
 
     def edit_video(self, path, segments, replace=False, to_discord=False,
-                   cap_mb=0):
+                   cap_mb=0, mute=None):
         """The multi-part editor. `segments` is the list of [start,end] seconds to
         KEEP, in order (the UI turns a keep/remove choice into this list). Each
         piece is re-encoded to the user's current bitrate/encoder, the pieces are
@@ -10112,6 +10166,14 @@ class _JsApi:
             else:
                 merged.append([s, e])
         segs = merged
+        mute_spans = []
+        try:
+            for a, b in (mute or []):
+                a, b = float(a), float(b)
+                if b > a:
+                    mute_spans.append((a, b))
+        except Exception:
+            mute_spans = []
         total = sum(e - s for s, e in segs)
         if total < 0.25:
             return {"ok": False, "why": "too short"}
@@ -10207,6 +10269,17 @@ class _JsApi:
                     # 4 seconds while recording, so a copy can start on one:
                     # instant, lossless, at most a few seconds of lead-in.
                     # An HDR piece still needs the tone-map, so that re-encodes.
+                    # SILENCE, don't cut: the marked stretches keep their
+                    # picture and lose their sound. The video is still copied
+                    # untouched - only the audio is rebuilt - so muting a
+                    # seven-hour recording costs seconds, not an encode.
+                    af = ""
+                    if mute_spans:
+                        af = ",".join(
+                            f"volume=enable='between(t,{max(0.0, a - s):.3f},"
+                            f"{max(0.0, b - s):.3f})':volume=0"
+                            for a, b in mute_spans
+                            if b > s and a < s + seg_dur)
                     if cap > 0:
                         kb = int(_EDIT_JOB.get("cap_kbps") or (br * 1000))
                         # A THIN BUDGET WANTS FEWER PIXELS. 5300 kbps spread
@@ -10233,7 +10306,12 @@ class _JsApi:
                         enc_args = ["-vf", vf0, "-c:v", enc,
                                     *encoder_quality_flags(enc, br),
                                     "-c:a", "aac", "-b:a", "192k"]
-                    copy_args = ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+                    copy_args = (["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                                  "-af", af, "-avoid_negative_ts", "make_zero"]
+                                 if af else
+                                 ["-c", "copy", "-avoid_negative_ts", "make_zero"])
+                    if af:
+                        enc_args = enc_args + ["-af", af]
                     # a cap can only be met by re-encoding
                     can_copy = (vf0 == "format=nv12") and cap <= 0
                     cmd = [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
@@ -10395,7 +10473,7 @@ class _JsApi:
                             os.path.splitext(os.path.basename(out))[0] + ".jpg")
                         if os.path.isfile(tp):
                             os.remove(tp)
-                        for kind in ("stt", "hl"):
+                        for kind in ("stt", "hl", "lvl"):
                             try:
                                 os.remove(_ai_sidecar(out, kind))
                             except OSError:

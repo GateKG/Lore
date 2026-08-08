@@ -869,6 +869,22 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
   border:1px solid rgba(140,110,70,.5);border-radius:11px;padding:3px 6px;
   outline:none;cursor:pointer;flex:0 0 auto}
 #vzoom option{background:#241a0c;color:#e8cf9c}
+/* the sound of the recording, drawn where the time is */
+#vlvl{display:none;width:100%;height:34px}
+#vlvl.on{display:block}
+/* one button, and a bubble holding the rest */
+#vmenu{position:absolute;right:10px;bottom:calc(100% + 10px);display:none;
+  flex-direction:column;gap:2px;padding:7px;border-radius:12px;z-index:98;
+  background:rgba(26,18,8,.97);border:1px solid rgba(140,110,70,.55);
+  box-shadow:0 14px 40px rgba(0,0,0,.7)}
+#vmenu.on{display:flex}
+#vmenu .vbtn{display:flex;align-items:center;gap:10px;width:100%;
+  justify-content:flex-start;padding:6px 12px 6px 9px;border-radius:8px;
+  font-size:15px;white-space:nowrap}
+#vmenu .vbtn span{font:600 11.5px var(--ui);letter-spacing:.04em;color:#e0cda4}
+#vmenu .vbtn:hover{background:rgba(232,181,99,.15)}
+#vmenu .vbtn.on span{color:var(--gold-hi)}
+#vbar{position:relative}
 #vpeek{position:fixed;z-index:99;display:none;pointer-events:none;
   border-radius:7px;overflow:hidden;background:#000;
   border:1px solid rgba(232,181,99,.75);
@@ -1155,6 +1171,7 @@ body.reduced #intro{display:none}
     <button class="vbtn" id="vplay" title="Play / pause">▮▮</button>
     <div id="vseekcol">
       <div id="vover" title="The whole recording - click to jump, drag the lit box"><div id="voverwin"></div><div id="voverhead"></div></div>
+      <canvas id="vlvl" height="34"></canvas>
       <div id="vseekwrap">
         <input type="range" id="vseek" min="0" max="1000" value="0">
         <div id="vsegs"></div>
@@ -1170,18 +1187,25 @@ body.reduced #intro{display:none}
     </select>
     <button class="vbtn" id="vhere" title="Anchor the timeline here - the window starts at the frame you are on">&#8676;</button>
     <input type="range" id="vvol" min="0" max="100" value="80" title="Volume">
-    <button class="vbtn" id="vtrim" title="Edit — keep or cut out pieces">✂</button>
-    <button class="vbtn" id="vsay" title="What was said — click any line to jump there">❝</button>
-    <button class="vbtn" id="vnext" title="Next video">⏭</button>
     <button class="vbtn" id="vfs" title="Fullscreen (whole screen)">⛶</button>
-    <button class="vbtn" id="vfolder" title="Open this game's folder">📁</button>
-    <button class="vbtn" id="vdel" title="Delete this video">🗑</button>
-    <button id="vext" title="Open with your video player">⧉ Open in player</button>
+    <button class="vbtn" id="vmore" title="Everything else">⋯</button>
+    <!-- the rest live in the bubble: a player wants a picture and a
+         timeline, not a row of eight glyphs competing with them -->
+    <div id="vmenu">
+      <button class="vbtn" id="vtrim" title="Edit — keep, cut out or silence pieces">✂<span>Edit</span></button>
+      <button class="vbtn" id="vsound" title="Show the sound levels along the timeline">◠<span>Sound</span></button>
+      <button class="vbtn" id="vsay" title="What was said — click any line to jump there">❝<span>Words</span></button>
+      <button class="vbtn" id="vnext" title="Next video">⏭<span>Next</span></button>
+      <button class="vbtn" id="vfolder" title="Open this game's folder">📁<span>Folder</span></button>
+      <button class="vbtn" id="vdel" title="Delete this video">🗑<span>Delete</span></button>
+      <button class="vbtn" id="vext" title="Open with your video player">⧉<span>Open in player</span></button>
+    </div>
   </div>
   <div id="vedrow">
     <div class="edmode">
       <button id="vedkeep" class="on" title="The pieces you mark are what you KEEP; everything else is dropped">✓ Keep marked</button>
       <button id="vedcut" title="The pieces you mark are CUT OUT; the rest is kept and stitched">✂ Remove marked</button>
+      <button id="vedmute" title="The pieces you mark keep their picture and LOSE THEIR SOUND — nothing is cut">🔇 Silence marked</button>
     </div>
     <div class="sep"></div>
     <button class="wbtn" id="vedadd" title="Add another piece at the playhead">＋ piece</button>
@@ -1487,6 +1511,8 @@ function makeMock(){
     pause_toggle:async()=>{st.status=st.status==='paused'?'recording':'paused';return true;},
     clip:async()=>true, clip_discord:async()=>true,
     open_video:async()=>true,reveal:async()=>true,open_game_folder:async()=>true,
+    levels:async()=>({dur:600,floor:-48,peak:-6,
+      db:Array.from({length:1800},(_,i)=>-46+22*Math.abs(Math.sin(i/37))+(i%211<6?16:0))}),
     search_words:async()=>[],highlights:async()=>[],
     transcript:async()=>[{a:4000,b:7000,t:'Right, we are going in.'},
       {a:9000,b:12000,t:'Watch the left side, someone is rotating.'},
@@ -1497,7 +1523,7 @@ function makeMock(){
       busy:{kind:'stt',name:'mock_session_20260801.mp4'},
       total:1757,stt_done:412,hl_done:380}),
     delete_video:async()=>({ok:true}),post_discord:async()=>true,
-    edit_video:async(p,segs,rep,disc,cap)=>{window.__mockEd={pct:0,phase:(cap>0?'squeezing':'cutting'),done:false,ok:false,name:'mock_edit.mp4',cap:cap||0};return {ok:true,id:'m'};},
+    edit_video:async(p,segs,rep,disc,cap,mute)=>{window.__mockEd={pct:0,phase:(cap>0?'squeezing':'cutting'),done:false,ok:false,name:'mock_edit.mp4',cap:cap||0};return {ok:true,id:'m'};},
     edit_status:async()=>{const m=window.__mockEd;if(!m)return{done:true,ok:false,pct:0,phase:''};
       if(!m.done){m.pct=Math.min(100,(m.pct||0)+30);m.phase=m.pct<94?'cutting':(m.pct<100?'stitching':'saving');
         if(m.pct>=100){m.done=true;m.ok=true;m.phase='done';}}return m;},
@@ -3587,6 +3613,10 @@ async function openViewer(vid,seekTo){
   }
   vd.play().catch(()=>{});
   renderHlMarks(vid,req);
+  try{ if(localStorage.getItem('lore.sound')==='1'){
+        $('#vlvl').classList.add('on'); $('#vsound').classList.add('on');
+        loadLevels(vid).then(()=>{ if(req===_viewerReq)drawLevels(); });
+      } }catch(e){}
   if(document.body.classList.contains('vsaid'))loadSaid(vid,req);
   else{_said={lines:[],path:null,at:-1};$('#vsaid .vsaidbody').innerHTML='';}
 }
@@ -3634,6 +3664,57 @@ async function renderHlMarks(vid,req){
     renderHlMarks._ro.observe(wrap);
   }
 }
+/* ---- THE SOUND OF THE RECORDING ----
+   The loudness curve the highlight pass already measured, drawn under the
+   timeline in the SAME window the bar shows, so zooming in zooms the sound
+   with it. Peaks are where the shouting is. */
+let _lvl=null,_lvlPath=null;
+async function loadLevels(v){
+  if(_lvlPath===v.path)return _lvl;
+  _lvlPath=v.path; _lvl=null;
+  try{ if(api.levels)_lvl=await api.levels(v.path); }catch(e){ _lvl=null; }
+  return _lvl;
+}
+function drawLevels(){
+  const c=$('#vlvl'); if(!c||!c.classList.contains('on'))return;
+  const d=tlDur(), L=_lvl;
+  const w=c.clientWidth||1, h=c.clientHeight||34, dpr=devicePixelRatio||1;
+  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){
+    c.width=Math.round(w*dpr); c.height=Math.round(h*dpr);
+  }
+  const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  if(!L||!L.db||!L.db.length||!d){
+    g.fillStyle='rgba(214,199,172,.45)'; g.font='italic 10px Georgia,serif';
+    g.fillText(L===null?'listening to this one is still to come…':'no sound here',8,h/2+3);
+    return;
+  }
+  const win=tlWin(), n=L.db.length, dur=L.dur||d;
+  const lo=Math.min(-60,(L.floor||-50)-4), hi=Math.max(lo+6,(L.peak||0)+1);
+  const yOf=db=>h-2-((clamp(db,lo,hi)-lo)/(hi-lo))*(h-4);
+  g.beginPath(); g.moveTo(0,h);
+  for(let x=0;x<=w;x++){
+    const t=win.a+(x/w)*win.len;
+    const i=clamp(Math.round(t/dur*(n-1)),0,n-1);
+    g.lineTo(x,yOf(L.db[i]));
+  }
+  g.lineTo(w,h); g.closePath();
+  const grad=g.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,'rgba(232,181,99,.55)');
+  grad.addColorStop(1,'rgba(232,181,99,.08)');
+  g.fillStyle=grad; g.fill();
+  g.strokeStyle='rgba(255,226,166,.85)'; g.lineWidth=1; g.stroke();
+  /* the pieces you marked, over the sound they cover */
+  if(V.ed&&V.ed.on&&V.ed.segs.length){
+    g.fillStyle=V.ed.mode==='mute'?'rgba(120,180,255,.28)'
+      :V.ed.mode==='remove'?'rgba(255,120,110,.25)':'rgba(150,255,170,.22)';
+    V.ed.segs.forEach(sg=>{
+      const x0=(sg.a-win.a)/win.len*w, x1=(sg.b-win.a)/win.len*w;
+      if(x1>0&&x0<w)g.fillRect(Math.max(0,x0),0,Math.min(w,x1)-Math.max(0,x0),h);
+    });
+  }
+}
+
 /* ---- THE SCRUB PREVIEW ----
    Hovering either timeline shows the frame you would land on. It rides a
    second <video> pointed at the same file, because pulling a still off this
@@ -3775,6 +3856,8 @@ function closeViewer(){
   try{vd.pause();}catch(e){}
   vd.removeAttribute('src');vd.load();
   peekHide();
+  const _mn=$('#vmenu'); if(_mn)_mn.classList.remove('on');
+  _lvl=null; _lvlPath=null;
   try{const pv=$('#vpeekv');if(pv){pv.removeAttribute('src');pv.load();}}catch(e){}
   _peek={t:-1,want:-1,busy:false,src:''};
   vw.classList.remove('on');
@@ -3862,6 +3945,7 @@ function tlPaint(){
   /* anchoring only means something when the bar shows a SLICE - with the
      whole recording on screen there is nothing to move it to */
   const hb=$('#vhere'); if(hb)hb.style.display=win.full?'none':'';
+  drawLevels();
   if(typeof _hlPlace==='function'&&_hlPlace)_hlPlace();
   if(V.ed&&V.ed.on)edRepos();
 }
@@ -3872,6 +3956,9 @@ function edMerge(list){
   return m;
 }
 function editKeeps(){
+  /* silencing keeps EVERYTHING - the marked pieces are what loses its sound,
+     not its place - so the kept range is the whole recording */
+  if(V.ed&&V.ed.mode==='mute')return [{a:0,b:edDur()}];
   const dur=edDur(),marked=edMerge(V.ed.segs);
   if(V.ed.mode==='keep')return marked;
   const keeps=[]; let cur=0;                                  /* remove mode: keep the gaps */
@@ -3932,6 +4019,7 @@ function layEd(){
   edLabel();
   $('#vedkeep').classList.toggle('on',V.ed.mode==='keep');
   $('#vedcut').classList.toggle('on',V.ed.mode==='remove');
+  const mb=$('#vedmute'); if(mb)mb.classList.toggle('on',V.ed.mode==='mute');
 }
 /* reposition the EXISTING band + handle nodes during a drag - must NOT rebuild
    #vsegs (innerHTML wipe would delete the handle mid-drag and kill pointermove) */
@@ -3973,13 +4061,19 @@ function edLabel(){
   edSyncOut(tot);
   const out=$('#vedsurv'); if(!out)return;
   if(!n||!sg){ out.textContent='nothing marked yet - press start, then end'; return; }
+  const silent=(V.ed.mode==='mute')
+    ? V.ed.segs.reduce((q,x)=>q+(x.b-x.a),0) : 0;
   out.textContent=fmtT(sg.a)+' \u2192 '+fmtT(sg.b)+' \u00b7 '+fmtT(sg.b-sg.a)
     +(n>1?'  (piece '+(V.ed.sel+1)+'/'+n+')':'')
-    +'   \u00b7   result '+fmtT(tot);
+    +(V.ed.mode==='mute'
+      ? '   \u00b7   silencing '+fmtT(silent)+' of '+fmtT(edDur())
+      : '   \u00b7   result '+fmtT(tot));
 }
 function edPreviewSeg(){ const vd=$('#vvideo'),s=V.ed.segs[V.ed.sel]; if(!s)return; V.ed.preview=true;
   try{vd.currentTime=s.a;vd.play().catch(()=>{});}catch(e){} }
 function edValid(keeps){
+  if(V.ed&&V.ed.mode==='mute'&&!(V.ed.segs||[]).length){
+    whisper('mark what should fall silent first'); return false; }
   if(!keeps||!keeps.length){ whisper('nothing would be kept — adjust your pieces'); return false; }
   if(keeps.reduce((n,s)=>n+(s.b-s.a),0)<0.25){ whisper('the result would be empty'); return false; }
   return true;
@@ -4005,7 +4099,9 @@ function edStart(replace,toDiscord){
                       edit_video is in flight must not pop the editor open on the
                       NEXT viewing session */
   const capMB=+(($('#vedqual')||{}).value||0);
-  Promise.resolve(api.edit_video(c.path,segs,!!replace,!!toDiscord,capMB)).then(r=>{
+  const muted=(V.ed.mode==='mute')
+    ? V.ed.segs.map(x=>[+x.a.toFixed(3),+x.b.toFixed(3)]) : [];
+  Promise.resolve(api.edit_video(c.path,segs,!!replace,!!toDiscord,capMB,muted)).then(r=>{
     if(ed!==V.ed)return;
     if(!(r&&r.ok)){ edFail((r&&r.why)||'could not start'); return; }
     edPoll();
@@ -4090,6 +4186,24 @@ function wireViewer(){
   $('#vfolder').addEventListener('click',()=>{const c=V.cur;if(c){api.open_game_folder(c.path);whisper('opened this game’s folder');}});
   $('#vnext').addEventListener('click',()=>{const n=viewerSibling(1);if(n)openViewer(n);});
   $('#vfs').addEventListener('click',()=>toggleFullscreenTrue());
+  /* one glyph, and a bubble with the rest - it closes on any click elsewhere
+     and whenever the player does */
+  const menu=$('#vmenu');
+  $('#vmore').addEventListener('click',e=>{
+    e.stopPropagation(); menu.classList.toggle('on');
+    $('#vmore').classList.toggle('on',menu.classList.contains('on'));});
+  menu.addEventListener('click',e=>{ if(e.target.closest('.vbtn'))menu.classList.remove('on'); });
+  document.addEventListener('click',e=>{
+    if(!e.target.closest('#vmenu,#vmore'))menu.classList.remove('on');});
+  /* the sound of the recording, along the timeline */
+  $('#vsound').addEventListener('click',async()=>{
+    const c=$('#vlvl'); const on=!c.classList.contains('on');
+    c.classList.toggle('on',on); $('#vsound').classList.toggle('on',on);
+    try{localStorage.setItem('lore.sound',on?'1':'0');}catch(e){}
+    if(on&&V.cur){ await loadLevels(V.cur);
+      if(_lvl===null)whisper('the tome has not listened to this one yet');
+    }
+    sizeViewer(); drawLevels();});
   const saidToggle=()=>{
     const on=document.body.classList.toggle('vsaid');
     $('#vsay').classList.toggle('on',on);
@@ -4277,6 +4391,8 @@ function wireViewer(){
     whisper('play to the start and press start, then to the end and press end');});
   $('#vedkeep').addEventListener('click',()=>{V.ed.mode='keep';layEd();});
   $('#vedcut').addEventListener('click',()=>{V.ed.mode='remove';layEd();});
+  $('#vedmute').addEventListener('click',()=>{V.ed.mode='mute';layEd();
+    whisper('marked pieces keep their picture and lose their sound');});
   $('#vedadd').addEventListener('click',()=>{
     const t=vd.currentTime||0, d=vd.duration||0;
     /* sized against what the BAR shows, so a new piece is always something you
