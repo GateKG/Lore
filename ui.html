@@ -1206,8 +1206,8 @@ body.reduced #intro{display:none}
   </div>
   <div id="vedrow">
     <div class="edmode">
-      <button id="vedkeep" title="This piece is KEPT — mark keeps and everything else is dropped">✓ Keep</button>
-      <button id="vedcut" class="on" title="This piece is CUT OUT of the video">✂ Cut</button>
+      <button id="vedkeep" class="on" title="This piece is KEPT — mark keeps and everything else is dropped">✓ Keep</button>
+      <button id="vedcut" title="This piece is CUT OUT of the video">✂ Cut</button>
       <button id="vedmute" title="This piece keeps its picture and loses its sound">🔇 Silence</button>
     </div>
     <div class="sep"></div>
@@ -1503,7 +1503,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.28'};},
+      webhook:true,version:'2.29'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1545,7 +1545,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.28'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.29'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3914,7 +3914,7 @@ function edReset(){
   try{ if(V.ed){ if(V.ed.busy){try{api.edit_cancel();}catch(_){}
         whisper('export cancelled — nothing was saved');   /* navigating away silently killed a Save-new; at least SAY so */ }
       if(V.ed._pt)clearTimeout(V.ed._pt); } }catch(_){}
-  V.ed={on:false,next:'cut',regions:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
+  V.ed={on:false,next:'keep',regions:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
 }
 function edDetach(){
   /* Closing the player must NOT kill a running export. This is edReset with
@@ -3926,7 +3926,7 @@ function edDetach(){
         if(V.ed._pt)clearTimeout(V.ed._pt);
         if(V.ed.busy)whisper('still cutting — follow it on Working');
       } }catch(_){}
-  V.ed={on:false,next:'cut',regions:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
+  V.ed={on:false,next:'keep',regions:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
 }
 function edDur(){ const d=$('#vvideo').duration; return (d&&isFinite(d))?d:0; }
 /* ================= the timeline ==================
@@ -4535,7 +4535,9 @@ function wireViewer(){
       if(V.ed.busy)edReset();
       edUI(false); return; }
     const t=vd.currentTime||0;
-    V.ed.next='cut'; V.ed.sel=0; V.ed.busy=false; V.ed.confirm=false;
+    /* dragging one area almost always means "I want THIS bit" - defaulting to
+       Cut made a first drag keep the other three hours instead */
+    V.ed.next='keep'; V.ed.sel=0; V.ed.busy=false; V.ed.confirm=false;
     V.ed.regions=[];                    /* nothing marked - you decide */
     $('#veddisc').style.display=S.hasWebhook?'':'none';
     edUI(true);

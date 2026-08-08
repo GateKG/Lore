@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.26"
+APP_VERSION = "2.29"
 
 try:
     import psutil
@@ -8142,6 +8142,19 @@ def _transcribe_one(video_path):
                 pass
 
 
+def _cap_vf(vf_base, kbps):
+    """The filter chain for a size-capped encode: at most ONE scale, chosen
+    from the bitrate. Built fresh every time - the version that edited a
+    shared string in place ended up rescaling each frame three times."""
+    lim = (720 if kbps < 6000 else
+           900 if kbps < 10000 else
+           1080 if kbps < 16000 else 0)
+    if not lim:
+        return vf_base
+    tail = "" if vf_base == "format=nv12" else "," + vf_base.rsplit(",", 1)[0]
+    return f"scale=-8:min(ih\\,{lim})" + tail + ",format=nv12"
+
+
 def _highlights_one(video_path):
     """Loudness-burst highlight pass -> .hl.json sidecar. 8kHz mono PCM is
     streamed straight out of ffmpeg (no temp file), a 50ms RMS envelope is
@@ -10361,6 +10374,13 @@ class _JsApi:
                     _EDIT_JOB["cap_kbps"] = vkbps
                     log(f"Fitting {total:.0f}s under {cap:.0f} MB: "
                         f"{vkbps} kbps video + {AUDIO_KBPS} kbps audio.")
+                    if vkbps < 800:
+                        # 3 hours into 500 MB is ~300 kbps - a slideshow, and
+                        # two full re-encodes to get there. Say so rather than
+                        # silently spending an hour making something unwatchable.
+                        log(f"That is {vkbps} kbps for {total / 60:.0f} minutes - "
+                            f"very low. Mark a shorter piece, or raise the cap.")
+                        _EDIT_JOB["thin"] = vkbps
                 vf0 = "format=nv12"
                 trc = _probe_color_trc(p)
                 if _is_hdr_trc(trc):
@@ -10413,11 +10433,17 @@ class _JsApi:
                         lim = (720 if kb < 6000 else
                                900 if kb < 10000 else
                                1080 if kb < 16000 else 0)
+                        # NEVER mutate vf0: it is reused for every piece and
+                        # again by the shrink pass, so mutating it stacked a
+                        # second and third scale onto the same chain - three
+                        # rescales of every frame, for nothing.
+                        vf_cap = vf0
                         if lim:
-                            vf0 = f"scale=-8:min(ih\\,{lim})" + (
-                                "" if vf0 == "format=nv12" else "," + vf0.rsplit(",", 1)[0]
-                            ) + ",format=nv12"
-                        enc_args = ["-vf", vf0, "-c:v", enc,
+                            vf_cap = (f"scale=-8:min(ih\\,{lim})"
+                                      + ("" if vf0 == "format=nv12"
+                                         else "," + vf0.rsplit(",", 1)[0])
+                                      + ",format=nv12")
+                        enc_args = ["-vf", vf_cap, "-c:v", enc,
                                     "-b:v", f"{kb}k",
                                     # a tight ceiling and a small buffer keep
                                     # VBR from banking bits and spending them
@@ -10526,7 +10552,7 @@ class _JsApi:
                         rc = subprocess.run(
                             [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
                              "-loglevel", "error", "-i", tmp_final,
-                             "-vf", vf0, "-c:v", enc, "-b:v", f"{nkb}k",
+                             "-vf", _cap_vf(vf0, nkb), "-c:v", enc, "-b:v", f"{nkb}k",
                              "-maxrate", f"{int(nkb * 1.1)}k",
                              "-bufsize", f"{int(nkb * 2)}k",
                              "-c:a", "aac", "-b:a", "128k", fit],
