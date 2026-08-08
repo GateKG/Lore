@@ -10164,7 +10164,12 @@ class _JsApi:
                     cap = 0
                 if cap > 0 and total > 0.5:
                     AUDIO_KBPS = 128
-                    budget_bits = cap * 1024 * 1024 * 8 * 0.97   # 3% for the container
+                    # 12% under the cap, not 3%: AMF's VBR runs about ten
+                    # percent over the bitrate it is handed (measured - a
+                    # 500 MB ask came back 535 MB), and the container wants
+                    # its own slice. The check after the encode enforces the
+                    # rest, so this only has to get close.
+                    budget_bits = cap * 1024 * 1024 * 8 * 0.88
                     vkbps = int(budget_bits / total / 1000) - AUDIO_KBPS
                     vkbps = max(200, vkbps)                      # never below watchable
                     br = max(1, int(round(vkbps / 1000.0)))
@@ -10204,10 +10209,25 @@ class _JsApi:
                     # An HDR piece still needs the tone-map, so that re-encodes.
                     if cap > 0:
                         kb = int(_EDIT_JOB.get("cap_kbps") or (br * 1000))
+                        # A THIN BUDGET WANTS FEWER PIXELS. 5300 kbps spread
+                        # over 5120x1440 is 0.012 bits per pixel - mush. The
+                        # same bits over a shorter frame are 0.048, which is
+                        # four times the detail per pixel and looks far better
+                        # on the way to Discord. Never upscales.
+                        lim = (720 if kb < 6000 else
+                               900 if kb < 10000 else
+                               1080 if kb < 16000 else 0)
+                        if lim:
+                            vf0 = f"scale=-8:min(ih\\,{lim})" + (
+                                "" if vf0 == "format=nv12" else "," + vf0.rsplit(",", 1)[0]
+                            ) + ",format=nv12"
                         enc_args = ["-vf", vf0, "-c:v", enc,
                                     "-b:v", f"{kb}k",
-                                    "-maxrate", f"{int(kb * 1.35)}k",
-                                    "-bufsize", f"{int(kb * 2.7)}k",
+                                    # a tight ceiling and a small buffer keep
+                                    # VBR from banking bits and spending them
+                                    # in one loud scene
+                                    "-maxrate", f"{int(kb * 1.15)}k",
+                                    "-bufsize", f"{int(kb * 2)}k",
                                     "-c:a", "aac", "-b:a", "128k"]
                     else:
                         enc_args = ["-vf", vf0, "-c:v", enc,
@@ -10282,6 +10302,48 @@ class _JsApi:
                     raise RuntimeError("stitch failed")
                 if not (os.path.isfile(tmp_final) and os.path.getsize(tmp_final) > 10_000):
                     raise RuntimeError("empty result")
+                # A CAP IS A CAP. Discord refuses a file AT the limit as well as
+                # over it, so aim under and then check: if the encoder still
+                # overshot, re-encode THIS file - already cut, so it is short -
+                # scaled by exactly how far over it landed.
+                if cap > 0:
+                    ceiling = int(cap * 1024 * 1024 * 0.985)   # comfortably below
+                    for _try in range(2):
+                        try:
+                            sz = os.path.getsize(tmp_final)
+                        except OSError:
+                            break
+                        if sz <= ceiling or _EDIT_JOB["cancel"]:
+                            break
+                        prev = int(_EDIT_JOB.get("cap_kbps") or 0) or 1
+                        nkb = max(150, int(prev * (ceiling / float(sz)) * 0.97))
+                        _EDIT_JOB["cap_kbps"] = nkb
+                        _EDIT_JOB["phase"] = "squeezing to fit"
+                        log(f"{sz / 1048576:.0f} MB is over the {cap:.0f} MB cap; "
+                            f"re-encoding at {nkb} kbps.")
+                        fit = tmp_final + ".fit.mp4"
+                        rc = subprocess.run(
+                            [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
+                             "-loglevel", "error", "-i", tmp_final,
+                             "-vf", vf0, "-c:v", enc, "-b:v", f"{nkb}k",
+                             "-maxrate", f"{int(nkb * 1.1)}k",
+                             "-bufsize", f"{int(nkb * 2)}k",
+                             "-c:a", "aac", "-b:a", "128k", fit],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=flags, timeout=3600).returncode
+                        if rc == 0 and os.path.isfile(fit) and os.path.getsize(fit) > 10_000:
+                            os.replace(fit, tmp_final)
+                        else:
+                            try:
+                                os.remove(fit)
+                            except OSError:
+                                pass
+                            break
+                    try:
+                        log(f"Final size: {os.path.getsize(tmp_final) / 1048576:.0f} MB "
+                            f"(cap {cap:.0f} MB).")
+                    except OSError:
+                        pass
                 # _concat_copy salvages a bad join by DROPPING THE LAST segment and
                 # still returns True - for an editor that would silently lose a kept
                 # piece (and, on replace, overwrite the original with it). Verify the
