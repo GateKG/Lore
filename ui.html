@@ -113,7 +113,7 @@ img{-webkit-user-drag:none;user-drag:none}
 /* the tome's name - the SAME gilt wordmark as the cover (.iname), just
    smaller: serif, wide-spaced, gold, breathing a soft glow */
 #brand{display:flex;align-items:center;justify-content:center;padding-top:11px;
-  color:var(--gold);pointer-events:none;
+  color:var(--gold);pointer-events:auto;cursor:pointer;
   font-family:var(--serif);font-size:23px;font-weight:600;
   letter-spacing:.46em;text-indent:.46em;line-height:1;
   text-shadow:0 0 16px rgba(255,225,134,.5), 0 0 30px rgba(232,172,45,.3);
@@ -406,7 +406,7 @@ body.cinema #grip:hover{opacity:1}
 /* the window-mover for the player: the scrying backdrop covers the leather,
    so a slim gold pill up top is the one handle left for dragging the window */
 /* the saving card: top-left, out of the way, gone the moment the bind lands */
-#bindcard{position:fixed;top:52px;left:14px;z-index:60;width:238px;padding:10px 13px 11px;
+#bindcard{cursor:pointer;position:fixed;top:52px;left:14px;z-index:60;width:238px;padding:10px 13px 11px;
   border-radius:11px;background:rgba(16,11,6,.88);pointer-events:none;
   box-shadow:0 6px 22px rgba(0,0,0,.5),0 0 0 1px rgba(200,160,95,.35);
   opacity:0;transform:translateY(-6px);transition:opacity .25s,transform .25s}
@@ -625,6 +625,23 @@ body.reduced .proj-glare::after{animation:none}
 .srow .ctl{flex:1;display:flex;align-items:center;gap:10px;font-family:var(--ui);min-width:0}
 .shint{font-size:10.5px;color:var(--ink-faint);font-style:italic;font-family:var(--serif);
   line-height:1.55;flex:0 0 auto}
+/* one labour: what it is, what it holds, how far, and the way to stop it */
+.lab{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:7px;
+  margin:3px 0;flex:0 0 auto;background:rgba(255,248,230,.34);
+  border:1px solid rgba(110,88,50,.3)}
+.lab.idle{background:rgba(255,248,230,.16);border-color:rgba(110,88,50,.18)}
+.lab .ldot{width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:rgba(110,88,50,.4)}
+.lab .ldot.on{background:var(--gold);box-shadow:0 0 5px var(--gold);
+  animation:aipulse 1.9s ease-in-out infinite}
+.lab .lmid{flex:1;min-width:0}
+.lab .lwhat{font:600 12px var(--serif);color:var(--ink)}
+.lab .lname{font-size:10.5px;color:var(--ink-faint);font-style:italic;
+  font-family:var(--serif);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lab .lbar{height:3px;border-radius:2px;margin-top:5px;background:rgba(90,70,40,.22);overflow:hidden}
+.lab .lbar i{display:block;height:100%;width:0;border-radius:2px;
+  background:linear-gradient(90deg,#c79a45,var(--gold));transition:width .5s ease}
+.lab .lpct{font:600 11px var(--ui);color:var(--gold);flex:0 0 auto;
+  font-variant-numeric:tabular-nums}
 /* the reader's own little status plate - the only place the AI work is
    visible while it happens (everything else about it is silent by design) */
 .aistat{margin:3px 0 5px;padding:9px 11px;border-radius:7px;flex:0 0 auto;
@@ -1077,7 +1094,7 @@ body.reduced #intro{display:none}
   <div id="sealinfo">
     <div id="stateword">WATCHING</div>
     <div id="timer">·</div>
-    <div id="statesub">the tome lies open</div>
+    <div id="statesub" title="See everything the tome is doing">the tome lies open</div>
   </div>
   <div id="apronspacer"></div>
   <div id="sealbtns"></div>
@@ -1571,6 +1588,8 @@ const APPENDIX=[
    desc:'Sending clips out into the world through Discord.'},
   {key:'hotkeys', title:'Sigils',   rlabel:'Hotkeys',
    desc:'The gestures that command the tome from inside any game.'},
+  {key:'work',    title:'Labours',  rlabel:'Working',
+   desc:'Everything the tome is doing this moment - reading, cutting, saving - and how to call it off.'},
 ];
 
 function perPage(){
@@ -2170,8 +2189,80 @@ function row(c,label,ctl,small){
   const r=el('div','srow');
   r.append(el('div','lab',esc(label)+(small?`<small>${esc(small)}</small>`:'')));
   const cw=el('div','ctl');cw.append(ctl);r.append(cw);c.append(r);return r;}
+function openWork(){
+  const i=S.spreads.findIndex(sp=>sp.type==='set'&&sp.app&&sp.app.key==='work');
+  if(i>=0)requestTurn(i);
+}
 function hint(c,t){c.append(el('div','shint',t));}
 function divider(c,t){c.append(el('div','sdiv',esc(t)));}
+
+/* EVERY labour in one place: the reader, a cut being exported, a recording
+   being saved, colour being restored. Polls only while it is on screen. */
+function workPlate(){
+  const box=el('div','set-rows');
+  box.style.cssText='display:flex;flex-direction:column;gap:2px;overflow:visible';
+  const mk=()=>{
+    const r=el('div','lab idle');
+    const d=el('span','ldot'); const mid=el('div','lmid');
+    const what=el('div','lwhat'); const name=el('div','lname');
+    const bar=el('div','lbar'); const fill=el('i'); bar.append(fill);
+    mid.append(what,name,bar);
+    const pct=el('div','lpct'); const stop=el('button','wbtn danger','Stop');
+    stop.style.display='none';
+    r.append(d,mid,pct,stop);
+    return {r:r,dot:d,what:what,name:name,bar:bar,fill:fill,pct:pct,stop:stop};
+  };
+  const rows={read:mk(),cut:mk(),save:mk(),colour:mk()};
+  ['read','cut','save','colour'].forEach(k=>box.append(rows[k].r));
+  const set=(o,live,what,name,pct,onStop)=>{
+    o.r.classList.toggle('idle',!live);
+    o.dot.classList.toggle('on',!!live);
+    o.what.textContent=what; o.name.textContent=name||'';
+    const has=(pct!=null&&isFinite(pct));
+    o.bar.style.display=has?'':'none';
+    if(has)o.fill.style.width=Math.max(0,Math.min(100,pct))+'%';
+    o.pct.textContent=has?Math.round(pct)+'%':'';
+    o.stop.style.display=onStop?'':'none';
+    o.stop.onclick=onStop||null;
+  };
+  let iv=null;
+  const ask=async()=>{
+    let st=null,ai=null,ed=null;
+    try{st=await api.state();}catch(e){}
+    try{ if(api.ai_status)ai=await api.ai_status(); }catch(e){}
+    try{ if(api.edit_status)ed=await api.edit_status(); }catch(e){}
+    /* the reader */
+    if(ai&&ai.busy)
+      set(rows.read,true,(ai.busy.kind==='hl'?'Listening for loud moments':'Reading a recording'),
+          String(ai.busy.name||'').replace(/\.mp4$/i,''),null,null);
+    else if(ai&&!ai.whisper)
+      set(rows.read,false,'The reader is not installed','',null,null);
+    else
+      set(rows.read,false,'The reader rests',
+          ai?((ai.why||'nothing left to read')+(ai.total?'  ·  '+(ai.stt_done||0)+' of '+ai.total+' read':'')):'',
+          null,null);
+    /* a cut being exported */
+    if(ed&&!ed.done&&(ed.pct!=null))
+      set(rows.cut,true,'Cutting your clip',(ed.name||'')+(ed.phase?'  ·  '+ed.phase:''),ed.pct,
+          ()=>{ try{api.edit_cancel();}catch(e){} whisper('stopping the cut - the original is untouched'); });
+    else set(rows.cut,false,'No clip being cut','',null,null);
+    /* a recording being saved */
+    if(st&&st.binding)
+      set(rows.save,true,'Saving a recording',
+          (st.binding.name||'')+(st.binding.mbps?'  ·  '+st.binding.mbps.toFixed(0)+' MB/s':'')
+          +(st.binding.eta?'  ·  '+fmtT(st.binding.eta)+' left':''),
+          st.binding.pct,null);
+    else set(rows.save,false,'Nothing being saved','',null,null);
+    /* colour restoration */
+    if(st&&st.converting)
+      set(rows.colour,true,'Restoring true colour',st.converting.name||'',st.converting.pct,null);
+    else set(rows.colour,false,'No colour to restore',
+        (st&&st.queued)?st.queued+' waiting for a quiet moment':'',null,null);
+  };
+  iv=setInterval(()=>{ if(!document.body.contains(box)){clearInterval(iv);return;} ask(); },1500);
+  ask();
+  return box;
+}
 
 /* The reader's status plate. The AI is deliberately silent - it only ever
    works while you are away - so this is the one place that says what it is
@@ -2479,6 +2570,21 @@ function renderSet(cL,cR,app,spreadIdx){
     hint(L,'A new sigil takes hold the moment it is inscribed — no restart needed.');
     divider(R,'The clip sigil’s reach');
     row(R,'Grab the last',ctlSlider('clip_hotkey_seconds',10,120,x=>`${x} seconds`));
+  }
+
+  if(app.key==='work'){
+    divider(L,'At this moment');
+    L.append(workPlate());
+    hint(L,'The tome only works while you are away from a game: reading and '
+      +'listening pause the instant one starts, and a save always finishes. '
+      +'Anything with a Stop can be called off safely - what is already '
+      +'written stays written, and the original is never touched.');
+    divider(R,'Where the work happens');
+    R.append(el('div','shint','Recordings are staged on a scratch drive while '
+      +'they are made, then welded into the finished film. When the library '
+      +'lives on a spinning disk LORE stages on a solid-state one instead, '
+      +'which is the difference between a save that crawls and one that '
+      +'streams. The log names the drive it chose at every start.'));
   }
 
   if(app.key==='general'){
@@ -3092,17 +3198,22 @@ function paintTabs(){
      so 'All' was redundant. The freed slot shows one more game. The column is
      7 tabs: up to 7 games, or 6 games + a '+N more' that opens the contents. */
   const GMAX=games.length>7?6:7;
+  /* the contents ribbon rides at the TOP of the column - it is the way home
+     to every chapter, so it belongs above the chapters, not buried under them */
+  if(games.length>GMAX)
+    gt.append(mkTab(`+${games.length-GMAX} more`,'#b79ade',cur==='contents',   /* must agree with syncTabActive, or the ribbon it lit mid-turn snaps dark on landing */
+      ()=>requestTurn(0),'Every chapter lives in the contents',true,'contents'));
   games.slice(0,GMAX).forEach((g,i)=>{
     gt.append(mkTab(g.display,GEMS[i%GEMS.length],cur===g.key,
       ()=>requestTurn(chapterStart(g.key)),g.display,true,g.key));
   });
-  if(games.length>GMAX)
-    gt.append(mkTab(`+${games.length-GMAX} more`,'#b79ade',cur==='contents',   /* must agree with syncTabActive, or the ribbon it lit mid-turn snaps dark on landing */
-      ()=>requestTurn(0),'Every chapter lives in the contents',true,'contents'));
   const at=$('#apptabs');at.innerHTML='';
-  at.append(mkTab('Library',GOLD,!cur.startsWith('set:'),()=>requestTurn(0),
-    'Back to the book',false,'library'));
+  /* 'Library' is gone: the contents ribbon opposite already goes home, and the
+     wordmark does too. The slot now shows what the tome is DOING. */
+  at.append(mkTab('Working',GOLD,cur==='set:work',openWork,
+    'Everything the tome is doing right now',false,'set:work'));
   APPENDIX.forEach((a,i)=>{
+    if(a.key==='work')return;          /* it already crowns the column */
     at.append(mkTab(a.rlabel,GEMS[i%GEMS.length],cur==='set:'+a.key,
       ()=>requestTurn(S.spreads.findIndex(sp=>sp.type==='set'&&sp.app.key===a.key)),
       a.title,false,'set:'+a.key));
@@ -4125,6 +4236,18 @@ function wireInput(){
     if(e.key==='ArrowLeft'||e.key==='PageUp')stepTurn(-1);
     if(e.key==='Home'||e.key==='Escape')requestTurn(0);
     if(e.key==='End')requestTurn(S.spreads.length-1);});   /* the back cover, one keypress - mirrors Home */
+  /* Every place that REPORTS work is now a door to the page that lists it:
+     the saving card top-left, the status line under the seal (the one that
+     says "reading big walk..."), and the wordmark goes home. */
+  const brand=$('#brand');
+  if(brand)brand.addEventListener('click',()=>requestTurn(0));
+  const ssub=$('#statesub');
+  if(ssub){ ssub.style.cursor='pointer';
+    ssub.addEventListener('click',e=>{e.stopPropagation();openWork();}); }
+  document.addEventListener('click',e=>{
+    const c=e.target&&e.target.closest&&e.target.closest('#bindcard');
+    if(c)openWork();
+  });
   $('#seal').addEventListener('click',()=>{api.record_toggle();});
   $('#btn-close').addEventListener('click',()=>api.hide());
   $('#btn-min').addEventListener('click',()=>api.minimize());
