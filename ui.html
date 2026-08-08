@@ -1061,8 +1061,10 @@ body.reduced #intro{display:none}
     <div class="leaf-face back paper side-l"><div class="page-inner" id="leafB"></div><div class="leaf-curl"></div></div>
     <div class="leaf-shade"></div><div class="leaf-glow"></div>
   </div>
-  <div class="corner l" id="cornerL" title="Previous page"></div>
-  <div class="corner r" id="cornerR" title="Next page"></div>
+  <!-- no title= on these: they sit over the closed cover too, and the native
+       tooltip popped a white "Previous page" bubble on the intro screen -->
+  <div class="corner l" id="cornerL"></div>
+  <div class="corner r" id="cornerR"></div>
 </div>
 <canvas id="dust"></canvas>
 

@@ -6258,7 +6258,12 @@ def _watch_core(ctl):
         pass
     _ENC_SAFE[0] = bool(SETTINGS.get("safe_capture", False))
     _migrate_library_layout() # shelve any flat legacy recordings first
-    _sweep_orphan_temp()      # clear scratch left by a crash/force-kill last time
+    # Housekeeping, NOT a boot step. Since the scratch can live on another
+    # drive, this walks the new cache AND the legacy one beside the library -
+    # and that legacy folder can hold tens of thousands of files on a spinning
+    # disk, which is exactly how long the tome took to appear. It blocks
+    # nothing, so let it run behind the window.
+    threading.Thread(target=_sweep_orphan_temp, daemon=True).start()
     resolve_encoder()
     gb_hr = SETTINGS["bitrate_mbps"] / 8 * 3600 / 1024
     log(f"Watching ({SETTINGS['detection_mode']}). {SETTINGS['framerate']}fps "
