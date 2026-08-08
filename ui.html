@@ -833,7 +833,7 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 .vbtn.on{color:var(--gold-hi);background:rgba(232,181,99,.18)}
 .vbtn:disabled,.vbtn:disabled:hover{opacity:.26;cursor:default;color:#e3cfa2;background:transparent}
 #vdel.arm{color:#ffd9d0;background:rgba(200,60,40,.30);width:auto;padding:0 10px;font-size:12px;font-weight:700;letter-spacing:.03em}
-#vseekcol{flex:1;min-width:240px;max-width:560px;display:flex;flex-direction:column;gap:3px}
+#vseekcol{flex:1;min-width:240px;max-width:560px;display:flex;flex-direction:column-reverse;gap:4px}
 #vseekwrap{position:relative;width:100%;display:block;line-height:0}
 /* THE OVERVIEW: the whole recording as one thin strip, always. The lit box is
    the slice the big bar below is showing, so a 7-hour session never loses its
@@ -879,7 +879,7 @@ body.vfull #vover{height:12px}
 .edseg.keep{background:rgba(120,205,120,.32);border-color:rgba(150,230,150,.75)}
 .edseg.cut{background:rgba(222,92,72,.34);border-color:rgba(242,120,100,.8)}
 .edseg.sel{box-shadow:0 0 0 1px #fff,0 0 9px rgba(255,255,255,.45);z-index:3}
-.edh{position:absolute;top:50%;width:12px;height:23px;transform:translate(-50%,-50%);border-radius:4px;cursor:ew-resize;z-index:4;pointer-events:auto;
+.edh{position:absolute;top:50%;width:7px;height:21px;transform:translate(-50%,-50%);border-radius:3px;cursor:ew-resize;z-index:5;pointer-events:auto;
   background:linear-gradient(180deg,var(--gold-hi),var(--gold));box-shadow:0 0 0 1px rgba(60,40,10,.7),0 0 9px rgba(232,181,99,.5)}
 #vtime{font:600 11px var(--ui);color:#bda87c;min-width:86px;text-align:center;
   font-variant-numeric:tabular-nums;flex:0 0 auto}
@@ -1426,7 +1426,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.08'};},
+      webhook:true,version:'2.09'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1465,7 +1465,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.08'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.09'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3626,12 +3626,18 @@ function tlTimeAt(clientX){
 }
 /* the window scrolls like a viewport: it only re-centres when the playhead
    nears an edge, so the bar is not yanked out from under your pointer */
+function tlPage(t){                 /* the page of the recording holding t */
+  const d=tlDur(), z=+(V.zoom||0);
+  if(!d||!z||z>=d)return null;
+  return Math.max(0,Math.min(Math.floor(t/z)*z,Math.max(0,d-z)));
+}
 function tlFollow(force){
   const d=tlDur(), z=+(V.zoom||0);
   if(!d||!z||z>=d){ V.winA=null; return; }
   const t=(($('#vvideo')||{}).currentTime)||0, win=tlWin();
-  if(force||t<win.a+z*0.06||t>win.b-z*0.06)
-    V.winA=Math.max(0,Math.min(t-z/2,d-z));
+  /* PAGES, not a sliding centre: land inside the 30 minutes and you start at
+     the START of those 30 minutes, and the view only turns when you leave. */
+  if(force||t<win.a||t>=win.b)V.winA=tlPage(t);
 }
 function tlPaint(){
   const vd=$('#vvideo'), d=tlDur(), win=tlWin();
@@ -3682,13 +3688,40 @@ function layEd(){
     const b=el('div','edseg '+(V.ed.mode==='keep'?'keep':'cut')+(i===V.ed.sel?' sel':''));
     const x=edPx(s.a),y=edPx(s.b);
     b.style.left=x+'px'; b.style.width=Math.max(2,y-x)+'px';
-    b.addEventListener('pointerdown',ev=>{ if(ev.target.classList.contains('edh'))return; V.ed.sel=i; layEd(); });
+    b.title=fmtT(s.a)+' \u2192 '+fmtT(s.b)+'  \u00b7  '+fmtT(s.b-s.a)
+      +' long\ndrag to move \u00b7 drag an end to trim';
+    b.addEventListener('pointerdown',ev=>{
+      if(ev.target.classList.contains('edh'))return;
+      /* select WITHOUT rebuilding: layEd() wipes #vsegs, which would delete
+         the very node this drag is attached to (and kill pointer capture) */
+      V.ed.sel=i;
+      box.querySelectorAll('.edseg').forEach((q,j)=>q.classList.toggle('sel',j===i));
+      edLabel();
+      /* DRAG THE WHOLE PIECE. Trimming both ends one at a time just to shift a
+         clip two minutes later is nobody's idea of an editor. */
+      const seg=V.ed.segs[i], x0=ev.clientX, a0=seg.a, len=seg.b-seg.a;
+      const wrapW=Math.max(1,$('#vseekwrap').getBoundingClientRect().width-14);
+      const bb=b;                       /* the node that got the pointerdown */
+      const move=e2=>{
+        const dt=((e2.clientX-x0)/wrapW)*tlWin().len;
+        seg.a=clamp(a0+dt,0,Math.max(0,edDur()-len)); seg.b=seg.a+len;
+        edRepos();
+        if(bb)bb.title=fmtT(seg.a)+' \u2192 '+fmtT(seg.b)+'  \u00b7  '+fmtT(len)+' long';
+        edLabel();};
+      const up=()=>{ try{bb.releasePointerCapture(ev.pointerId);}catch(_){}
+        bb.removeEventListener('pointermove',move);bb.removeEventListener('pointerup',up);
+        layEd(); };
+      try{bb.setPointerCapture(ev.pointerId);}catch(_){}
+      bb.addEventListener('pointermove',move); bb.addEventListener('pointerup',up);
+      ev.preventDefault();});
     box.append(b);
   });
   const sg=V.ed.segs[V.ed.sel];
-  if(sg){ ['a','b'].forEach(k=>{ const h=el('div','edh'); h.dataset.k=k; h.style.left=edPx(sg[k])+'px'; box.append(h); }); }
-  const keeps=editKeeps(), tot=keeps.reduce((n,s)=>n+(s.b-s.a),0);
-  $('#vedsurv').textContent=keeps.length?`keeps ${keeps.length} piece${keeps.length>1?'s':''} · ${fmtT(tot)}`:'nothing kept';
+  if(sg){ ['a','b'].forEach(k=>{ const h=el('div','edh'); h.dataset.k=k;
+    h.style.left=edPx(sg[k])+'px';
+    h.title=(k==='a'?'start ':'end ')+fmtT(sg[k])+' - drag to trim';
+    box.append(h); }); }
+  edLabel();
   $('#vedkeep').classList.toggle('on',V.ed.mode==='keep');
   $('#vedcut').classList.toggle('on',V.ed.mode==='remove');
 }
@@ -3700,8 +3733,16 @@ function edRepos(){
   V.ed.segs.forEach((s,i)=>{ const b=bands[i]; if(b){ const x=edPx(s.a); b.style.left=x+'px'; b.style.width=Math.max(2,edPx(s.b)-x)+'px'; } });
   const hs=box.querySelectorAll('.edh'), sg=V.ed.segs[V.ed.sel];
   if(sg&&hs.length>=2){ hs[0].style.left=edPx(sg.a)+'px'; hs[1].style.left=edPx(sg.b)+'px'; }
-  const keeps=editKeeps(), tot=keeps.reduce((n,s)=>n+(s.b-s.a),0);
-  $('#vedsurv').textContent=keeps.length?`keeps ${keeps.length} piece${keeps.length>1?'s':''} · ${fmtT(tot)}`:'nothing kept';
+  edLabel();
+}
+function edLabel(){
+  const sg=V.ed.segs[V.ed.sel], n=V.ed.segs.length;
+  const keeps=editKeeps(), tot=keeps.reduce((q,x)=>q+(x.b-x.a),0);
+  const out=$('#vedsurv'); if(!out)return;
+  if(!n||!sg){ out.textContent='nothing marked yet - press start, then end'; return; }
+  out.textContent=fmtT(sg.a)+' \u2192 '+fmtT(sg.b)+' \u00b7 '+fmtT(sg.b-sg.a)
+    +(n>1?'  (piece '+(V.ed.sel+1)+'/'+n+')':'')
+    +'   \u00b7   result '+fmtT(tot);
 }
 function edPreviewSeg(){ const vd=$('#vvideo'),s=V.ed.segs[V.ed.sel]; if(!s)return; V.ed.preview=true;
   try{vd.currentTime=s.a;vd.play().catch(()=>{});}catch(e){} }
@@ -3869,7 +3910,7 @@ function wireViewer(){
     const t=clamp((e.clientX-r.left)/Math.max(1,r.width),0,1)*d;
     try{vd.currentTime=t;}catch(err){}
     if(V.ed&&V.ed.on)V.ed.preview=false;
-    tlFollow(true); tlPaint(); e.preventDefault(); });
+    V.winA=tlPage(t); tlPaint(); e.preventDefault(); });
   /* wheel over the bar = fine scrub, scaled to what the bar is showing */
   const scol=$('#vseekcol');
   if(scol)scol.addEventListener('wheel',e=>{
@@ -3940,23 +3981,36 @@ function wireViewer(){
       edUI(false); return; }
     const t=vd.currentTime||0;
     V.ed.mode='keep'; V.ed.sel=0; V.ed.busy=false; V.ed.confirm=false;
-    V.ed.segs=[{a:clamp(t-6,0,Math.max(0,vd.duration-1)),b:clamp(t+6,1,vd.duration)}];
+    V.ed.segs=[];                       /* nothing marked - you decide */
     $('#veddisc').style.display=S.hasWebhook?'':'none';
     edUI(true);
-    whisper('mark pieces, pick Keep or Remove, then Save');});
+    whisper('play to the start and press start, then to the end and press end');});
   $('#vedkeep').addEventListener('click',()=>{V.ed.mode='keep';layEd();});
   $('#vedcut').addEventListener('click',()=>{V.ed.mode='remove';layEd();});
   $('#vedadd').addEventListener('click',()=>{
-    const t=vd.currentTime||0;
-    V.ed.segs.push({a:clamp(t-4,0,Math.max(0,vd.duration-1)),b:clamp(t+4,1,vd.duration)});
-    V.ed.sel=V.ed.segs.length-1; layEd();});
+    const t=vd.currentTime||0, d=vd.duration||0;
+    /* sized against what the BAR shows, so a new piece is always something you
+       can see and grab - eight seconds is invisible on a seven-hour bar */
+    const span=Math.max(2,tlWin().len*0.06);
+    V.ed.segs.push({a:clamp(t,0,Math.max(0,d-0.5)),b:clamp(t+span,0.5,d)});
+    V.ed.sel=V.ed.segs.length-1; layEd(); whisper('piece added at the playhead');});
   $('#veddel').addEventListener('click',()=>{
     if(V.ed.segs.length<=1){whisper('keep at least one piece');return;}
     V.ed.segs.splice(V.ed.sel,1); V.ed.sel=Math.max(0,V.ed.sel-1); layEd();});
-  $('#vedsetA').addEventListener('click',()=>{const s=V.ed.segs[V.ed.sel];if(!s)return;
-    s.a=clamp(Math.min(vd.currentTime,s.b-0.3),0,vd.duration);edPreviewSeg();layEd();});
-  $('#vedsetB').addEventListener('click',()=>{const s=V.ed.segs[V.ed.sel];if(!s)return;
-    s.b=clamp(Math.max(vd.currentTime,s.a+0.3),0,vd.duration);edPreviewSeg();layEd();});
+  /* Marking an edge NEVER collapses the piece. Putting the start after the
+     end simply swaps them, so the piece spans the two points you actually
+     chose instead of shrinking to a second stranded behind the playhead. */
+  const edEdge=(which)=>{
+    const t=clamp(vd.currentTime||0,0,vd.duration||0);
+    let s=V.ed.segs[V.ed.sel];
+    if(!s){ s={a:t,b:t}; V.ed.segs.push(s); V.ed.sel=V.ed.segs.length-1; }
+    s[which]=t;
+    if(s.b<s.a){ const q=s.a; s.a=s.b; s.b=q; }
+    if(s.b-s.a<0.05)s.b=Math.min((vd.duration||0),s.a+0.05);
+    layEd();
+    whisper((which==='a'?'start ':'end ')+fmtT(s[which])+' - piece '+fmtT(s.b-s.a));};
+  $('#vedsetA').addEventListener('click',()=>edEdge('a'));
+  $('#vedsetB').addEventListener('click',()=>edEdge('b'));
   $('#vedcancel').addEventListener('click',()=>edUI(false));
   $('#vedsave').addEventListener('click',()=>edStart(false,false));
   $('#veddisc').addEventListener('click',()=>edStart(false,true));
