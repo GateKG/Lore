@@ -824,7 +824,7 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 #vtitle{order:2;margin-bottom:8px;font-family:var(--serif);font-size:14px;color:#d6c8a4;letter-spacing:.05em;
   max-width:90vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   text-shadow:0 2px 8px rgba(0,0,0,.8)}   /* order:2 + small margin-bottom -> details sit as a tight group DIRECTLY ABOVE the toolbar */
-#vbar{order:3;display:flex;align-items:center;gap:12px;padding:9px 16px;border-radius:22px;
+#vbar{order:3;display:flex;align-items:center;gap:12px;padding:9px 16px;border-radius:22px;width:100%;box-sizing:border-box;
   background:rgba(16,11,6,.82);box-shadow:0 6px 22px rgba(0,0,0,.5),
     0 0 0 1px rgba(200,160,95,.35);backdrop-filter:blur(3px);max-width:88vw}
 .vbtn{border:0;background:transparent;color:#e3cfa2;font-size:16px;cursor:pointer;
@@ -833,7 +833,7 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 .vbtn.on{color:var(--gold-hi);background:rgba(232,181,99,.18)}
 .vbtn:disabled,.vbtn:disabled:hover{opacity:.26;cursor:default;color:#e3cfa2;background:transparent}
 #vdel.arm{color:#ffd9d0;background:rgba(200,60,40,.30);width:auto;padding:0 10px;font-size:12px;font-weight:700;letter-spacing:.03em}
-#vseekcol{flex:1;min-width:240px;max-width:560px;display:flex;flex-direction:column-reverse;gap:4px}
+#vseekcol{flex:1;min-width:240px;max-width:none;display:flex;flex-direction:column-reverse;gap:4px}
 #vseekwrap{position:relative;width:100%;display:block;line-height:0}
 /* THE OVERVIEW: the whole recording as one thin strip, always. The lit box is
    the slice the big bar below is showing, so a 7-hour session never loses its
@@ -842,9 +842,10 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
   background:linear-gradient(180deg,rgba(60,44,22,.85),rgba(38,27,13,.9));
   border:1px solid rgba(140,110,70,.4);overflow:hidden}
 #vover.on{display:block}
-#voverwin{position:absolute;top:0;bottom:0;min-width:3px;border-radius:4px;
-  background:rgba(232,181,99,.32);border:1px solid rgba(232,181,99,.75);
-  box-sizing:border-box;pointer-events:none}
+#voverwin{position:absolute;top:0;bottom:0;min-width:6px;border-radius:4px;
+  background:rgba(232,181,99,.32);border:1px solid rgba(232,181,99,.8);
+  box-sizing:border-box;pointer-events:auto;cursor:grab}
+#voverwin:active{cursor:grabbing;background:rgba(232,181,99,.45)}
 #voverhead{position:absolute;top:-1px;bottom:-1px;width:2px;background:#fff2d4;
   box-shadow:0 0 5px rgba(255,235,190,.9);pointer-events:none}
 #vzoom{font:600 10.5px var(--ui);color:#e8cf9c;background:rgba(40,29,14,.9);
@@ -1426,7 +1427,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.09'};},
+      webhook:true,version:'2.10'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1465,7 +1466,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.09'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.10'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3549,6 +3550,9 @@ async function toggleFullscreenTrue(){   /* TRUE OS fullscreen: the whole monito
        are still in the un-consumed enter state (a fast Esc mid-RPC already cleared it) */
     if(ok===false&&V.vfsTrue){ V.vfsTrue=false; document.body.classList.remove('vfull'); } } }catch(e){ V.vfsTrue=false; }
   setTimeout(()=>{try{sendShape();}catch(e){}},70);   /* re-silhouette to a full rect once the window resized */
+  /* entering OS fullscreen rebuilds the window and the page loses the
+     keyboard, so Esc was never reaching us. Take focus back. */
+  setTimeout(()=>{try{window.focus();document.body.focus();}catch(e){}},90);
   armIdleHide();
 }
 function exitTheater(){
@@ -3556,6 +3560,7 @@ function exitTheater(){
   if(document.body.classList.contains('vfull')){
     document.body.classList.remove('vfull');
     if(V.vfsTrue){ V.vfsTrue=false; try{api.toggle_fullscreen&&api.toggle_fullscreen();}catch(e){} setTimeout(()=>{try{sendShape();}catch(e){}},70); }
+    setTimeout(()=>{try{window.focus();document.body.focus();}catch(e){}},90);
   }
   /* belt-and-suspenders: if any stray HTML fullscreen ever got set, drop it so it
      can't linger over the page and eat clicks */
@@ -3626,10 +3631,10 @@ function tlTimeAt(clientX){
 }
 /* the window scrolls like a viewport: it only re-centres when the playhead
    nears an edge, so the bar is not yanked out from under your pointer */
-function tlPage(t){                 /* the page of the recording holding t */
+function tlPage(t){    /* the window BEGINS at t - where you actually clicked */
   const d=tlDur(), z=+(V.zoom||0);
   if(!d||!z||z>=d)return null;
-  return Math.max(0,Math.min(Math.floor(t/z)*z,Math.max(0,d-z)));
+  return Math.max(0,Math.min(t,Math.max(0,d-z)));
 }
 function tlFollow(force){
   const d=tlDur(), z=+(V.zoom||0);
@@ -3907,7 +3912,23 @@ function wireViewer(){
   if(ov)ov.addEventListener('pointerdown',e=>{
     const d=tlDur(); if(!d)return;
     const r=ov.getBoundingClientRect();
-    const t=clamp((e.clientX-r.left)/Math.max(1,r.width),0,1)*d;
+    const z=+(V.zoom||0);
+    const at=x=>clamp((x-r.left)/Math.max(1,r.width),0,1)*d;
+    const box=$('#voverwin');
+    const onBox=z&&z<d&&e.target===box;
+    if(onBox){
+      /* DRAG THE WINDOW along the recording - the same gesture as the green
+         piece, so the strip is something you steer, not just a picture */
+      const x0=e.clientX, a0=tlWin().a;
+      const move=e2=>{ V.winA=clamp(a0+((e2.clientX-x0)/Math.max(1,r.width))*d,0,Math.max(0,d-z));
+        tlPaint(); };
+      const up=()=>{ try{ov.releasePointerCapture(e.pointerId);}catch(_){}
+        ov.removeEventListener('pointermove',move); ov.removeEventListener('pointerup',up); };
+      try{ov.setPointerCapture(e.pointerId);}catch(_){}
+      ov.addEventListener('pointermove',move); ov.addEventListener('pointerup',up);
+      e.preventDefault(); return;
+    }
+    const t=at(e.clientX);
     try{vd.currentTime=t;}catch(err){}
     if(V.ed&&V.ed.on)V.ed.preview=false;
     V.winA=tlPage(t); tlPaint(); e.preventDefault(); });
