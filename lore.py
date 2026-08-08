@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.29"
+APP_VERSION = "2.30"
 
 try:
     import psutil
@@ -10549,15 +10549,46 @@ class _JsApi:
                         log(f"{sz / 1048576:.0f} MB is over the {cap:.0f} MB cap; "
                             f"re-encoding at {nkb} kbps.")
                         fit = tmp_final + ".fit.mp4"
-                        rc = subprocess.run(
+                        # Popen, not run: a blocking call cannot notice Stop,
+                        # so pressing it during a squeeze did nothing until the
+                        # encode finished on its own - which on a long clip is
+                        # the better part of an hour.
+                        fp = subprocess.Popen(
                             [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
                              "-loglevel", "error", "-i", tmp_final,
                              "-vf", _cap_vf(vf0, nkb), "-c:v", enc, "-b:v", f"{nkb}k",
                              "-maxrate", f"{int(nkb * 1.1)}k",
                              "-bufsize", f"{int(nkb * 2)}k",
-                             "-c:a", "aac", "-b:a", "128k", fit],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=flags, timeout=3600).returncode
+                             "-c:a", "aac", "-b:a", "128k",
+                             "-progress", "pipe:1", "-nostats", fit],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            creationflags=flags, text=True, bufsize=1)
+                        try:
+                            for line in fp.stdout:
+                                if _EDIT_JOB["cancel"]:
+                                    try:
+                                        fp.kill()
+                                        fp.wait(timeout=5)
+                                    except Exception:
+                                        pass
+                                    break
+                                if line.startswith("out_time_us=") and total > 0:
+                                    try:
+                                        done_s = int(line.split("=", 1)[1]) / 1e6
+                                        _EDIT_JOB["pct"] = int(
+                                            94 + max(0, min(5, done_s / total * 5)))
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        fp.wait()
+                        rc = fp.returncode
+                        if _EDIT_JOB["cancel"]:
+                            try:
+                                os.remove(fit)
+                            except OSError:
+                                pass
+                            raise _EditCancelled()
                         if rc == 0 and os.path.isfile(fit) and os.path.getsize(fit) > 10_000:
                             os.replace(fit, tmp_final)
                         else:
