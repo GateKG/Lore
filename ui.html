@@ -3859,6 +3859,9 @@ function tlPaint(){
     const f=clamp((((vd&&vd.currentTime)||0)-win.a)/win.len,0,1);
     $('#vseek').value=Math.round(f*1000);
   }
+  /* anchoring only means something when the bar shows a SLICE - with the
+     whole recording on screen there is nothing to move it to */
+  const hb=$('#vhere'); if(hb)hb.style.display=win.full?'none':'';
   if(typeof _hlPlace==='function'&&_hlPlace)_hlPlace();
   if(V.ed&&V.ed.on)edRepos();
 }
