@@ -832,7 +832,30 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 .vbtn.on{color:var(--gold-hi);background:rgba(232,181,99,.18)}
 .vbtn:disabled,.vbtn:disabled:hover{opacity:.26;cursor:default;color:#e3cfa2;background:transparent}
 #vdel.arm{color:#ffd9d0;background:rgba(200,60,40,.30);width:auto;padding:0 10px;font-size:12px;font-weight:700;letter-spacing:.03em}
-#vseekwrap{position:relative;flex:1;min-width:240px;max-width:560px;display:flex;align-items:center}
+#vseekcol{flex:1;min-width:240px;max-width:560px;display:flex;flex-direction:column;gap:3px}
+#vseekwrap{position:relative;width:100%;display:flex;align-items:center}
+/* THE OVERVIEW: the whole recording as one thin strip, always. The lit box is
+   the slice the big bar below is showing, so a 7-hour session never loses its
+   "where am I" while the bar is zoomed into 30 seconds of it. */
+#vover{position:relative;height:9px;border-radius:5px;cursor:pointer;display:none;
+  background:linear-gradient(180deg,rgba(60,44,22,.85),rgba(38,27,13,.9));
+  border:1px solid rgba(140,110,70,.4);overflow:hidden}
+#vover.on{display:block}
+#voverwin{position:absolute;top:0;bottom:0;min-width:3px;border-radius:4px;
+  background:rgba(232,181,99,.32);border:1px solid rgba(232,181,99,.75);
+  box-sizing:border-box;pointer-events:none}
+#voverhead{position:absolute;top:-1px;bottom:-1px;width:2px;background:#fff2d4;
+  box-shadow:0 0 5px rgba(255,235,190,.9);pointer-events:none}
+#vzoom{font:600 10.5px var(--ui);color:#e8cf9c;background:rgba(40,29,14,.9);
+  border:1px solid rgba(140,110,70,.5);border-radius:11px;padding:3px 6px;
+  outline:none;cursor:pointer;flex:0 0 auto}
+#vzoom option{background:#241a0c;color:#e8cf9c}
+/* FULLSCREEN: the timeline is the whole point of fullscreen for a long
+   recording - let it use the width instead of staying in its 560px box.
+   On a 5120px screen that alone is ~9x the pointing precision. */
+body.vfull #vbar{max-width:none;width:96vw}
+body.vfull #vseekcol{max-width:none}
+body.vfull #vover{height:12px}
 .hlmark{position:absolute;top:-7px;width:2px;height:7px;border-radius:1px;
   background:var(--gold);opacity:.85;cursor:pointer;z-index:3;box-sizing:border-box}
 .hlmark:hover{background:var(--gold-hi);height:9px;top:-9px}
@@ -1084,11 +1107,21 @@ body.reduced #intro{display:none}
   </div>
   <div id="vbar">
     <button class="vbtn" id="vplay" title="Play / pause">▮▮</button>
-    <div id="vseekwrap">
-      <input type="range" id="vseek" min="0" max="1000" value="0">
-      <div id="vsegs"></div>
+    <div id="vseekcol">
+      <div id="vover" title="The whole recording - click to jump, drag the lit box"><div id="voverwin"></div><div id="voverhead"></div></div>
+      <div id="vseekwrap">
+        <input type="range" id="vseek" min="0" max="1000" value="0">
+        <div id="vsegs"></div>
+      </div>
     </div>
-    <div id="vtime">0:00 / 0:00</div>
+    <div id="vtime" title="Click to type an exact time">0:00 / 0:00</div>
+    <select id="vzoom" title="How much of the recording the bar shows">
+      <option value="0">whole</option>
+      <option value="1800">30 min</option>
+      <option value="600">10 min</option>
+      <option value="120">2 min</option>
+      <option value="30">30 sec</option>
+    </select>
     <input type="range" id="vvol" min="0" max="100" value="80" title="Volume">
     <button class="vbtn" id="vtrim" title="Edit — keep or cut out pieces">✂</button>
     <button class="vbtn" id="vsay" title="What was said — click any line to jump there">❝</button>
@@ -1389,7 +1422,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.06'};},
+      webhook:true,version:'2.07'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1428,7 +1461,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.06'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.07'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3431,10 +3464,11 @@ async function renderHlMarks(vid,req){
        each end, which pushed the late marks past the end of the track. */
     const W=wrap.getBoundingClientRect().width;
     if(W<20)return;
-    const track=W-14;
+    const win=tlWin();
     keep.sort((a,b)=>a.t-b.t).forEach(ev=>{
+      if(ev.t<win.a-0.5||ev.t>win.b+0.5)return;   /* outside the shown slice */
       const m=el('div','hlmark');
-      m.style.left=Math.round(7+Math.min(1,Math.max(0,ev.t/d))*track-1)+'px';
+      m.style.left=Math.round(tlPx(ev.t)-1)+'px';
       m.title='a loud moment — jump there';
       m.addEventListener('click',()=>{try{vd.currentTime=Math.max(0,ev.t-2);}catch(e){}});
       wrap.append(m);
@@ -3563,7 +3597,57 @@ function edReset(){
   V.ed={on:false,mode:'keep',segs:[],sel:0,busy:false,confirm:false,preview:false,wasReplace:false,_pt:null};
 }
 function edDur(){ const d=$('#vvideo').duration; return (d&&isFinite(d))?d:0; }
-function edPx(t){ const w=$('#vseekwrap').getBoundingClientRect(); return clamp(t/(edDur()||1),0,1)*(w.width-14)+7; }
+/* ================= the timeline ==================
+   The bar used to be the WHOLE recording, always. On a seven-hour session
+   that is ~57 seconds per pixel: a one-pixel twitch jumps half an hour, and
+   marking a three-minute clip is hopeless. So the bar now shows a WINDOW of
+   the recording (30s / 2m / 10m / 30m / whole) and the thin strip above it
+   keeps the whole thing in view, with the lit box showing where you are. */
+function tlDur(){ const vd=$('#vvideo'); const d=vd&&vd.duration; return (d&&isFinite(d))?d:0; }
+function tlWin(){
+  const d=tlDur(), z=+(V.zoom||0);
+  if(!d)return {a:0,b:1,len:1,full:true};
+  if(!z||z>=d)return {a:0,b:d,len:d,full:true};
+  let a=(V.winA==null)?((($('#vvideo')||{}).currentTime||0)-z/2):V.winA;
+  a=Math.max(0,Math.min(a,d-z));
+  return {a:a,b:a+z,len:z,full:false};
+}
+function tlPx(t){
+  const w=$('#vseekwrap').getBoundingClientRect(), W=Math.max(1,w.width-14), win=tlWin();
+  return clamp((t-win.a)/win.len,0,1)*W+7;
+}
+function tlTimeAt(clientX){
+  const w=$('#vseekwrap').getBoundingClientRect(), win=tlWin();
+  return win.a+clamp((clientX-w.left-7)/Math.max(1,w.width-14),0,1)*win.len;
+}
+/* the window scrolls like a viewport: it only re-centres when the playhead
+   nears an edge, so the bar is not yanked out from under your pointer */
+function tlFollow(force){
+  const d=tlDur(), z=+(V.zoom||0);
+  if(!d||!z||z>=d){ V.winA=null; return; }
+  const t=(($('#vvideo')||{}).currentTime)||0, win=tlWin();
+  if(force||t<win.a+z*0.06||t>win.b-z*0.06)
+    V.winA=Math.max(0,Math.min(t-z/2,d-z));
+}
+function tlPaint(){
+  const vd=$('#vvideo'), d=tlDur(), win=tlWin();
+  const ov=$('#vover'), wb=$('#voverwin'), hd=$('#voverhead');
+  if(ov){
+    ov.classList.toggle('on',!win.full&&d>0);
+    if(d>0){
+      wb.style.left=(win.a/d*100).toFixed(4)+'%';
+      wb.style.width=Math.max(0.35,win.len/d*100).toFixed(4)+'%';
+      hd.style.left=(((vd&&vd.currentTime)||0)/d*100).toFixed(4)+'%';
+    }
+  }
+  if(!V.seeking&&win.len>0){
+    const f=clamp((((vd&&vd.currentTime)||0)-win.a)/win.len,0,1);
+    $('#vseek').value=Math.round(f*1000);
+  }
+  if(typeof _hlPlace==='function'&&_hlPlace)_hlPlace();
+  if(V.ed&&V.ed.on)edRepos();
+}
+function edPx(t){ return tlPx(t); }
 function edMerge(list){
   const s=list.map(x=>({a:Math.max(0,x.a),b:Math.min(edDur(),x.b)})).filter(x=>x.b-x.a>=0.2).sort((p,q)=>p.a-q.a);
   const m=[]; for(const x of s){ if(m.length&&x.a<=m[m.length-1].b+0.02)m[m.length-1].b=Math.max(m[m.length-1].b,x.b); else m.push({a:x.a,b:x.b}); }
@@ -3698,7 +3782,31 @@ function sizeViewer(){
 function wireViewer(){
   const vd=$('#vvideo'),seek=$('#vseek'),play=$('#vplay'),time=$('#vtime');
   $('#vclose').addEventListener('click',closeViewer);
-  $('#viewer').addEventListener('click',e=>{if(e.target.id==='viewer')closeViewer();});
+  /* Clicking the dark surround closes the player - but a DRAG that happens to
+     start there is you moving the window, not asking to leave. Only a click
+     that stayed put counts. The top strip is also a drag handle for the OS
+     move loop, and double-clicking it goes fullscreen (matching the book,
+     where a double-click on the cover maximises the app). */
+  let _vdn=null;
+  $('#viewer').addEventListener('pointerdown',e=>{
+    if(e.target.id!=='viewer'){_vdn=null;return;}
+    _vdn={x:e.clientX,y:e.clientY,top:e.clientY<Math.max(64,innerHeight*0.13)};
+    if(_vdn.top&&e.button===0&&api&&api.begin_drag){
+      try{api.begin_drag();}catch(err){}     /* hand the window to the OS */
+    }
+  });
+  $('#viewer').addEventListener('click',e=>{
+    if(e.target.id!=='viewer')return;
+    const d=_vdn; _vdn=null;
+    if(!d)return;
+    if(Math.abs(e.clientX-d.x)>4||Math.abs(e.clientY-d.y)>4)return;  /* a drag */
+    if(d.top)return;                       /* the top strip is for moving */
+    closeViewer();
+  });
+  $('#viewer').addEventListener('dblclick',e=>{
+    if(e.target.id!=='viewer')return;
+    if(e.clientY<Math.max(64,innerHeight*0.13)){toggleFullscreenTrue();e.preventDefault();}
+  });
   $('#vext').addEventListener('click',()=>{const c=V.cur;closeViewer();if(c)api.open_video(c.path);});
   $('#vfolder').addEventListener('click',()=>{const c=V.cur;if(c){api.open_game_folder(c.path);whisper('opened this game’s folder');}});
   $('#vnext').addEventListener('click',()=>{const n=viewerSibling(1);if(n)openViewer(n);});
@@ -3732,15 +3840,52 @@ function wireViewer(){
        a paused scrub also fires timeupdate, and snapping that back to A made
        "set end here" collapse the whole selection to 0.3s */
     if(V.ed&&V.ed.on&&V.ed.preview&&!vd.paused&&!V.seeking){const s=V.ed.segs[V.ed.sel];if(s&&vd.currentTime>s.b-0.03)vd.currentTime=s.a;}
-    saidFollow(vd.currentTime);});
+    saidFollow(vd.currentTime);
+    tlFollow(); tlPaint();});
   seek.addEventListener('input',()=>{V.seeking=true;
-    if(vd.duration)time.textContent=`${fmtT(seek.value/1000*vd.duration)} / ${fmtT(vd.duration)}`;});
+    const w=tlWin();
+    if(vd.duration)time.textContent=`${fmtT(w.a+seek.value/1000*w.len)} / ${fmtT(vd.duration)}`;});
   seek.addEventListener('change',()=>{
-    if(vd.duration){const t=seek.value/1000*vd.duration;vd.currentTime=t;
+    if(vd.duration){const w=tlWin();const t=w.a+seek.value/1000*w.len;vd.currentTime=t;
       /* scrubbing past the cut end means "let me look" — pause the loop
          until the playhead is back inside the selection */
       if(V.ed&&V.ed.on)V.ed.preview=false;}
     V.seeking=false;});
+  /* zoom: how much of the recording the bar spans */
+  V.zoom=+(localStorage.getItem('lore.zoom')||0)||0; V.winA=null;
+  const zsel=$('#vzoom'); if(zsel)zsel.value=String(V.zoom);
+  if(zsel)zsel.addEventListener('change',()=>{
+    V.zoom=+zsel.value||0; try{localStorage.setItem('lore.zoom',String(V.zoom));}catch(e){}
+    tlFollow(true); tlPaint(); });
+  /* the overview strip: click anywhere in the whole recording to go there */
+  const ov=$('#vover');
+  if(ov)ov.addEventListener('pointerdown',e=>{
+    const d=tlDur(); if(!d)return;
+    const r=ov.getBoundingClientRect();
+    const t=clamp((e.clientX-r.left)/Math.max(1,r.width),0,1)*d;
+    try{vd.currentTime=t;}catch(err){}
+    if(V.ed&&V.ed.on)V.ed.preview=false;
+    tlFollow(true); tlPaint(); e.preventDefault(); });
+  /* wheel over the bar = fine scrub, scaled to what the bar is showing */
+  const scol=$('#vseekcol');
+  if(scol)scol.addEventListener('wheel',e=>{
+    const w=tlWin(); if(!tlDur())return;
+    const step=Math.max(1/60,w.len/60)*(e.shiftKey?5:1);
+    try{vd.currentTime=clamp((vd.currentTime||0)+(e.deltaY>0?step:-step),0,tlDur()-0.02);}catch(err){}
+    if(V.ed&&V.ed.on)V.ed.preview=false;
+    tlFollow(); tlPaint(); e.preventDefault(); e.stopPropagation(); },{passive:false});
+  /* type an exact time - the only sane way to land on 4:12:30 of seven hours */
+  $('#vtime').addEventListener('click',()=>{
+    const d=tlDur(); if(!d)return;
+    const cur=fmtT(vd.currentTime||0);
+    const ans=prompt('Go to (h:mm:ss, m:ss or seconds)',cur);
+    if(ans==null)return;
+    const parts=String(ans).trim().split(':').map(x=>parseFloat(x)||0);
+    let t=0; parts.forEach(p=>{t=t*60+p;});
+    if(!isFinite(t))return;
+    try{vd.currentTime=clamp(t,0,d-0.02);}catch(e){}
+    if(V.ed&&V.ed.on)V.ed.preview=false;
+    tlFollow(true); tlPaint(); });
   $('#vvol').addEventListener('input',()=>{vd.volume=(+$('#vvol').value)/100;});
   vd.addEventListener('error',()=>{
     if(!V.cur)return;
@@ -3774,6 +3919,10 @@ function wireViewer(){
       let t=(vd.currentTime||0)+(e.key==='ArrowLeft'?-jump:jump);
       t=Math.max(0,d!==null?Math.min(t,Math.max(0,d-0.02)):t);
       try{vd.currentTime=t;}catch(err){}
+      /* stepping out of the marked piece means "let me look" - otherwise the
+         preview loop yanks you straight back and the arrows appear dead */
+      if(V.ed&&V.ed.on)V.ed.preview=false;
+      tlFollow(); tlPaint();
     }
   },true);
   /* --- editor --- */
@@ -3817,7 +3966,7 @@ function wireViewer(){
     const k=h.dataset.k,s=V.ed.segs[V.ed.sel]; if(!s)return;
     try{h.setPointerCapture(e.pointerId);}catch(_){}
     const wrap=$('#vseekwrap').getBoundingClientRect();
-    const move=ev=>{ const f=clamp((ev.clientX-wrap.left-7)/(wrap.width-14),0,1),t=f*vd.duration;
+    const move=ev=>{ const t=tlTimeAt(ev.clientX);
       if(k==='a')s.a=Math.min(t,s.b-0.3); else s.b=Math.max(t,s.a+0.3); edRepos(); };
     const up=()=>{h.removeEventListener('pointermove',move);h.removeEventListener('pointerup',up);layEd();edPreviewSeg();};
     h.addEventListener('pointermove',move); h.addEventListener('pointerup',up);
