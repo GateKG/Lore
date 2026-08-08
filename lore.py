@@ -7832,9 +7832,13 @@ def _game_shelf(base, kind, make=True):
     """Where a recording belongs now: output_dir/<Game>/Videos for full
     sessions, output_dir/<Game>/Clips for clips - one tidy shelf per game
     (the user's library-organisation ask)."""
+    sub = ("Videos" if kind == "session"
+           # clips YOU cut in the player get their own shelf: a long session
+           # can spawn a dozen of them and they would bury the recording they
+           # came from. Hotkey clips are untouched - they stay in Clips.
+           else "Edits" if kind == "edit" else "Clips")
     d = os.path.join(SETTINGS.get("output_dir", ""),
-                     _safe_folder(_display_name(base)),
-                     "Videos" if kind == "session" else "Clips")
+                     _safe_folder(_display_name(base)), sub)
     if make:
         os.makedirs(d, exist_ok=True)
     return d
@@ -7855,6 +7859,7 @@ def _library_dirs(out):
                 continue
             pairs.append((os.path.join(d, "Videos"), "session"))
             pairs.append((os.path.join(d, "Clips"), "clip"))
+            pairs.append((os.path.join(d, "Edits"), "edit"))
     except Exception:
         pass
     pairs.append((out, "session"))
@@ -10109,7 +10114,7 @@ class _JsApi:
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         raw = _parse_clip_name(os.path.basename(p))
         base = raw.replace(" ", "")
-        out_dir = os.path.dirname(p) if replace else _game_shelf(raw, "clip")
+        out_dir = os.path.dirname(p) if replace else _game_shelf(raw, "edit")
         out = p if replace else os.path.join(out_dir, f"{base}_edit_{stamp}.mp4")
         job_id = f"edit_{stamp}"
         _EDIT_JOB.update({"id": job_id, "pct": 0, "phase": "starting",

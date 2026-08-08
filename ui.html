@@ -1807,7 +1807,8 @@ function renderVid(v,hue,delayIdx){
     <circle cx="20" cy="20" r="16" stroke="#3f4a63" stroke-width="1" stroke-dasharray="3 5"/>
     <circle cx="20" cy="20" r="8" stroke="#3f4a63" stroke-width="1"/></svg>`));
   fr.append(el('div','proj-glare'));
-  if(v.kind==='clip')fr.append(el('div','proj-kind','CLIP'));
+  if(v.kind==='edit')fr.append(el('div','proj-kind','EDIT'));
+  else if(v.kind==='clip')fr.append(el('div','proj-kind','CLIP'));
   const play=el('div','proj-play','<div class="ring"></div>');fr.append(play);
   if(v.badge){
     const b=el('div','proj-badge');
@@ -1989,8 +1990,8 @@ function renderContents(cL,cR,spreadIdx){
       m.append(el('div','vname',esc(v.gname)));
       m.append(el('div','vwhen',esc(fmtWhen(v.mtime))+' · '+esc(fmtSize(v.size))));
       r.append(m);
-      r.append(el('span','vtag '+(v.kind==='clip'?'clip':'session'),
-                  v.kind==='clip'?'CLIP':'SESSION'));
+      r.append(el('span','vtag '+(v.kind==='session'?'session':'clip'),
+                  v.kind==='edit'?'EDIT':(v.kind==='clip'?'CLIP':'SESSION')));
       r.addEventListener('click',()=>openViewer(v));
       r.title='Watch in the tome';
       list.append(r);loadThumb(v.path,img,v.mtime);
