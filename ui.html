@@ -1505,7 +1505,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.11'};},
+      webhook:true,version:'2.23'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1546,7 +1546,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.11'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.23'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -1903,11 +1903,15 @@ function renderVid(v,hue,delayIdx){
   const acts=el('div','proj-acts');
   const mkA=(txt,title,cls,fn)=>{const b=el('button',cls,txt);b.title=title;
     b.addEventListener('click',e=>{e.stopPropagation();fn();});acts.append(b);return b;};
-  const sel=mkA('▢','Select — pick several to send or burn together','selbtn',()=>toggleSel(v,p));
+  const sel=mkA('▢','Select — pick several to burn together','selbtn',()=>toggleSel(v,p));
   sel.setAttribute('aria-pressed','false');
   mkA('⧉','Open in your own player instead','',()=>api.open_video(v.path));
   mkA('◈','Show in folder','',()=>api.reveal(v.path));
-  if(S.hasWebhook)mkA('➤','Send to Discord','discord',()=>{api.post_discord(v.path);whisper('a herald carries it to Discord…');});
+  /* No "Send to Discord" on a memory. A webhook carries a few megabytes and
+     these are whole recordings - and even a minute-long clip is too much. The
+     keybind still catches a short clip and sends it, and the editor can fit a
+     clip to 25 MB deliberately. Offering a button that fails is worse than
+     not offering it. */
   mkA('🕮','Burn this memory','burn',()=>confirmBurn(v,p));
   fr.append(acts);
   p.append(fr);
@@ -1946,10 +1950,7 @@ function renderSelBar(){
   if(!bar){bar=el('div');bar.id='selbar';document.body.appendChild(bar);}
   bar.innerHTML='';const n=SEL.size;
   bar.append(el('span','selcount',n+' selected'));
-  if(S.hasWebhook){const s=el('button','selact','➤ Send all');
-    s.addEventListener('click',()=>{SEL.forEach(v=>api.post_discord(v.path));
-      whisper(n+' carried to Discord…');selClear();});
-    bar.append(s);}
+  /* "Send all" was the same promise multiplied - dropped for the same reason */
   const d=el('button','selact danger','🕮 Burn all');let armed=false,armT=null;
   d.addEventListener('click',()=>{
     if(!armed){armed=true;d.textContent='Burn '+n+' — tap again';
@@ -3711,9 +3712,10 @@ function drawLevels(){
   g.strokeStyle='rgba(255,226,166,.85)'; g.lineWidth=1; g.stroke();
   /* the pieces you marked, over the sound they cover */
   if(V.ed&&V.ed.on&&V.ed.segs.length){
-    g.fillStyle=V.ed.mode==='mute'?'rgba(120,180,255,.28)'
+    /* silence is a LAYER now, not a mode - colour by what is being marked */
+    g.fillStyle=V.ed.layer==='silence'?'rgba(120,180,255,.28)'
       :V.ed.mode==='remove'?'rgba(255,120,110,.25)':'rgba(150,255,170,.22)';
-    V.ed.segs.forEach(sg=>{
+    (V.ed.segs||[]).concat(V.ed.other||[]).forEach(sg=>{
       const x0=(sg.a-win.a)/win.len*w, x1=(sg.b-win.a)/win.len*w;
       if(x1>0&&x0<w)g.fillRect(Math.max(0,x0),0,Math.min(w,x1)-Math.max(0,x0),h);
     });
