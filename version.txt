@@ -4,8 +4,8 @@
 # Bump the version numbers here together with APP_VERSION / installer.iss.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 0, 23, 0),
-    prodvers=(2, 0, 23, 0),
+    filevers=(2, 0, 24, 0),
+    prodvers=(2, 0, 24, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
           '040904B0',
           [StringStruct('CompanyName', 'Gate'),
            StringStruct('FileDescription', 'LORE - the living tome'),
-           StringStruct('FileVersion', '2.0.23.0'),
+           StringStruct('FileVersion', '2.0.24.0'),
            StringStruct('InternalName', 'Lore'),
            StringStruct('LegalCopyright', 'Created by Gate'),
            StringStruct('OriginalFilename', 'Lore.exe'),
            StringStruct('ProductName', 'Lore'),
-           StringStruct('ProductVersion', '2.0.23.0')])
+           StringStruct('ProductVersion', '2.0.24.0')])
       ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

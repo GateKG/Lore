@@ -40,7 +40,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.23"
+APP_VERSION = "2.24"
 
 try:
     import psutil
@@ -8265,6 +8265,28 @@ def _ai_tick(ctl):
                 _AI["busy"] = None
         threading.Thread(target=work, daemon=True).start()
 
+    # SOMETHING ASKED FOR FIRST. The sweep walks newest-first through a
+    # thousand recordings, so the one you are looking at can be days down the
+    # queue. A forced path jumps the line and stops being forced the moment it
+    # has nothing left owing.
+    fp = _AI.get("force")
+    if fp:
+        try:
+            owed_stt = do_stt and not _ai_sidecar_fresh(fp, "stt")
+            owed_hl = do_hl and not _ai_sidecar_fresh(fp, "hl")
+            mt = os.path.getmtime(fp) if os.path.isfile(fp) else None
+        except OSError:
+            owed_stt = owed_hl = False
+            mt = None
+        if mt is None or not (owed_stt or owed_hl):
+            _AI["force"] = None            # done, or gone - back to the sweep
+        elif _AI["failed"].get(fp) == mt:
+            _AI["force"] = None            # it refused this exact file before
+            log(f"Cannot read {os.path.basename(fp)}; back to the usual order.")
+        else:
+            _spawn("hearing" if owed_stt else "marking", fp, mt)
+            return
+
     for p in vids:
         if _queued_finish_badge(p):
             continue                       # HDR master still awaiting SDR
@@ -9360,7 +9382,9 @@ class _JsApi:
                 why = "waiting for your edit"
             elif time.time() - _MEDIA.get("last_read", 0) < 20:
                 why = "waiting while you watch"
+        forced = _AI.get("force")
         out = {"stt_on": stt_on, "hl_on": hl_on, "whisper": have, "why": why,
+               "forced": (os.path.basename(forced) if forced else None),
                "busy": ({"kind": busy[0], "name": busy[1]} if busy else None)}
         c = _AI.get("_read")
         fresh = c and time.time() - c["t"] < 20
@@ -9391,6 +9415,26 @@ class _JsApi:
             return _search_words(str(query or ""))
         except Exception:
             return []
+
+    def prioritise(self, path):
+        """Put this recording at the FRONT of the reader's queue - the one you
+        are looking at now, rather than whatever the sweep happens to reach."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "unknown file"}
+        stt_left = bool(SETTINGS.get("ai_transcribe", True)
+                        and _whisper_paths() and not _ai_sidecar_fresh(p, "stt"))
+        hl_left = bool(SETTINGS.get("ai_highlights", True)
+                       and not _ai_sidecar_fresh(p, "hl"))
+        if not (stt_left or hl_left):
+            return {"ok": False, "why": "already done"}
+        _AI["force"] = p
+        _AI["failed"].pop(p, None)     # asking again clears an old refusal
+        if _AI.get("busy"):
+            _ai_abort()                # let go of the current one, take this
+        _AI["t_last"] = 0              # and start on the very next beat
+        log(f"Moved to the front of the queue: {os.path.basename(p)}")
+        return {"ok": True, "stt": stt_left, "hl": hl_left}
 
     def levels(self, path):
         """The recording's loudness curve: {dur, floor, peak, db[]} where db is

@@ -1197,6 +1197,7 @@ body.reduced #intro{display:none}
       <button class="vbtn" id="vtrim" title="Edit — keep, cut out or silence pieces">✂<span>Edit</span></button>
       <button class="vbtn" id="vsound" title="Show the sound levels along the timeline">◠<span>Sound</span></button>
       <button class="vbtn" id="vsay" title="What was said — click any line to jump there">❝<span>Words</span></button>
+      <button class="vbtn" id="vnow" title="Read and listen to THIS one next, ahead of the queue">⚡<span>Do this one now</span></button>
       <button class="vbtn" id="vnext" title="Next video">⏭<span>Next</span></button>
       <button class="vbtn" id="vfolder" title="Open this game's folder">📁<span>Folder</span></button>
       <button class="vbtn" id="vdel" title="Delete this video">🗑<span>Delete</span></button>
@@ -1505,7 +1506,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.23'};},
+      webhook:true,version:'2.24'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1516,6 +1517,7 @@ function makeMock(){
     pause_toggle:async()=>{st.status=st.status==='paused'?'recording':'paused';return true;},
     clip:async()=>true, clip_discord:async()=>true,
     open_video:async()=>true,reveal:async()=>true,open_game_folder:async()=>true,
+    prioritise:async()=>({ok:true,stt:true,hl:true}),
     levels:async()=>({dur:600,floor:-48,peak:-6,
       db:Array.from({length:1800},(_,i)=>-46+22*Math.abs(Math.sin(i/37))+(i%211<6?16:0))}),
     search_words:async()=>[],highlights:async()=>[],
@@ -1546,7 +1548,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.23'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.24'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -2296,8 +2298,12 @@ function workPlate(){
     try{ if(api.edit_status)ed=await api.edit_status(); }catch(e){}
     /* the reader */
     if(ai&&ai.busy)
-      set(rows.read,true,(ai.busy.kind==='hl'?'Listening for loud moments':'Reading a recording'),
+      set(rows.read,true,(ai.busy.kind==='hl'?'Listening for loud moments':'Reading a recording')
+            +(ai.forced?'  (asked for first)':''),
           String(ai.busy.name||'').replace(/\.mp4$/i,''),null,null);
+    else if(ai&&ai.forced)
+      set(rows.read,true,'Next up, asked for first',
+          String(ai.forced).replace(/\.mp4$/i,''),null,null);
     else if(ai&&!ai.whisper)
       set(rows.read,false,'The reader is not installed','',null,null);
     else
@@ -3692,7 +3698,9 @@ function drawLevels(){
   g.clearRect(0,0,w,h);
   if(!L||!L.db||!L.db.length||!d){
     g.fillStyle='rgba(214,199,172,.45)'; g.font='italic 10px Georgia,serif';
-    g.fillText(L===null?'listening to this one is still to come…':'no sound here',8,h/2+3);
+    g.fillText(L===null
+      ? 'not listened to yet — "Do this one now" in the ⋯ menu jumps the queue'
+      : 'no sound here',8,h/2+3);
     return;
   }
   const win=tlWin(), n=L.db.length, dur=L.dur||d;
@@ -4245,6 +4253,19 @@ function wireViewer(){
   document.addEventListener('click',e=>{
     if(!e.target.closest('#vmenu,#vmore'))menu.classList.remove('on');});
   /* the sound of the recording, along the timeline */
+  /* the sweep is newest-first through a thousand recordings, so the one in
+     front of you can be days away - this puts it at the front */
+  $('#vnow').addEventListener('click',async()=>{
+    if(!V.cur)return;
+    let r=null; try{ if(api.prioritise)r=await api.prioritise(V.cur.path); }catch(e){}
+    if(!r){whisper('this copy of LORE cannot reorder the queue');return;}
+    if(!r.ok){whisper(r.why==='already done'
+      ?'this one is already read and listened to'
+      :'could not move it to the front');return;}
+    whisper('next up: '+[r.stt?'reading':'',r.hl?'listening':''].filter(Boolean).join(' + ')
+      +' — follow it on Working');
+    setTimeout(()=>{ if(V.cur)loadLevels(V.cur).then(()=>drawLevels()); },1500);
+  });
   $('#vsound').addEventListener('click',async()=>{
     const c=$('#vlvl'); const on=!c.classList.contains('on');
     c.classList.toggle('on',on); $('#vsound').classList.toggle('on',on);
