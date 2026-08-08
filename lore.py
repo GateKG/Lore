@@ -10080,7 +10080,8 @@ class _JsApi:
         threading.Thread(target=work, daemon=True).start()
         return {"ok": True, "name": os.path.basename(out)}
 
-    def edit_video(self, path, segments, replace=False, to_discord=False):
+    def edit_video(self, path, segments, replace=False, to_discord=False,
+                   cap_mb=0):
         """The multi-part editor. `segments` is the list of [start,end] seconds to
         KEEP, in order (the UI turns a keep/remove choice into this list). Each
         piece is re-encoded to the user's current bitrate/encoder, the pieces are
@@ -10152,6 +10153,24 @@ class _JsApi:
                 os.makedirs(out_dir, exist_ok=True)
                 enc = _current_encoder()
                 br = int(SETTINGS.get("bitrate_mbps", 25))
+                # A SIZE CAP means: spend every bit the cap allows and not one
+                # more. Bits = bytes x 8 / seconds, minus the audio, minus a
+                # small margin for the container's own overhead. Copying is off
+                # the table here - fitting a size means re-encoding.
+                cap = 0
+                try:
+                    cap = max(0, float(cap_mb or 0))
+                except Exception:
+                    cap = 0
+                if cap > 0 and total > 0.5:
+                    AUDIO_KBPS = 128
+                    budget_bits = cap * 1024 * 1024 * 8 * 0.97   # 3% for the container
+                    vkbps = int(budget_bits / total / 1000) - AUDIO_KBPS
+                    vkbps = max(200, vkbps)                      # never below watchable
+                    br = max(1, int(round(vkbps / 1000.0)))
+                    _EDIT_JOB["cap_kbps"] = vkbps
+                    log(f"Fitting {total:.0f}s under {cap:.0f} MB: "
+                        f"{vkbps} kbps video + {AUDIO_KBPS} kbps audio.")
                 vf0 = "format=nv12"
                 trc = _probe_color_trc(p)
                 if _is_hdr_trc(trc):
@@ -10183,11 +10202,20 @@ class _JsApi:
                     # 4 seconds while recording, so a copy can start on one:
                     # instant, lossless, at most a few seconds of lead-in.
                     # An HDR piece still needs the tone-map, so that re-encodes.
-                    enc_args = ["-vf", vf0, "-c:v", enc,
-                                *encoder_quality_flags(enc, br),
-                                "-c:a", "aac", "-b:a", "192k"]
+                    if cap > 0:
+                        kb = int(_EDIT_JOB.get("cap_kbps") or (br * 1000))
+                        enc_args = ["-vf", vf0, "-c:v", enc,
+                                    "-b:v", f"{kb}k",
+                                    "-maxrate", f"{int(kb * 1.35)}k",
+                                    "-bufsize", f"{int(kb * 2.7)}k",
+                                    "-c:a", "aac", "-b:a", "128k"]
+                    else:
+                        enc_args = ["-vf", vf0, "-c:v", enc,
+                                    *encoder_quality_flags(enc, br),
+                                    "-c:a", "aac", "-b:a", "192k"]
                     copy_args = ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-                    can_copy = (vf0 == "format=nv12")
+                    # a cap can only be met by re-encoding
+                    can_copy = (vf0 == "format=nv12") and cap <= 0
                     cmd = [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
                            "-loglevel", "error",
                            "-ss", f"{s:.3f}", "-i", p, "-t", f"{seg_dur:.3f}",

@@ -869,6 +869,11 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
   border:1px solid rgba(140,110,70,.5);border-radius:11px;padding:3px 6px;
   outline:none;cursor:pointer;flex:0 0 auto}
 #vzoom option{background:#241a0c;color:#e8cf9c}
+#vedqual{font:600 11px var(--ui);color:#e8cf9c;background:rgba(40,29,14,.9);
+  border:1px solid rgba(140,110,70,.5);border-radius:11px;padding:4px 7px;
+  outline:none;cursor:pointer;flex:0 0 auto}
+#vedqual option{background:#241a0c;color:#e8cf9c}
+#vedsize{font:600 10.5px var(--ui);color:#bda87c;flex:0 0 auto;white-space:nowrap}
 /* FULLSCREEN: the timeline is the whole point of fullscreen for a long
    recording - let it use the width instead of staying in its 560px box.
    On a 5120px screen that alone is ~9x the pointing precision. */
@@ -1085,8 +1090,10 @@ body.reduced #intro{display:none}
 </div>
 <canvas id="dust"></canvas>
 
-<button class="pagenav" id="navPrev" title="Previous page (←)">‹</button>
-<button class="pagenav" id="navNext" title="Next page (→)">›</button>
+<!-- no title= here either: these sit over the closed cover, and the native
+     tooltip is what put a white "Previous page" bubble on the intro -->
+<button class="pagenav" id="navPrev">‹</button>
+<button class="pagenav" id="navNext">›</button>
 
 <div id="apron">
   <div id="mediatoggle"></div>
@@ -1168,6 +1175,13 @@ body.reduced #intro{display:none}
     <button class="wbtn" id="vedsetB" title="Move the selected piece's end to the playhead">end ⌝</button>
     <span id="vedsurv">—</span>
     <div class="sep"></div>
+    <select id="vedqual" title="How the saved clip is encoded">
+      <option value="0">Best quality</option>
+      <option value="500">Fit 500 MB</option>
+      <option value="100">Fit 100 MB</option>
+      <option value="25">Fit 25 MB · Discord</option>
+    </select>
+    <span id="vedsize">—</span>
     <button class="wbtn primary" id="vedsave" title="Save the result as a NEW clip — the original is untouched">💾 Save new</button>
     <button class="wbtn danger" id="vedrepl" title="Replace the original with your edit (asks first)">♻ Save &amp; replace</button>
     <button class="wbtn" id="veddisc" style="display:none" title="Save the result and post it to your Discord">📤 + Discord</button>
@@ -1468,7 +1482,7 @@ function makeMock(){
       busy:{kind:'stt',name:'mock_session_20260801.mp4'},
       total:1757,stt_done:412,hl_done:380}),
     delete_video:async()=>({ok:true}),post_discord:async()=>true,
-    edit_video:async()=>{window.__mockEd={pct:0,phase:'cutting',done:false,ok:false,name:'mock_edit.mp4'};return {ok:true,id:'m'};},
+    edit_video:async(p,segs,rep,disc,cap)=>{window.__mockEd={pct:0,phase:(cap>0?'squeezing':'cutting'),done:false,ok:false,name:'mock_edit.mp4',cap:cap||0};return {ok:true,id:'m'};},
     edit_status:async()=>{const m=window.__mockEd;if(!m)return{done:true,ok:false,pct:0,phase:''};
       if(!m.done){m.pct=Math.min(100,(m.pct||0)+30);m.phase=m.pct<94?'cutting':(m.pct<100?'stitching':'saving');
         if(m.pct>=100){m.done=true;m.ok=true;m.phase='done';}}return m;},
@@ -3211,15 +3225,16 @@ function paintTabs(){
   });
   const at=$('#apptabs');at.innerHTML='';
   /* 'Library' is gone: the contents ribbon opposite already goes home, and the
-     wordmark does too. The slot now shows what the tome is DOING. */
-  at.append(mkTab('Working',GOLD,cur==='set:work',openWork,
-    'Everything the tome is doing right now',false,'set:work'));
+     wordmark does too. Working sits at the END of the column, after the
+     settings pages, where its page also sits. */
   APPENDIX.forEach((a,i)=>{
-    if(a.key==='work')return;          /* it already crowns the column */
+    if(a.key==='work')return;          /* appended last, below */
     at.append(mkTab(a.rlabel,GEMS[i%GEMS.length],cur==='set:'+a.key,
       ()=>requestTurn(S.spreads.findIndex(sp=>sp.type==='set'&&sp.app.key===a.key)),
       a.title,false,'set:'+a.key));
   });
+  at.append(mkTab('Working',GOLD,cur==='set:work',openWork,
+    'Everything the tome is doing right now',false,'set:work'));
 }
 
 /* -------------------------------------------------- media filter toggle */
@@ -3857,9 +3872,34 @@ function edRepos(){
   if(sg&&hs.length>=2){ hs[0].style.left=edPx(sg.a)+'px'; hs[1].style.left=edPx(sg.b)+'px'; }
   edLabel();
 }
+/* MB the saved clip will take: the cap when there is one, otherwise the
+   recording's own bitrate. Discord's webhook only carries small files, so the
+   button for it appears only when the result would actually fit. */
+function edSizeMB(seconds){
+  const cap=+(($('#vedqual')||{}).value||0);
+  if(cap>0)return cap;
+  const mbps=+((S.settings&&S.settings.settings&&S.settings.settings.bitrate_mbps)||15);
+  return seconds*mbps/8;
+}
+const DISCORD_MB=25;      /* a webhook will not take more than this */
+function edSyncOut(seconds){
+  const mb=edSizeMB(seconds), cap=+(($('#vedqual')||{}).value||0);
+  const sz=$('#vedsize');
+  if(sz)sz.textContent=seconds>0
+    ?(cap>0?'≈ '+cap+' MB cap':'≈ '+(mb<1024?mb.toFixed(0)+' MB':(mb/1024).toFixed(1)+' GB'))
+    :'—';
+  const d=$('#veddisc');
+  if(d){
+    const fits=S.hasWebhook&&seconds>0&&mb<=DISCORD_MB;
+    d.style.display=fits?'':'none';
+    d.title=fits?'Save it and post it to your Discord'
+                :'Too large for a Discord webhook - choose "Fit 25 MB"';
+  }
+}
 function edLabel(){
   const sg=V.ed.segs[V.ed.sel], n=V.ed.segs.length;
   const keeps=editKeeps(), tot=keeps.reduce((q,x)=>q+(x.b-x.a),0);
+  edSyncOut(tot);
   const out=$('#vedsurv'); if(!out)return;
   if(!n||!sg){ out.textContent='nothing marked yet - press start, then end'; return; }
   out.textContent=fmtT(sg.a)+' \u2192 '+fmtT(sg.b)+' \u00b7 '+fmtT(sg.b-sg.a)
@@ -3893,7 +3933,8 @@ function edStart(replace,toDiscord){
   const ed=V.ed;   /* same generation trick as edPoll: a close-then-reopen while
                       edit_video is in flight must not pop the editor open on the
                       NEXT viewing session */
-  Promise.resolve(api.edit_video(c.path,segs,!!replace,!!toDiscord)).then(r=>{
+  const capMB=+(($('#vedqual')||{}).value||0);
+  Promise.resolve(api.edit_video(c.path,segs,!!replace,!!toDiscord,capMB)).then(r=>{
     if(ed!==V.ed)return;
     if(!(r&&r.ok)){ edFail((r&&r.why)||'could not start'); return; }
     edPoll();
@@ -4157,6 +4198,11 @@ function wireViewer(){
     whisper((which==='a'?'start ':'end ')+fmtT(s[which])+' - piece '+fmtT(s.b-s.a));};
   $('#vedsetA').addEventListener('click',()=>edEdge('a'));
   $('#vedsetB').addEventListener('click',()=>edEdge('b'));
+  const qsel=$('#vedqual');
+  if(qsel)qsel.addEventListener('change',()=>{ edLabel();
+    whisper(+qsel.value>0
+      ?'the clip will be squeezed to fit '+qsel.value+' MB, at the best quality that fits'
+      :'the clip keeps its original quality');});
   $('#vedcancel').addEventListener('click',()=>edUI(false));
   $('#vedsave').addEventListener('click',()=>edStart(false,false));
   $('#veddisc').addEventListener('click',()=>edStart(false,true));
@@ -4267,7 +4313,10 @@ function wireInput(){
     let lastDn=0,lastX=0,lastY=0;
     elx.addEventListener('pointerdown',async e=>{
       if(e.button!==0)return;
-      if(e.target.closest('button,.itab'))return;
+      /* #brand is a link home, not a place to grab the window: begin_drag
+         hands the mouse to the OS move loop, so the browser never sees the
+         button-up and the click never fires */
+      if(e.target.closest('button,.itab,#brand'))return;
       const now=performance.now();
       /* double-press needs the cursor to have STAYED PUT: a drag-drop-regrab
          within 400ms is two drags, not a maximize (the OS move loop eats the
