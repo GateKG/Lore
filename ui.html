@@ -1127,6 +1127,7 @@ body.reduced #intro{display:none}
       <option value="120">2 min</option>
       <option value="30">30 sec</option>
     </select>
+    <button class="vbtn" id="vhere" title="Anchor the timeline here - the window starts at the frame you are on">&#8676;</button>
     <input type="range" id="vvol" min="0" max="100" value="80" title="Volume">
     <button class="vbtn" id="vtrim" title="Edit — keep or cut out pieces">✂</button>
     <button class="vbtn" id="vsay" title="What was said — click any line to jump there">❝</button>
@@ -1427,7 +1428,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'2.10'};},
+      webhook:true,version:'2.11'};},
     signature:async()=>'mock',
     library:async()=>lib,
     thumb:async(p)=>mkThumb(hashStr(p)),
@@ -1466,7 +1467,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.10'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'2.11'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3845,13 +3846,13 @@ function wireViewer(){
       try{api.begin_drag();}catch(err){}     /* hand the window to the OS */
     }
   });
+  /* Clicking the surround does NOT close the player. It used to, and losing a
+     half-marked clip to a stray click beside the video is indefensible - the
+     way out is the ✕ or Esc, both of which are deliberate. The surround is
+     just somewhere to grab the window. */
   $('#viewer').addEventListener('click',e=>{
     if(e.target.id!=='viewer')return;
-    const d=_vdn; _vdn=null;
-    if(!d)return;
-    if(Math.abs(e.clientX-d.x)>4||Math.abs(e.clientY-d.y)>4)return;  /* a drag */
-    if(d.top)return;                       /* the top strip is for moving */
-    closeViewer();
+    _vdn=null;
   });
   $('#viewer').addEventListener('dblclick',e=>{
     if(e.target.id!=='viewer')return;
@@ -3952,6 +3953,14 @@ function wireViewer(){
     try{vd.currentTime=clamp(t,0,d-0.02);}catch(e){}
     if(V.ed&&V.ed.on)V.ed.preview=false;
     tlFollow(true); tlPaint(); });
+  /* found the frame? pin the window to it, so the whole bar is the stretch
+     that starts right here instead of wherever the view happened to be */
+  $('#vhere').addEventListener('click',()=>{
+    const d=tlDur(), z=+(V.zoom||0);
+    if(!d)return;
+    if(!z||z>=d){ whisper('pick a window first - 30 min, 10 min, 2 min or 30 sec'); return; }
+    V.winA=clamp(vd.currentTime||0,0,Math.max(0,d-z));
+    tlPaint(); whisper('timeline starts at '+fmtT(V.winA));});
   $('#vvol').addEventListener('input',()=>{vd.volume=(+$('#vvol').value)/100;});
   vd.addEventListener('error',()=>{
     if(!V.cur)return;
