@@ -2765,7 +2765,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.09'};},
+      webhook:true,version:'3.10'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2903,7 +2903,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.09'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.10'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -6581,6 +6581,12 @@ function renderSet(cL,cR,app,spreadIdx){
     row(L,'Devices changed?',rb);
     divider(R,'Mixing');
     row(R,'Audio tracks',ctlSeg('audio_mode',[['mix','Mix — one track'],['separate','Separate']]));
+    hint(R,'Both play the same everywhere: the first track is always '
+      +'what you heard, voice included. Separate keeps System and your '
+      +'mic as extra tracks behind it, so the reader can hear YOU '
+      +'alone \u2014 better transcripts, slightly bigger files. '
+      +'(Recordings made in Separate before 3.10 led with the game '
+      +'and hid your voice \u2014 those have been repaired.)');
     divider(R,'App sounds');
     row(R,'Chime volume',ctlSlider('sfx_volume',0,100,x=>`${x}%`));
     const tb=el('button','wbtn','Test');

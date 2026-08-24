@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.09"
+APP_VERSION = "3.10"
 
 try:
     import psutil
@@ -5627,12 +5627,32 @@ def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset
     pre = [f"[{i + 1}:a]aresample=48000,aformat=channel_layouts=stereo"
            f"{_sync(audio_inputs[i][2])}[a{i}]" for i in range(n)]
 
-    if n >= 2 and s["audio_mode"] == "mix":
-        # THE LAYERED BIND (2.81). Track 0 stays the mix - every player and
-        # the tome hear exactly what they always did - but System and Mic
-        # ride along as their own tracks, so the AI can tell HIS voice from
-        # the game's without un-mixing guesswork. asplit, because a filter
-        # pad may only feed one consumer.
+    if n >= 2:
+        # THE LAYERED BIND (2.81), NOW FOR BOTH MODES (3.10). Track 0 is
+        # ALWAYS the mix - every player and the tome hear exactly what
+        # they always did - and System and Mic ride along as their own
+        # tracks, so the AI can tell HIS voice from the game's without
+        # un-mixing guesswork. asplit, because a filter pad may only
+        # feed one consumer.
+        #
+        # "Separate" used to write the parts and NO MIX, and a player
+        # takes the first track - which is the game. His voice was in
+        # the file and unreachable, and the tome's own track chooser
+        # could not save it either: it leans on video.audioTracks,
+        # which Chromium does not implement. One mode that could not
+        # play was one mode too many.
+        #
+        # "Mix - one track" still means exactly that: when he asks for
+        # one track he gets one, and the branch below writes it.
+        if s["audio_mode"] == "mix":
+            graph1 = ";".join(pre + [
+                "".join(f"[a{i}]" for i in range(n))
+                + f"amix=inputs={n}:duration=longest:normalize=0[a]"])
+            cmd += ["-filter_complex", graph1, "-map", "0:v",
+                    "-map", "[a]", "-c:v", "copy", "-c:a", "aac",
+                    "-b:a", "192k", "-metadata:s:a:0", "title=Mix",
+                    out_final]
+            return cmd
         ins = "".join(f"[s{i}]" for i in range(n))
         split = ";".join(f"[a{i}]asplit=2[s{i}][t{i}]" for i in range(n))
         graph = ";".join(pre + [split,

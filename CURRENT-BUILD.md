@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.09` (backend) / `3.09` (UI) |
-| **Stamped** | 2026-08-24 23:35 |
-| **Last commit** | 35bf295 LORE v3.09 - the auditor tells the truth, and the tome fetches its own mind |
-| **lore.py** | 1.1 MB, 25,300 lines, saved 2026-08-24 23:30 |
-| **ui.html** | 0.9 MB, 13,187 lines, saved 2026-08-24 22:53 |
-| **Built exe** | 13.2 MB, 2026-08-24 23:33 |
+| **Version** | `3.10` (backend) / `3.10` (UI) |
+| **Stamped** | 2026-08-25 00:50 |
+| **Last commit** | 3463a1f the build report, regenerated after the push |
+| **lore.py** | 1.1 MB, 25,320 lines, saved 2026-08-25 00:36 |
+| **ui.html** | 0.9 MB, 13,193 lines, saved 2026-08-25 00:45 |
+| **Built exe** | 13.2 MB, 2026-08-25 00:49 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
