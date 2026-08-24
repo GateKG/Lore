@@ -13,8 +13,8 @@
 [Setup]
 AppId={{7C1A44D9-63BF-4A0E-9E7D-2F4B8C5A930E}
 AppName=Lore
-AppVersion=2.07
-VersionInfoVersion=2.0.7
+AppVersion=3.09
+VersionInfoVersion=3.9.0
 ; A 64-bit app should live in the real Program Files (v1 landed in x86;
 ; upgrades reuse whichever folder is already installed, so nothing breaks).
 ArchitecturesAllowed=x64compatible
@@ -70,8 +70,19 @@ Filename: "{cmd}"; Parameters: "/C taskkill /F /IM whisper-cli.exe"; Flags: runh
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: files;          Name: "{userstartup}\Lore.lnk"
 Type: filesandordirs; Name: "{localappdata}\Temp\lore_sfx"
-; LORE keeps its settings, log, games list and capture cache here - clean up.
-Type: filesandordirs; Name: "{localappdata}\Lore"
+; LORE keeps its settings, log and games list here - clean those up, but
+; NEVER the models or the runtime: they are up to 32 GB the user chose to
+; download, they are not ours to throw away on an uninstall, and a
+; reinstall finds them again exactly where they were.
+Type: files;          Name: "{localappdata}\Lore\*.json"
+Type: files;          Name: "{localappdata}\Lore\*.txt"
+Type: files;          Name: "{localappdata}\Lore\*.log*"
+Type: files;          Name: "{localappdata}\Lore\*.key"
+Type: files;          Name: "{localappdata}\Lore\*.lock"
+Type: files;          Name: "{localappdata}\Lore\*.flag"
+Type: files;          Name: "{localappdata}\Lore\*.gen"
+Type: files;          Name: "{localappdata}\Lore\*.beat"
+Type: files;          Name: "{localappdata}\Lore\*.reader"
 
 [Code]
 { No default settings.json is written here on purpose. The app applies its own

@@ -25,3 +25,14 @@ user_game_names.json
 finish_queue.json
 lore.log
 whisper/
+
+# ---- the AI payload: the workers are source, the rest is downloaded ----
+# 50+ GB of models and runtimes must never reach the repo. The app
+# fetches them (see tools/ and the Models panel in Settings).
+ai/*
+!ai/*.py
+
+# ---- history, kept on disk and out of the repo ----
+_archive/
+tools/__pycache__/
+CURRENT-BUILD.md.bak

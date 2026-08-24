@@ -76,6 +76,15 @@ if not exist known_games.txt echo   * known_games.txt not found - building witho
   --hidden-import PIL.Image ^
   --hidden-import psutil ^
   --hidden-import numpy ^
+  REM NOT EXCLUDED, and each for a reason found the hard way:
+  REM   cv2     - windows_capture imports it; without it WGC window
+  REM             capture dies
+  REM   tkinter - every over-game popup and the second-launch "show
+  REM             the tome" is built with it
+  REM   scipy   - the game-audio-only path resamples with it
+  REM The 53 GB was never these; it was the models, and they are
+  REM fetched now.
+  --exclude-module matplotlib ^
   lore.py || goto :err
 
 set APP=dist\Lore
@@ -101,26 +110,36 @@ if not exist ffmpeg\bin\ffprobe.exe (
   goto :err
 )
 xcopy /e /i /y ffmpeg "%APP%\ffmpeg" >nul
-REM whisper is NOT optional in 2.0 - without it the tome cannot read itself
-REM (transcription + word search), so refuse to build a half-blind installer.
-if not exist whisper\Release\whisper-cli.exe (
-  echo   *** whisper\Release\whisper-cli.exe is missing. Put the whisper folder
-  echo       ^(Release\ + the two ggml model files^) next to build.bat.
-  goto :err
+REM THE READER. Qwen3-ASR in its own environment, because it needs torch and
+REM that is far too heavy to bundle into the exe - the same reason ffmpeg is a
+REM separate program. Without it LORE records and plays perfectly well, it just
+REM cannot read what was said, and it says so in the log rather than pretending.
+if not exist ai\asr_worker.py (
+  echo   * ai\asr_worker.py not found - building WITHOUT the reader.
+  echo     Recording, playback and editing all still work.
+) else (
+  echo Adding the workers ^(small - the models are NOT bundled^) ...
+  REM ONLY THE SOURCE TRAVELS. ai\models is ~35 GB, ai\venv ~1.1 GB
+  REM and ai\llama* ~0.2 GB: bundling them made an installer nobody
+  REM could download. The app fetches them on request - see the
+  REM tome's mind panel in Settings.
+  if not exist "%APP%\ai" mkdir "%APP%\ai"
+  copy /y ai\*.py "%APP%\ai\" >nul
+  for %%D in (packs torchlibrosa vendor_ocr vendor_sb) do (
+    if exist "ai\%%D" xcopy /e /i /y /d "ai\%%D" "%APP%\ai\%%D" >nul
+  )
+  REM THE WORKERS' PYTHON ENVIRONMENT still travels ^(~1.1 GB^). The
+  REM models and the llama.cpp runtime are fetched by the app, but
+  REM nothing can yet build this venv on the user's machine - and
+  REM without it the reader, the laughter ear, the senses and the HUD
+  REM reader simply do not exist. Cutting it to make the installer
+  REM smaller shipped an app that could download thirty gigabytes of
+  REM models and still not read a word.
+  if exist "ai\venv" (
+    echo Adding the workers' Python environment ^(about 1.1 GB^) ...
+    xcopy /e /i /y /d "ai\venv" "%APP%\ai\venv" >nul
+  )
 )
-if not exist whisper\ggml-large-v3-turbo-q5_0.bin (
-  echo   *** whisper\ggml-large-v3-turbo-q5_0.bin is missing. This is THE
-  echo       accurate model ^(the small base.en one transcribes accented
-  echo       speech so badly it is not worth shipping alone^). Download it from
-  echo       huggingface.co/ggerganov/whisper.cpp into the whisper folder.
-  goto :err
-)
-if not exist whisper\ggml-base.en-q5_1.bin (
-  echo   *** whisper\ggml-base.en-q5_1.bin is missing - it is the "Quick"
-  echo       setting's model. Put both model files in the whisper folder.
-  goto :err
-)
-xcopy /e /i /y whisper "%APP%\whisper" >nul
 if exist games.txt copy /y games.txt "%APP%\" >nul
 if exist app_launchers xcopy /e /i /y app_launchers "%APP%\" >nul
 

@@ -29,18 +29,22 @@ FIRST-TIME SETUP (from source; the installer does all this for friends):
 
 import argparse
 import datetime as _dt
+import urllib.error as _urlerr
+import urllib.request as _urlreq
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import unicodedata
 import time
 import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "2.30"
+APP_VERSION = "3.09"
 
 try:
     import psutil
@@ -69,8 +73,34 @@ DEFAULTS = {
     "output_dir":        _default_output_dir(),
     "ffmpeg_path":       "ffmpeg",
 
+    # --- what the AI is allowed to cost ---------------------------------
+    # Describing a recording is the only job that costs money, and it costs
+    # it PER RECORDING. Running it over a whole library once emptied a ten
+    # dollar wallet in a night, so it is off unless asked for: the button in
+    # the player's menu describes the one you are watching.
+    "insights_auto":     True,
+    # How many times the eye is allowed to LOOK at one recording. A look is
+    # one frame plus a small structured question and costs about twenty
+    # seconds on this card, so two dozen is roughly eight minutes of GPU
+    # for a whole night - enough to name every place it passed through
+    # without turning a review into an afternoon.
+    "eye_looks":         24,
+    # A hard ceiling in cents that the request layer itself refuses to cross.
+    # 500 = five dollars. Zero means no ceiling.
+    "ai_budget_cents":   500.0,
+    "ai_spent_cents":    0.0,
+
     # Video / quality
     "framerate":         60,
+    # Read the library whether or not you are busy. Off by default because a
+    # reader that fights a recording for the disk is a rude default; on, it is
+    # the difference between a backlog that moves and one that never does.
+    "always_read":       False,
+    "bg_shutdown":       False,
+    # the Claude pass. Off is impossible to hit by accident anyway: it needs a
+    # key, and without one it simply never runs.
+    "claude_insights":   True,
+    "claude_model":      "good",
     "bitrate_mbps":      25,          # VBR target; peaks to 2x. Up to ~11 GB/hr, usually less
     "encoder":           "auto",      # "auto" detects your GPU (AMD/NVIDIA/Intel)
                                       # and picks the best encoder; or force one:
@@ -92,6 +122,12 @@ DEFAULTS = {
     "mic_name_contains": "",          # which microphone ("" = Windows default input)
     "audio_mode":        "mix",       # "mix" = one track, "separate" = two tracks
     "audio_offset_ms":   0,           # nudge if audio is slightly ahead/behind
+
+    # A game opened and shut again is not a session. Anything shorter than
+    # this that ended BY ITSELF (the game closed) is thrown away instead of
+    # filed - you never asked for it and you would only delete it later.
+    # Stopping it yourself always keeps it, however short. 0 = keep everything.
+    "min_keep_seconds":  45,
 
     # Replay buffer ("save the last minute" hotkey)
     "segment_seconds":   4,           # internal capture chunk size (don't fuss with this)
@@ -135,12 +171,10 @@ DEFAULTS = {
     # frame (and pauses); the rest are seconds. Shift multiplies by 10.
     "seek_step":         "5",         # frame | 1 | 5 | 10
     # Transcription model: 'best' = large-v3-turbo (accurate, handles
-    # accents), 'fast' = base.en (quick, English-only, much weaker).
-    "stt_quality":       "best",      # best | fast
+    # accents), 'fast' = base.en (quick, English-only, much weaker).      # best | fast
     # Spoken language. 'auto' lets the model decide - but it decides ONCE per
     # recording, so a sentence that switches mid-way still lands in whichever
     # language won. 'en'/'ar' pin it.
-    "stt_language":      "auto",      # auto | en | ar
     # Where in-progress recordings are staged. 'auto' puts them on a solid
     # state drive when the library lives on a spinning one - that is the whole
     # difference between a save that crawls and one that streams.
@@ -153,7 +187,8 @@ DEFAULTS = {
     # if the game's stream can't be tapped.
     "game_audio_only":   False,
     # The tome's own intelligence, all local: transcribe recordings with
-    # whisper.cpp so the library is searchable by what was SAID, and mark
+    # Qwen3-ASR so the library is searchable by what was SAID - it keeps
+    # English and Arabic in the same line instead of forcing one - and mark
     # loud moments as highlights on the timeline. Both run only while idle.
     "ai_transcribe":     True,
     "ai_highlights":     True,
@@ -179,6 +214,11 @@ DEFAULTS = {
     "discord_max_mb":        9,        # keep the upload under Discord's free 10 MB cap
     "discord_clip_seconds":  15,       # how much of the clip to post (its last N sec)
     "discord_quality_mbps":  6,        # target quality of the Discord copy
+
+    # The vault (2.76): library chapter keys (display name, lowercased) whose
+    # recordings the storage cap must never auto-delete. Pinned games still
+    # COUNT toward the cap - they hold real shelf space - they just can't go.
+    "cap_pinned_games":      [],
 }
 
 # Apps Lore never auto-records when they go full-screen (games are still always
@@ -292,6 +332,93 @@ def _data_dir():
         return _here()
 
 
+_JOB = [None]
+
+
+def _job_object():
+    """ONE Windows Job Object with KILL_ON_JOB_CLOSE: every child bound to
+    it dies when this process dies - however it dies. Tonight's orphaned
+    model servers (15 GB of VRAM surviving the app, then silently adopted
+    by the next run) are impossible once children live here."""
+    if _JOB[0] is not None or os.name != "nt":
+        return _JOB[0]
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class _IOC(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong)]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", wt.LARGE_INTEGER),
+                        ("PerJobUserTimeLimit", wt.LARGE_INTEGER),
+                        ("LimitFlags", wt.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wt.DWORD),
+                        ("Affinity", ctypes.POINTER(wt.ULONG)),
+                        ("PriorityClass", wt.DWORD),
+                        ("SchedulingClass", wt.DWORD)]
+
+        class _EXT(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BASIC),
+                        ("IoInfo", _IOC),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.windll.kernel32
+        h = k32.CreateJobObjectW(None, None)
+        info = _EXT()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        if h and k32.SetInformationJobObject(h, 9, ctypes.byref(info),
+                                             ctypes.sizeof(info)):
+            _JOB[0] = h
+        else:
+            _JOB[0] = 0
+    except Exception:
+        _JOB[0] = 0
+    return _JOB[0]
+
+
+_ERRMODE_SET = [False]
+
+
+def _popen(*a, **k):
+    """subprocess.Popen + bind the child to the kill-on-close job.
+
+    SEM_NOGPFAULTERRORBOX first, once: children inherit the parent's
+    error mode, and without it a model server that dies on the graphics
+    driver throws a Windows crash dialog onto HIS SCREEN mid-game. The
+    crash still logs and still retries - it just stops shouting."""
+    if os.name == "nt" and not _ERRMODE_SET[0]:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetErrorMode(0x8003)
+            _ERRMODE_SET[0] = True
+        except Exception:
+            pass
+    pr = subprocess.Popen(*a, **k)
+    try:
+        j = _job_object()
+        if j:
+            import ctypes
+            ctypes.windll.kernel32.AssignProcessToJobObject(
+                j, int(pr._handle))
+    except Exception:
+        pass
+    return pr
+
+
+_LOG_WHY = [False, False]      # each fallback names its cause ONCE
+
+
 def log(msg):
     line = f"[{_dt.datetime.now():%H:%M:%S}] {msg}"
     try:
@@ -299,10 +426,52 @@ def log(msg):
     except Exception:
         pass
     try:
-        with open(os.path.join(_data_dir(), "lore.log"), "a", encoding="utf-8") as fh:
+        lp = os.path.join(_data_dir(), "lore.log")
+        try:
+            if os.path.getsize(lp) > 4_000_000:   # keep one past life
+                os.replace(lp, lp + ".1")
+        except OSError:
+            pass
+        with open(lp, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-    except Exception:
-        pass
+    except Exception as e_log:
+        # THE BEACON. The 4:04 instance of 2.93 ran for hours writing
+        # opened.json into this very folder while lore.log gained not one
+        # line - and every recorder mystery since (the Bazaar's self-stop
+        # included) has been undiagnosable for it. If the main log write
+        # fails, the line goes to a second file instead of nowhere, and
+        # the failure itself is written down once.
+        wrote = False
+        try:
+            lb = os.path.join(_data_dir(), "lore.log.b")
+            with open(lb, "a", encoding="utf-8") as fh:
+                if not _LOG_WHY[0]:
+                    _LOG_WHY[0] = True
+                    fh.write("[the main log failed: %r]\n" % (e_log,))
+                fh.write(line + "\n")
+            wrote = True
+        except Exception:
+            pass
+        if not wrote:
+            # THE THIRD CHANNEL. 3.01's main instance lost every line
+            # with BOTH channels above failing together (same folder,
+            # same invisible cause) - while its sidecar writes to the
+            # Records volume never missed. The last resort lives where
+            # the writes provably work, and it writes down WHY the
+            # healthy channels failed - the fact every dead-log hunt
+            # has been missing. Engages only on double failure; a
+            # healthy install never creates this file.
+            try:
+                d3 = _thumb_dir(SETTINGS.get("output_dir", ""))
+                with open(os.path.join(d3, "lore.log.c"), "a",
+                          encoding="utf-8") as fh:
+                    if not _LOG_WHY[1]:
+                        _LOG_WHY[1] = True
+                        fh.write("[log AND beacon failed: %r]\n"
+                                 % (e_log,))
+                    fh.write(line + "\n")
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +646,7 @@ def _sanitize_settings(d):
     INT_BOUNDS = {
         "framerate": (1, 1000), "bitrate_mbps": (1, 1000), "monitor_index": (-1, 64),
         "poll_interval": (1, 60), "segment_seconds": (2, 60), "replay_seconds": (1, 3600),
+        "min_keep_seconds": (0, 3600),
         "audio_offset_ms": (-60000, 60000),
         "max_storage_gb": (0, 1000000), "sfx_volume": (0, 100),
         "clip_hotkey_seconds": (1, 3600), "discord_max_mb": (1, 1000),
@@ -497,13 +667,18 @@ def _sanitize_settings(d):
         "capture_scope": ("screen", "window"),
         "capture_backend": ("auto", "ddagrab"),
         "seek_step": ("frame", "1", "5", "10"),
-        "stt_quality": ("best", "fast"),
-        "stt_language": ("auto", "en", "ar"),
     }
     # (hdr_mode is normalised by _migrate_settings_shape, which also maps legacy values)
     for k, allowed in ENUMS.items():
         v = d.get(k)
         d[k] = v.lower() if (isinstance(v, str) and v.lower() in allowed) else DEFAULTS[k]
+    # vault pins: a list of chapter keys; anything malformed collapses to []
+    try:
+        d["cap_pinned_games"] = [str(x).strip().lower()
+                                 for x in (d.get("cap_pinned_games") or [])
+                                 if str(x).strip()][:500]
+    except Exception:
+        d["cap_pinned_games"] = []
 
 
 def load_settings():
@@ -582,6 +757,96 @@ def save_settings(data):
         _atomic_write_json(_settings_path(), clean)
 
 
+# ---------------------------------------------------------------- the key
+# NOT in settings.json. That file is plain JSON, gets copied around, and shows
+# up in a screenshot the moment anyone opens it. This one is encrypted by
+# Windows against this user on this machine, and nothing in LORE ever reads it
+# back to the interface - the closest you can get is "yes, there is one".
+def _key_path():
+    return os.path.join(_data_dir(), "claude.key")
+
+
+def _dpapi(data, unprotect=False):
+    """Windows DPAPI. Returns None if it cannot be done, and the caller then
+    refuses to store anything rather than writing a key in the clear."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        buf = ctypes.create_string_buffer(data, len(data))
+        src = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        out = BLOB()
+        fn = (ctypes.windll.crypt32.CryptUnprotectData if unprotect
+              else ctypes.windll.crypt32.CryptProtectData)
+        args = ([ctypes.byref(src), None, None, None, None, 0,
+                 ctypes.byref(out)] if not unprotect else
+                [ctypes.byref(src), None, None, None, None, 0,
+                 ctypes.byref(out)])
+        if not fn(*args):
+            return None
+        try:
+            return ctypes.string_at(out.pbData, out.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(out.pbData)
+    except Exception:
+        return None
+
+
+def _key_save(raw):
+    """Store a key. Returns (ok, why)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return False, "nothing to save"
+    if not raw.startswith("sk-ant-"):
+        return False, "that does not look like an Anthropic key"
+    blob = _dpapi(raw.encode("utf-8"))
+    if blob is None:
+        return False, "this PC will not encrypt it, so it will not be stored"
+    try:
+        os.makedirs(os.path.dirname(_key_path()), exist_ok=True)
+        with open(_key_path(), "wb") as fh:
+            fh.write(blob)
+        # remember only what is safe to show: when it went in, and the last
+        # four characters, so you can tell one key from another
+        when = _dt.datetime.now().strftime("%d %B %Y")
+        SETTINGS["claude_key_added"] = when
+        SETTINGS["claude_key_tail"] = raw[-4:]
+        _persist_setting("claude_key_added", when)
+        _persist_setting("claude_key_tail", raw[-4:])
+        log("Claude key stored (encrypted to this Windows account).")
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _key_read():
+    """The key itself, for LORE's own use only. Never returned over the API."""
+    try:
+        with open(_key_path(), "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    out = _dpapi(blob, unprotect=True)
+    return out.decode("utf-8", "replace") if out else None
+
+
+def _key_forget():
+    try:
+        os.remove(_key_path())
+    except OSError:
+        pass
+    for k in ("claude_key_added", "claude_key_tail"):
+        _persist_setting(k, "")      # also clears the live SETTINGS copy
+    log("Claude key forgotten.")
+    return True
+
+
 def _persist_setting(key, value):
     """Update a single key in settings.json on disk without disturbing the live
     SETTINGS or other keys. Used by the watcher to remember a discovered fix."""
@@ -594,8 +859,8 @@ def _persist_setting(key, value):
             d[key] = value
             _atomic_write_json(_settings_path(), d)
             SETTINGS[key] = value
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Could not persist setting '{key}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +873,31 @@ def running_process_names():
         if n:
             names.add(n.lower())
     return names
+
+
+def _looks_gone(current):
+    """The three-agreements gone test in ONE place: a game reads as
+    closed only when a TRUSTWORTHY process walk lacks it AND no window
+    of its answers. Four separate sites used to trust a single raw walk
+    - the active-recording check among them, which is precisely how a
+    16-minute Bazaar saved itself and restarted while he was playing:
+    two short walks in a row, debounce of two, recording gone."""
+    if not current:
+        return False
+    names = running_process_names()
+    return (_process_walk_trustworthy(names)
+            and current not in names
+            and not _exe_has_any_window(current))
+
+
+def _process_walk_trustworthy(names):
+    """Did that walk actually see the machine?
+
+    Windows is never running twelve processes. A list that short means the
+    walk was refused or cut off, and a recording must never be ended on the
+    strength of a question that failed to be asked. Idle Windows sits around
+    a hundred; twenty is generous."""
+    return len(names) >= 20
 
 
 def load_game_list():
@@ -639,12 +929,13 @@ def read_games_lines():
 
 def write_games_lines(lines):
     path = os.path.join(_data_dir(), "games.txt")
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path + ".tmp", "w", encoding="utf-8") as fh:
         fh.write("# Games Lore always captures (one name per line, e.g. eldenring).\n")
         for ln in lines:
             ln = ln.strip()
             if ln:
                 fh.write(ln + "\n")
+    os.replace(path + ".tmp", path)   # a crash mid-write keeps the old list
 
 
 def _ignore_path():
@@ -730,10 +1021,9 @@ def _watched_monitor_rect():
     by display number, the same contract build_video_cmd uses for ddagrab output_idx.
     Returns None when monitors can't be enumerated (then any monitor is accepted)."""
     try:
-        mons = _enumerate_active_monitors()
+        mons = _monitors_ranked()
         if not mons:
             return None
-        mons.sort(key=lambda m: m["num"])
         idx = min(max(0, _resolve_capture_monitor()), len(mons) - 1)
         return tuple(mons[idx]["rect"])
     except Exception:
@@ -890,6 +1180,10 @@ def _learned_games_path():
     return os.path.join(_data_dir(), "learned_games.json")
 
 
+_WATCH_NOTE = {"fail_at": 0.0, "fail_g": "",
+               "learn_at": 0.0, "learn_g": ""}
+
+
 def _learned_games():
     """Exes the GPU+fullscreen heuristic has already proven to be games -
     persisted, so every future launch records instantly (windowed too),
@@ -993,15 +1287,17 @@ def _pad_check():
             if xi.XInputGetState(i, ctypes.byref(st)) == 0:
                 _PAD["conn"].add(i)
                 g, prev = st.Gamepad, _PAD["last"].get(i)
+                # THE STATE must differ - never the packet counter alone.
+                # Emulated XInput pads (Steam Input / DS4Windows, a
+                # DualSense on USB) bump dwPacketNumber at their report
+                # rate, hundreds per poll, with the pad flat on the desk:
+                # the old bare packet test read that as a human forever
+                # and silently defeated the AFK pause.
                 if prev is not None and (
                         g.wButtons != prev[0]
                         or g.bLeftTrigger > 30 or g.bRightTrigger > 30
                         or abs(g.sThumbLX) > 7849 or abs(g.sThumbLY) > 7849
-                        or abs(g.sThumbRX) > 8689 or abs(g.sThumbRY) > 8689
-                        # a quick tap can start AND end between polls - the
-                        # packet counter still jumps far more than resting
-                        # stick jitter does over one poll interval
-                        or (st.dwPacketNumber - prev[3]) & 0xFFFFFFFF > 30):
+                        or abs(g.sThumbRX) > 8689 or abs(g.sThumbRY) > 8689):
                     _PAD["active_t"] = now
                 _PAD["last"][i] = (g.wButtons, g.bLeftTrigger,
                                    g.bRightTrigger, st.dwPacketNumber)
@@ -1012,13 +1308,88 @@ def _pad_check():
         pass
 
 
+def _cursor_pos():
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+        pt = PT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        return (pt.x, pt.y)
+    except Exception:
+        return None
+
+
+# breadcrumb state: the last idle reading, where the cursor was, and when
+# the log last spoke (>=10 min between lines - never a log storm)
+_AFK_CLK = {"prev": 0.0, "pos": None, "said": 0.0}
+
+
 def _afk_idle_seconds():
-    """Seconds since the user last did ANYTHING - keyboard, mouse, or a real
-    (dead-zone-beating) controller input."""
+    """Seconds since the user last did ANYTHING - keyboard, mouse, or a
+    real (state-changing, dead-zone-beating) controller input. When a
+    countdown that had passed two quiet minutes is reset, the log says by
+    WHAT - so a defeated AFK pause (30 silent minutes recorded on
+    2026-08-15) is a named culprit next time, not a mystery."""
     _pad_check()
+    now = time.time()
     idle = _kbms_idle_ms() / 1000.0
-    pad_ago = time.time() - _PAD["active_t"] if _PAD["active_t"] else 1e9
-    return min(idle, pad_ago)
+    pad_ago = now - _PAD["active_t"] if _PAD["active_t"] else 1e9
+    got = min(idle, pad_ago)
+    prev = _AFK_CLK["prev"]
+    if prev > 120 and got < 5 and now - _AFK_CLK["said"] > 600:
+        _AFK_CLK["said"] = now
+        pos, ppos = _cursor_pos(), _AFK_CLK["pos"]
+        moved = (abs(pos[0] - ppos[0]) + abs(pos[1] - ppos[1])
+                 if pos and ppos else -1)
+        src = ("the controller" if pad_ago < 5 else
+               f"keyboard/mouse (cursor travelled {moved} px)"
+               if moved >= 0 else "keyboard/mouse")
+        log(f"AFK countdown reset at {int(prev // 60)} min by {src}.")
+    _AFK_CLK["prev"] = got
+    _AFK_CLK["pos"] = _cursor_pos()
+    return got
+
+
+def _inp_beat(session):
+    """THE INPUT CHRONICLE: one cheap sample per healthy watcher beat -
+    how many keys/buttons are held and how far the mouse moved - kept on
+    the session and written as an .inp sidecar at save. The clock is
+    ACTIVE capture time (pauses excluded), so the curve lines up with the
+    footage within a rotation's slack. Counts only - never WHICH keys."""
+    try:
+        now = time.time()
+        last = getattr(session, "_inp_wall", 0.0)
+        session._inp_wall = now
+        if getattr(session, "suspended", False):
+            return
+        dt = (now - last) if (last and now - last < 5.0) else 0.0
+        session._inp_t = getattr(session, "_inp_t", 0.0) + dt
+        down = 0
+        try:
+            import ctypes
+            gaks = ctypes.windll.user32.GetAsyncKeyState
+            for vk in range(1, 224):
+                if gaks(vk) & 0x8000:      # held NOW - never the since-bit
+                    down += 1
+        except Exception:
+            pass
+        pos = _cursor_pos()
+        prev = getattr(session, "_inp_pos", None)
+        px = (abs(pos[0] - prev[0]) + abs(pos[1] - prev[1]))             if (pos and prev) else 0
+        session._inp_pos = pos
+        buf = getattr(session, "_inp", None)
+        if buf is None:
+            buf = session._inp = []
+        buf.append([round(session._inp_t, 1), down, min(4000, px)])
+        if len(buf) > 90000:               # ~15h of beats - never unbounded
+            del buf[:len(buf) - 90000]
+    except Exception:
+        pass
 
 
 def _afk_track(ctl, session, current):
@@ -1166,12 +1537,34 @@ def detect_game_smart():
                 on_watched = (watched is None
                               or (mrect is not None and tuple(mrect) == watched))
                 try:
-                    exe = psutil.Process(pid.value).name().lower()
+                    pr = psutil.Process(pid.value)
+                    exe = pr.name().lower()
                 except psutil.Error:
                     return
                 if exe in ignore:
                     return
-                cands.append((exe, pid.value, fs, on_watched))
+                # a window whose exe lives in a game-store library is a
+                # game until proven otherwise - browsers and editors do
+                # not live in steamapps\common. The TOOLS that live in
+                # there beside the games (crash reporters, prelaunchers,
+                # setup stubs) are named like tools, and a mislearn is
+                # permanent - so they never earn.
+                gamey = False
+                try:
+                    pth = (pr.exe() or "").lower()
+                    gamey = ("\\steamapps\\common\\" in pth
+                             or "\\epic games\\" in pth
+                             or "\\gog galaxy\\games\\" in pth
+                             or "\\xboxgames\\" in pth)
+                    if gamey and any(t in exe for t in (
+                            "launcher", "crashreport", "helper",
+                            "setup", "install", "updater", "unins",
+                            "redist", "dxsetup", "easyanticheat",
+                            "battleye", "report", "config")):
+                        gamey = False
+                except (psutil.Error, OSError):
+                    pass
+                cands.append((exe, pid.value, fs, on_watched, gamey))
             except Exception:
                 pass
 
@@ -1187,7 +1580,7 @@ def detect_game_smart():
 
         # Signal 2: the OS already calls it a game -> record, windowed or
         # not, whatever monitor it's on (window scope follows it there).
-        for exe, pid, fs, onw in cands:
+        for exe, pid, fs, onw, gamey in cands:
             if exe in gamedb:
                 return exe
 
@@ -1212,22 +1605,45 @@ def detect_game_smart():
                         pass
         except Exception:
             pass
+        # who is HE looking at - a store-library game earns windowed,
+        # but only the one in front (a launcher idling in the back must
+        # not learn its way into the library)
+        fg_pid = 0
+        try:
+            _fh = user32.GetForegroundWindow()
+            _fp = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(_fh, ctypes.byref(_fp))
+            fg_pid = _fp.value or 0
+        except Exception:
+            pass
         hopefuls = {}
-        for exe, pid, fs, onw in cands:
+        for exe, pid, fs, onw, gamey in cands:
             if fs and onw:
-                hopefuls[exe] = pid
+                hopefuls[exe] = (pid, 12.0)
+            elif gamey and onw and pid == fg_pid \
+                    and exe not in hopefuls:
+                # WINDOWED GAMES EXIST. The fullscreen requirement made
+                # a windowed indie invisible forever (Hearth and Hamlet,
+                # a whole session unrecorded). A store-library exe in
+                # the FOREGROUND earns by the same two-poll GPU streak,
+                # at a threshold a cozy indie on a big card can clear.
+                # Never overwriting means a fullscreen sibling window
+                # keeps its stricter bar.
+                hopefuls[exe] = (pid, 3.0)
         if excl and excl[0] not in hopefuls:
-            hopefuls[excl[0]] = excl[1]
+            hopefuls[excl[0]] = (excl[1], 12.0)
         if hopefuls:
             # cache no longer than the poll gap, or two 'consecutive' polls
             # would read the SAME GPU sample and one spike could pass for two
             usage = _gpu3d_usage(max_age=min(2.0, max(0.5, poll * 0.8)))
-            for exe, pid in hopefuls.items():
-                if usage.get(pid, 0.0) >= 12.0:
+            for exe, (pid, thresh) in hopefuls.items():
+                if usage.get(pid, 0.0) >= thresh:
                     n = _GPU_HITS.get(exe, (0, 0.0))[0] + 1
                     _GPU_HITS[exe] = (n, now)
                     if n >= 2:
                         _learn_game_exe(exe)
+                        _WATCH_NOTE["learn_at"] = time.time()
+                        _WATCH_NOTE["learn_g"] = exe
                         return exe
                 else:
                     _GPU_HITS.pop(exe, None)   # streak broke: GPU went idle
@@ -1399,6 +1815,52 @@ def load_builtin_games():
     return names
 
 
+def _listed_game_by_window(listed):
+    """A listed game found by its WINDOW, for when the process walk
+    misses it. The walk lied before (the Bazaar's self-stop) and it
+    lied again tonight: hearth and hamlet.exe ran, listed, foreground -
+    and the walk-based check read blank for a whole session while a
+    per-window PID lookup saw it instantly. Windows are enumerated and
+    each owner is asked by PID - a different road entirely, so one
+    flaky snapshot cannot blind both checks at once."""
+    if os.name != "nt" or not listed:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        hits = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                            ctypes.c_void_p)
+        def _enum(h, _l):
+            try:
+                if not user32.IsWindowVisible(h) or user32.IsIconic(h):
+                    return 1
+                r = wintypes.RECT()
+                user32.GetWindowRect(h, ctypes.byref(r))
+                if (r.right - r.left) < 480 or (r.bottom - r.top) < 320:
+                    return 1               # dialogs, stubs
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                if not pid.value or pid.value == os.getpid():
+                    return 1
+                try:
+                    nm = psutil.Process(pid.value).name().lower()
+                except psutil.Error:
+                    return 1
+                if nm in listed:
+                    hits.append(nm)
+                    return 0
+            except Exception:
+                pass
+            return 1
+        user32.EnumWindows(_enum, 0)
+        return hits[0] if hits else None
+    except Exception:
+        return None
+
+
 def find_active_game():
     # The games.txt list is ALWAYS honored - this catches windowed games like
     # Hearthstone that window detection would miss.
@@ -1409,6 +1871,12 @@ def find_active_game():
         hit = listed & running
         if hit:
             return sorted(hit)[0]
+        # the walk can lie (short/incomplete snapshots, measured twice
+        # on this machine) - a listed game with a real window on screen
+        # is playing, whatever the walk says
+        byw = _listed_game_by_window(listed)
+        if byw:
+            return byw
     if SETTINGS["detection_mode"] == "list":
         return None
     # Auto mode: the built-in known-games list catches windowed games the
@@ -1432,6 +1900,33 @@ def find_active_game():
 # ---------------------------------------------------------------------------
 #  WASAPI audio capture (the part ffmpeg can't do)
 # ---------------------------------------------------------------------------
+# ONE process-wide gate for PortAudio. Its initialise/terminate touch global
+# state; two threads inside them at once corrupts the heap, which is what the
+# ntdll access violation on a quick stop-then-start actually was.
+_PA_GATE = threading.RLock()
+# how long to let in-flight callbacks finish after the streams are closed.
+# Measured against the crash: without it, terminate() could free structures a
+# callback was still writing into.
+_PA_SETTLE = 0.25
+
+
+def _pa_open(pyaudio):
+    """Enter PortAudio under the gate."""
+    with _PA_GATE:
+        return pyaudio.PyAudio()
+
+
+def _pa_close(pa):
+    """Leave PortAudio under the same gate, never twice."""
+    if pa is None:
+        return
+    with _PA_GATE:
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+
+
 class AudioRecorder:
     """Captures system loopback (default playback device) and/or the mic to
     separate WAV files using WASAPI. No rerouting, no added latency."""
@@ -1564,6 +2059,12 @@ class AudioRecorder:
                         wf.writeframes(q.get(timeout=0.3))
                     except queue.Empty:
                         continue
+            except Exception as e:
+                # one write error used to kill this thread in silence while
+                # the video kept encoding - a 3-hour session with audio
+                # ending at minute 40 and nothing anywhere saying why
+                log(f"Audio writer DIED mid-recording: {e} - this "
+                    f"recording's sound ends early.")
             finally:
                 try:
                     wf.close()
@@ -1731,6 +2232,12 @@ class AudioRecorder:
                         wf.writeframes(q.get(timeout=0.3))
                     except queue.Empty:
                         continue
+            except Exception as e:
+                # one write error used to kill this thread in silence while
+                # the video kept encoding - a 3-hour session with audio
+                # ending at minute 40 and nothing anywhere saying why
+                log(f"Audio writer DIED mid-recording: {e} - this "
+                    f"recording's sound ends early.")
             finally:
                 try:
                     wf.close()
@@ -1744,7 +2251,7 @@ class AudioRecorder:
 
     def start(self):
         import pyaudiowpatch as pyaudio
-        self._pa = pyaudio.PyAudio()
+        self._pa = _pa_open(pyaudio)
         wasapi = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
 
         if SETTINGS["capture_system"] and SETTINGS.get("game_audio_only") \
@@ -1844,23 +2351,37 @@ class AudioRecorder:
 
     def finalize(self):
         """Stop capture, then let writer threads flush the rest to disk."""
+        if getattr(self, "_finalized", False):
+            return                       # twice through here is a double-free
+        self._finalized = True
         # Stop the callback streams first so they stop filling the queues...
         for s in self._streams:
             try:
-                s.stop_stream(); s.close()
+                s.stop_stream()
             except Exception:
                 pass
+        # ...let any callback ALREADY RUNNING finish before the close. Closing
+        # underneath a live callback is half of the crash.
+        try:
+            time.sleep(_PA_SETTLE)
+        except Exception:
+            pass
+        for s in self._streams:
+            try:
+                s.close()
+            except Exception:
+                pass
+        self._streams = []
         # ...then let the writer threads drain whatever's left and close files.
         for t in self._threads:
             t.join(timeout=10)
             if t.is_alive():
                 log("Audio: a writer thread is still flushing after 10s (slow/full "
                     "disk); its track may be slightly truncated.")
-        if self._pa:
-            try:
-                self._pa.terminate()
-            except Exception:
-                pass
+        # and terminate under the gate, so a recording starting right now
+        # cannot be inside PyAudio() while this one is inside terminate()
+        _pa_close(self._pa)
+        self._pa = None
 
     def stop(self):
         self.signal_stop()
@@ -1944,7 +2465,7 @@ def list_audio_devices():
     outs, mics = [], []
     try:
         import pyaudiowpatch as pyaudio
-        pa = pyaudio.PyAudio()
+        pa = _pa_open(pyaudio)
         try:
             was = pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
             for i in range(pa.get_device_count()):
@@ -1959,7 +2480,7 @@ def list_audio_devices():
                 if d.get("maxInputChannels", 0) > 0 and name not in mics:
                     mics.append(name)
         finally:
-            pa.terminate()
+            _pa_close(pa)
     except Exception as e:
         log(f"Audio device scan failed: {e}")
     return outs, mics
@@ -1972,7 +2493,7 @@ def diag_audio():
     except ImportError:
         print("PyAudioWPatch not installed. Run:  pip install PyAudioWPatch")
         return
-    p = pyaudio.PyAudio()
+    p = _pa_open(pyaudio)
     wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
     out = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
     inp = p.get_device_info_by_index(wasapi["defaultInputDevice"])
@@ -1986,7 +2507,7 @@ def diag_audio():
         d = p.get_device_info_by_index(i)
         if d["maxInputChannels"] > 0 and not d.get("isLoopbackDevice"):
             print(f"  - {d['name']}")
-    p.terminate()
+    _pa_close(p)
     print("\nTip: to use your clean HyperX mic, set mic_name_contains to 'HyperX'.")
 
 
@@ -2066,6 +2587,140 @@ def _enumerate_active_monitors():
 def _active_monitor_count():
     """How many monitors the screen-grabber can address (>=1)."""
     return max(1, len(_enumerate_active_monitors()))
+
+
+_DXGI_MAP = {"at": 0.0, "map": None}
+
+
+def _dxgi_output_map():
+    """{device name: ddagrab output_idx}, asked of DXGI itself.
+
+    ddagrab counts outputs the way DXGI enumerates them, which has nothing
+    to do with the number in a device name. The tome used to assume they
+    matched; on a desk whose primary screen is DISPLAY2 they are inverted,
+    and every capture went to the wrong monitor. Cached for a minute -
+    enumerating COM objects on the watcher beat is rude. An empty dict on
+    any failure, and the caller falls back to the old guess rather than
+    refusing to record."""
+    now = time.time()
+    if _DXGI_MAP["map"] is not None and now - _DXGI_MAP["at"] < 60:
+        return _DXGI_MAP["map"]
+    out = {}
+    if os.name != "nt":
+        return out
+    try:
+        import ctypes
+        from ctypes import POINTER, byref, c_void_p, c_uint
+        import uuid as _uuid
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                        ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class _ODESC(ctypes.Structure):
+            _fields_ = [("DeviceName", ctypes.c_wchar * 32),
+                        ("DesktopCoordinates", _RECT),
+                        ("AttachedToDesktop", ctypes.c_int),
+                        ("Rotation", ctypes.c_uint),
+                        ("Monitor", c_void_p)]
+
+        g = _GUID()
+        b = _uuid.UUID("770aae78-f26f-4dba-a829-253c83d1b387").bytes
+        g.d1 = int.from_bytes(b[0:4], "big")
+        g.d2 = int.from_bytes(b[4:6], "big")
+        g.d3 = int.from_bytes(b[6:8], "big")
+        for i in range(8):
+            g.d4[i] = b[8 + i]
+
+        fac = c_void_p()
+        if ctypes.windll.dxgi.CreateDXGIFactory1(byref(g), byref(fac)) != 0:
+            return out
+
+        def _call(p, slot, restype, *args):
+            vt = ctypes.cast(p, POINTER(POINTER(c_void_p)))[0]
+            return ctypes.WINFUNCTYPE(restype, c_void_p, *args)(vt[slot])
+
+        try:
+            a = 0
+            while True:
+                ad = c_void_p()
+                # EnumAdapters1 is slot 12, read as a plain long: the LAST
+                # call always returns a failure code and an HRESULT
+                # restype would raise on it
+                if _call(fac, 12, ctypes.c_long, c_uint,
+                         POINTER(c_void_p))(fac, a, byref(ad)) != 0:
+                    break
+                try:
+                    o = 0
+                    while True:
+                        op = c_void_p()
+                        if _call(ad, 7, ctypes.c_long, c_uint,
+                                 POINTER(c_void_p))(ad, o, byref(op)) != 0:
+                            break
+                        try:
+                            d = _ODESC()
+                            _call(op, 7, ctypes.c_long,
+                                  POINTER(_ODESC))(op, byref(d))
+                            if d.DeviceName:
+                                out[d.DeviceName] = o
+                        finally:
+                            _call(op, 2, ctypes.c_ulong)(op)
+                        o += 1
+                finally:
+                    _call(ad, 2, ctypes.c_ulong)(ad)
+                a += 1
+        finally:
+            _call(fac, 2, ctypes.c_ulong)(fac)
+    except Exception:
+        return {}
+    _DXGI_MAP["map"] = out
+    _DXGI_MAP["at"] = now
+    return out
+
+
+def _mon_output_idx(mon, fallback=0):
+    """One monitor's ddagrab output index, or the old guess if DXGI is
+    unreadable."""
+    try:
+        got = _dxgi_output_map().get(mon.get("device") or "")
+        if got is not None:
+            return int(got)
+    except Exception:
+        pass
+    return int(fallback)
+
+
+def _monitors_ranked():
+    """Every active monitor, PRIMARY FIRST, then by display number.
+
+    The setting has always said "0 = the primary screen". It ranked by the
+    number in the device name instead, so on a desk whose primary is
+    DISPLAY2 the default pointed at the other screen. Primary first makes
+    that sentence true, and every rect check now reads the same list."""
+    mons = _enumerate_active_monitors()
+    if not mons:
+        return []
+    return sorted(mons, key=lambda m: (0 if m.get("primary") else 1,
+                                       m.get("num", 0)))
+
+
+def _capture_output_idx(idx=None):
+    """The ddagrab output_idx for the screen the tome is set to record.
+
+    The single place that turns "which monitor" into "which output"."""
+    mons = _monitors_ranked()
+    if not mons:
+        return 0
+    try:
+        i = int(idx if idx is not None else SETTINGS.get("monitor_index", 0))
+    except (TypeError, ValueError):
+        i = 0
+    i = min(max(0, i), len(mons) - 1)
+    return _mon_output_idx(mons[i], i)
 
 
 def _resolve_capture_monitor():
@@ -2569,7 +3224,7 @@ def _screen_capture_wh(mon_idx):
     # shape" and split the recording - the exact symptom being fixed.
     for attempt in range(3):
         try:
-            mons = sorted(_enumerate_active_monitors(), key=lambda m: m["num"])
+            mons = _monitors_ranked()
             if mons:
                 m = mons[min(max(0, int(mon_idx or 0)), len(mons) - 1)]
                 r = m["rect"]
@@ -2720,11 +3375,17 @@ def _game_window_rect(pname, hwnd=None):
                 return None
             mrect = (mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right, mi.rcMonitor.bottom)
-            mons = sorted(_enumerate_active_monitors(), key=lambda m: m["num"])
+            # WHICH OUTPUT, NOT WHICH RANK. This matched the window's
+            # monitor against a list sorted by device number and gave
+            # ddagrab that position. DXGI numbers its outputs its own way,
+            # so on his desk a game on the main screen was captured from
+            # the second one - the screen his own window was filling,
+            # which is how the tome ended up inside his recordings.
+            mons = _monitors_ranked()
             mon = 0
             for i, m in enumerate(mons):
                 if tuple(m["rect"]) == mrect:
-                    mon = i
+                    mon = _mon_output_idx(m, i)
                     break
             cx, cy = max(x, mrect[0]), max(y, mrect[1])
             cw = min(x + w, mrect[2]) - cx
@@ -2870,7 +3531,19 @@ def build_wgc_cmd(w, h, fps, out_pattern, start_number=0):
         s["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error", "-stats",
         "-f", "rawvideo", "-pixel_format", "bgr0",
         "-video_size", f"{w}x{h}", "-framerate", str(fps),
+        # WHY THE AUDIO USED TO DRIFT. rawvideo carries no timestamps, so
+        # ffmpeg stamped frame N at exactly N/fps - the rate we ASKED for.
+        # The audio is captured separately against the wall clock. So any
+        # stretch where the window did not actually deliver 60 fps made the
+        # picture's clock run slow while the sound's kept real time, and the
+        # two slid apart for the rest of the recording. Measured on a real
+        # session: 58.9 fps delivered, 5.4 seconds adrift by the end.
+        # Wall-clock stamps in, constant rate out: frames are timed by when
+        # they ARRIVED, then resampled to an exactly-60fps output so the
+        # segment weld still has one unchanging frame rate to copy.
+        "-use_wallclock_as_timestamps", "1",
         "-i", "pipe:0",
+        "-fps_mode", "cfr", "-r", str(fps),
         "-c:v", enc, *rc,
         "-g", str(gop), *keyframes,
         "-f", "segment", "-segment_time", str(seg),
@@ -3253,6 +3926,10 @@ def _already_saved(base):
     return False
 
 
+def _salvage_skip(d):
+    return os.path.isfile(os.path.join(d, "_discarded.flag"))
+
+
 def _salvage_interrupted():
     """A previous run died mid-save (force-kill, crash, power cut). NEVER
     just sweep its remains - they are the user's footage:
@@ -3320,11 +3997,17 @@ def _salvage_interrupted():
             except Exception as e:
                 log(f"Salvage skipped for {name}: {e}")
     # 2) orphaned session folders with real segments -> best-effort weld
-    try:
-      for cache in _work_dirs_all():
+    for cache in _work_dirs_all():
+      try:
         for name in list(os.listdir(cache)):
             d = os.path.join(cache, name)
             if not os.path.isdir(d) or name == "lost":
+                continue
+            if _salvage_skip(d):
+                # HE THREW THIS ONE AWAY. The tombstone goes down before the
+                # discard starts; welding these segments back into a video
+                # would resurrect a recording he explicitly binned.
+                shutil.rmtree(d, ignore_errors=True)
                 continue
             # A weld that already finished is sitting right there. Re-running
             # it costs half an hour of disk, times out, holds the file open,
@@ -3436,8 +4119,11 @@ def _salvage_interrupted():
                         os.remove(tmp)
                 except Exception:
                     pass
-    except Exception:
-        pass
+      except Exception as e:
+        # one unreadable cache dir (AV lock, degraded volume) used to abort
+        # the WHOLE walk in silence, deferring every remaining rescue
+        log(f"Salvage stopped early in {cache}: {e} - its remaining "
+            "leftovers wait for the next launch.")
 
 
 def _migrate_library_layout():
@@ -3481,6 +4167,8 @@ def _migrate_library_layout():
     try:
         with _MANIFEST_LOCK:
             paths, _ = _load_manifest()
+            if paths is None:
+                raise OSError("manifest unreadable")
             healed = set()
             changed = False
             for p in paths:
@@ -3502,7 +4190,7 @@ def _migrate_library_layout():
     except Exception:
         pass
     try:
-        q = _load_finish_queue()
+        q = _load_finish_queue(strict=True)
         qchanged = False
         for it in q:
             fp = it.get("path", "")
@@ -3524,6 +4212,8 @@ def _migrate_library_layout():
     try:
         with _MANIFEST_LOCK:
             paths, _ = _load_manifest()
+            if paths is None:
+                raise OSError("manifest unreadable")
             changed = False
             for old_p, new_p in remap.items():
                 if old_p in paths:
@@ -3536,7 +4226,7 @@ def _migrate_library_layout():
         pass
     # pending HDR restorations follow too
     try:
-        q = _load_finish_queue()
+        q = _load_finish_queue(strict=True)
         changed = False
         for it in q:
             k = os.path.normcase(os.path.abspath(it.get("path", "")))
@@ -3556,7 +4246,12 @@ def _sweep_orphan_temp():
     late). What's swept here synchronously is only empty scratch, legacy
     '.tmp_*' litter and half-written SDR conversions (whose HDR originals
     still exist untouched)."""
-    threading.Thread(target=_salvage_interrupted, daemon=True).start()
+    def _salvage_guarded():
+        try:
+            _salvage_interrupted()
+        except Exception as e:
+            log(f"Salvage crashed: {e} - leftovers wait for the next launch.")
+    threading.Thread(target=_salvage_guarded, daemon=True).start()
     removed = 0
     try:
       now0 = time.time()
@@ -3570,8 +4265,15 @@ def _sweep_orphan_temp():
                 removed += 1
             # transcription scratch is written HERE, not in the library - the
             # old sweep looked for it beside the videos and never found it
-            elif (os.path.isfile(p) and name.startswith("stt_")
-                    and (name.endswith(".wav") or name.endswith("_out.json"))):
+            # the reader's output is '<wav>.json', i.e. 'stt_..._....wav.json'
+            # - it does not end '_out.json', so the old test never matched it
+            # and a kill between the reader finishing and the cleanup running
+            # left one behind for good. Any stt_ scratch, either extension.
+            elif (os.path.isfile(p)
+                    and (name.startswith("stt_")
+                         or name.startswith("laugh_"))
+                    and name.rsplit(".", 1)[-1] in
+                    ("wav", "json", "ctl", "prog", "tmp")):
                 try:
                     if now0 - os.path.getmtime(p) > 600:
                         os.remove(p)
@@ -3622,6 +4324,82 @@ def _sweep_orphan_temp():
         log(f"Cleaned up {removed} leftover temp folder(s) from a previous run.")
 
 
+def _clip_in_flight(session):
+    """Is a 'save the last minute' clip being assembled right now?
+
+    save_replay holds this lock for the whole build, and every intermediate it
+    writes lives in the folder discard() deletes."""
+    lk = getattr(session, "_replay_lock", None)
+    if lk is None:
+        return False
+    if lk.acquire(blocking=False):
+        lk.release()
+        return False
+    return True
+
+
+def _discard_soon(session):
+    """Throw the recording away - but not while a clip is still being written
+    into the same folder. Off the watch loop, which must keep detecting
+    games while we wait.
+
+    The tombstone goes down FIRST: if the app dies before the discard
+    finishes, the boot salvage would otherwise re-weld the surviving
+    segments into a finished video - resurrecting a recording that was
+    explicitly thrown away."""
+    try:
+        with open(os.path.join(session.tmp, "_discarded.flag"), "w") as fh:
+            fh.write("1")
+    except Exception:
+        pass
+
+    def work():
+        for _ in range(900):                 # up to ~90s, then give up waiting
+            if not _clip_in_flight(session):
+                break
+            time.sleep(0.1)
+        try:
+            session.discard()
+        except Exception as e:
+            log(f"Could not discard the recording: {e}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _fmt_secs(n):
+    n = int(n or 0)
+    if n < 60:
+        return f"{n} second" + ("" if n == 1 else "s")
+    m, sec = divmod(n, 60)
+    return f"{m}m {sec:02d}s"
+
+
+def _captured_seconds(session):
+    """Seconds of footage actually on disk for this session.
+
+    Counted from the segments, not the clock: a session paused for an hour has
+    an hour of wall time and none of it is footage."""
+    try:
+        seg = max(2, int(SETTINGS.get("segment_seconds", 4)))
+        return len(_list_segments(session.tmp)) * seg
+    except Exception:
+        return 0
+
+
+def _not_worth_keeping(session, manual):
+    """A game opened and closed again straight away.
+
+    Only ever asked about a recording that ended BY ITSELF. If you pressed
+    record, or pressed stop, you meant it - length is none of our business."""
+    if manual:
+        return False
+    lim = int(SETTINGS.get("min_keep_seconds", 45) or 0)
+    if lim <= 0:
+        return False
+    if _clip_in_flight(session) or getattr(session, "_clip_saved", False):
+        return False          # you asked for something out of this one
+    return _captured_seconds(session) < lim
+
+
 def _list_segments(seg_dir):
     """All finished+current capture segments in order (oldest -> newest)."""
     try:
@@ -3643,8 +4421,11 @@ def _watch_concat_progress(out_path, want_bytes):
     _CONCAT_WATCH["stop"] = False
     _CONCAT_WATCH["ev"] = stop
     name = os.path.basename(out_path).replace(".__assembling__.mp4", "")
+    _BIND_TOK[0] += 1
+    tok = _BIND_TOK[0]
     _BINDING.update({"name": name, "pct": 0, "eta": None, "mbps": None,
-                     "t0": time.time(), "total": want_bytes / 1e6})
+                     "t0": time.time(), "total": want_bytes / 1e6,
+                     "tok": tok})
 
     def _run():
         last_sz, last_t = 0, time.time()
@@ -3656,6 +4437,8 @@ def _watch_concat_progress(out_path, want_bytes):
                 sz = os.path.getsize(out_path)
             except OSError:
                 continue
+            if _BINDING.get("tok") != tok:
+                break              # a newer bind owns the card now
             now = time.time()
             pct = max(0, min(99, int(sz * 100 / want_bytes)))
             spent = now - _BINDING["t0"]
@@ -3682,7 +4465,621 @@ def _stop_concat_progress():
     _CONCAT_WATCH["ev"] = None
 
 
-def _concat_copy(ffmpeg, seg_files, out_path):
+def _edit_watch(proc):
+    """Remember a child of the export so a Stop can actually reach it. The
+    stitch used to spawn ffmpeg through a helper nothing tracked, so cancelling
+    left five of them grinding the disk against a file nobody wanted."""
+    try:
+        _EDIT_JOB.setdefault("procs", []).append(proc)
+    except Exception:
+        pass
+    return proc
+
+
+def _edit_kill_children():
+    """Stop everything this export started, and say how many there were."""
+    procs = _EDIT_JOB.get("procs") or []
+    killed = 0
+    for pr in list(procs):
+        try:
+            if pr.poll() is None:
+                pr.kill()
+                killed += 1
+        except Exception:
+            pass
+    try:
+        for pr in list(procs):
+            try:
+                pr.wait(timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _EDIT_JOB["procs"] = []
+    return killed
+
+
+_DRIFT = {"busy": False, "cancel": False, "done": 0, "total": 0,
+          "fixed": 0, "name": "", "scanned": False, "hits": [],
+          # scan or repair. The tome used to GUESS this from a flag it set on
+          # the click, and lost the guess in the gap between the call
+          # returning and the worker thread setting busy - so a repair came
+          # out labelled 'checking'. The engine knows; it says.
+          "mode": ""}
+
+
+def _av_durations(path):
+    """(video seconds, audio seconds) or None."""
+    try:
+        d = os.path.dirname(SETTINGS["ffmpeg_path"])
+        probe = os.path.join(d, "ffprobe.exe" if os.name == "nt" else "ffprobe")
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        r = subprocess.run([probe, "-v", "error", "-show_entries",
+                            "stream=codec_type,duration", "-of", "json", path],
+                           capture_output=True, text=True, timeout=40,
+                           creationflags=flags)
+        v = a = None
+        for st in (json.loads(r.stdout or "{}").get("streams") or []):
+            if st.get("codec_type") == "video" and v is None:
+                v = float(st.get("duration") or 0)
+            elif st.get("codec_type") == "audio" and a is None:
+                a = float(st.get("duration") or 0)
+        if v and a and v > 1 and a > 1:
+            return v, a
+    except Exception:
+        pass
+    return None
+
+
+def _drift_repair_one(path):
+    """Stretch the picture's clock onto the sound's. Nothing is re-encoded, so
+    a two-gigabyte recording takes about half a minute and loses nothing."""
+    got = _av_durations(path)
+    if not got:
+        return False
+    vd, ad = got
+    if abs(ad - vd) < 0.5:
+        return False                      # already in step
+    ratio = ad / vd
+    if not (0.9 < ratio < 1.1):
+        return False                      # not drift; leave it well alone
+    tmp = path + ".__sync__.mp4"
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        # input 0 carries the picture with its timestamps stretched; input 1 is
+        # the same file untouched and carries the sound.
+        pr = _popen(
+            [SETTINGS["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error",
+             "-itsscale", f"{ratio:.9f}", "-i", path, "-i", path,
+             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+             "-movflags", "+faststart", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=flags)
+        _DRIFT["proc"] = pr
+        try:
+            pr.wait(timeout=3600)
+        except subprocess.TimeoutExpired:
+            # the generic except below cannot kill it - it must die HERE or
+            # it grinds the library disk for another hour and holds the tmp
+            pr.kill()
+            pr.wait(timeout=30)
+            raise RuntimeError("re-sync took over an hour; stopped")
+        if pr.returncode != 0 or not os.path.isfile(tmp):
+            raise RuntimeError("ffmpeg refused")
+        # NEVER replace the original until the new one is checked
+        if os.path.getsize(tmp) < os.path.getsize(path) * 0.9:
+            raise RuntimeError("the repaired copy came out too small")
+        chk = _av_durations(tmp)
+        if not chk or abs(chk[1] - chk[0]) > 0.5:
+            raise RuntimeError("still adrift")
+        try:
+            st = os.stat(path)
+        except OSError:
+            st = None
+        os.replace(tmp, path)
+        if st is not None:
+            try:
+                # keep the original mtime: the transcript, marks and review
+                # still describe this same content, and a bumped clock made
+                # one drift repair silently queue HOURS of AI redo
+                os.utime(path, (st.st_atime, st.st_mtime))
+            except OSError:
+                pass
+        log(f"Re-synced {os.path.basename(path)}: was {ad - vd:+.2f}s adrift.")
+        return True
+    except Exception as e:
+        log(f"Could not re-sync {os.path.basename(path)}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    finally:
+        _DRIFT["proc"] = None
+
+
+# which sidecars a job owns. 'listening' owns TWO - the gold moments and the
+# sound curve underneath them - and redoing the moments without the curve
+# would leave the graph drawn from the old measurements.
+_JOB_SIDES = {"listening": ("hl", "lvl"), "hearing": ("stt",),
+              "thinking": ("ins", "aud"),
+              # the audit alone: corrections live on the transcript lines
+              # (was/pin), so forgetting the .aud loses no history
+              "auditing": ("aud",)}
+
+
+def _redo_sweep(kinds):
+    """Delete the sidecars for these jobs so the ordinary queue redoes them.
+    Nothing is recomputed here - this only forgets."""
+    sides = []
+    for k in kinds:
+        sides.extend(_JOB_SIDES.get(k, ()))
+    if not sides:
+        return 0
+    gone = 0
+    try:
+        for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+            for v in _scan_dir_mp4s(d, kind):
+                for side in sides:
+                    p = _ai_sidecar(v["path"], side)
+                    try:
+                        if os.path.isfile(p):
+                            os.remove(p)
+                            gone += 1
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    _AI.pop("_tally", None)          # the counts are stale the moment we start
+    return gone
+
+
+# window CLASS names and engine furniture. None of these is ever a game.
+_NOT_A_GAME = {"d3dproxywindow", "unrealwindow", "ue4window", "ue5window",
+               "sdlapp", "glfw30", "winclass", "mainwindow", "gamewindow",
+               "directx", "renderwindow", "splashscreen", "launcher"}
+_BUILD_TAG_RE = (r"^(?:\d+[- ]?bit|x64|x86|dx\d+|d3d\d*|vulkan|opengl|cooked|"
+                 r"shipping|release|debug|development|final|retail|steam|epic|"
+                 r"demo|beta|alpha|win(?:64|32)?|64|32)$")
+
+
+def _clean_stored_name(name, raw):
+    """What survives of a stored name once you actually look at it. None means
+    nothing did - go and ask properly."""
+    import re
+    n = str(name or "").strip()
+    if not n:
+        return None
+    if _norm_game_key(n) in _NOT_A_GAME:
+        return None                       # a window class, not a game
+    tag = re.compile(_BUILD_TAG_RE, re.I)
+
+    def _debracket(m):
+        parts = [p.strip() for p in re.split(r"[,;/]| - ", m.group(1))
+                 if p.strip()]
+        return "" if parts and all(tag.match(p) for p in parts) else m.group(0)
+
+    n = re.sub(r"\s*\(([^()]*)\)", _debracket, n).strip()
+    n = re.sub(r"\s+\d{3,6}$", "", n).strip()      # 'yuzu 1734'
+    if len(n) < 3:
+        return None
+    # STRIP THE BUILD TAGS OFF THE EXECUTABLE FIRST. Comparing against the raw
+    # stem rejected every good name too: 'theinvincible-win64-shipping' starts
+    # with 'theinvincible', so The Invincible looked like a truncation of
+    # itself. Against the de-tagged stem the test does what it is meant to.
+    # peel the build tags off the executable one at a time. The regex that
+    # was here kept silently not matching; a loop is duller and it is obvious
+    # what it does, which is worth more than the cleverness was.
+    parts = [p for p in re.split(r"[-_ ]+", str(raw or "")) if p]
+    while parts and parts[-1].lower() in (
+            "win64", "win32", "shipping", "cooked", "release", "debug",
+            "final", "retail", "x64", "x86", "64", "32", "exe"):
+        parts.pop()
+    key, rk = _norm_game_key(n), _norm_game_key("".join(parts))
+    # 'Pal' for palworld: a strict truncation of its own executable is the
+    # title bar being lazy, not the game's name
+    if rk and key and key != rk and rk.startswith(key) and len(key) < len(rk):
+        return None
+    return n
+
+
+def _game_names_sweep(force=False):
+    """Re-derive every game's name. Free sources first; the paid last resort
+    only fires for the ones that still come back as their own executable."""
+    changed, dropped, looked = [], [], 0
+    if force:
+        _AI["named"] = set()         # ask again about ones already asked
+    try:
+        seen = set()
+        for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+            for v in _scan_dir_mp4s(d, kind):
+                raw = _parse_clip_name(os.path.basename(v["path"]))
+                key = _norm_game_key(raw)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                looked += 1
+                if looked > 150:     # a check, not an audit
+                    break
+                stored = None
+                try:
+                    stored = _auto_name_for_raw(raw)
+                except Exception:
+                    pass
+                kept = _clean_stored_name(stored, raw) if stored else None
+                if stored and not kept:
+                    # the stored answer did not survive being looked at
+                    auto = _load_auto_game_names()
+                    for kk in (key, _norm_game_key(raw + ".exe")):
+                        auto.pop(kk, None)
+                    _save_auto_game_names(auto)
+                    dropped.append((raw, stored))
+                    kept = _claude_game_name("", "", raw) if force else None
+                if kept and _norm_game_key(kept) != _norm_game_key(stored or ""):
+                    auto = _load_auto_game_names()
+                    auto[key] = {"name": kept, "source": "checked"}
+                    _save_auto_game_names(auto)
+                if kept and _norm_game_key(kept) != key:
+                    changed.append((raw, kept))
+    except Exception:
+        pass
+    _persist_setting("names_last_sweep", int(time.time()))
+    if dropped:
+        log("Game names: threw out " + str(len(dropped)) + " bad title(s) - "
+            + ", ".join(f"{a} was '{b}'" for a, b in dropped[:6]))
+    if changed:
+        log("Game names: " + ", ".join(f"{a} -> {b}" for a, b in changed[:12])
+            + (f" (+{len(changed) - 12} more)" if len(changed) > 12 else ""))
+    if not changed and not dropped:
+        log(f"Game names: checked {looked}, nothing to correct.")
+    return {"looked": looked, "changed": changed, "dropped": dropped}
+
+
+# Bumped when the results on disk stop being worth keeping. 3 = the reader
+# became Qwen3-ASR, which reads English and Arabic together; every whisper-era
+# transcript is a single-language guess and cannot be trusted.
+_ENGINE_GENERATION = 3
+
+
+def _free_now_so_turn_it_on():
+    """Describing used to cost money per recording, so it was off. It is local
+    and free now - but a settings file written before today still says off,
+    and a default only helps a fresh install. Flip it once."""
+    if SETTINGS.get("insights_auto"):
+        return
+    if SETTINGS.get("insights_auto_freed"):
+        return                       # he turned it off himself afterwards
+    _persist_setting("insights_auto", True)
+    _persist_setting("insights_auto_freed", True)
+    log("Describing recordings is free now that it runs on your own machine, "
+        "so it has been switched on. Settings > Video to turn it back off.")
+
+
+_HL_GENERATION = 1
+
+
+# a slate walk in progress: the AI tick must not spawn on a half-cleared
+# shelf (a describe started mid-wipe resurrects exactly what the slate is
+# clearing)
+_SLATE_BUSY = [0]
+
+
+def _hl_slate_if_needed():
+    """Every gold sidecar written before 2.68 was chosen deaf to laughter.
+    Wipe the marks once (the loudness CURVE stays - the editor's sound canvas
+    keeps working); the sweep re-marks each video with the laughter ear as
+    it works through the shelf."""
+    mark = os.path.join(_data_dir(), "hl.gen")
+    try:
+        with open(mark, encoding="utf-8") as fh:
+            if int((fh.read() or "0").strip() or 0) >= _HL_GENERATION:
+                return
+    except Exception:
+        pass
+
+    def work():
+        gone = 0
+        done_walk = False
+        _SLATE_BUSY[0] += 1
+        try:
+            for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                for v in _scan_dir_mp4s(d, kind):
+                    p = _ai_sidecar(v["path"], "hl")
+                    try:
+                        if os.path.isfile(p):
+                            os.remove(p)
+                            gone += 1
+                    except OSError:
+                        pass
+            done_walk = True
+        except Exception as e:
+            log(f"Gold slate stopped early: {e} - no marker written; it "
+                "finishes next launch.")
+        finally:
+            _SLATE_BUSY[0] -= 1
+        if done_walk:
+            try:
+                _atomic_write_json(mark, _HL_GENERATION)
+            except Exception:
+                pass
+        if gone:
+            log(f"GOLD SLATE: cleared {gone} mark set(s) - they were chosen "
+                "before the tome could hear laughter. Each will be re-marked "
+                "as the tome works.")
+    threading.Thread(target=work, daemon=True).start()
+
+
+_INS_GENERATION = 3
+
+# WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
+# learns to hear something it could not hear before; 2 is the reader
+# whose transliteration wall faces both ways.
+_STT_READER = 2
+
+
+def _stt_reader_note():
+    """Say ONCE how many transcripts predate the reader on disk.
+
+    A .stt.json is fresh if it is newer than its recording, and that is
+    the only question anything asks - so a wall added to the reader
+    today never reaches a night that was read yesterday. That was not
+    merely undone, it was INVISIBLE: nothing on disk recorded which
+    reader had written a transcript, so there was no way to tell
+    whether a fix had ever touched his library.
+
+    Every transcript carries the number now. This counts the ones that
+    do not and says so plainly. It does NOT re-read them behind his
+    back: the tome's own Re-do card already prices that honestly
+    ("MINUTES per recording - the whole library is DAYS of work"), and
+    that is his call to make, not this function's."""
+    mark = os.path.join(_data_dir(), "stt.reader")
+    try:
+        with open(mark, encoding="utf-8") as fh:
+            if int((fh.read() or "0").strip() or 0) >= _STT_READER:
+                return
+    except Exception:
+        pass
+
+    def work():
+        old = new = 0
+        try:
+            d = _thumb_dir(SETTINGS.get("output_dir", ""))
+            for fn in os.listdir(d):
+                if not fn.endswith(".stt.json"):
+                    continue
+                try:
+                    # the version sits in the first line of the file,
+                    # ahead of the segments - reading 4 KB of a
+                    # multi-megabyte transcript is the whole cost
+                    with open(os.path.join(d, fn),
+                              encoding="utf-8") as fh:
+                        head = fh.read(4096)
+                except OSError:
+                    continue
+                m = re.search(r'"reader"\s*:\s*(\d+)', head)
+                if m and int(m.group(1)) >= _STT_READER:
+                    new += 1
+                else:
+                    old += 1
+        except Exception as e:
+            log(f"Could not count the transcripts' reader: {e}")
+            return
+        if old:
+            log(f"{old} transcript(s) here were read before the current "
+                f"reader ({new} with it). A transcript already on disk "
+                "is never read again on its own, so the reader's newest "
+                "hearing reaches only recordings transcribed from now "
+                "on - Re-do the words on a recording to get it there.")
+        try:
+            with open(mark, "w", encoding="utf-8") as fh:
+                fh.write(str(_STT_READER))
+        except OSError:
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _ins_slate_if_needed():
+    """Nothing is ever wiped again. Reviews carry the generation that wrote
+    them; an older-generation finished review keeps serving while the sweep
+    rebuilds it into a .new side file, and only a COMPLETE new review
+    replaces the old - his design: 'until the update finishes the new one,
+    the old one stays.'"""
+    return
+
+
+def _clean_slate_if_needed():
+    """Throw away results built by an engine LORE no longer has. Once."""
+    mark = os.path.join(_data_dir(), "engine.gen")
+    try:
+        with open(mark, encoding="utf-8") as fh:
+            if int((fh.read() or "0").strip() or 0) >= _ENGINE_GENERATION:
+                return
+    except Exception:
+        pass
+
+    def work():
+        gone, kept = 0, 0
+        done_walk = False
+        _SLATE_BUSY[0] += 1
+        try:
+            for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                for v in _scan_dir_mp4s(d, kind):
+                    for side in ("stt", "hl", "lvl", "ins", "aud"):
+                        p = _ai_sidecar(v["path"], side)
+                        try:
+                            if os.path.isfile(p):
+                                os.remove(p)
+                                gone += 1
+                        except OSError:
+                            kept += 1
+            done_walk = True
+        except Exception as e:
+            log(f"Clean slate stopped early: {e} - no marker written; it "
+                "finishes next launch.")
+        finally:
+            _SLATE_BUSY[0] -= 1
+        _AI.pop("_tally", None)
+        _AI["index"] = None
+        _AI["failed"] = {}
+        if done_walk:
+            try:
+                with open(mark, "w", encoding="utf-8") as fh:
+                    fh.write(str(_ENGINE_GENERATION))
+            except Exception:
+                pass
+        log(f"CLEAN SLATE: cleared {gone:,} old result(s) written by the "
+            f"previous reader"
+            + (f" ({kept} could not be removed)" if kept else "")
+            + ". Your recordings are untouched. The tome starts again from "
+              "the newest recording and works backwards.")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _names_daily():
+    """Once a day, in the background, never while a game is on."""
+    def work():
+        try:
+            last = int(SETTINGS.get("names_last_sweep") or 0)
+        except Exception:
+            last = 0
+        if time.time() - last < 86_400:
+            return
+        try:
+            _game_names_sweep(False)
+        except Exception as e:
+            log(f"Game-name check failed: {e}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _self_check_daily():
+    """One health line a day in the log - the library's size, where each
+    job stands, and the room left on the drives the tome depends on. Grep
+    the log for 'Self-check' to see the trend."""
+    try:
+        last = float(SETTINGS.get("selfcheck_last") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if time.time() - last < 86_400:
+        return
+    try:
+        ctl = _AI.get("ctl")
+        if ctl is not None and ctl.session is not None:
+            return                # not while a recording is being written
+    except Exception:
+        pass
+    SETTINGS["selfcheck_last"] = time.time()   # claim the day BEFORE the
+    #                             thread runs - two beats must not log twice
+
+    def work():
+        try:
+            _persist_setting("selfcheck_last", int(time.time()))
+        except Exception:
+            pass
+        try:
+            import shutil
+            t = _ai_tally()
+
+            def free(p):
+                try:
+                    return (f"{shutil.disk_usage(p).free / 1e9:,.0f}"
+                            f" GB free")
+                except Exception:
+                    return "unreadable"
+            parts = []
+            for kind, word in (("listening", "sound"),
+                               ("hearing", "words"),
+                               ("thinking", "reviews")):
+                k = t.get(kind) or {}
+                g = (t.get("gaveup") or {}).get(kind) or 0
+                parts.append(f"{word} {k.get('done', 0)} done"
+                             f"/{k.get('left', 0)} owed"
+                             + (f"/{g} given up" if g else ""))
+            lib = SETTINGS.get("output_dir", "") or "."
+            log(f"Self-check: {t.get('total', 0)} recordings; "
+                + "; ".join(parts)
+                + f"; library {free(lib)}; scratch {free(_work_dir())}.")
+        except Exception as e:
+            log(f"Self-check failed: {e}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _lost_dirs():
+    """Every place abandoned assemblies pile up. The work dirs ARE the
+    .lore_cache folders already - joining '.lore_cache' onto them again
+    built a doubled path (.lore_cache inside .lore_cache) that never
+    exists, so the staging UI only ever saw the legacy library-drive
+    location."""
+    out = []
+    lib = SETTINGS.get("output_dir", "")
+    if lib:
+        d = os.path.join(lib, ".lore_cache", "lost")
+        if os.path.isdir(d):
+            out.append(d)
+    for w in _work_dirs_all():
+        d = os.path.join(w, "lost")
+        if os.path.isdir(d) and d not in out:
+            out.append(d)
+    return out
+
+
+def _lost_base(name):
+    """The recording a leftover belongs to."""
+    n = name.lower()
+    for suf in (".mp4.__assembling__.mp4", ".__assembling__.mp4", ".mp4",
+                ".wav", ".txt"):
+        if n.endswith(suf):
+            n = n[:-len(suf)]
+            break
+    return n
+
+
+def _dir_size(p):
+    if os.path.isfile(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+    t = 0
+    for dp, _, fs in os.walk(p):
+        for f in fs:
+            try:
+                t += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return t
+
+
+def _cache_survey():
+    """What is in the staging folder, and which of it is safe to lose."""
+    saved = set()
+    try:
+        for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+            for v in _scan_dir_mp4s(d, kind):
+                saved.add(os.path.splitext(os.path.basename(v["path"]))[0].lower())
+    except Exception:
+        pass
+    safe, orphan = [], []
+    for lost in _lost_dirs():
+        try:
+            names = os.listdir(lost)
+        except OSError:
+            continue
+        for name in names:
+            p = os.path.join(lost, name)
+            row = {"path": p, "name": name, "size": _dir_size(p),
+                   "base": _lost_base(name)}
+            # a folder of seg_*.mp4 can be welded back into a real recording
+            row["salvageable"] = (os.path.isdir(p) and any(
+                f.startswith("seg_") and f.endswith(".mp4")
+                for f in (os.listdir(p) if os.path.isdir(p) else [])))
+            (safe if row["base"] in saved else orphan).append(row)
+    return safe, orphan
+
+
+def _concat_copy(ffmpeg, seg_files, out_path, watch=None):
+    # `watch`, when given, is handed each ffmpeg child so the caller can end
+    # it. Recording saves pass nothing and behave exactly as before.
     """Concatenate segments into out_path with no re-encode (instant). If the
     join fails - which usually means the final segment was truncated by a crash
     or a force-kill - retry once without that last segment, so a long recording
@@ -3702,6 +5099,8 @@ def _concat_copy(ffmpeg, seg_files, out_path):
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path]
+        # `watch` lets the caller keep a handle on this child. Without it the
+        # export's stitch was unreachable by Stop.
         # The stitch of a PAUSED recording lands here, and for a long session
         # that is tens of gigabytes moving for many minutes. It used to run
         # blind - nothing in the tome, nothing in the tray, no way to tell
@@ -3713,10 +5112,21 @@ def _concat_copy(ffmpeg, seg_files, out_path):
             except OSError:
                 pass
         _watch_concat_progress(out_path, want_bytes)
+        # Popen, not run: a blocking run leaves NOBODY holding the process,
+        # so a Stop had nothing to stop and the weld carried on against a file
+        # that was already being thrown away.
+        r = None
         try:
-            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, creationflags=flags,
-                               timeout=1800)
+            pr = _popen(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, creationflags=flags)
+            if watch:
+                watch(pr)
+            try:
+                err = pr.communicate(timeout=1800)[1]
+            except subprocess.TimeoutExpired:
+                pr.kill()
+                err = pr.communicate()[1]
+            r = subprocess.CompletedProcess(cmd, pr.returncode, None, err)
         except Exception as e:
             log(f"Concat error: {e}")
             r = None
@@ -3773,7 +5183,10 @@ def _manifest_path():
 
 def _load_manifest():
     """The set of absolute paths Lore itself created (recordings + clips), plus
-    a flag saying whether the manifest existed at all. Returns (set, existed)."""
+    a flag saying whether the manifest existed at all. Returns (set, existed);
+    (None, True) when the manifest EXISTS but could not be read - callers must
+    then skip their write, or one transient read failure (AV lock, disk
+    hiccup) persists a manifest that has disowned every prior recording."""
     p = _manifest_path()
     if not os.path.isfile(p):
         return set(), False
@@ -3781,8 +5194,10 @@ def _load_manifest():
         with open(p, encoding="utf-8") as fh:
             data = json.load(fh)
         return {os.path.normcase(os.path.abspath(x)) for x in data}, True
-    except Exception:
-        return set(), False
+    except Exception as e:
+        log(f"The ownership manifest could not be read ({e}) - "
+            "leaving it exactly as it is.")
+        return None, True
 
 
 def _save_manifest(paths):
@@ -3801,10 +5216,193 @@ def _record_made_file(path):
     try:
         with _MANIFEST_LOCK:      # two finalizes/clips can land at the same moment
             paths, _existed = _load_manifest()
+            if paths is None:
+                return    # unreadable: adding one would disown the rest
             paths.add(os.path.normcase(os.path.abspath(path)))
             _save_manifest(paths)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+#  The Vault (2.76) - disk truth, cap pins, cold shelf, one-button tidy and
+#  the audio echo test. Read-mostly: walks run on workers, results cached.
+# ---------------------------------------------------------------------------
+_VAULT = {"busy": False, "res": None, "t": 0.0}
+_TIDY = {"busy": False, "step": "", "report": [], "t": 0.0}
+_ECHO = {"busy": False, "res": None, "t": 0.0}
+_OPENS_LOCK = threading.Lock()
+_OPENS = {"map": None}
+
+
+def _opens_path():
+    return os.path.join(_data_dir(), "opened.json")
+
+
+def _opens_load():
+    """Last-opened times keyed by normcased absolute path. Written by the
+    player's stream_url from 2.76 on; the cold-shelf view prefers this truth
+    over mtime (Windows last-access times are unreliable and unused)."""
+    with _OPENS_LOCK:
+        if _OPENS["map"] is None:
+            try:
+                with open(_opens_path(), encoding="utf-8") as fh:
+                    _OPENS["map"] = {str(k): float(v)
+                                     for k, v in json.load(fh).items()}
+            except Exception:
+                _OPENS["map"] = {}
+        return dict(_OPENS["map"])
+
+
+def _note_open(path):
+    try:
+        k = os.path.normcase(os.path.abspath(path))
+        _opens_load()
+        with _OPENS_LOCK:
+            _OPENS["map"][k] = time.time()
+            snap = dict(_OPENS["map"])
+        _atomic_write_json(_opens_path(), snap)
+    except Exception:
+        pass
+
+
+def _cap_pinned_keys():
+    """Games pinned on the vault page: the cap counts them, never takes them.
+    Keys are the library's chapter keys (display name, lowercased)."""
+    try:
+        return {str(x).strip().lower()
+                for x in (SETTINGS.get("cap_pinned_games") or [])
+                if str(x).strip()}
+    except Exception:
+        return set()
+
+
+def _cap_game_key(path):
+    """The chapter key a recording belongs to - the same display-name key
+    scan_library groups by, so a pin made in the UI matches here exactly."""
+    try:
+        return _display_name(_parse_clip_name(os.path.basename(path))).lower()
+    except Exception:
+        return ""
+
+
+def _vault_walk():
+    """One pass of disk truth: the library per game, the staging scratch, the
+    parked 'lost' evidence, the thumbnail cache, and free space per drive.
+    Walks real folders, which is why it runs on a worker and is cached."""
+    out = SETTINGS.get("output_dir", "") or ""
+    totals = {"library": 0, "staging": 0, "lost": 0, "thumbs": 0}
+    games, loose_b, loose_n = [], 0, 0
+    covered = set()
+    try:
+        for name in os.listdir(out):
+            p = os.path.join(out, name)
+            try:
+                if name == ".lore_thumbs":
+                    totals["thumbs"] += _dir_size(p)
+                elif name == ".lore_cache":
+                    lp = os.path.join(p, "lost")
+                    lb = _dir_size(lp) if os.path.isdir(lp) else 0
+                    totals["lost"] += lb
+                    totals["staging"] += max(0, _dir_size(p) - lb)
+                    covered.add(os.path.normcase(os.path.abspath(p)))
+                elif name.startswith("."):
+                    pass                      # someone else's dot-folder
+                elif os.path.isdir(p):
+                    b, n = 0, 0
+                    for _dp, _dn, fs in os.walk(p):
+                        for f in fs:
+                            try:
+                                b += os.path.getsize(os.path.join(_dp, f))
+                            except OSError:
+                                continue
+                            if f.lower().endswith(".mp4"):
+                                n += 1
+                    totals["library"] += b
+                    if name in ("Clips", "Old"):
+                        loose_b += b
+                        loose_n += n
+                    else:
+                        games.append({"name": name, "bytes": b, "n": n})
+                else:
+                    sz = os.path.getsize(p)
+                    totals["library"] += sz
+                    if name.lower().endswith(".mp4"):
+                        loose_b += sz
+                        loose_n += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    for w in _work_dirs_all():
+        k = os.path.normcase(os.path.abspath(w))
+        if k in covered:
+            continue
+        covered.add(k)
+        lp = os.path.join(w, "lost")
+        lb = _dir_size(lp) if os.path.isdir(lp) else 0
+        totals["lost"] += lb
+        totals["staging"] += max(0, _dir_size(w) - lb)
+    games.sort(key=lambda g: -g["bytes"])
+    top, rest = games[:12], games[12:]
+    drives, seen = [], set()
+    for p in [out] + _work_dirs_all():
+        try:
+            drv = os.path.splitdrive(os.path.abspath(p))[0].upper()
+            if not drv or drv in seen:
+                continue
+            seen.add(drv)
+            u = shutil.disk_usage(p)
+            drives.append({"drive": drv, "free": u.free, "total": u.total})
+        except Exception:
+            continue
+    return {"totals": totals, "games": top,
+            "rest_bytes": sum(g["bytes"] for g in rest) + loose_b,
+            "rest_n": sum(g["n"] for g in rest) + loose_n,
+            "drives": drives, "t": time.time()}
+
+
+def _echo_analyze(path):
+    """Peak/average level percentages plus ~200 ms peak buckets from a short
+    wav - enough to drive an honest meter from ONE capture. Deliberately no
+    continuous live tap: the recorder owns the devices when it matters."""
+    try:
+        import array
+        wf = wave.open(path, "rb")
+        try:
+            ch = max(1, wf.getnchannels())
+            rate = max(1, wf.getframerate())
+            if wf.getsampwidth() != 2:
+                return None
+            raw = wf.readframes(wf.getnframes())
+        finally:
+            wf.close()
+        if not raw:
+            return None
+        a = array.array("h")
+        a.frombytes(raw[:len(raw) - (len(raw) % 2)])
+        if not len(a):
+            return None
+        full = 32768.0
+        step = max(1, int(rate * ch * 0.2))
+        bars, peak = [], 0
+        for i in range(0, len(a), step):
+            seg = a[i:i + step]
+            m = max(max(seg), -min(seg))
+            bars.append(round(m / full, 3))
+            peak = max(peak, m)
+        acc, cnt = 0.0, 0
+        stride = max(1, len(a) // 200000)  # sparse rms: instant in pure python
+        for i in range(0, len(a), stride):
+            v = a[i] / full
+            acc += v * v
+            cnt += 1
+        rms = (acc / max(1, cnt)) ** 0.5
+        return {"peak_pct": round(min(100.0, peak / full * 100.0), 1),
+                "rms_pct": round(min(100.0, rms * 100.0), 1),
+                "bars": bars[:60], "bucket_s": 0.2}
+    except Exception:
+        return None
 
 
 def enforce_storage_cap():
@@ -3822,6 +5420,8 @@ def enforce_storage_cap():
     out = SETTINGS["output_dir"]
     with _MANIFEST_LOCK:
         owned, existed = _load_manifest()
+        if owned is None:
+            return             # unreadable manifest: delete NOTHING today
         if not existed:
             # one-time seed from existing, unmistakably-ours files, so the cap keeps
             # managing pre-upgrade recordings without ever matching a camera clip.
@@ -3863,6 +5463,11 @@ def enforce_storage_cap():
         total = sum(os.path.getsize(p) for p in files)
     except Exception:
         return
+    # pinned games hold real shelf space, so they COUNT toward the total -
+    # but the cap may never take them (the vault page's per-game pin)
+    pinned = _cap_pinned_keys()
+    if pinned:
+        files = [p for p in files if _cap_game_key(p) not in pinned]
     cap = cap_gb * (1024 ** 3)
     i = 0
     deleted = set()
@@ -3880,7 +5485,79 @@ def enforce_storage_cap():
     if deleted:
         with _MANIFEST_LOCK:      # re-read: saves may have added entries meanwhile
             cur, _e = _load_manifest()
-            _save_manifest(cur - deleted)
+            if cur is not None:
+                _save_manifest(cur - deleted)
+
+
+def _audio_track_names(path):
+    """What each audio track of a recording calls itself, in order.
+
+    A layered (2.81+) file names its tracks Mix / System / Mic; anything
+    older, or anything the tome did not record, comes back as a list of
+    empty strings. THE POSITION IS THE POINT - it is what -map 0:a:N
+    counts - so codec_type is asked for as well as the tags, to keep one
+    row per audio stream whatever ffprobe decides to print for a stream
+    that carries no tags at all."""
+    try:
+        d = os.path.dirname(SETTINGS["ffmpeg_path"])
+        probe = os.path.join(d, "ffprobe.exe" if os.name == "nt"
+                             else "ffprobe")
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        r = subprocess.run([probe, "-v", "error", "-select_streams", "a",
+                            "-show_entries",
+                            "stream=codec_type:stream_tags=title,name",
+                            "-of", "json", path],
+                           capture_output=True, text=True, timeout=30,
+                           creationflags=flags)
+        streams = (json.loads(r.stdout or "{}") or {}).get("streams") or []
+        # the mp4 muxer files a stream title under 'name'
+        return [str((st.get("tags") or {}).get("title")
+                    or (st.get("tags") or {}).get("name") or "").lower()
+                for st in streams]
+    except Exception:
+        return []
+
+
+def _mic_track(path, names=None):
+    """The Mic layer's audio-stream index in a layered (2.81+) recording,
+    or None for older mixed files - callers then read the default track
+    exactly as they always did. Pass `names` when the caller has already
+    probed: two probes of the same file can disagree if one of them times
+    out on a cold disk, and then the mic gets extracted beside a mix that
+    was never built."""
+    names = _audio_track_names(path) if names is None else names
+    return names.index("mic") if "mic" in names else None
+
+
+def _mix_audio_args(path, names=None):
+    """The ffmpeg arguments that extract EVERYTHING AUDIBLE from a
+    recording - what a player would hear, him included.
+
+    ffmpeg picks a default audio stream when you do not name one: the
+    lowest-numbered track of the widest layout. On a layered file that IS
+    the Mix (checked byte for byte against the default pick on
+    hearthstone_20260816_153823), but with audio_mode="separate" there is
+    no Mix track at all and the default lands on System - the one track
+    his own microphone is not in. Measured on a 120s slice of that same
+    night remuxed as separate: the default pick gave the voice detector
+    6.4s of speech and NONE of the 7.2s his mic had actually captured;
+    summing the layers gives 13.7s and all 7.2s of it, matching the real
+    Mix track to a thousandth of a peak.
+
+    The sum uses normalize=0 because that is exactly how the recorder
+    builds its own Mix track (see _record_cmd), so this is at parity with
+    it and not louder. A file the tome did not record keeps the old
+    behaviour untouched: we only build a mix out of layers we can name."""
+    names = _audio_track_names(path) if names is None else names
+    if "mix" in names:
+        return ["-vn", "-map", "0:a:%d" % names.index("mix")]
+    if len(names) < 2 or "mic" not in names:
+        return ["-vn"]
+    ins = "".join("[0:a:%d]" % i for i in range(len(names)))
+    return ["-vn", "-filter_complex",
+            ins + ("amix=inputs=%d:duration=longest:normalize=0[a]"
+                   % len(names)),
+            "-map", "[a]"]
 
 
 def _probe_duration(path):
@@ -3951,11 +5628,24 @@ def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset
            f"{_sync(audio_inputs[i][2])}[a{i}]" for i in range(n)]
 
     if n >= 2 and s["audio_mode"] == "mix":
-        ins = "".join(f"[a{i}]" for i in range(n))
-        graph = ";".join(pre + [f"{ins}amix=inputs={n}:duration=longest:normalize=0[a]"])
-        cmd += ["-filter_complex", graph,
-                "-map", "0:v", "-map", "[a]",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_final]
+        # THE LAYERED BIND (2.81). Track 0 stays the mix - every player and
+        # the tome hear exactly what they always did - but System and Mic
+        # ride along as their own tracks, so the AI can tell HIS voice from
+        # the game's without un-mixing guesswork. asplit, because a filter
+        # pad may only feed one consumer.
+        ins = "".join(f"[s{i}]" for i in range(n))
+        split = ";".join(f"[a{i}]asplit=2[s{i}][t{i}]" for i in range(n))
+        graph = ";".join(pre + [split,
+                                f"{ins}amix=inputs={n}"
+                                f":duration=longest:normalize=0[a]"])
+        cmd += ["-filter_complex", graph, "-map", "0:v", "-map", "[a]"]
+        for i in range(n):
+            cmd += ["-map", f"[t{i}]"]
+        cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-metadata:s:a:0", "title=Mix"]
+        for i, (label, _p, _o) in enumerate(audio_inputs):
+            cmd += [f"-metadata:s:a:{i + 1}", f"title={label}"]
+        cmd += [out_final]
     else:
         cmd += ["-filter_complex", ";".join(pre), "-map", "0:v"]
         for i in range(n):
@@ -3982,6 +5672,9 @@ _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
 # pct from ffmpeg's -progress out_time vs the session's known length, MB/s from
 # the growing temp file. Also the instrumentation for "why was that save slow" -
 # the completion log line records wall time, size and speed for every bind.
+_BIND_TOK = [0]     # concurrent binds (chapter split + game close + a clip)
+#                     used to co-write one card - percentages flapping between
+#                     two names. The newest owner writes; elders go silent.
 _BINDING = {"name": None, "pct": None, "eta": None, "mbps": None,
             "t0": 0.0, "total": 0.0}
 _CONCAT_WATCH = {"stop": True, "ev": None}   # the stream-copy progress watcher
@@ -4031,12 +5724,17 @@ def _finish_queue_path():
 _FINISH_Q_LOCK = threading.RLock()
 
 
-def _load_finish_queue():
+def _load_finish_queue(strict=False):
     """Queue entries are dicts {'path', 'nits'}: nits = the Windows SDR white
     level when the file was recorded, because the conversion must use the value
     from RECORD time even if the user moves the slider (or turns HDR off) before
     the conversion gets its idle moment. Plain-string entries from 1.23 are
-    accepted and upgraded (their nits defaults at convert time)."""
+    accepted and upgraded (their nits defaults at convert time).
+
+    strict: an EXISTING queue file that cannot be read RAISES instead of
+    returning [] - a read-modify-write caller must never persist emptiness
+    over a real queue because of one transient read failure (that silently
+    dropped every pending HDR conversion, forever)."""
     try:
         with _FINISH_Q_LOCK:
             with open(_finish_queue_path(), encoding="utf-8") as fh:
@@ -4048,7 +5746,13 @@ def _load_finish_queue():
             elif isinstance(it, dict) and isinstance(it.get("path"), str):
                 out.append({"path": it["path"], "nits": it.get("nits")})
         return out
-    except Exception:
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        if strict and os.path.isfile(_finish_queue_path()):
+            log(f"The SDR queue could not be read ({e}) - "
+                "leaving it exactly as it is.")
+            raise
         return []
 
 
@@ -4069,6 +5773,10 @@ def _queue_sdr_finish(path):
     try:
         if not SETTINGS.get("sdr_finish", True) or not path:
             return
+        ap0 = os.path.normcase(os.path.abspath(path))
+        if any(os.path.normcase(os.path.abspath(str(x))) == ap0
+               for x in (SETTINGS.get("sdr_optout") or [])):
+            return                 # he chose to keep this one HDR
         if not _is_hdr_trc(_probe_color_trc(path)):
             return                     # already SDR
         dur = _probe_duration(path) or 0
@@ -4080,7 +5788,7 @@ def _queue_sdr_finish(path):
         # one locked unit: a delete's queue rewrite racing this append used to
         # overwrite the new entry - the file then stayed HDR forever, silently
         with _FINISH_Q_LOCK:
-            q = _load_finish_queue()
+            q = _load_finish_queue(strict=True)
             ap = os.path.abspath(path)
             if not any(it["path"] == ap for it in q):
                 q.append({"path": ap, "nits": _sdr_white_nits() or 240})
@@ -4092,10 +5800,15 @@ def _queue_sdr_finish(path):
 
 def _sdr_finish_abort():
     """A recording is starting: stop any in-flight conversion immediately (the
-    file stays queued and is retried later). GPU belongs to the game."""
+    file stays queued and is retried later). GPU belongs to the game.
+    STICKY: the flag is set whenever the worker is busy - during its probe
+    window there is no proc yet, and the old proc-only version silently
+    no-opped there, letting a full re-encode fight the whole game session."""
+    if not _FINISHING["busy"]:
+        return
+    _FINISHING["aborted"] = True
     p = _FINISHING.get("proc")
     if p is not None and p.poll() is None:
-        _FINISHING["aborted"] = True
         try:
             p.terminate()
         except Exception:
@@ -4178,8 +5891,13 @@ def _sdr_finish_worker(item, ctl=None):
         flags = ((subprocess.CREATE_NO_WINDOW
                   | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
                  if os.name == "nt" else 0)
-        _FINISHING["aborted"] = False
         _FINISHING["pct"] = None
+        if _FINISHING["aborted"]:
+            # the abort landed during the probes above (it is sticky now) -
+            # honor it before spawning a full-length re-encode into a game
+            # session. The entry stays queued; no strike.
+            aborted = True
+            return
         cmd = [SETTINGS["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error",
                "-progress", "pipe:1", "-nostats",
                "-i", path, "-vf", vf, "-c:v", enc,
@@ -4190,7 +5908,7 @@ def _sdr_finish_worker(item, ctl=None):
                # the end (a whole extra disk pass) and only matters for web
                # streaming - local players and Discord's own re-encode don't care.
                "-c:a", "copy", tmp_out]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+        proc = _popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, creationflags=flags)
         _FINISHING["proc"] = proc
         err_tail = bytearray()
@@ -4284,21 +6002,24 @@ def _sdr_finish_worker(item, ctl=None):
         # machine that can't convert doesn't spin ffmpeg forever. The whole
         # load->filter->save is one locked unit so a trim/delete editing the
         # queue at the same moment can't have its update overwritten.
-        with _FINISH_Q_LOCK:
-            q = _load_finish_queue()
-            ap = os.path.abspath(path)
-            if ok or not os.path.isfile(path):
-                q = [x for x in q if x["path"] != ap]
-                _save_finish_queue(q)
-                _FINISH_FAILS.pop(ap, None)
-            elif not aborted:
-                n = _FINISH_FAILS.get(ap, 0) + 1
-                _FINISH_FAILS[ap] = n
-                if n >= 3:
+        try:
+            with _FINISH_Q_LOCK:
+                q = _load_finish_queue(strict=True)
+                ap = os.path.abspath(path)
+                if ok or not os.path.isfile(path):
                     q = [x for x in q if x["path"] != ap]
                     _save_finish_queue(q)
-                    log("SDR conversion given up after 3 attempts (file stays HDR): "
-                        + os.path.basename(path))
+                    _FINISH_FAILS.pop(ap, None)
+                elif not aborted:
+                    n = _FINISH_FAILS.get(ap, 0) + 1
+                    _FINISH_FAILS[ap] = n
+                    if n >= 3:
+                        q = [x for x in q if x["path"] != ap]
+                        _save_finish_queue(q)
+                        log("SDR conversion given up after 3 attempts "
+                            "(file stays HDR): " + os.path.basename(path))
+        except Exception:
+            pass            # unreadable queue: leave it exactly as it is
         _FINISHING["busy"] = False
 
 
@@ -4315,16 +6036,21 @@ def _sdr_finish_tick(ctl):
     # machine to them and resume the conversion once they've stopped.
     if time.time() - _MEDIA.get("last_read", 0) < 20:
         return
-    q = _load_finish_queue()
-    q = [it for it in q if os.path.isfile(it["path"])]
-    if not q:
-        return
-    _save_finish_queue(q)
+    try:
+        with _FINISH_Q_LOCK:
+            q = _load_finish_queue(strict=True)
+            q = [it for it in q if os.path.isfile(it["path"])]
+            if not q:
+                return
+            _save_finish_queue(q)
+    except Exception:
+        return              # unreadable queue: convert nothing, erase nothing
     # Never convert a file the user is watching or cutting right now - the
     # final os.replace would fail against their open handle anyway.
     pick = next((it for it in q if not _source_busy(it["path"])), None)
     if pick is None:
         return
+    _FINISHING["aborted"] = False    # armed fresh for THIS job; sticky after
     _FINISHING["busy"] = True
     _FINISHING["path"] = pick["path"]     # dashboard badge reads these two
     _FINISHING["t0"] = time.time()
@@ -4515,7 +6241,7 @@ class Session:
                 if size and size[0] * size[1] <= 4_200_000 and (
                         self.cap_wh is None or not _list_segments(self.tmp)
                         or (size[0], size[1]) == tuple(self.cap_wh)):
-                    self.vproc = subprocess.Popen(
+                    self.vproc = _popen(
                         build_wgc_cmd(size[0], size[1],
                                       int(SETTINGS["framerate"]),
                                       self.seg_pattern,
@@ -4553,10 +6279,13 @@ class Session:
                     # (differently-aligned) size - end the chapter instead
                     raise RuntimeError(
                         f"capture size changed ({intend} vs {self.cap_wh})")
-            self.vproc = subprocess.Popen(
+            self.vproc = _popen(
                 build_video_cmd(self.seg_pattern, start_number=self._seg_start,
+                                # window scope already carries a real
+                                # output index; screen scope converts here
                                 monitor_index=(self.win["mon"] if self.win
-                                               else self.monitor_idx),
+                                               else _capture_output_idx(
+                                                   self.monitor_idx)),
                                 window_rect=((self.win["x"], self.win["y"],
                                               self.win["w"], self.win["h"])
                                              if self.win else None)),
@@ -4758,10 +6487,26 @@ class Session:
                         f"assembled - about {lost:.0f}s is missing from this "
                         f"recording (the rest is saved normally).")
             if len(run_finals) == 1:
+                # scratch lives on E: and the library on D: - os.replace
+                # across volumes fails EVERY time on this machine. Land on
+                # the destination volume first, then swap atomically,
+                # exactly like the many-run path below.
+                ok = False
                 try:
-                    os.replace(run_finals[0], self.final)
-                    ok = True
-                except Exception:
+                    tmp_final = self.final + ".__assembling__.mp4"
+                    shutil.move(run_finals[0], tmp_final)
+                    for _try in range(3):   # AV/indexer touch-locks pass
+                        try:
+                            os.replace(tmp_final, self.final)
+                            ok = True
+                            break
+                        except OSError:
+                            time.sleep(1.0)
+                    if not ok:
+                        raise OSError("the library file stayed locked")
+                except Exception as e:
+                    log(f"Could not move the finished video into the "
+                        f"library: {e}")
                     ok = False
             elif len(run_finals) > 1:
                 tmp_final = self.final + ".__assembling__.mp4"
@@ -4789,6 +6534,15 @@ class Session:
 
         if ok and os.path.isfile(self.final):
             log(f"Saved: {self.final}")
+            try:
+                buf = getattr(self, "_inp", None)
+                if buf and len(buf) > 10:
+                    os.makedirs(os.path.dirname(
+                        _ai_sidecar(self.final, "inp")), exist_ok=True)
+                    _atomic_write_json(_ai_sidecar(self.final, "inp"),
+                                       {"v": 1, "s": buf})
+            except Exception:
+                pass
             _record_made_file(self.final)   # own it before the cap can consider it
             _queue_sdr_finish(self.final)   # HDR file? convert to SDR once idle
             enforce_storage_cap()
@@ -4919,6 +6673,7 @@ class Session:
                     except Exception:
                         pass
             if r.returncode == 0 and os.path.isfile(out_final):
+                self._clip_saved = True     # this session mattered to him
                 log(f"Clip saved ({d:.0f}s): {out_final}")
                 _record_made_file(out_final)
                 _queue_sdr_finish(out_final)   # converted after the game session
@@ -5052,8 +6807,11 @@ class Session:
                 bind_total = d0 * max(1, len(segs) - 1) + dl
         except Exception:
             pass
+        _BIND_TOK[0] += 1
+        _btok = _BIND_TOK[0]
         _BINDING.update({"name": os.path.basename(out), "pct": None, "eta": None,
-                         "mbps": None, "t0": time.time(), "total": bind_total})
+                         "mbps": None, "t0": time.time(), "total": bind_total,
+                         "tok": _btok})
 
         def _mux(src, is_concat):
             cmd = build_mux_cmd(src, sys_wav, mic_wav, tmp_out, off_sys, off_mic,
@@ -5062,7 +6820,7 @@ class Session:
             cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
             t_start = time.time()
             try:
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                p = _popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, creationflags=flags)
             except Exception as e:
                 log(f"Mux failed to start ({e}); raw footage kept in the cache.")
@@ -5090,7 +6848,8 @@ class Session:
                     if s_ln.startswith("out_time_us=") or s_ln.startswith("out_time_ms="):
                         try:
                             done_s = int(s_ln.split("=")[1]) / 1e6
-                            if bind_total > 1:
+                            if bind_total > 1 \
+                                    and _BINDING.get("tok") == _btok:
                                 pct = max(0, min(99, int(done_s / bind_total * 100)))
                                 if pct != _BINDING["pct"] and _TRAY_ICON[0] is not None:
                                     # the tray answers "how far along?" without opening the tome
@@ -5105,7 +6864,8 @@ class Session:
                         except Exception:
                             pass
                         now = time.time()
-                        if now - last_size_t >= 1.5:
+                        if now - last_size_t >= 1.5 \
+                                and _BINDING.get("tok") == _btok:
                             try:
                                 sz = os.path.getsize(tmp_out) if os.path.isfile(tmp_out) else 0
                                 _BINDING["mbps"] = max(0.0, (sz - last_size) / 1e6
@@ -5214,6 +6974,7 @@ class _Ctl:
         self.watching = threading.Event()
         self.watching.set()
         self.stop_now = threading.Event()     # "stop this recording but keep watching"
+        self.drop_now = threading.Event()     # "stop it and throw it away"
         self.force_record = threading.Event()  # manual "record now" (even with no game)
         self.lock = threading.Lock()
         self.session = None
@@ -5697,7 +7458,8 @@ def _probe_dims(path):
         return None
 
 
-def _compress_for_discord(clip_path, max_mb, length_s=0, quality_mbps=0):
+def _compress_for_discord(clip_path, max_mb, length_s=0, quality_mbps=0,
+                          start_s=None):
     """Make a small, GOOD-looking copy of a clip for Discord. Optionally trims to
     the LAST `length_s` seconds, aims for `quality_mbps`, never exceeds `max_mb`.
     Quality levers (all offline - the game is long gone by now): the frame is
@@ -5710,11 +7472,26 @@ def _compress_for_discord(clip_path, max_mb, length_s=0, quality_mbps=0):
         return None
     import tempfile
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    # a UNIQUE name per send: two sends of the same file used to share one
+    # temp - ffmpeg -y overwrote the upload mid-flight and the loser deleted
+    # the winner's file
     out = os.path.join(tempfile.gettempdir(),
-                       "lore_share_" + os.path.basename(clip_path))
+                       f"lore_share_{os.getpid()}_{threading.get_ident()}_"
+                       + os.path.basename(clip_path))
     trim = []
+    tail = []
     use_dur = dur
-    if length_s and 0 < length_s < dur:
+    if start_s is not None and length_s:
+        # ANYWHERE IN THE FILE, not just the end - the Clipper hands over a
+        # span you dragged out in the player. Fast seek before -i lands on the
+        # nearest keyframe cheaply, and -t after it takes exactly the length
+        # asked for (without -t it would run to the end of a two-hour file and
+        # the bitrate maths would be nonsense).
+        start_s = max(0.0, min(float(start_s), max(0.0, dur - 0.2)))
+        use_dur = max(0.2, min(float(length_s), dur - start_s))
+        trim = ["-ss", f"{start_s:.3f}"]
+        tail = ["-t", f"{use_dur:.3f}"]
+    elif length_s and 0 < length_s < dur:
         trim = ["-ss", f"{max(0, dur - length_s):.3f}"]   # seek to the last N sec
         use_dur = length_s
     audio_kbps = 96
@@ -5748,7 +7525,7 @@ def _compress_for_discord(clip_path, max_mb, length_s=0, quality_mbps=0):
                "-c:v", "libx264", "-preset", "medium", "-b:v", f"{vbk}k",
                "-maxrate", f"{int(vbk * 1.35)}k", "-bufsize", f"{int(vbk * 2)}k",
                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-               "-movflags", "+faststart", out]
+               *tail, "-movflags", "+faststart", out]
         try:
             rr = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 creationflags=flags, timeout=600)
@@ -5844,12 +7621,16 @@ def _maybe_post_discord(ctl, clip_path):
     if not clip_path or not os.path.isfile(clip_path):
         return
     ctl.notify("Discord", "Posting clip...")
-    small = _compress_for_discord(
-        clip_path,
-        int(SETTINGS.get("discord_max_mb", 9) or 9),
-        length_s=int(SETTINGS.get("discord_clip_seconds", 0) or 0),
-        quality_mbps=int(SETTINGS.get("discord_quality_mbps", 0) or 0),
-    )
+    _source_busy_add(clip_path)      # the SDR finisher must not replace a
+    try:                             # file mid-read
+        small = _compress_for_discord(
+            clip_path,
+            int(SETTINGS.get("discord_max_mb", 9) or 9),
+            length_s=int(SETTINGS.get("discord_clip_seconds", 0) or 0),
+            quality_mbps=int(SETTINGS.get("discord_quality_mbps", 0) or 0),
+        )
+    finally:
+        _source_busy_done(clip_path)
     if not small:
         ctl.notify("Discord", "Couldn't fit the clip under the size limit - "
                    "lower the seconds or raise the limit in Sharing.")
@@ -5977,6 +7758,29 @@ def _window_track(ctl, session, current):
             else:
                 log("Window capture: the window is back - recording resumed.")
             return None
+        # LET IT SETTLE FIRST. A game returning from exclusive fullscreen
+        # rebuilds its swapchain, and for a poll or two its window measures
+        # something that is neither the old size nor the final one. Ending
+        # the chapter on that first reading is why alt-tab killed the
+        # recording on some games and not others. Two identical polls, the
+        # same patience the move/resize path below already applies - and
+        # while it waits the run stays paused, so nothing is lost. A window
+        # that settles back to the size it left at never reaches here at
+        # all: the branch above resumes the same file.
+        p, session._win_pend = session._win_pend, w
+        if not (p and (p["w"], p["h"]) == (w["w"], w["h"])):
+            return None
+        session._win_pend = None
+        cur0 = session.win
+        if (cur0 and w["w"] == cur0["w"]
+                and abs(w["h"] - cur0["h"]) <= 32):
+            # the Bazaar's 20 pixels, on the away-and-return path: a
+            # toolbar breathing is not a new chapter here either
+            log("Window capture: the window returned a few pixels "
+                "different - carrying on in the same chapter.")
+            session.win = w
+            session.win_paused = False
+            return None
         log("Window capture: the window returned at a new size - saving "
             "this chapter and starting fresh.")
         session.win_paused = False     # stays suspended; stop()/discard cope
@@ -5991,7 +7795,21 @@ def _window_track(ctl, session, current):
     p, session._win_pend = session._win_pend, w
     if not (p and (p["mon"], p["x"], p["y"], p["w"], p["h"]) ==
             (w["mon"], w["x"], w["y"], w["w"], w["h"])):
+        session._win_settle = 0
         return None                    # still moving; wait for it to settle
+    # THE BAZAAR'S 20 PIXELS. A same-width resize of a few dozen pixels
+    # is a toolbar or a border breathing, not a new chapter - his 16
+    # minute Bazaar was split for exactly this. A NEAR-SAME resize must
+    # hold for six consecutive polls before the recorder acts; a real
+    # resolution change (different width, or a big jump) acts on two,
+    # as it always has.
+    if (w["w"] == cur["w"] and w["h"] != cur["h"]
+            and abs(w["h"] - cur["h"]) <= 32):
+        session._win_settle = getattr(session, "_win_settle", 0) + 1
+        if session._win_settle < 6:
+            session._win_pend = w      # keep watching it
+            return None
+    session._win_settle = 0
     session._win_pend = None
     if (w["w"], w["h"]) == (cur["w"], cur["h"]):
         if getattr(session, "_wgc", None) is not None:
@@ -6034,6 +7852,20 @@ def _note_restart(session):
     return session._restart_streak
 
 
+def _restart_streak_now(session):
+    """The restart streak WITH its decay applied - what the gates must read.
+
+    The raw attribute only decays when _note_restart is next CALLED, but the
+    gates read it first - so one six-alt-tab storm froze the streak at 6 for
+    the rest of the session, and every later capture death (even a minute of
+    clean recording later) skipped the alt-tab recovery and ended the
+    chapter. Seven 'continuing the same recording' lines followed by a split
+    on the eighth alt-tab: this exact bug, measured 2026-08-15."""
+    if time.time() - getattr(session, "_last_restart", 0.0) > 60.0:
+        session._restart_streak = 0
+    return getattr(session, "_restart_streak", 0)
+
+
 def _apply_track_act(ctl, session, current, act):
     """End the current chapter on _window_track's orders ('split' = save it,
     'restart' = a seconds-old head, discard it) and immediately re-attach to
@@ -6047,11 +7879,25 @@ def _apply_track_act(ctl, session, current, act):
     with ctl.lock:
         ctl.session = None
     if act == "split":
-        ctl.notify("Saving your video…", current or "Screen", force=True)
-        _finalize_async(ctl, session)
+        # A LAUNCH IS NOT A CHAPTER. A game that changes resolution a few
+        # seconds after it opens - which is most of them - split the
+        # recording here and filed the head, so every launch left a
+        # five-second video behind. The worth-keeping mark already existed
+        # for a game that opens and shuts again; a chapter the TOME ended
+        # deserves the same test. What he started by hand is never judged
+        # on its length.
+        if _not_worth_keeping(session, ctl.force_record.is_set()):
+            secs = _captured_seconds(session)
+            log(f"{current or 'Screen'} changed shape after {secs}s - "
+                f"that head was a launch, not a chapter, so it was not "
+                f"saved.")
+            _discard_soon(session)
+        else:
+            ctl.notify("Saving your video…", current or "Screen", force=True)
+            _finalize_async(ctl, session)
     else:
         session.discard()
-    if not current or current not in running_process_names():
+    if not current or _looks_gone(current):
         # The game is gone: this chapter was the end. A manual recording's
         # force_record must be cleared too, or the next poll would start an
         # endless desktop recording (manual record never auto-stops).
@@ -6107,8 +7953,9 @@ def _trigger_replay(ctl, seconds=None, force_discord=False):
         if fresh:
             with ctl.lock:
                 ctl.saving += 1
+            _BIND_TOK[0] += 1
             _BINDING.update({"name": f"last {secs}s clip", "pct": None,
-                             "eta": None, "mbps": None,
+                             "eta": None, "mbps": None, "tok": _BIND_TOK[0],
                              "t0": time.time(), "total": 0.0})
         try:
             path = sess.save_replay(secs)
@@ -6350,6 +8197,8 @@ def _watch_core(ctl):
     threading.Thread(target=_sweep_orphan_temp, daemon=True).start()
     resolve_encoder()
     gb_hr = SETTINGS["bitrate_mbps"] / 8 * 3600 / 1024
+    _ai_rates_load()
+    _ai_state_load()
     log(f"Watching ({SETTINGS['detection_mode']}). {SETTINGS['framerate']}fps "
         f"{SETTINGS['bitrate_mbps']}Mbps VBR (~{gb_hr:.0f} GB/hr max) "
         f"{SETTINGS['_encoder_resolved']}/{SETTINGS['amf_quality']}. "
@@ -6363,8 +8212,8 @@ def _watch_core(ctl):
     log("Audio: " + (" + ".join(parts) if parts else "none") +
         (f"  [{SETTINGS['audio_mode']}]" if len(parts) == 2 else ""))
 
-    if SETTINGS.get("ai_transcribe", True) and _whisper_paths() is None:
-        log("The tome's reader (whisper) isn't installed next to the app; "
+    if SETTINGS.get("ai_transcribe", True) and _reader_paths() is None:
+        log("The tome's reader isn't installed next to the app; "
             "transcription and word-search stay quietly off.")
     if not _ffmpeg_ok():
         log("ffmpeg health check failed: the video tool did not run.")
@@ -6407,6 +8256,27 @@ def _watch_core(ctl):
                 # paused would leave the app paused (and not detecting the next game).
                 ctl.watching.set()
 
+            # STOP AND THROW IT AWAY. Every other way out of a recording ends
+            # in a saved file; sometimes you know within seconds that this one
+            # is not worth one.
+            if ctl.drop_now.is_set():
+                ctl.drop_now.clear()
+                ctl.force_record.clear()
+                if session:
+                    _loop_sound(ctl, "off")
+                    ctl.suppressed_game = current
+                    with ctl.lock:
+                        ctl.session = None
+                    secs = _captured_seconds(session)
+                    ctl.notify("Recording thrown away",
+                               f"{_fmt_secs(secs)} discarded - nothing was saved.",
+                               force=True)
+                    log(f"Recording thrown away by hand ({secs}s, nothing saved).")
+                    _discard_soon(session)
+                    session = current = None
+                    manual = False
+                ctl.watching.set()
+
             # PAUSE: suspend the current recording (keep footage); Continue resumes it.
             if not ctl.watching.is_set():
                 if session and not session.suspended:
@@ -6429,7 +8299,15 @@ def _watch_core(ctl):
             # auto-pause keeps watching set, so only the game-gone check may
             # act - _window_track resumes when the window returns.)
             if session and session.suspended:
-                game_gone = current is not None and current not in running_process_names()
+                # THREE THINGS HAVE TO AGREE THAT A GAME CLOSED. It used to
+                # be one: a name missing from one process walk, twice. That
+                # walk can come back short while he is gaming, and two short
+                # walks ended a recording he was still making.
+                _names = running_process_names()
+                game_gone = (current is not None
+                             and _process_walk_trustworthy(_names)
+                             and current not in _names
+                             and not _exe_has_any_window(current))
                 # Debounced: a suspended session can sit here for hours (a
                 # minimised game), and one incomplete process-list poll must
                 # not finalise a recording whose game is merely minimised.
@@ -6488,7 +8366,7 @@ def _watch_core(ctl):
                         _loop_sound(ctl, "on")
                         ctl.notify("Recording resumed", current or "Screen", force=True)
                         ctl.set_status("recording")
-                elif session._gone_polls >= 2:
+                elif session._gone_polls >= 3:
                     ctl.force_record.clear()
                     with ctl.lock:
                         ctl.session = None
@@ -6499,6 +8377,26 @@ def _watch_core(ctl):
                     # started (no matching start chime ever sounded).
                     if session.win_paused and not _list_segments(session.tmp):
                         session.discard()
+                    elif _not_worth_keeping(session, manual):
+                        # this branch previously existed ONLY in the window-
+                        # scope path; the ordinary screen-scope exit saved
+                        # every accidental open-and-quit regardless
+                        # OPENED AND SHUT AGAIN. You never asked for this one,
+                        # and a file you would only have deleted later is worse
+                        # than no file: it goes in the queue, gets read, gets
+                        # described, and sits in the list looking like a
+                        # session. Nothing was worth keeping, so nothing is.
+                        secs = _captured_seconds(session)
+                        log(f"{current or 'Screen'} closed after {secs}s - "
+                            f"under the {int(SETTINGS.get('min_keep_seconds', 45))}s "
+                            f"worth-keeping mark, so it was not saved.")
+                        # SAY SO. The start was announced with a toast; an
+                        # unannounced vanishing reads as a lost recording.
+                        ctl.notify("Not kept",
+                                   f"{current or 'Screen'} closed after "
+                                   f"{_fmt_secs(secs)} - too short to file. "
+                                   "Settings > Replay to change the mark.")
+                        _discard_soon(session)
                     else:
                         _loop_sound(ctl, "off")
                         ctl.notify("Saving your video…", current or "Screen", force=True)
@@ -6506,10 +8404,47 @@ def _watch_core(ctl):
                     session = current = None
                     manual = False
 
+            # READING WHILE RECORDING. Everything below this line lives inside
+            # "if session is None", so from the instant a recording starts the
+            # reader was never called at all. The Background work switch says
+            # "anytime, even mid-game" and could not possibly deliver it -
+            # the call site was unreachable during a recording, which is most
+            # of the time on this machine.
+            if session is not None and (SETTINGS.get("always_read")
+                                        or _AI.get("force")
+                                        or _AI.get("force_queue")):
+                _ai_tick(ctl)
+
             if session is None:
                 if ctl.saving <= 0:
                     ctl.set_status("watching")   # but keep showing 'saving' while a save runs
                 g = find_active_game()
+                try:
+                    # THE PULSE. The log dies silently on this machine
+                    # (item 11), and tonight that blinded a whole
+                    # recorder diagnosis. One tiny file, rewritten in
+                    # place every poll, says what the watcher saw. It
+                    # lives beside settings.json - the one folder this
+                    # app provably writes all day - and lands whole via
+                    # replace, so a reader never catches half a json.
+                    _bp = os.path.join(_data_dir(), "watch.beat")
+                    _doc = {"at": round(time.time(), 1),
+                            "sees": g or "",
+                            "suppressed": ctl.suppressed_game or "",
+                            "forced": bool(ctl.force_record.is_set())}
+                    if _WATCH_NOTE["fail_g"]:
+                        _doc["last_start_fail"] = {
+                            "at": round(_WATCH_NOTE["fail_at"], 1),
+                            "game": _WATCH_NOTE["fail_g"]}
+                    if _WATCH_NOTE["learn_g"]:
+                        _doc["last_learned"] = {
+                            "at": round(_WATCH_NOTE["learn_at"], 1),
+                            "game": _WATCH_NOTE["learn_g"]}
+                    with open(_bp + ".tmp", "w", encoding="utf-8") as _bf:
+                        _bf.write(json.dumps(_doc))
+                    os.replace(_bp + ".tmp", _bp)
+                except Exception:
+                    pass
                 # Forget the suppression as soon as the game we manually stopped is no
                 # longer the active full-screen app (you minimised it, alt-tabbed away,
                 # or closed it) - so RE-maximising it starts a fresh recording. This is
@@ -6520,8 +8455,15 @@ def _watch_core(ctl):
                     ctl.suppressed_game = None
                 auto = bool(g) and g != ctl.suppressed_game and not ctl.force_record.is_set()
                 if not g and not ctl.force_record.is_set():
-                    _sdr_finish_tick(ctl)      # truly idle: chip away at HDR->SDR queue
+                    if _bg_work_allowed():
+                        _sdr_finish_tick(ctl)  # truly idle: HDR->SDR
                     _ai_tick(ctl)              # ...and let the tome read its books
+                elif SETTINGS.get("always_read") or _AI.get("force") \
+                        or _AI.get("force_queue"):
+                    # a game is in front, or one is being recorded, and you have
+                    # said to read anyway. It runs BELOW NORMAL and the game
+                    # keeps the GPU - only the disk is shared.
+                    _ai_tick(ctl)
                 if auto:
                     _sdr_finish_abort()        # game first - the GPU is theirs now
                     # ...but a recording you asked for BY NAME keeps going
@@ -6530,6 +8472,10 @@ def _watch_core(ctl):
                     ctl.set_status("starting")     # honest "warming up" while ffmpeg spins up
                     if not _safe_start(session, ctl):
                         session = None
+                        # the failure rides every later pulse - a note
+                        # one poll wide was unreadable by design
+                        _WATCH_NOTE["fail_at"] = time.time()
+                        _WATCH_NOTE["fail_g"] = g or ""
                         start_fails += 1
                         if start_fails >= 4:
                             # stop hammering one game that won't start (the user was
@@ -6611,8 +8557,8 @@ def _watch_core(ctl):
                     # session and the file, and only end the chapter when the
                     # window genuinely comes back a different SIZE (one file
                     # can never hold two frame sizes).
-                    if (getattr(session, "win", None)
-                            and getattr(session, "_restart_streak", 0) < 6):
+                    if getattr(session, "win", None):
+                        streak_ok = _restart_streak_now(session) < 6
                         _note_restart(session)
                         for ln in session.err_text().splitlines()[-2:]:
                             if ln.strip():
@@ -6625,7 +8571,7 @@ def _watch_core(ctl):
                                     break
                             except OSError:
                                 pass
-                        game_alive = (current in running_process_names()
+                        game_alive = ((not _looks_gone(current))
                                       if current else bool(manual))
                         try:
                             fresh = _game_window_rect(
@@ -6633,7 +8579,7 @@ def _watch_core(ctl):
                                 hwnd=session.win.get("hwnd"))
                         except Exception:
                             fresh = None
-                        if proven and game_alive:
+                        if streak_ok and proven and game_alive:
                             if fresh is None or fresh.get("iconic"):
                                 # the window is away right now (that IS the
                                 # alt-tab): pause and let the tracker resume
@@ -6676,6 +8622,10 @@ def _watch_core(ctl):
                                 continue
                             log("Window capture: the window came back a "
                                 "different size - saving this chapter.")
+                        if not streak_ok:
+                            log("The capture keeps dying moments after each "
+                                "restart - saving this chapter and starting "
+                                "a fresh one.")
                         act = ("split"
                                if len(_list_segments(session.tmp)) >= 4
                                else "restart")
@@ -6699,7 +8649,7 @@ def _watch_core(ctl):
                             and len(_list_segments(session.tmp))
                                 <= getattr(session, "_run_vstart", 0)
                             and (not _list_segments(session.tmp)
-                                 or getattr(session, "_restart_streak", 0) >= 6)):
+                                 or _restart_streak_now(session) >= 6)):
                         err = session.err_text()
                         for ln in err.splitlines()[-4:]:
                             if ln.strip():
@@ -6790,7 +8740,7 @@ def _watch_core(ctl):
                     # A manual desktop recording has no game to be alive -
                     # it must still survive a display-mode change (it used to
                     # fall through and re-persist compatible mode).
-                    game_alive = (current in running_process_names()
+                    game_alive = ((not _looks_gone(current))
                                   if current else bool(manual))
                     # ...but ONLY while the capture would come back identical.
                     # The very event that kills it (a display-mode change) can
@@ -6807,7 +8757,7 @@ def _watch_core(ctl):
                         and now_wh == session.cap_wh
                         and _hdr_run_flag() == getattr(session, "_hdr_used", False))
                     if (proven and game_alive and same_shape
-                            and getattr(session, "_restart_streak", 0) < 6):
+                            and _restart_streak_now(session) < 6):
                         _note_restart(session)
                         for ln in session.err_text().splitlines()[-2:]:
                             if ln.strip():
@@ -6889,11 +8839,14 @@ def _watch_core(ctl):
                     if gg:
                         current = gg
                         log(f"Attached recording to '{gg}'.")
-                elif current is not None and current not in running_process_names():
+                elif current is not None and _looks_gone(current):
                     # Debounce: a single missed poll (alt-tab, brief hitch) shouldn't
                     # end the recording - only stop once the game is really gone.
+                    # THREE polls now, and each one demands the full
+                    # three-agreements test - this is the site that ended
+                    # his Bazaar mid-game on two short walks.
                     gone += 1
-                    if gone >= 2:
+                    if gone >= 3:
                         gone = 0
                         enc_fails = 0
                         _loop_sound(ctl, "off")
@@ -6908,6 +8861,7 @@ def _watch_core(ctl):
                 else:
                     gone = 0
                     enc_fails = 0   # healthy: encoder alive and the game is running
+                    _inp_beat(session)
                     _afk_track(ctl, session, current)
                     if session.suspended:              # AFK pause just landed
                         _interruptible_sleep(ctl, SETTINGS["poll_interval"])
@@ -6993,13 +8947,33 @@ def _claim_lock():
     return True
 
 
+def _watch_core_guarded(ctl):
+    """_watch_core with a confession. An uncaught raise in its pre-loop
+    section (settings load, migrations, encoder resolve) died on a daemon
+    thread into a stderr the windowed exe discards - tray up, tome up, and
+    nothing ever records again with no line anywhere saying why."""
+    try:
+        _watch_core(ctl)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc().strip().splitlines()
+        log("THE WATCHER CRASHED - nothing will record until LORE is "
+            "restarted: " + " | ".join(tb[-3:]))
+        try:
+            ctl.notify("Lore", "The recorder crashed - restart LORE to "
+                       "record again. See lore.log.")
+        except Exception:
+            pass
+
+
 def watch_loop():
     """Legacy console watcher (no tray icon). Ctrl+C to quit."""
     if not _hold_singleton_mutex() or not _claim_lock():
         return
     log("Idle. Launch a game to start. Ctrl+C to quit.")
     ctl = _Ctl()
-    t = threading.Thread(target=_watch_core, args=(ctl,), daemon=True)
+    t = threading.Thread(target=_watch_core_guarded, args=(ctl,),
+                         daemon=True)
     t.start()
     try:
         while t.is_alive():
@@ -7556,6 +9530,51 @@ def _norm_game_key(s):
     return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
 
 
+_GAME_NAME_TOOL = {
+    "name": "name_the_game",
+    "description": "Identify a PC game from its executable and window title.",
+    "input_schema": {"type": "object", "properties": {
+        "name": {"type": "string",
+                 "description": "The game's proper title as players know it, "
+                                "or an empty string if you are not sure."},
+        "sure": {"type": "boolean",
+                 "description": "true only if you actually recognise it"}},
+        "required": ["name", "sure"]}}
+
+
+def _claude_game_name(exe, title, raw):
+    """The last resort, and only ever the last resort - everything free has
+    already failed by the time this is called."""
+    if not os.path.isfile(_key_path()):
+        return None
+    key = _norm_game_key(raw or exe or "")
+    if not key:
+        return None
+    asked = _AI.setdefault("named", set())
+    if key in asked:
+        return None                    # one question per game, ever
+    asked.add(key)
+    data, why = _claude(
+        "You identify PC games from the name of their executable and the title "
+        "of their window. Answer with the title players actually use - "
+        "'Palworld', not 'palworld-win64-shipping'. Strip engine and build "
+        "tags. If you do not genuinely recognise it, say so with sure=false "
+        "and an empty name rather than guessing.",
+        f"Executable: {exe or '(unknown)'}\n"
+        f"Window title: {title or '(none)'}\n"
+        f"Folder name LORE derived: {raw or '(none)'}",
+        _GAME_NAME_TOOL, max_tokens=200, model=CLAUDE_MODELS["fast"])
+    if not data or not data.get("sure"):
+        return None
+    name = str(data.get("name") or "").strip()
+    if not name or len(name) > 60:
+        return None
+    if _norm_game_key(name) == _norm_game_key(raw or ""):
+        return None                    # it agreed with the filename: no news
+    log(f"Claude named a game: {raw} -> {name}")
+    return name
+
+
 def _auto_name_for_raw(raw):
     """Automatic exe/title/appmanifest alias for an old or future recording.
     This is what makes a newly discovered real title apply to all existing files
@@ -7828,9 +9847,18 @@ def _learn_game_display_name(pname, retry=True):
             except Exception:
                 _RELEARN_PENDING.discard(raw_base)
         if _norm_game_key(name) == _norm_game_key(raw_base):
-            # the winner just confirms the filename-derived title: nothing worth
-            # persisting, and crucially nothing WRONG got stored either
-            return name
+            # NOTHING FREE COULD NAME IT. Steam, Windows' own game list and the
+            # window title all came back with the executable. This is the case
+            # that produced 'dsclient-win64-shipping' - so if there is a key,
+            # ask, and treat the answer as a middling-confidence source that a
+            # real Steam match would still beat later.
+            asked = _claude_game_name(exe, title, raw_base)
+            if asked:
+                name, source, score = asked, "claude", 55
+            else:
+                # the winner just confirms the filename-derived title: nothing
+                # worth persisting, and nothing WRONG got stored either
+                return name
         auto = dict(_load_auto_game_names())
         keys = {_norm_game_key(raw_base), _norm_game_key(pname)}
         if exe:
@@ -7966,7 +9994,7 @@ def _thumb_dir(out):
 
 # ---------------------------------------------------------------------------
 #  The tome's intelligence (Lore 2.0) - all LOCAL, all idle-time:
-#    * whisper.cpp transcribes every recording (CPU, BELOW_NORMAL, ~20x
+#    * Qwen3-ASR transcribes every recording (CPU, BELOW_NORMAL,
 #      realtime on this machine) -> the library is searchable by what was
 #      actually SAID, and a hit jumps playback to that second.
 #    * a numpy loudness pass marks the moments worth rewatching (fights,
@@ -7977,20 +10005,408 @@ def _thumb_dir(out):
 #  orphan files the cache sweep can clear.
 # ---------------------------------------------------------------------------
 _AI = {"busy": None, "t_last": 0.0, "index": None, "index_t": 0.0,
-       "proc": None, "abort": False, "failed": {}}
+       "proc": None, "abort": False, "failed": {},
+       # what the job in hand is working on, so the UI can show a real bar
+       "started": 0.0, "job_secs": 0.0,
+       # HOW LONG THINGS ACTUALLY TAKE, measured rather than guessed: seconds
+       # of wall clock per second of video, kept per kind as a rolling mean.
+       # An estimate built from this library beats any constant.
+       "rate": {"listening": [], "hearing": [], "thinking": []},
+       # held PER JOB: one switch for both meant holding the sound silently
+       # held transcripts too, with nothing on screen to say so
+       "paused": False,
+       "held": {"listening": False, "hearing": False, "thinking": False,
+                "auditing": False}}
+
+# The two things the reader does, named for what they produce.
+AI_KINDS = ("listening", "hearing", "thinking")
+
+# force/force_queue are written by the UI thread (prioritise, batches, Stop)
+# and consumed by the watcher's tick. The pairs must move as one: unlocked,
+# a Stop between jobs resurrected the batch from the tick's stale write-back,
+# and a fresh batch was clobbered by the old remainder.
+_AI_FORCE_LOCK = threading.RLock()
+AI_LABEL = {"listening": "sound & gold moments", "hearing": "transcript",
+            "thinking": "titles, chapters & clips"}
+
+
+# Where to start before this machine has timed anything itself. Measured on
+# a real 4.4 TB library: the audio pass runs about 54x real time (it is disk
+# bound, not CPU bound) and the reader about 2x. Being roughly right from the
+# first second beats showing nothing at all, and the moment a real job
+# finishes these are replaced by what actually happened.
+# Until this machine has timed one for itself. The reader's guess was 10.5x
+# realtime, which is what a short quiet clip looks like - the first busy
+# session it met (29% talking) really ran at 1.2x, so it promised twenty
+# minutes and took two hours. Roughly 1.5x realtime is the honest middle:
+# still a guess, but one that does not flatter itself by a factor of nine.
+_AI_RATE_GUESS = {"listening": 1.0 / 54.0, "hearing": 1.0 / 1.5,
+                  "thinking": 1.0 / 900.0}
+
+
+def _game_has_focus():
+    """Is a game the window he is actually looking at?
+
+    find_active_game() answers "is a game running", which is the right
+    question for deciding whether to RECORD and the wrong one for deciding
+    how much processor to take: a launcher, an idle Hearthstone behind the
+    tome, a game left open while he reads - none of those are being played,
+    and each of them used to cost him three quarters of his machine."""
+    if os.name != "nt":
+        return False
+    try:
+        # imported HERE, as everything else in this file does - ctypes is not
+        # a module-level name and reaching for one that is not there would
+        # throttle him forever behind a silent except
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value or pid.value == os.getpid():
+            return False
+        name = psutil.Process(pid.value).name().lower()
+    except Exception:
+        return False              # cannot tell -> do not throttle him
+    try:
+        if name in load_ignore_list():
+            return False
+        return bool(name in load_game_list() or name in load_builtin_games())
+    except Exception:
+        return False
+
+
+def _reader_threads():
+    """How much of the machine the reader may take, RIGHT NOW.
+
+    A quarter of it while he is actually playing - a stuttering game is
+    noticed instantly and slow reading is invisible. Otherwise nearly all of
+    it, because nothing is competing for it."""
+    n = os.cpu_count() or 8
+    playing = False
+    try:
+        ctl = _AI.get("ctl")
+        playing = bool(ctl is not None and ctl.session is not None)
+    except Exception:
+        pass
+    if not playing:
+        playing = _game_has_focus()
+    return max(2, n // 4) if playing else max(2, n - 4)
+
+
+def _write_reader_budget(ctl_path):
+    """Tell a running reader what it may use. It re-reads this between
+    utterances, so alt-tabbing out of a game speeds it up within seconds
+    instead of at the next job."""
+    try:
+        n = _reader_threads()
+        tmp = ctl_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"threads": n}, fh)
+        os.replace(tmp, ctl_path)
+        return n
+    except Exception:
+        return None
+
+
+def _ai_rate(kind):
+    """Seconds of work per second of video, averaged over what this machine
+    has actually done - falling back to a sensible figure until it has."""
+    r = _AI["rate"].get(kind) or []
+    if r:
+        return sum(r) / len(r)
+    return _AI_RATE_GUESS.get(kind)
+
+
+def _ai_rates_load():
+    """Bring back what was learned before the last restart."""
+    try:
+        got = SETTINGS.get("ai_rates") or {}
+        # speech_cost/speech_frac ride along with the rest - they are the ones
+        # the reader is actually priced by now, and leaving them out here
+        # would have thrown them away on every restart, which is exactly the
+        # bug that was already fixed once for the other three.
+        for k in ("listening", "hearing", "thinking",
+                  "speech_cost", "speech_frac"):
+            v = got.get(k)
+            if isinstance(v, list):
+                keep = 24 if k == "speech_frac" else 12
+                _AI["rate"][k] = [float(x) for x in v[-keep:] if float(x) > 0]
+    except Exception:
+        pass
+
+
+def _ai_note_rate(kind, video_secs, took):
+    if video_secs <= 0 or took <= 0:
+        return
+    r = _AI["rate"].setdefault(kind, [])
+    r.append(took / video_secs)
+    del r[:-12]                       # only the recent dozen matter
+    # WRITE IT DOWN. Held only in memory, every update threw it away - and
+    # with it the percentage, the time left and the speed on the Working page.
+    try:
+        _persist_setting("ai_rates", {k: v for k, v in _AI["rate"].items() if v})
+    except Exception:
+        pass
+
+
+def _ai_note_speech(video_secs, speech_secs, took):
+    """Remember what a second of TALKING costs, and how much of a recording
+    tends to be talking. Two numbers instead of one, because they vary for
+    completely different reasons: the first is this machine, the second is
+    whether anybody was in Discord."""
+    if video_secs <= 0 or speech_secs <= 0 or took <= 0:
+        return
+    sr = _AI["rate"].setdefault("speech_cost", [])
+    sr.append(took / speech_secs)
+    del sr[:-12]
+    fr = _AI["rate"].setdefault("speech_frac", [])
+    fr.append(max(0.0, min(1.0, speech_secs / video_secs)))
+    del fr[:-24]                  # this one is noisier - keep more of it
+    try:
+        _persist_setting("ai_rates", {k: v for k, v in _AI["rate"].items() if v})
+    except Exception:
+        pass
+
+
+def _hearing_secs_per_video_sec():
+    """What one second of recording costs the reader, on this machine.
+
+    Preferring speech x cost over the old flat per-video average, because the
+    flat one is an average over whoever happened to be talking in the last
+    dozen recordings, and it was wrong by 5x on the first busy session it met.
+    Falls back to the old number until there is speech history to use."""
+    cost = _AI["rate"].get("speech_cost") or []
+    frac = _AI["rate"].get("speech_frac") or []
+    if cost and frac:
+        return (sum(cost) / len(cost)) * (sum(frac) / len(frac))
+    return _ai_rate("hearing")
+
+
+def _ask_srv_drop():
+    """Stop the question box's PRIVATE server, if one is idling. A job is
+    about to own the card, and with the fit now automatic that idle
+    server can be holding most of it - which is how a transcribe found
+    no room and fell back to the CPU road at a third of the speed. A
+    BORROWED server (a describe job's own, pr is None) is never touched."""
+    srv = _ASK.get("srv")
+    if srv is not None and srv.pr is not None:
+        try:
+            srv.stop()
+        except Exception:
+            pass
+        _ASK["srv"] = None
+
+
+def _ai_want_lanes(want):
+    """Which of the reader's three lanes a forced ask drives. The queue
+    holds (path, want, redo); pause holds lanes; this is the bridge."""
+    w = str(want or "all").lower()
+    if w == "sound":
+        return ("listening",)
+    if w == "words":
+        return ("hearing",)
+    if w == "think":
+        return ("thinking",)
+    if w == "audit":
+        return ("auditing",)
+    return ("listening", "hearing", "thinking")   # "all" and anything odd
+
+
+def _ai_effective_lane(kind, name):
+    """The lane a busy tuple REALLY belongs to. The audit rides the
+    thinking lane wearing a name prefix; three sites sniffed it three
+    different ways before this."""
+    if str(name or "").startswith("the audit \u00b7") \
+            or _AI.get("aud_prog") is not None:
+        return "auditing"
+    return kind or "thinking"
+
+
+def _bg_work_allowed():
+    """One question, one answer: may ANY background work run? The
+    master switch is the whole answer - the finer switches and holds
+    speak below it."""
+    return not SETTINGS.get("bg_shutdown")
+
+
+def _ai_next_sweep():
+    """What the sweep would take next, by NAME - the queue stops being
+    a mystery. Read-only, 8-second cache, same selection the real walk
+    makes; drift between the two is a review item, not a crash."""
+    now = time.time()
+    c = _AI.get("next_pick")
+    if c and now - c[0] < 8:
+        return c[1]
+    val = None
+    try:
+        held = _AI.get("held") or {}
+        if _bg_work_allowed() and not (held and all(held.values())):
+            out = SETTINGS.get("output_dir", "")
+            vids = []
+            for d, kind in _library_dirs(out):
+                for v in _scan_dir_mp4s(d, kind):
+                    vids.append((v["path"], v.get("mtime") or 0))
+            vids.sort(key=lambda pm: -pm[1])
+            do_stt = (SETTINGS.get("ai_transcribe", True)
+                      and _reader_paths() is not None
+                      and not held.get("hearing"))
+            do_hl = (SETTINGS.get("ai_highlights", True)
+                     and not held.get("listening"))
+            do_ins = (SETTINGS.get("insights_auto", True)
+                      and not held.get("thinking")
+                      and _describer_paths() is not None)
+            for p, mt in vids:
+                if _queued_finish_badge(p):
+                    continue
+                if (_AI.get("failed") or {}).get(p) == mt:
+                    continue
+                if do_hl and (not _ai_sidecar_fresh(p, "hl")
+                              or not _ai_sidecar_fresh(p, "lvl")):
+                    val = {"name": os.path.basename(p),
+                           "kind": "listening"}
+                    break
+                if do_stt and not _ai_sidecar_fresh(p, "stt"):
+                    val = {"name": os.path.basename(p),
+                           "kind": "hearing"}
+                    break
+                if (do_ins and (_ins_owing(p) or _sns_owing(p))
+                        and _ai_sidecar_fresh(p, "hl")
+                        and _ai_sidecar_fresh(p, "stt")):
+                    val = {"name": os.path.basename(p),
+                           "kind": "thinking"}
+                    break
+                if (SETTINGS.get("insights_auto", True)
+                        and not held.get("auditing")
+                        and _aud_owing_swept(p)
+                        and _ai_sidecar_fresh(p, "hl")
+                        and _ai_sidecar_fresh(p, "stt")):
+                    val = {"name": os.path.basename(p),
+                           "kind": "auditing"}
+                    break
+    except Exception:
+        val = None
+    _AI["next_pick"] = (now, val)
+    return val
+
+
+def _ai_state_path():
+    return os.path.join(_data_dir(), "ai_state.json")
+
+
+def _ai_state_save():
+    """The line, the holds and the master switch, written down - so
+    closing LORE and opening it continues the SAME work. The job in
+    hand is saved as the head of the line: its banked pieces are on
+    disk, so re-asking is a resume, not a restart."""
+    try:
+        with _AI_FORCE_LOCK:
+            q = list(_AI.get("force_queue") or [])
+            f = _AI.get("force")
+            if f:
+                q = [(f, _AI.get("force_want") or "all",
+                      bool(_AI.get("force_redo")),
+                      sorted(_AI.get("force_ran") or set()))] + q
+        doc = {"queue": [[it[0], it[1] if len(it) > 1 else "all",
+                          bool(it[2]) if len(it) > 2 else False,
+                          list(it[3]) if len(it) > 3 else []]
+                         for it in q],
+               "held": dict(_AI.get("held") or {})}
+        tmp = _ai_state_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, _ai_state_path())
+    except Exception:
+        pass
+
+
+def _ai_state_load():
+    """Boot: the line and the holds come back exactly as they were
+    left. Paths that no longer exist fall out quietly."""
+    try:
+        with open(_ai_state_path(), encoding="utf-8") as fh:
+            doc = json.load(fh) or {}
+    except Exception:
+        return
+    try:
+        q = []
+        for it in (doc.get("queue") or []):
+            if (isinstance(it, list) and it
+                    and isinstance(it[0], str) and os.path.isfile(it[0])):
+                q.append((it[0],
+                          str(it[1]) if len(it) > 1 else "all",
+                          bool(it[2]) if len(it) > 2 else False,
+                          [str(x) for x in it[3]] if len(it) > 3 else []))
+        h = doc.get("held") or {}
+        held = _AI.setdefault("held", {"listening": False,
+                                       "hearing": False})
+        for k in ("listening", "hearing", "thinking", "auditing"):
+            held[k] = bool(h.get(k))
+        _AI["paused"] = all(held.values())
+        with _AI_FORCE_LOCK:
+            _AI["force_queue"] = q
+        if q:
+            log("The waiting line came back with " + str(len(q))
+                + " item(s) - closing the tome loses nothing.")
+    except Exception:
+        pass
+
+
+def _ai_lanes_free(want):
+    """May a forced ask with this want start right now, or is a lane it
+    needs held? Held lanes make queued work WAIT - never disappear."""
+    held = _AI.get("held") or {}
+    return not any(held.get(k) for k in _ai_want_lanes(want))
+
+
+def _ai_unhold_for(want):
+    """Asking by name lifts the hold on the lanes that ask needs. The
+    press is him saying "this one, now", and that outranks the earlier
+    "wait" - without this, a name-ask made while held would sit in the
+    queue in silence, which is the pause bug wearing a new hat."""
+    held = _AI.get("held") or {}
+    lifted = [k for k in _ai_want_lanes(want) if held.get(k)]
+    for k in lifted:
+        held[k] = False
+    if lifted:
+        _AI["paused"] = all(held.values()) if held else False
+        log("You asked by name, so the hold is lifted on: "
+            + ", ".join(AI_LABEL.get(k, k) for k in lifted) + ".")
 
 
 def _ai_abort(force_too=True):
-    """A game just appeared: stop the current AI job NOW (the whisper /
+    """A game just appeared: stop the current AI job NOW (the reader /
     ffmpeg child is terminated; the sidecar stays missing and the job
     simply re-runs at the next idle stretch).
 
     force_too=False spares a job you ASKED for by name - a game starting is
     not a reason to abandon the one recording you pointed at."""
-    if not force_too and _AI.get("force"):
+    pr = _AI.get("proc")           # the JOB's child, captured before any
+    #                                 other stop() can touch the slot
+    srv = _ASK.get("srv")
+    if srv is not None and srv.pr is not None:
+        try:
+            srv.stop()             # the sage's 10 GB yields to the game,
+        except Exception:          # spared job or not
+            pass
+        _ASK["srv"] = None
+    _desc_keep_drop()              # a parked warm describer yields too
+    try:
+        _aud_keep_drop()               # and the parked thinker with it
+    except NameError:
+        pass                           # import order; defined below
+    # spare ONLY the job he pointed at by name - always_read used to give
+    # EVERY background job this pass, which let a 10 GB describer sit on
+    # the card straight through a game launch
+    if not force_too and _AI.get("busy_path") \
+            and _AI.get("busy_path") == _AI.get("force"):
         return
     _AI["abort"] = True
-    pr = _AI.get("proc")
+    _AI["wind"] = False                # stop outranks a pending wind-down
+    _AI["wind_src"] = None
     if pr is not None:
         try:
             pr.terminate()
@@ -7998,11 +10414,12 @@ def _ai_abort(force_too=True):
             pass
 
 
-def _ai_run(cmd, timeout, flags):
+def _ai_run(cmd, timeout, flags, env=None):
     """subprocess.run, but abortable via _ai_abort() - the handle is
     published so a starting game can kill the child instantly."""
-    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, creationflags=flags)
+    pr = _popen(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, creationflags=flags,
+                          env=env)
     _AI["proc"] = pr
     if _AI["abort"]:
         try:                       # abort landed between gate and spawn -
@@ -8032,32 +10449,6 @@ def _ai_run(cmd, timeout, flags):
 #  forty times"). large-v3-turbo is multilingual, far more accurate on
 #  accented English, and measured only ~1.7x slower here (10.5x realtime
 #  against 17.6x) - worth every second.
-WHISPER_MODELS = {
-    "best": "ggml-large-v3-turbo-q5_0.bin",
-    "fast": "ggml-base.en-q5_1.bin",
-}
-
-
-def _whisper_paths():
-    """(whisper-cli, model, vad-model) when the bundled transcriber is
-    present, else None. Lives in <app>/whisper (staged by the build).
-    Falls back to whichever model IS present, so a half-copied update
-    still transcribes instead of going quiet."""
-    base = os.path.join(_here(), "whisper")
-    cli = os.path.join(base, "Release", "whisper-cli.exe")
-    vad = os.path.join(base, "ggml-silero-v5.1.2.bin")
-    if not os.path.isfile(cli):
-        return None
-    want = str(SETTINGS.get("stt_quality", "best"))
-    order = [WHISPER_MODELS.get(want, WHISPER_MODELS["best"])]
-    order += [m for m in WHISPER_MODELS.values() if m not in order]
-    for name in order:
-        model = os.path.join(base, name)
-        if os.path.isfile(model):
-            return cli, model, (vad if os.path.isfile(vad) else None)
-    return None
-
-
 def _ai_sidecar(video_path, kind):
     """Path of a video's transcript ('stt') or highlights ('hl') sidecar."""
     name = os.path.splitext(os.path.basename(video_path))[0]
@@ -8065,7 +10456,199 @@ def _ai_sidecar(video_path, kind):
                         f"{name}.{kind}.json")
 
 
+def _read_sidecar(video_path, kind):
+    """ONE reader for every sidecar shape this app has ever written.
+
+    Returns a dict in today's shape, or None when absent or unreadable:
+      hl  -> {"events": [...]}       (v1 wrote the events as a bare list)
+      ins -> "windows" always a dict; each window {"segments", "moments"}
+             (2.66 wrote a bare list per window); every moment carries a
+             "kind" key ("" where the old writer had none)
+      stt/lvl -> the dict as stored
+    Normalisation only - nothing is ever written back."""
+    try:
+        with open(_ai_sidecar(video_path, kind), encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    if isinstance(d, list):
+        d = {"events": d} if kind == "hl" else {"segments": d}
+    if not isinstance(d, dict):
+        return None
+    if kind == "vis":
+        # a half-written or ancient sighting file must not crash a caller
+        # that only ever wanted to draw a list
+        for k2 in ("looks", "places", "creatures"):
+            if not isinstance(d.get(k2), list):
+                d[k2] = []
+    if kind == "ins":
+        w = d.get("windows")
+        if not isinstance(w, dict):
+            d["windows"] = {}
+        else:
+            d["windows"] = {k: (v if isinstance(v, dict)
+                                else {"segments": v or [], "moments": []})
+                            for k, v in w.items()}
+        for m in (d.get("moments") or []):
+            if isinstance(m, dict) and "kind" not in m:
+                m["kind"] = ""
+    return d
+
+def _ins_retone(moments, sns):
+    """The senses cross-examine the review's feelings. A moment filed
+    funny or scary is re-read against the arousal curve at that second
+    (scored against the night's own spread) and against whether anyone
+    actually laughed or screamed nearby. High arousal with neither is
+    EXCITEMENT - the kind he kept asking for by name. Returns how many
+    were retoned; mutates in place, keeps the original under kind0."""
+    try:
+        h = (sns or {}).get("hype") or {}
+        v = [float(x) for x in (h.get("v") or [])]
+        hop = float(h.get("hop") or 3.0)
+        if len(v) < 20 or not moments:
+            return 0
+        sv = sorted(v)
+        p85 = sv[int(len(sv) * 0.85)]
+        evs = [(float(e.get("t") or 0), str(e.get("kind") or ""))
+               for e in ((sns or {}).get("events") or [])]
+        n = 0
+        for m in moments:
+            k = str(m.get("kind") or "")
+            if k not in ("funny", "scary"):
+                continue
+            try:
+                t = float(m.get("t") or 0)
+            except (TypeError, ValueError):
+                continue
+            x = v[max(0, min(len(v) - 1, int(t / hop)))]
+            if x < p85:
+                continue              # not even hot - leave the label be
+            near = [kk for tt, kk in evs if abs(tt - t) <= 10]
+            if k == "funny" and "laugh" in near:
+                continue              # someone really laughed - it stands
+            if k == "scary" and "scream" in near:
+                continue              # someone really screamed - it stands
+            m["kind0"] = k
+            m["kind"] = "excited"
+            n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _merge_sns_into_hl(video_path, sns=None):
+    """Fold the senses' sound events + HUD reads into the gold marks.
+
+    Lives apart from _senses_one because a REDONE sound pass rebuilds hl
+    from nothing - without this re-fold, redoing the sound silently
+    dropped every sense mark (cheer, scare, VICTORY...) the ears had
+    already earned. Near-duplicate-guarded, so calling it twice is safe.
+    Returns (added, error_or_None)."""
+    try:
+        # A PASS THAT JUST RAN MAY ALSO TAKE MARKS BACK. Nothing here ever
+        # removed a kind-carrying mark, so the three music ticks his
+        # backrooms night earned from a fluorescent hum sat on the bar for
+        # good - re-running the ears could not clear them, and a fix he
+        # cannot see on his own library is not a fix. Only a fresh pass
+        # prunes, and only the kind it just re-judged.
+        fresh = sns is not None
+        if sns is None:
+            sp = _ai_sidecar(video_path, "sns")
+            # FRESH OR NOTHING. A .sns older than the video describes
+            # footage that may have been cut - folding it plants ghost
+            # marks at times that no longer exist, and nothing downstream
+            # ever removes a kind-carrying mark.
+            try:
+                if not os.path.isfile(sp) or \
+                        os.path.getmtime(sp) < os.path.getmtime(video_path):
+                    return 0, None
+            except OSError:
+                return 0, None
+            with open(sp, encoding="utf-8") as fh:
+                sns = json.load(fh) or {}
+        newev = list(sns.get("events") or []) \
+            + [{"t": e2["t"], "kind": e2["kind"], "p": 0.2}
+               for e2 in (sns.get("ocr") or [])]
+        if not newev and not fresh:
+            return 0, None
+        with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
+            hl = json.load(fh) or {}
+        gold = hl.get("events") or []
+        ceil = max([g.get("z") or 0 for g in gold] + [10.0])
+        added, changed = 0, False
+        # music only: it is the kind the ears just re-judged against the
+        # room. A missing "music" key means they had no opinion at all
+        # (the pack asks for no music, or the pass fell over) - a pass
+        # that failed must never delete anything.
+        pruned = 0
+        if fresh and sns.get("music") is not None:
+            heard = [e2["t"] for e2 in newev if e2.get("kind") == "music"]
+            for g in gold:
+                if g.get("kind") == "music" and not [
+                        1 for t2 in heard
+                        if abs((g.get("t") or 0) - t2) <= 8.0]:
+                    # TAKE THE LABEL, NEVER THE MARK. An older fold stamped
+                    # "music" onto whatever loud peak was already sitting
+                    # there, so deleting the event would delete a real
+                    # moment he heard for a mistake the ears made about it.
+                    # The lie goes; the mark stays and answers to Loud.
+                    g.pop("kind", None)
+                    pruned += 1
+        for e2 in newev:
+            z2 = round(ceil + 1.0 + float(e2.get("p") or 0.1), 2)
+            near = [g for g in gold
+                    if abs((g.get("t") or 0) - e2["t"]) <= 8.0]
+            if not near:
+                # a repick can WALK a kept mark up to 8s per pass; two
+                # passes put it outside the 8s window and this fold then
+                # planted a twin. A same-kind mark within 20s IS this
+                # event, moved - never a second one.
+                near = [g for g in gold
+                        if g.get("kind") == e2["kind"]
+                        and abs((g.get("t") or 0) - e2["t"]) <= 20.0]
+            if near:
+                # a near mark borrows the kind - that alone is worth
+                # writing back, or the label vanishes on the next redo
+                if "kind" not in near[0]:
+                    near[0]["kind"] = e2["kind"]
+                    changed = True
+            else:
+                gold.append({"t": round(float(e2["t"]), 1),
+                             "z": z2, "kind": e2["kind"]})
+                added += 1
+        if added or changed or pruned:
+            gold.sort(key=lambda g: g.get("t") or 0)
+            hl["events"] = gold
+            _atomic_write_json(_ai_sidecar(video_path, "hl"), hl)
+        if added or pruned:
+            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+        if pruned:
+            log(f"The ears took back {pruned} music mark(s) on "
+                f"{os.path.basename(video_path)} - they do not hear it "
+                f"any more.")
+        return added, None
+    except Exception as e:
+        return 0, str(e)[:120]
+
+
+def _ins_failed(video_path):
+    """A review that FAILED wrote a sidecar saying so - and a sidecar that
+    exists used to mean "described", so the recording was finished forever
+    and the lightning button could never retry it. It is not a result."""
+    try:
+        with open(_ai_sidecar(video_path, "ins"), encoding="utf-8") as fh:
+            return bool(json.load(fh).get("failed"))
+    except Exception:
+        return False
+
+
 def _ai_sidecar_fresh(video_path, kind):
+    # A FAILED REVIEW COUNTS AS DONE HERE, on purpose. 2.56 made it count as
+    # unfinished so the button could retry it - but this function is also what
+    # the automatic sweep asks, and the sweep's memo of a refusal lives only in
+    # memory. Every restart forgot it and began the identical doomed review
+    # again: three times over on his machine, forever if left. Asking BY NAME
+    # still retries - the force path checks _ins_failed() itself.
     sp = _ai_sidecar(video_path, kind)
     try:
         return (os.path.isfile(sp)
@@ -8073,73 +10656,1089 @@ def _ai_sidecar_fresh(video_path, kind):
     except OSError:
         return False
 
+def _ai_pending_counts():
+    """(transcripts pending, highlights pending) - cheap enough for state()
+    consumers to poll occasionally; cached 30s."""
+    now = time.time()
+    c = _AI.get("_counts")
+    if c and now - c[2] < 30:
+        return c[0], c[1]
+    out = SETTINGS.get("output_dir", "")
+    stt = hl = 0
+    try:
+        for d, kind in _library_dirs(out):
+            for v in _scan_dir_mp4s(d, kind):
+                if not _ai_sidecar_fresh(v["path"], "stt"):
+                    stt += 1
+                if not _ai_sidecar_fresh(v["path"], "hl"):
+                    hl += 1
+    except Exception:
+        pass
+    _AI["_counts"] = (stt, hl, now)
+    return stt, hl
 
-def _transcribe_one(video_path):
-    """whisper.cpp over one recording -> .stt.json sidecar. Runs at
-    BELOW_NORMAL with 8 threads (the 5900X sweet spot); VAD skips silence
-    and stops the model hallucinating lyrics into music-only stretches."""
-    wp = _whisper_paths()
-    if wp is None:
+def _lvl_is_coarse(video_path):
+    """True when the sound curve was drawn by the old, blocky measurement.
+
+    v1 curves used a fixed handful of points however long the recording was,
+    so an hour-long session came out as a few dozen steps. v2 scales the
+    detail with the length. A coarse one is worth re-doing; it costs seconds
+    and it is what the editor draws its shape from."""
+    try:
+        with open(_ai_sidecar(video_path, "lvl"), encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        # NO CURVE AT ALL counts as work still to do. This is the question
+        # "does the sound pass still owe this recording anything", and the
+        # answer for a missing curve is obviously yes.
+        return True
+    if int(d.get("v") or 1) >= 2:
         return False
-    cli, model, vad = wp
+    return True
+
+
+# ---------------------------------------------------------------------------
+#  THE MIND, AND WHERE IT COMES FROM
+#
+#  Every file the AI pipeline needs, the public place it comes from, and
+#  what it costs. None of it is bundled: the app ships small and fetches
+#  what the user asks for, which also means the licences (Gemma's terms,
+#  audeering's non-commercial research licence) are accepted by the
+#  person downloading, on the original host - the only place that
+#  acceptance means anything.
+#
+#  Every URL below was checked byte-for-byte against a working install.
+# ---------------------------------------------------------------------------
+_HF = "https://huggingface.co/%s/resolve/main/%s"
+
+_MODEL_SETS = [
+    {"key": "reader", "tier": "reader",
+     "title": "The reader",
+     "what": "hears what was said - the transcript everything else "
+             "is built on",
+     "dir": "qwen3-asr-gguf",
+     "files": [
+         ("Qwen3-ASR-1.7B-bf16.gguf",
+          _HF % ("ggml-org/Qwen3-ASR-1.7B-GGUF",
+                 "Qwen3-ASR-1.7B-bf16.gguf"), 4069674944),
+         ("mmproj-Qwen3-ASR-1.7B-bf16.gguf",
+          _HF % ("ggml-org/Qwen3-ASR-1.7B-GGUF",
+                 "mmproj-Qwen3-ASR-1.7B-bf16.gguf"), 641773984),
+     ]},
+    {"key": "senses", "tier": "reader",
+     "title": "The senses",
+     "what": "laughter, the sound tags, who is speaking, and the "
+             "excitement curve",
+     "dir": "",
+     "files": [
+         ("Cnn14_DecisionLevelMax_mAP=0.385.pth",
+          "https://zenodo.org/records/3987831/files/"
+          "Cnn14_DecisionLevelMax_mAP%3D0.385.pth?download=1",
+          327428481),
+         ("clap/pytorch_model.bin",
+          _HF % ("laion/larger_clap_general", "pytorch_model.bin"),
+          776444665),
+         ("clap/config.json",
+          _HF % ("laion/larger_clap_general", "config.json"), 643),
+         ("clap/merges.txt",
+          _HF % ("laion/larger_clap_general", "merges.txt"), 456318),
+         ("clap/preprocessor_config.json",
+          _HF % ("laion/larger_clap_general",
+                 "preprocessor_config.json"), 541),
+         ("clap/special_tokens_map.json",
+          _HF % ("laion/larger_clap_general",
+                 "special_tokens_map.json"), 280),
+         ("clap/tokenizer.json",
+          _HF % ("laion/larger_clap_general", "tokenizer.json"),
+          2108774),
+         ("clap/tokenizer_config.json",
+          _HF % ("laion/larger_clap_general",
+                 "tokenizer_config.json"), 1362),
+         ("clap/vocab.json",
+          _HF % ("laion/larger_clap_general", "vocab.json"), 798293),
+         ("ecapa/embedding_model.ckpt",
+          _HF % ("speechbrain/spkrec-ecapa-voxceleb",
+                 "embedding_model.ckpt"), 83316686),
+         ("ecapa/classifier.ckpt",
+          _HF % ("speechbrain/spkrec-ecapa-voxceleb",
+                 "classifier.ckpt"), 5534328),
+         ("ecapa/hyperparams.yaml",
+          _HF % ("speechbrain/spkrec-ecapa-voxceleb",
+                 "hyperparams.yaml"), 1919),
+         ("ecapa/mean_var_norm_emb.ckpt",
+          _HF % ("speechbrain/spkrec-ecapa-voxceleb",
+                 "mean_var_norm_emb.ckpt"), 1921),
+         ("ecapa/config.json",
+          _HF % ("speechbrain/spkrec-ecapa-voxceleb", "config.json"),
+          51),
+         ("hype/pytorch_model.bin",
+          _HF % ("audeering/wav2vec2-large-robust-12-ft-emotion-"
+                 "msp-dim", "pytorch_model.bin"), 661436013),
+         ("hype/config.json",
+          _HF % ("audeering/wav2vec2-large-robust-12-ft-emotion-"
+                 "msp-dim", "config.json"), 2344),
+         ("hype/preprocessor_config.json",
+          _HF % ("audeering/wav2vec2-large-robust-12-ft-emotion-"
+                 "msp-dim", "preprocessor_config.json"), 214),
+         ("hype/vocab.json",
+          _HF % ("audeering/wav2vec2-large-robust-12-ft-emotion-"
+                 "msp-dim", "vocab.json"), 2),
+     ],
+     "licence": "the excitement model is audeering's, under a "
+                "non-commercial research licence"},
+    {"key": "describer", "tier": "full",
+     "title": "The describer and the eye",
+     "what": "writes the chapters, names the night, and looks at the "
+             "screen when the words cannot settle a line",
+     "dir": "",
+     "files": [
+         ("google_gemma-3-27b-it-Q3_K_M.gguf",
+          _HF % ("bartowski/google_gemma-3-27b-it-GGUF",
+                 "google_gemma-3-27b-it-Q3_K_M.gguf"), 13437356672),
+         ("mmproj-gemma-3-27b-it-f16.gguf",
+          _HF % ("bartowski/google_gemma-3-27b-it-GGUF",
+                 "mmproj-google_gemma-3-27b-it-f16.gguf"), 857739168),
+     ],
+     "licence": "Gemma is Google's, under the Gemma Terms of Use"},
+    {"key": "thinker", "tier": "full",
+     "title": "The auditor's thinker",
+     "what": "reads every layer back against the others and repairs "
+             "what was misheard",
+     "dir": "",
+     "files": [
+         ("Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf",
+          _HF % ("jrell/Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller",
+                 "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf"),
+          13543869408),
+     ]},
+]
+
+# the llama.cpp servers - two builds on purpose: the auditor's thinker
+# needs a newer one than the describer was proven on
+_LLAMA_ZIP = ("https://github.com/ggml-org/llama.cpp/releases/"
+              "download/b10588/llama-b10588-bin-win-vulkan-x64.zip")
+
+_RUNTIME_SETS = [
+    # TWO homes, on purpose: the describer, the eye and the GPU reader
+    # run in "llama"; the auditor's thinker needs its own copy in
+    # "llama2". Fetching only one left a machine that could download
+    # thirty gigabytes of models and still never start a describer
+    # (review 309, critical).
+    {"key": "runtime", "tier": "reader", "title": "The model runtime",
+     "what": "llama.cpp, the server every local model runs inside",
+     "zip": _LLAMA_ZIP, "into": ["llama", "llama2"],
+     "bytes": 34470020},
+]
+
+
+def _free_bytes(path):
+    try:
+        import shutil as _sh
+        return _sh.disk_usage(path).free
+    except Exception:
+        return 0
+
+
+def _human_bytes(n):
+    n = float(n or 0)
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return ("%.0f %s" % (n, u)) if u in ("B", "KB") \
+                else ("%.1f %s" % (n, u))
+        n /= 1024.0
+    return "%.1f GB" % n
+
+
+def _writable(d):
+    """Can we actually put a file there? Program Files says yes to
+    isdir and no to everything that matters."""
+    try:
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, ".lore_write_test")
+        with open(p, "wb") as fh:
+            fh.write(b"1")
+        os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
+def _models_dir(for_writing=False):
+    """Where the mind lives. Program Files is read-only to us, so the
+    default home is beside the settings - but an install that already
+    keeps its models next to the exe keeps working, untouched."""
+    want = str(SETTINGS.get("models_dir") or "").strip()
+    if want and os.path.isdir(want):
+        return want
+    if for_writing:
+        # FETCHING NEEDS A HOME IT CAN WRITE TO. An upgraded install
+        # keeps its models beside the exe, and beside the exe is
+        # Program Files - every download would have failed on
+        # permissions, forever (review 309).
+        beside0 = os.path.join(_here(), "ai", "models")
+        try:
+            if os.path.isdir(beside0) and os.listdir(beside0) \
+                    and _writable(beside0):
+                return beside0
+        except OSError:
+            pass
+        d0 = os.path.join(_data_dir(), "models")
+        return d0 if _writable(d0) else beside0
+    beside = os.path.join(_here(), "ai", "models")
+    try:
+        # the old home wins ONLY if it actually holds something, so a
+        # fresh install does not start writing into Program Files
+        if os.path.isdir(beside) and os.listdir(beside):
+            return beside
+    except OSError:
+        pass
+    d = os.path.join(_data_dir(), "models")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return beside
+    return d
+
+
+def _model_file(*parts):
+    return os.path.join(_models_dir(), *parts)
+
+
+def _runtime_dir(name):
+    """A llama.cpp build: beside the exe if it shipped there, else in
+    the data folder where the fetcher puts it."""
+    beside = os.path.join(_here(), "ai", name)
+    if os.path.isfile(os.path.join(beside, "llama-server.exe")):
+        return beside
+    return os.path.join(_data_dir(), "runtime", name)
+
+
+def _model_have(item):
+    """(have_all, bytes_on_disk, bytes_total) for one manifest set."""
+    got = tot = 0
+    all_ok = True
+    for rel, _url, size in item["files"]:
+        p = _model_file(item["dir"], rel) if item["dir"] \
+            else _model_file(rel)
+        tot += size
+        try:
+            n = os.path.getsize(p)
+        except OSError:
+            n = 0
+        # a length that does not match is a half-download, not a model
+        if n == size:
+            got += size
+        else:
+            all_ok = False
+            got += 0
+    return all_ok, got, tot
+
+
+_DL = {"busy": None, "cancel": False, "done": 0, "total": 0,
+       "item": "", "file": "", "state": "", "err": "",
+       "last_err": "", "last_state": "", "base": 0}
+_DL_LOCK = threading.Lock()
+
+
+def _dl_one(url, dest, size):
+    """One file, resumable. Writes to .part and only becomes the real
+    name once the length is right - a truncated download can never
+    look like a model."""
+    part = dest + ".part"
+    try:
+        # INSIDE the try: an unwritable destination used to raise
+        # straight out of the worker thread with nothing recorded
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        have = 0
+        try:
+            have = os.path.getsize(part)
+        except OSError:
+            have = 0
+        # A PART IS ONLY OURS IF IT SAYS SO. Length alone cannot tell a
+        # good half-download from a stale one, and a stale part of the
+        # right size sailed through the size check and became a
+        # "model". The note beside it names the URL and the size it
+        # belongs to; anything else starts over.
+        note = part + ".from"
+        mine = url + "|" + str(size)
+        if have:
+            try:
+                if io.open(note, encoding="utf-8").read().strip() \
+                        != mine:
+                    have = 0
+            except Exception:
+                have = 0
+            if not have:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+        if have > size:                  # longer than the real thing
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            have = 0
+        try:
+            io.open(note, "w", encoding="utf-8").write(mine)
+        except Exception:
+            pass
+        if have == size:
+            os.replace(part, dest)
+            try:
+                os.remove(note)
+            except OSError:
+                pass
+            _DL["done"] = _DL["base"] + size   # credit it, or the bar
+            return True                        # can never reach 100%
+        req = _urlreq.Request(url, headers={
+            "User-Agent": "LORE/" + APP_VERSION})
+        if have:
+            req.add_header("Range", "bytes=%d-" % have)
+        with _urlreq.urlopen(req, timeout=60) as r:
+            # DID IT HONOUR THE RANGE? A CDN or a proxy answering 200
+            # with the WHOLE body was appended onto the part-file -
+            # twenty-five gigabytes of garbage, and then a restart
+            # from zero. If it did not, start this file over.
+            code = getattr(r, "status", None) or r.getcode()
+            if have and code != 206:
+                have = 0
+            mode = "ab" if have else "wb"
+            with open(part, mode) as fh:
+                _DL["done"] = _DL["base"] + have
+                while True:
+                    if _DL["cancel"]:
+                        return False
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    have += len(chunk)
+                    _DL["done"] = _DL["base"] + have
+    except Exception as e:
+        _DL["err"] = str(e)[:160]
+        _DL["last_err"] = _DL["err"]
+        return False
+    try:
+        got = os.path.getsize(part)
+    except OSError:
+        got = -1
+    if got != size:
+        _DL["err"] = ("it came back %s instead of %s - the download "
+                      "will start again" % (_human_bytes(max(0, got)),
+                                            _human_bytes(size)))
+        _DL["last_err"] = _DL["err"]
+        return False
+    os.replace(part, dest)
+    try:
+        os.remove(part + ".from")
+    except OSError:
+        pass
+    return True
+
+
+def _reader_paths():
+    """(python, worker script) for the transcriber, or None if not installed.
+
+    Lives in <app>/ai. It is a separate environment on purpose: the model
+    needs torch, which is far too heavy to bundle into the app itself - the
+    same reasoning that keeps ffmpeg a separate exe."""
+    base = os.path.join(_here(), "ai")
+    py = os.path.join(base, "venv", "Scripts",
+                      "python.exe" if os.name == "nt" else "python")
+    work = os.path.join(base, "asr_worker.py")
+    if os.path.isfile(py) and os.path.isfile(work):
+        return py, work
+    return None
+
+
+def _laugh_paths():
+    """(python, worker, checkpoint) for the laughter ear, or None.
+
+    Same venv as the reader; the model is the published AudioSet CNN14
+    (framewise heads) and torchlibrosa is VENDORED beside the worker, so
+    installing 2.68's files IS the installation."""
+    base = os.path.join(_here(), "ai")
+    py = os.path.join(base, "venv", "Scripts",
+                      "python.exe" if os.name == "nt" else "python")
+    work = os.path.join(base, "laugh_worker.py")
+    ck = _model_file("Cnn14_DecisionLevelMax_mAP=0.385.pth")
+    if os.path.isfile(py) and os.path.isfile(work) and os.path.isfile(ck):
+        return py, work, ck
+    return None
+
+
+SNS_KINDS = ("cheer", "groan", "music", "scare", "victory", "defeat",
+             "kill", "level", "boss", "hud")
+
+
+def _senses_paths():
+    """The new senses, if their models shipped. CLAP or the hype model is
+    enough to run; each pass inside the worker fails open on its own."""
+    base = os.path.join(_here(), "ai")
+    py = os.path.join(base, "venv", "Scripts",
+                      "python.exe" if os.name == "nt" else "python")
+    work = os.path.join(base, "senses_worker.py")
+    if not (os.path.isfile(py) and os.path.isfile(work)):
+        return None
+    if not (os.path.isdir(_model_file("clap"))
+            or os.path.isdir(_model_file("hype"))):
+        return None
+    return py, work
+
+
+def _bank_sidecar(video_path, kind):
+    """A redo is about to REPLACE this sidecar: keep what is there. Three
+    generations ride beside the current one (.v1 newest banked, .v3 oldest,
+    then gone) - his ask, verbatim: redoing something must never silently
+    destroy the version he might prefer."""
+    try:
+        cur = _ai_sidecar(video_path, kind)
+        if not os.path.isfile(cur):
+            return
+        try:
+            if os.path.isfile(cur + ".v2"):
+                os.replace(cur + ".v2", cur + ".v3")
+            if os.path.isfile(cur + ".v1"):
+                os.replace(cur + ".v1", cur + ".v2")
+        except OSError:
+            pass
+        import shutil as _sh
+        _sh.copy2(cur, cur + ".v1")
+    except Exception:
+        pass
+
+
+def _sns_owing(video_path):
+    """Does this recording still owe its senses pass? Missing or older than
+    the video = owed; failed with tries left = owed; complete = settled."""
+    if _senses_paths() is None:
+        return False
+    sp = _ai_sidecar(video_path, "sns")
+    try:
+        if not os.path.isfile(sp)                 or os.path.getmtime(sp) < os.path.getmtime(video_path):
+            return True
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        if d.get("failed"):
+            return int(d.get("tries") or 0) < 3
+        return False
+    except Exception:
+        return True
+
+
+def _sns_carry_names(old, new):
+    """The names he typed, carried onto the voices a new pass found.
+
+    Every senses pass used to do sns["names"] = {} - it threw away both
+    the mic's auto-name and every name he had typed, which is why his
+    voices "keep coming back unnamed", while sns_rename's docstring
+    promised the opposite in the same breath. A name rides on the
+    VOICEPRINT now, not the cluster number: a re-run renumbers clusters by
+    size, so number 1 is not the same man twice. Sidecars written before
+    2.84 carry no prints - there the numbers are all there is, so they are
+    kept as they stand and the log says which way it went.
+
+    Returns (names, how) - "how" is one plain phrase for the log."""
+    fresh = dict((new or {}).get("names") or {})
+    oldn = dict((old or {}).get("names") or {})
+    if not oldn:
+        return fresh, ""
+    ov = (old or {}).get("voices") or []
+    nv = (new or {}).get("voices") or []
+    carried, how = {}, ""
+    if ov and nv:
+        pairs = []
+        for o in ov:
+            for m in nv:
+                a, b = o.get("v") or [], m.get("v") or []
+                if not a or len(a) != len(b):
+                    continue
+                na = sum(x * x for x in a) ** 0.5
+                nb = sum(x * x for x in b) ** 0.5
+                if na and nb:
+                    dot = sum(x * y for x, y in zip(a, b))
+                    pairs.append((dot / (na * nb), o.get("n"), m.get("n")))
+        pairs.sort(reverse=True)
+        seen_o, seen_n = set(), set()
+        for sc, on, nn in pairs:
+            # 0.5 is the same wall the worker's own merge uses for "this
+            # is the same voice"; below it, it is somebody else
+            if sc < 0.5 or on in seen_o or nn in seen_n:
+                continue
+            seen_o.add(on)
+            seen_n.add(nn)
+            nm = oldn.get(str(on))
+            if nm:
+                carried[str(nn)] = nm
+        how = (f"{len(carried)} name(s) followed their voiceprint"
+               if carried else "no named voice was found again")
+    else:
+        carried = dict(oldn)
+        how = f"{len(carried)} name(s) kept by number (no voiceprints yet)"
+    if "you" in fresh.values():
+        # the mic track is ground truth for "you"; a carried "you" from an
+        # older pass would leave two of him in the panel
+        carried = {k: v for k, v in carried.items() if v != "you"}
+    fresh.update(carried)
+    return fresh, how
+
+
+def _senses_one(video_path):
+    """One senses pass: CLAP sound vocabulary + hype curve + voices apart,
+    then the HUD reader over the gold moments' own seconds. Everything lands
+    in the .sns sidecar; the sound events ALSO merge into the gold marks the
+    way the laughter ear's do."""
+    got = _senses_paths()
+    if got is None:
+        return False
+    py, work = got
+    name = os.path.basename(video_path)
+    prior_tries = 0
+    try:
+        with open(_ai_sidecar(video_path, "sns"), encoding="utf-8") as fh:
+            prior_tries = int((json.load(fh) or {}).get("tries") or 0)
+    except Exception:
+        pass
+
+    def _fail(why):
+        try:
+            os.makedirs(os.path.dirname(_ai_sidecar(video_path, "sns")),
+                        exist_ok=True)
+            # A FAILURE MUST NOT COST HIM THE NAMES HE TYPED. This wrote a
+            # bare failure record straight over the sidecar, so an ffmpeg
+            # hiccup or a timeout erased every voice he had named - which
+            # is why they kept "coming back unnamed".
+            keep = {}
+            try:
+                with open(_ai_sidecar(video_path, "sns"),
+                          encoding="utf-8") as fh2:
+                    old2 = json.load(fh2) or {}
+                keep = {k: v for k, v in (old2 or {}).items()
+                        if k in ("names", "voiceprints")}
+            except Exception:
+                keep = {}
+            doc2 = {"v": 1, "failed": True,
+                    "tries": prior_tries + 1, "why": str(why)[:160]}
+            doc2.update(keep)
+            _atomic_write_json(_ai_sidecar(video_path, "sns"), doc2)
+        except Exception:
+            pass
+        log(f"The senses pass failed on {name}: {str(why)[:140]}")
+        return False
+
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     if os.name == "nt":
         flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
-    wav = os.path.join(_work_dir(), f"stt_{os.getpid()}_{threading.get_ident()}.wav")
-    outb = os.path.join(_work_dir(), f"stt_{os.getpid()}_{threading.get_ident()}_out")
-    _source_busy_add(video_path)   # delete/edit must know we hold this file
+    wav = os.path.join(_work_dir(),
+                       f"sns_{os.getpid()}_{threading.get_ident()}.wav")
+    outj = wav + ".json"
+    _source_busy_add(video_path)
     try:
+        # THE SAME MIX THE READER GETS, and for the same reason: under
+        # audio_mode="separate" the default pick is System, which he is
+        # not in, so the hype curve and the sound tags would be built out
+        # of a night he never spoke in.
+        names = _audio_track_names(video_path)
         rc, _o, _e = _ai_run([SETTINGS["ffmpeg_path"], "-y", "-loglevel",
-                              "error", "-i", video_path, "-vn", "-ac", "1",
-                              "-ar", "16000", "-c:a", "pcm_s16le", wav],
+                              "error", "-i", video_path]
+                             + _mix_audio_args(video_path, names)
+                             + ["-ac", "1", "-ar", "48000",
+                                "-c:a", "pcm_s16le", wav],
                              1800, flags)
         if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
+            if _AI["abort"]:
+                return False
+            _AI["soft_fail"] = True
+            return _fail(f"audio extract rc={rc}")
+        game = _display_name(_parse_clip_name(name))
+        micwav = ""
+        mt = _mic_track(video_path, names)
+        if mt is not None:
+            micwav = wav + ".mic.wav"
+            rc3, _o3, _e3 = _ai_run(
+                [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+                 "-i", video_path, "-map", f"0:a:{mt}", "-ac", "1",
+                 "-ar", "48000", "-c:a", "pcm_s16le", micwav],
+                1800, flags)
+            if rc3 != 0 or not os.path.isfile(micwav):
+                micwav = ""
+        dur = _AI.get("job_secs") or _probe_duration(video_path) or 0
+        to = max(3600, int(dur * 2.5))
+        rc, _o, err = _ai_run(
+            [py, work, wav, outj, game] + ([micwav] if micwav else []),
+            to, flags)
+        if _AI["abort"]:
             return False
-        # -mc 0: never feed the model its OWN previous text back as context.
-        # That carry-over is what turns one bad guess into the same sentence
-        # repeated for a minute. The entropy threshold + non-speech-token
-        # suppression catch the rest.
-        lang = str(SETTINGS.get("stt_language", "auto"))
-        if lang not in ("auto", "en", "ar"):
-            lang = "auto"
-        if os.path.basename(model).startswith("ggml-base.en"):
-            lang = "en"          # the small model only ever knew English
-        cmd = [cli, "-m", model, "-f", wav, "-l", lang, "-t", "8",
-               "-oj", "-of", outb, "-np",
-               "-mc", "0", "--entropy-thold", "2.6", "--suppress-nst"]
-        if vad:
-            cmd += ["--vad", "-vm", vad]
-        rc, _o, _e = _ai_run(cmd, 3600, flags)
-        jf = outb + ".json"
-        if rc != 0 or not os.path.isfile(jf) or _AI["abort"]:
+        if rc != 0 or not os.path.isfile(outj):
+            return _fail((err or b"").decode("utf-8", "replace")[-160:])
+        with open(outj, encoding="utf-8") as fh:
+            sns = json.load(fh) or {}
+        sns["tries"] = 0
+        try:
+            with open(_ai_sidecar(video_path, "sns"), encoding="utf-8") as fh:
+                _was = json.load(fh) or {}
+        except Exception:
+            _was = {}
+        # A NAME IS NOT WORTH A CRASHED PASS. Carrying names reads a file
+        # written by older versions and by hand-editing; four malformed
+        # shapes threw straight out of the job. Worst case the names are
+        # carried by number, which is what every pass before this did.
+        try:
+            sns["names"], _how = _sns_carry_names(_was, sns)
+        except Exception as _e5:
+            sns["names"] = dict(_was.get("names") or {})
+            _how = f"carried by number ({str(_e5)[:60]})"
+        # ---- the HUD reader: frames around the gold moments + chapters --
+        try:
+            ow = os.path.join(_here(), "ai", "ocr_worker.py")
+            if os.path.isfile(ow)                     and os.path.isdir(os.path.join(_here(), "ai",
+                                                   "vendor_ocr")):
+                secs = []
+                try:
+                    with open(_ai_sidecar(video_path, "hl"),
+                              encoding="utf-8") as fh:
+                        evs = (json.load(fh) or {}).get("events") or []
+                    evs = sorted(evs, key=lambda e2: -(e2.get("z") or 0))[:12]
+                    for e2 in evs:
+                        t0 = float(e2.get("t") or 0)
+                        secs += [max(0.5, t0 - 2), t0 + 2]
+                except Exception:
+                    pass
+                try:
+                    with open(_ai_sidecar(video_path, "ins"),
+                              encoding="utf-8") as fh:
+                        for c in ((json.load(fh) or {}).get("chapters")
+                                  or [])[:10]:
+                            secs.append(float(c.get("t") or 0) + 1.0)
+                except Exception:
+                    pass
+                secs = sorted({round(x, 1) for x in secs if x >= 0})[:40]
+                if secs:
+                    oj = wav + ".ocr.json"
+                    rc2, _o2, _e2 = _ai_run(
+                        [py, ow, video_path, SETTINGS["ffmpeg_path"], oj,
+                         ",".join(f"{x:.1f}" for x in secs), game],
+                        1200, flags)
+                    if rc2 == 0 and os.path.isfile(oj):
+                        with open(oj, encoding="utf-8") as fh:
+                            sns["ocr"] = (json.load(fh) or {}).get("events")                                 or []
+                    try:
+                        if os.path.isfile(oj):
+                            os.remove(oj)
+                    except OSError:
+                        pass
+        except Exception as e:
+            sns.setdefault("counters", {})["ocr_failed"] = str(e)[:120]
+        if _AI["abort"]:
             return False
-        with open(jf, encoding="utf-8") as fh:
+        # ---- merge the sound + HUD events into the gold marks -----------
+        _a2, _err2 = _merge_sns_into_hl(video_path, sns)
+        if _err2:
+            sns.setdefault("counters", {})["merge_failed"] = _err2
+        os.makedirs(os.path.dirname(_ai_sidecar(video_path, "sns")),
+                    exist_ok=True)
+        # the log promises "the old banks as a version" - keep it for the
+        # senses too (voice names and clusters are hand-earned)
+        try:
+            _bank_sidecar(video_path, "sns")
+        except Exception:
+            pass
+        _atomic_write_json(_ai_sidecar(video_path, "sns"), sns)
+        # GAME-AUDIO TAGGING: words heard inside detected music stretches
+        # are probably the game (a cutscene, a background video), not the
+        # room. Flagged - never deleted; the player dims them, the
+        # describer is told, and search still finds them.
+        try:
+            # AN EMPTY LIST IS AN ANSWER. The guard here was "if mus:",
+            # so when a re-run stopped hearing music the flags from the
+            # run before could never come off - his lines stayed dimmed as
+            # "the game's own audio" for good. None means the ears had no
+            # opinion (no music prompt, or the pass fell over); [] means
+            # they listened and heard none.
+            mus = sns.get("music")
+            if mus is not None:
+                sp2 = _ai_sidecar(video_path, "stt")
+                with open(sp2, encoding="utf-8") as fh:
+                    sd2 = json.load(fh) or {}
+                on = off = 0
+                for sg in sd2.get("segments") or []:
+                    mid = ((sg.get("a") or 0) + (sg.get("b")
+                                                 or (sg.get("a") or 0))) \
+                        / 2000.0
+                    g2 = any(a2 <= mid <= b2 for a2, b2 in mus)
+                    if sg.get("src") == "you":
+                        # HIS MIC IS GROUND TRUTH. Music playing under a
+                        # line he actually said does not make it the
+                        # game's audio - and the player reads the flag
+                        # first ("ln.g?null:..."), so this would hide the
+                        # "you" tag on exactly the lines that earned it.
+                        # A guard, not a repair: nothing in his library
+                        # is currently both, because the one recording
+                        # with mic tagging has no music spans.
+                        g2 = False
+                    if g2 != bool(sg.get("g")):
+                        if g2:
+                            sg["g"] = 1
+                            on += 1
+                        else:
+                            sg.pop("g", None)
+                            off += 1
+                if on or off:
+                    _atomic_write_json(sp2, sd2)
+                    _AI["index"] = None
+                    log(f"Senses on {name}: {on} transcript line(s) "
+                        f"flagged as probably the game's own audio, "
+                        f"{off} unflagged.")
+        except Exception:
+            pass
+        c = sns.get("counters") or {}
+        # WHAT WAS TAKEN AWAY IS NEWS TOO. This pass deletes detections -
+        # marks the room explained away, utterances it will not name - and
+        # a deletion that leaves no trace in the log he reads is a change
+        # he cannot check.
+        bits = []
+        gone = int(c.get("sound_dropped_room") or 0)
+        sgone = int(c.get("music_spans_dropped_room") or 0)
+        if gone or sgone:
+            bits.append(f"the room explained away {gone} mark(s) and "
+                        f"{sgone} music stretch(es)")
+        if int(c.get("speaker_unknown") or 0):
+            bits.append(f"{int(c['speaker_unknown'])} utterance(s) left "
+                        f"unnamed rather than guessed")
+        if _how:
+            bits.append(_how)
+        log(f"Senses on {name}: {len(sns.get('events') or [])} sound "
+            f"moment(s), {len(sns.get('ocr') or [])} HUD event(s), "
+            f"{c.get('speaker_clusters') or 0} voice(s), hype "
+            f"{'yes' if sns.get('hype') else 'no'}."
+            + (" " + "; ".join(bits) + "." if bits else ""))
+        return True
+    except Exception as e:
+        return _fail(e)
+    finally:
+        _source_busy_done(video_path)
+        for p2 in (wav, outj, wav + ".mic.wav"):
+            try:
+                if os.path.isfile(p2):
+                    os.remove(p2)
+            except OSError:
+                pass
+
+
+def _repick_moments(video_path):
+    """Choose the gold moments again, now that the words are known.
+
+    Costs no audio decode: the envelope is reconstructed from the sound curve
+    that the sound pass already wrote. Returns True if the moments changed."""
+    import numpy as np
+    try:
+        with open(_ai_sidecar(video_path, "lvl"), encoding="utf-8") as fh:
+            lvl = json.load(fh) or {}
+        curve = lvl.get("db") or []
+        dur = float(lvl.get("dur") or 0)
+    except Exception:
+        return False
+    if len(curve) < 20 or dur < 20:
+        return False
+    said, hot_said = _speech_times(video_path)
+    if not said and not hot_said:
+        return False        # nothing was said: the marks cannot improve
+    hop_s = dur / float(len(curve))
+    es = np.asarray(curve, dtype=float)
+    try:
+        events = _pick_moments(es, hop_s, said, hot_said)
+        # the SAME rule the first pass uses - this is the pass that
+        # actually decides what he sees, because it runs once the words
+        # are known and rewrites the marks
+        events = _thin_moments(events, dur)
+    except Exception as e:
+        log(f"Could not re-pick moments for {os.path.basename(video_path)}: {e}")
+        return False
+    prior_ev = []
+    try:
+        with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
+            prior_ev = (json.load(fh) or {}).get("events") or []
+    except Exception:
+        pass
+    before = len(prior_ev) if prior_ev else -1
+    # THE LAUGHTER SURVIVES THE RE-PICK. The laughs and screams came from a
+    # model that heard them, not from this loudness curve - re-choosing the
+    # loud moments must not silently delete them (it did, for one build).
+    kinds = [e for e in prior_ev if e.get("kind")]
+    for kv in kinds:
+        near = [g for g in events if abs(g["t"] - kv["t"]) <= 8.0]
+        if near:
+            near[0]["kind"] = kv["kind"]
+            near[0]["z"] = max(near[0].get("z") or 0, kv.get("z") or 0)
+        else:
+            events.append(kv)
+    events.sort(key=lambda e: e["t"])
+    _atomic_write_json(_ai_sidecar(video_path, "hl"),
+                       {"v": 2, "events": events})
+    log(f"Gold moments for {os.path.basename(video_path)} re-picked with the "
+        f"words: {before if before >= 0 else '?'} -> {len(events)}.")
+    return True
+
+
+def _transcribe_one(video_path):
+    """Qwen3-ASR over one recording -> .stt.json sidecar.
+
+    It keeps English in Latin letters and Arabic in Arabic letters, in the same
+    sentence, which is the whole reason whisper was dropped. Voice detection
+    runs first so it is never asked to transcribe silence, and a repetition
+    penalty stops it running away inside an utterance."""
+    rp = _reader_paths()
+    if rp is None:
+        log("The tome's reader is not installed (looked for ai\\venv and "
+            "ai\\asr_worker.py next to the app). Nothing was transcribed.")
+        return False
+    py, work = rp
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    wav = os.path.join(_work_dir(),
+                       f"stt_{os.getpid()}_{threading.get_ident()}.wav")
+    outj = wav + ".json"
+    asrv = None                       # the GPU server, if one comes up
+    _source_busy_add(video_path)
+    try:
+        # ALL of the audio, not whichever track ffmpeg felt like: under
+        # audio_mode="separate" the default pick is System and his own
+        # microphone is not in it, so his whole half of the night went
+        # untranscribed. ONE probe feeds both this and the mic layer
+        # below - probing twice lets the two disagree when one of them
+        # times out on a cold file.
+        names = _audio_track_names(video_path)
+        rc, _o, _e = _ai_run([SETTINGS["ffmpeg_path"], "-y", "-loglevel",
+                              "error", "-i", video_path]
+                             + _mix_audio_args(video_path, names)
+                             + ["-ac", "1", "-ar", "16000",
+                                "-c:a", "pcm_s16le", wav],
+                             1800, flags)
+        if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
+            if not _AI["abort"]:
+                log(f"Could not extract audio from "
+                    f"{os.path.basename(video_path)} (ffmpeg rc={rc}) - "
+                    f"the transcript was not attempted.")
+                _AI["soft_fail"] = True    # a busy disk is not a bad file
+            return False
+        # THE MIC LAYER (2.81+): extracted beside the mix so the worker
+        # can say which lines are HIS voice - not the game's, not a tab's
+        micwav = ""
+        mt = _mic_track(video_path, names)
+        if mt is not None:
+            micwav = wav + ".mic.wav"
+            rc2, _o2, _e2 = _ai_run(
+                [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+                 "-i", video_path, "-map", f"0:a:{mt}", "-ac", "1",
+                 "-ar", "16000", "-c:a", "pcm_s16le", micwav],
+                1800, flags)
+            if rc2 != 0 or not os.path.isfile(micwav):
+                micwav = ""
+        env = dict(os.environ)
+        env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        env.setdefault("HF_HOME", _models_dir())
+        # WHAT THE AUDIO IS. Qwen3-ASR takes a free-text biasing context and
+        # it has been sitting unused - the game's name and the register of
+        # the room measurably steer names and jargon the right way.
+        try:
+            pp = os.path.dirname(video_path)
+            gname = (os.path.basename(os.path.dirname(pp))
+                     if os.path.basename(pp).lower() in ("videos", "clips")
+                     else "")
+            if not gname:
+                # a recording sitting outside its shelf still knows its
+                # game - the filename is the only truth we ever have, and
+                # it is how the whole app names a clip anyway
+                gname = _display_name(_parse_clip_name(video_path))
+                if gname == "Recording":
+                    gname = ""      # that is the app's word for "no idea"
+        except Exception:
+            gname = ""
+        env["LORE_ASR_CONTEXT"] = (
+            ("Gaming session of " + gname + ". " if gname else "")
+            + "Friends on Discord playing together; casual gaming chat, "
+              "callouts, jokes. They speak Emirati Gulf Arabic and English, "
+              "often switching within one sentence.")
+        # LEAVE THE GAME ITS CORES - BUT ONLY WHILE HE IS PLAYING ONE.
+        # This used to ask find_active_game(), i.e. "is a game running", and
+        # then freeze the answer for the whole job. Measured on his machine:
+        # Hearthstone sitting behind the tome, not being played, held the
+        # reader to 5.81 threads of 24 for half an hour, and closing the game
+        # would not have changed it either. Now it asks what he is LOOKING at,
+        # and keeps answering while the job runs.
+        ctl_file = wav + ".ctl"
+        prog_file = wav + ".prog"
+        env["LORE_ASR_THREADS"] = str(_write_reader_budget(ctl_file)
+                                      or _reader_threads())
+        # THE GPU, WHEN IT IS THERE. Same model as GGUF on the card:
+        # measured 3.7x faster at parity on his own clips. A server that
+        # will not start simply means the CPU road, exactly as before.
+        asrv = None
+        if _asr_gguf_paths() is not None and not _AI["abort"] \
+                and not _game_has_focus():
+            asrv = _AsrServer()
+            if asrv.start():
+                env["LORE_ASR_GGUF"] = "1"
+                env["LORE_ASR_SERVER"] = f"http://127.0.0.1:{_ASR_PORT}"
+                log(f"The reader rides the GPU for "
+                    f"{os.path.basename(video_path)}.")
+            else:
+                asrv.stop()
+                asrv = None
+                log(f"The GPU reader would not start for "
+                    f"{os.path.basename(video_path)} - taking the CPU road.")
+        _AI["prog_file"] = prog_file
+        _AI["prog_t0"] = None
+        stop_budget = threading.Event()
+
+        def keep_budget():
+            while not stop_budget.wait(4.0):
+                _write_reader_budget(ctl_file)
+
+        bt = threading.Thread(target=keep_budget, daemon=True)
+        bt.start()
+        try:
+            # A FLAT FOUR-HOUR KILL burned four CPU-hours on any long busy
+            # session and then re-burned them every launch, forever. The cap
+            # now scales with the recording (6x its length at the measured
+            # worst of ~1.2x realtime leaves honest headroom), floored at the
+            # old value.
+            to = max(14400, int((_AI.get("job_secs") or 0.0) * 6.0))
+            rc, _o, err = _ai_run(
+                [py, work, wav, outj] + ([micwav] if micwav else []),
+                to, flags, env=env)
+        finally:
+            stop_budget.set()
+            _AI.pop("prog_file", None)
+        if _AI["abort"]:
+            return False
+        if rc != 0 or not os.path.isfile(outj):
+            log(f"The reader could not manage {os.path.basename(video_path)}: "
+                f"{(err or b'').decode('utf-8', 'replace')[-160:]}")
+            return False
+        with open(outj, encoding="utf-8") as fh:
             data = json.load(fh)
-        segs = []
-        for seg in data.get("transcription", []):
-            txt = (seg.get("text") or "").strip()
-            off = seg.get("offsets") or {}
-            if txt and isinstance(off.get("from"), int):
-                segs.append({"a": off["from"], "b": off.get("to", off["from"]),
-                             "t": txt})
+        segs = [sg for sg in (data.get("segments") or [])
+                if (sg.get("t") or "").strip()]
+        # HOW MUCH TALKING WAS IN IT. The reader counted it during voice
+        # detection; without this the only yardstick is video length, which
+        # says the same thing about a silent solo session and a night in
+        # Discord.
+        try:
+            with open(prog_file, encoding="utf-8") as fh:
+                _AI["last_speech_s"] = float(json.load(fh).get("audio_total") or 0)
+        except Exception:
+            _AI["last_speech_s"] = 0.0
+        if not segs and (_AI.get("last_speech_s") or 0) > 30:
+            # the voice detector heard real minutes of talking and the
+            # model wrote NOTHING - that is a failure, not a quiet night.
+            # Writing it would cache the emptiness as permanent success
+            # (the observed 'Transcribed X: 0 lines' on Discord nights).
+            log(f"Refusing an empty transcript for "
+                f"{os.path.basename(video_path)}: the voice detector heard "
+                f"{_AI['last_speech_s']:.0f}s of speech. Will retry.")
+            _AI["soft_fail"] = True
+            return False
         os.makedirs(os.path.dirname(_ai_sidecar(video_path, "stt")),
                     exist_ok=True)
+        _bank_sidecar(video_path, "stt")   # a redo keeps the one it replaces
+        cnt = data.get("counters") or {}
+        # KEEP THE GUARD COUNTS. They were logged once and thrown away, so
+        # there was no way to ask a finished library how often the reader
+        # had to be corrected - which is the only way to tell whether a
+        # guard is earning its keep. Every reader of this sidecar in the
+        # app and in ui.html goes through .get("segments"), so an extra
+        # key beside it changes nothing for them.
         _atomic_write_json(_ai_sidecar(video_path, "stt"),
-                           {"v": 1, "model": os.path.basename(model),
+                           {"v": 3, "model": data.get("model") or "qwen3-asr",
+                            "engine": "qwen3-asr", "counters": cnt,
+                            "reader": int(data.get("reader") or 1),
                             "segments": segs})
-        _AI["index"] = None                     # search index: rebuild lazily
+        _AI["index"] = None
+        # THE GOLD MOMENTS WERE PICKED WITHOUT THESE WORDS. Sound runs first on
+        # purpose - seconds against minutes, and the editor needs that curve
+        # immediately. But a peak earns a bonus when someone was speaking, and
+        # a bigger one on a reaction word ("no way", "\u0647\u0647\u0647\u0647"), and none of
+        # that could fire before the transcript existed.
+        # Re-pick from the curve already on disk rather than deleting the
+        # result and decoding the whole recording a second time - that would
+        # double the only expensive step, 1,775 times over.
+        try:
+            _repick_moments(video_path)
+        except Exception:
+            pass
+        if any(cnt.values()):
+            log(f"Reader guards on {os.path.basename(video_path)}: "
+                f"{cnt.get('arabizi', 0)} Arabizi re-ask(s), "
+                f"{cnt.get('leash', 0)} language re-ask(s), "
+                f"{cnt.get('echo', 0)} prompt echo(es) re-asked, "
+                f"{cnt.get('translit', 0)} Arabic-in-Latin re-ask(s) "
+                f"({cnt.get('translit_won', 0)} kept), "
+                f"{cnt.get('enwall', 0)} English-in-Arabic re-ask(s) "
+                f"({cnt.get('enwall_won', 0)} kept), "
+                f"{cnt.get('laugh', 0)} unreadable-word re-ask(s) "
+                f"({cnt.get('laugh_won', 0)} kept).")
+        # WHAT THE READER HAS TO SAY. It used to say it on stderr, which
+        # this function only ever reads when the job FAILS - so a mic
+        # layer that skipped itself was invisible on every good run.
+        for note in (data.get("notes") or [])[:4]:
+            log(f"The reader on {os.path.basename(video_path)}: "
+                f"{str(note)[:160]}")
         log(f"Transcribed {os.path.basename(video_path)}: {len(segs)} lines.")
         return True
     except Exception as e:
         log(f"Transcribe failed for {os.path.basename(video_path)}: {e}")
         return False
     finally:
+        if asrv is not None:          # the 4.7 GB comes off the card the
+            asrv.stop()               # moment the job ends, every path out
         _source_busy_done(video_path)
-        for p in (wav, outb + ".json"):
+        for p in (wav, outj, wav + ".ctl", wav + ".prog", wav + ".prog.tmp",
+                  wav + ".mic.wav"):
             try:
                 os.remove(p)
             except OSError:
                 pass
+
+
+def _vf_chain(crop, body):
+    """CROP FIRST, always. Its numbers are in SOURCE pixels, so anything that
+    changes the frame size - a tone-map, a scale - has to come after it or the
+    rectangle lands somewhere else entirely."""
+    return (crop + "," + body) if crop else body
+
+
+def _crop_filter(crop, path):
+    """Turn the browser's rectangle into a crop filter, clamped to the real
+    frame and rounded to even numbers (h264/AV1 cannot encode odd ones).
+    Returns None when there is nothing to crop."""
+    if not crop:
+        return None
+    try:
+        cw = int(crop.get("w") or 0)
+        ch = int(crop.get("h") or 0)
+        cx = int(crop.get("x") or 0)
+        cy = int(crop.get("y") or 0)
+    except Exception:
+        return None
+    if cw <= 0 or ch <= 0:
+        return None
+    dims = _probe_dims(path) or None
+    if dims:
+        sw, sh = int(dims[0]), int(dims[1])
+        cw = max(16, min(cw, sw))
+        ch = max(16, min(ch, sh))
+        cx = max(0, min(cx, sw - cw))
+        cy = max(0, min(cy, sh - ch))
+        if cw >= sw and ch >= sh:
+            return None                      # the whole frame is not a crop
+    cw -= cw % 2
+    ch -= ch % 2
+    cx -= cx % 2
+    cy -= cy % 2
+    return f"crop={cw}:{ch}:{cx}:{cy}"
 
 
 def _cap_vf(vf_base, kbps):
@@ -8155,6 +11754,6305 @@ def _cap_vf(vf_base, kbps):
     return f"scale=-8:min(ih\\,{lim})" + tail + ",format=nv12"
 
 
+# ---------------------------------------------------------------- Claude
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_VER = "2023-06-01"
+CLAUDE_MODELS = {
+    "fast": "claude-haiku-4-5-20251001",     # pennies, good enough to sort
+    "good": "claude-sonnet-5",               # the default
+    "best": "claude-opus-5",
+}
+
+
+def _claude_model():
+    return CLAUDE_MODELS.get(SETTINGS.get("claude_model") or "good",
+                             CLAUDE_MODELS["good"])
+
+
+# US dollars per MILLION tokens, per model. The bill is computed from the
+# token counts the reply actually reports, so this is the only place prices
+# live and the counter cannot drift from reality.
+_PRICES = {"claude-haiku-4-5-20251001": (1.00, 5.00),
+           "claude-opus-5": (15.00, 75.00),
+           "claude-sonnet-5": (3.00, 15.00)}
+_PRICE_FALLBACK = (1.00, 5.00)
+# What to ASSUME a request will cost when deciding whether there is room for
+# it - the real figure is only known afterwards. Measured on his own library:
+# describing a recording carries a whole transcript and runs about 2.6 cents,
+# so guessing a third of a penny (as this did) would have let roughly seven
+# times the ceiling through before anything noticed.
+_COST_GUESS_CENTS = {"fast": 2.6, "deep": 12.0}
+
+
+def _price_of(model, usage):
+    """What this request actually cost, in cents, from the reported tokens."""
+    try:
+        pin, pout = _PRICES.get(str(model or ""), _PRICE_FALLBACK)
+        tin = float((usage or {}).get("input_tokens") or 0)
+        tout = float((usage or {}).get("output_tokens") or 0)
+        # cache reads are billed at a tenth; treat them as input if reported
+        tin += float((usage or {}).get("cache_read_input_tokens") or 0) * 0.1
+        return (tin * pin + tout * pout) / 1_000_000.0 * 100.0
+    except Exception:
+        return 0.0
+
+
+def _ai_spent():
+    try:
+        return float(SETTINGS.get("ai_spent_cents") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _ai_budget():
+    """The ceiling, in cents. 0 means 'ask me first, never spend on your own'."""
+    try:
+        return float(SETTINGS.get("ai_budget_cents") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _ai_spend_room(kind="fast"):
+    """Is there room for one more request? Returns (ok, why)."""
+    b = _ai_budget()
+    if b <= 0:
+        return True, ""                    # no ceiling set: unlimited
+    need = _COST_GUESS_CENTS.get(kind, 1.0)
+    if _ai_spent() + need > b:
+        return False, (f"spending limit reached "
+                       f"(${_ai_spent() / 100:.2f} of ${b / 100:.2f}) - "
+                       f"raise it in Settings \u203a Video")
+    return True, ""
+
+
+def _ai_spend_add(cents):
+    """Add what it really cost. Callers used to pass a kind and get a guess."""
+    try:
+        c = max(0.0, float(cents))
+    except Exception:
+        c = 0.0
+    if c <= 0:
+        return
+    _persist_setting("ai_spent_cents", round(_ai_spent() + c, 4))
+
+
+def _claude(system, user, tool, max_tokens=2000, timeout=180, model=None):
+    """One Messages call, forced through a tool so the answer is valid JSON
+    of the shape we asked for rather than prose we have to guess at.
+
+    Returns (data, error). Never raises, never logs the key."""
+    key = _key_read()
+    if not key:
+        return None, "no key"
+    # THE CEILING IS ENFORCED HERE, at the one door every request goes through,
+    # so no caller can spend around it.
+    _kind = "deep" if (model or "") == CLAUDE_MODELS.get("deep") else "fast"
+    _ok, _why = _ai_spend_room(_kind)
+    if not _ok:
+        return None, _why
+    body = json.dumps({
+        "model": model or _claude_model(),
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": tool["name"]},
+    }).encode("utf-8")
+    req = _urlreq.Request(CLAUDE_URL, data=body, method="POST")
+    req.add_header("content-type", "application/json")
+    req.add_header("anthropic-version", CLAUDE_VER)
+    req.add_header("x-api-key", key)
+    del key
+    try:
+        with _urlreq.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read().decode("utf-8", "replace"))
+    except _urlerr.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8", "replace"))
+            why = (msg.get("error") or {}).get("message") or str(e.code)
+        except Exception:
+            why = f"HTTP {e.code}"
+        return None, why[:200]
+    except Exception as e:
+        return None, str(e)[:200]
+    # BILLED OUTSIDE THE REQUEST'S OWN try. It was inside it, which meant any
+    # slip in the pricing would have been caught by the same handler that
+    # catches network faults - turning a perfectly good answer into a failure,
+    # and (because a failed describe now writes a marker) permanently marking
+    # the recording as un-describable. Accounting must never be able to break
+    # the thing it is accounting for.
+    try:
+        _ai_spend_add(_price_of(out.get("model") or model or _claude_model(),
+                                out.get("usage")))
+    except Exception:
+        pass
+    for blk in out.get("content") or []:
+        if blk.get("type") == "tool_use":
+            return blk.get("input") or {}, None
+    return None, "no answer"
+
+
+_INSIGHT_TOOL = {
+    "name": "describe_recording",
+    "description": "Describe one gaming recording for the person who made it.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string",
+                      "description": "A short, specific title someone would "
+                                     "recognise later. No date, no filename."},
+            "summary": {"type": "string",
+                        "description": "Two or three sentences on what "
+                                       "happened in this session."},
+            "chapters": {
+                "type": "array",
+                "items": {"type": "object", "properties": {
+                    "t": {"type": "number", "description": "seconds"},
+                    "label": {"type": "string"}},
+                    "required": ["t", "label"]},
+                "description": "Sections of the session, in order. Only where "
+                               "the recording genuinely changes."},
+            "moments": {
+                "type": "array",
+                "items": {"type": "object", "properties": {
+                    "t": {"type": "number", "description": "seconds"},
+                    "why": {"type": "string",
+                            "description": "A few words on what happens here."}},
+                    "required": ["t", "why"]},
+                "description": "The moments worth jumping to."},
+            "clips": {
+                "type": "array",
+                "items": {"type": "object", "properties": {
+                    "a": {"type": "number"}, "b": {"type": "number"},
+                    "why": {"type": "string"}},
+                    "required": ["a", "b", "why"]},
+                "description": "Stretches worth cutting out as a short clip, "
+                               "15-90 seconds each, with a little lead-in."},
+        },
+        "required": ["title", "summary", "chapters", "moments", "clips"],
+    },
+}
+
+
+def _insight_prompt(video_path, game, dur, segs, peaks):
+    lines = []
+    for sg in segs:
+        try:
+            t = int(float(sg.get("a", 0)) / 1000)
+        except Exception:
+            continue
+        txt = (sg.get("t") or "").strip()
+        if txt:
+            lines.append(f"[{t // 60}:{t % 60:02d}] {txt}")
+    said = "\n".join(lines) if lines else "(nothing was said out loud)"
+    loud = ", ".join(f"{int(p['t']) // 60}:{int(p['t']) % 60:02d}"
+                     for p in peaks[:40]) or "(none stood out)"
+    return (
+        f"Game: {game}\n"
+        f"Length: {int(dur // 60)} minutes {int(dur % 60)} seconds\n"
+        f"Moments where the sound stood out from everything around it: {loud}\n\n"
+        f"What was said, with timestamps:\n{said}\n"
+    )
+
+
+_INSIGHT_SYSTEM = (
+    "You label a gamer's own recordings so they can find things again later.\n"
+    "You are given a transcript with timestamps and a list of times where the "
+    "audio stood out. Be concrete and specific: name what actually happened, "
+    "in their words where possible.\n"
+    "Every time you give MUST be in seconds and MUST be inside the recording.\n"
+    "If little or nothing was said, lean on the loud moments and the game, and "
+    "return fewer items rather than inventing any. An empty list is a fine "
+    "answer. Never describe something you were not told about."
+)
+
+
+def _speech_times(video_path):
+    """When words were spoken, in seconds, from the transcript we already
+    have - and which of them sound like a REACTION rather than chatter."""
+    try:
+        with open(_ai_sidecar(video_path, "stt"), encoding="utf-8") as fh:
+            segs = (json.load(fh) or {}).get("segments") or []
+    except Exception:
+        return [], []
+    said, hot = [], []
+    for sg in segs:
+        try:
+            t = float(sg.get("a", 0)) / 1000.0
+        except Exception:
+            continue
+        txt = (sg.get("t") or "").strip().lower()
+        if not txt:
+            continue
+        said.append(t)
+        # what a reaction sounds like. Not clever, but it does not have to be:
+        # it only has to nudge the ranking between two otherwise equal peaks.
+        if (any(w in txt for w in _REACTION_WORDS)
+                or txt.count("!") >= 1
+                or (txt.isupper() and len(txt) > 3)):
+            hot.append(t)
+    return said, hot
+
+
+_REACTION_WORDS = (
+    "haha", "hahaha", "lol", "lmao", "oh my god", "oh my", "what the",
+    "no way", "let's go", "lets go", "yes!", "yesss", "holy", "wow",
+    "fuck", "shit", "damn", "bruh", "insane", "clutch", "come on",
+    "are you kidding", "unbelievable", "gg", "nice", "oh no", "wait what",
+    # ARABIC, AND EMIRATI IN PARTICULAR. Every word above is English, so for as
+    # long as this list has existed a gold mark could only be earned by
+    # reacting in English - half of what is said in these recordings never
+    # counted. Worth adding only now, because until the reader changed the
+    # Arabic in the transcripts was not real Arabic.
+    "ههه",              # hhh - laughing
+    "خخخ",              # khkhkh - laughing
+    "يا سلام",          # ya salam
+    "والله",             # wallah
+    "يا شيخ",            # ya sheikh
+    "مو معقول",        # not possible
+    "ما شاء الله",     # mashallah
+    "الله يستر",       # allah yistir
+    "شو هذا",            # what is this
+    "ويش هذا",          # what is this (gulf)
+    "خلاص",              # khalas - enough
+    "عاد",                # 3aad - gulf emphatic
+    "وايد",              # wayed - a lot (gulf)
+    "حرام",              # haram
+    "يا حبيبي",        # ya habibi
+    "استغفر الله",   # astaghfirullah
+    "لا لا لا",          # la la la
+)
+
+
+_DESC_PORT = 8907
+# HOW MUCH THE DESCRIBER CAN HOLD AT ONCE. Kept modest on purpose: the model
+# is already 15.4 GB on a 16 GB card, and a bigger window is more memory for
+# the cache to live in. The transcript is fitted to THIS number rather than
+# the number being raised to fit the transcript.
+_DESC_CTX = 8192
+
+
+def _describer_paths():
+    """(llama-server, model) for the local describer, or None."""
+    exe = os.path.join(_runtime_dir("llama"), "llama-server.exe")
+    # Q3_K_M is the default since 2.91: measured on his own frames and
+    # lines against Q4_K_M - indistinguishable quality, 1.6x faster,
+    # and the whole model fits the card instead of leaving 24 layers on
+    # the CPU. The Q4 file stays on disk; one settings line goes back.
+    want = str(SETTINGS.get("describe_model")
+               or "google_gemma-3-27b-it-Q3_K_M.gguf")
+    mdl = _model_file(want)
+    if not os.path.isfile(mdl):
+        try:
+            # THE LAST RESORT, AND WHAT IT MUST NOT PICK. "the first
+            # .gguf that is not an mmproj" is the AUDITOR's Qwen by
+            # the alphabet - the describer would have tried to write
+            # chapters with the thinker. Look for a gemma; never adopt
+            # the audit model.
+            names = sorted(os.listdir(_models_dir()))
+            aud = str(SETTINGS.get("audit_model")
+                      or "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf")
+            pick = None
+            for f in names:
+                if (f.endswith(".gguf") and not f.startswith("mmproj")
+                        and f != aud and "gemma" in f.lower()):
+                    pick = f
+                    break
+            if pick is None:
+                for f in names:
+                    if (f.endswith(".gguf")
+                            and not f.startswith("mmproj")
+                            and f != aud):
+                        pick = f
+                        break
+            if pick is None:
+                return None
+            mdl = _model_file(pick)
+        except Exception:
+            return None
+    if os.path.isfile(exe) and os.path.isfile(mdl):
+        return exe, mdl
+    return None
+
+
+_DESC_SYSTEM = """You are given part of the transcript of one recorded gaming session.
+The people speak Emirati/Gulf Arabic and English, often switching mid-sentence,
+and they frequently discuss things that are NOT on screen - other games, work,
+food, plans, other people. Both languages are normal here and are never worth
+remarking on.
+
+Every line is numbered: [#12 35:04] means line 12, spoken at 35 minutes 04
+seconds. You refer to lines ONLY by their #numbers.
+
+Reply with STRICT JSON and nothing else:
+{"segments": [{"from_line": 0, "to_line": 47, "name": "a short title",
+               "topics": ["...", "..."],
+               "what": "one sentence", "quote": "a real line"}],
+ "moments": [{"line": 33, "kind": "funny", "why": "one short plain sentence"}]}
+Kinds: funny needs actual laughter; scary needs actual fear; a rush of
+adrenaline - a clutch play, a race won, shouting with joy - is EXCITED,
+not funny and not scary. "Holy fuck" said grinning is excited.
+
+RULES:
+- COVER EVERY LINE YOU WERE GIVEN: the first stretch starts at your first
+  line's number, the last ends at your last. Stretches run in order and do
+  not overlap. Start a new stretch when the SUBJECT changes, not when the
+  sentence does.
+- "name" is what you would CALL that stretch if it were a chapter in a book:
+  three to seven words, the real words and names from the transcript.
+  "The Cleave and the Goat Demon", "Gate keeps opening the wrong door".
+  Never a list, never joined with "+", never "General chat".
+- NEVER mention the language, in ANY field - not in names, not in "what",
+  not in a moment's "why". "Arabic phrases", "followed by a string of
+  Arabic", "the group switches to Arabic", "speaking English", "in both
+  languages" - none of these may appear. The reader lives in this house;
+  which language carried a sentence is as unremarkable as which chair they
+  sat on. Say WHAT was said or done instead.
+  BAD: "They switch to Arabic to discuss strategy."
+  GOOD: "They plan who takes the generator and who holds the door."
+  BAD: "Someone exclaims 'Oh shit!' followed by a string of Arabic."
+  GOOD: "Someone screams 'Oh shit!' when the ghost lunges out of the dark."
+- "what" is ONE PLAIN SENTENCE saying what happened in that stretch, the way
+  you would tell someone who was not there.
+- A moment's "why" says WHAT HAPPENED, and every one is written in its own
+  voice. NEVER open with "Someone..." - lead with the quote itself, the
+  speaker's name, or the event. Never open two moments the same way. No
+  analysis words ("seemingly", "likely", "which is amusing") - if it needs
+  explaining, it was not the moment. Rewritten from real reviews:
+  BAD:  "Someone screams 'Oh shit!' when something unexpected happens."
+  GOOD: "'Oh shit!' - the game pulls something nobody saw coming."
+  BAD:  "Someone exclaims 'Fucking finally!' after defeating a difficult
+        enemy."
+  GOOD: "'Fucking finally!' - the wall of a boss goes down."
+  BAD:  "Someone says 'Skin is a cat' which is an odd and amusing statement."
+  GOOD: "'Skin is a cat' - nobody knows what it means either."
+  BAD:  "Someone shouts in frustration about an order not being followed."
+  GOOD: "An order gets ignored and the shouting starts."
+  BAD:  "Someone describes a loud explosion that shook their windows."
+  GOOD: "A real explosion outside rattles his windows mid-game."
+- "topics" is a short LIST of the real subjects - names, games, objects,
+  people. Never a language, never "conversation".
+- "moments" are the up to FOUR lines here somebody would clip and send to a
+  friend: a joke landing, a scare, a big play, a proper argument. "kind" is
+  one of funny | scary | big | argument. "why" says what makes that line the
+  moment, in plain words. If nothing is clip-worthy, return fewer or none.
+  EVERY moment must be a DIFFERENT event - never two entries for the same
+  line or the same shout described twice.
+- "quote" must be copied from a line inside that stretch.
+- Write Arabic in Arabic letters and English in English letters, as spoken."""
+
+# the same shape as a GRAMMAR, handed to llama-server's sampler so a
+# malformed answer cannot be generated at all (the prompt above still
+# teaches the shape - the grammar is never shown to the model)
+_DESC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segments": {"type": "array", "maxItems": 8, "items": {
+            "type": "object",
+            "properties": {
+                "from_line": {"type": "integer"},
+                "to_line": {"type": "integer"},
+                "name": {"type": "string"},
+                "topics": {"type": "array", "maxItems": 4,
+                           "items": {"type": "string"}},
+                "what": {"type": "string"},
+                "quote": {"type": "string"}},
+            "required": ["from_line", "to_line", "name", "what"]}},
+        "moments": {"type": "array", "maxItems": 4, "items": {
+            "type": "object",
+            "properties": {
+                "line": {"type": "integer"},
+                "kind": {"type": "string",
+                         "enum": ["funny", "scary", "big", "argument",
+                                  "excited"]},
+                "why": {"type": "string"}},
+            "required": ["line", "kind", "why"]}}},
+    "required": ["segments"]}
+
+_TITLE_SCHEMA = {
+    "type": "object",
+    "properties": {"title": {"type": "string"},
+                   "summary": {"type": "string"}},
+    "required": ["title", "summary"]}
+
+
+def _devoice(text):
+    """Break the 'Someone exclaims ...' drone. Half of every review's
+    moments opened with the same faceless subject-verb; when the moment
+    carries a quote, the quote IS the lead. 'Someone screams "Oh shit!"
+    when a ghost appears' becomes '"Oh shit!" - a ghost appears.'
+    Unquoted ones are left for the prompt's style law to handle."""
+    if not text:
+        return text
+    m = re.match(
+        r"(?i)^some(?:one|body)\s+"
+        r"(?:jokingly\s+|playfully\s+|quickly\s+)?"
+        r"(?:exclaims?|shouts?|yells?|screams?|says?|asks?|jokes?|demands?|"
+        r"warns?|suggests?|praises?|whispers?|announces?|repeats?|adds?|"
+        r"mutters?|cries)\s*[,:]?\s*['‘’“”\"]"
+        r"(.+?)['‘’“”\"](?=[\s,.!]|$)[\s,.!]*(.*)$",
+        text.strip())
+    if not m:
+        return text
+    quote, rest = m.group(1).strip(), m.group(2).strip()
+    if re.match(r"(?i)^(which|that|this)\b", rest):
+        rest = ""            # 'which is an odd and amusing statement' -
+    #                          analysis about the quote, not the moment
+    stripped = re.sub(r"(?i)^(?:when|after|while|as|because|in response to|"
+                      r"upon|at|during)\s+", "", rest).strip(" ,.")
+    if len(stripped.split()) >= 3:
+        rest = stripped      # a real clause stands alone; a two-word tail
+    else:                    # keeps its connective ('after a disagreement')
+        rest = rest.strip(" ,.")
+    rest = re.sub(r"(?i)\b(?:seemingly|likely|apparently)\s+", "", rest)
+    out = "'" + quote + "'"
+    if rest:
+        out += " - " + rest[:1].upper() + rest[1:]
+    if not out.endswith((".", "!", "?", "'")):
+        out += "."
+    return out
+
+
+def _descrub(text):
+    """Cut the which-language-was-that clause out of a sentence.
+
+    "Someone exclaims 'Oh shit!' followed by a string of Arabic, seemingly
+    reacting to..." -> "Someone exclaims 'Oh shit!' seemingly reacting to..."
+    The language is never the story; the prompt says so twice and the model
+    still slips, so every descriptive sentence passes through here on its
+    way to the sidecar. Verbatim quotes never do - they are what was said."""
+    if not text:
+        return text
+    if not re.search(r"(?i)\b(arabic|english|bilingual|languages?)\b", text):
+        return text
+    out = re.sub(r"[^,.;!?]*\b(?i:arabic|english|bilingual|languages?)\b"
+                 r"[^,.;!?]*(?:[,.;!?]|$)", " ", text)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,;-")
+    if len(out) < 8:
+        # the clause WAS the sentence: keep it, minus the language words
+        out = re.sub(r"(?i)\s*(?:(?:a\s+)?(?:string|burst|mix(?:ture)?)\s+of"
+                     r"\s+)?\b(?:arabic|english|bilingual|languages?)\b\s*"
+                     r"(?:phrases?|words?|speech|commentary|chat(?:ter)?|"
+                     r"discussion|conversation)?", " ", text)
+        out = re.sub(r"\s{2,}", " ", out).strip(" ,;-")
+    # a clause-cut can leave a preposition hanging ("said in .") or a space
+    # before the full stop - tidy both
+    out = re.sub(r"(?i)\s+(?:in|into|to|with|between|of)\s*([,.;!?]|$)",
+                 r"\1", out)
+    out = re.sub(r"\s+([,.;!?])", r"\1", out).strip(" ,;-")
+    if out and out[0].islower():
+        out = out[0].upper() + out[1:]
+    return out if len(out) >= 4 else text
+
+
+def _desc_mmproj():
+    """gemma's vision tower, if it shipped. One file turns the describer
+    multimodal; its absence turns all of this code off."""
+    p = _model_file("mmproj-gemma-3-27b-it-f16.gguf")
+    return p if os.path.isfile(p) else None
+
+
+def _free_port(port):
+    """An orphaned llama-server from a dead run keeps LISTENING on our own
+    port and answers /health - the next job would silently adopt the
+    corpse and every kill-path would miss it. Before any server starts,
+    whatever holds the port is put down (it can only ever be ours)."""
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=flags).stdout or ""
+        for ln in out.splitlines():
+            parts = ln.split()
+            # column-parse, never state text: netstat localizes 'LISTENING'
+            # (German ABHOEREN etc.) - a listener is TCP, local address on
+            # our port, foreign address :0
+            if len(parts) < 4 or parts[0].upper() != "TCP":
+                continue
+            if not parts[1].endswith(f":{port}") \
+                    or not parts[2].endswith(":0"):
+                continue
+            if True:
+                try:
+                    pid = int(parts[-1])
+                except ValueError:
+                    continue
+                if pid > 0 and pid != os.getpid():
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                   capture_output=True, timeout=15,
+                                   creationflags=flags)
+                    log(f"Cleared an orphaned server holding port {port} "
+                        f"(pid {pid}).")
+                    time.sleep(1.0)
+    except Exception:
+        pass
+
+
+class _DescServer:
+    """llama-server for the length of ONE describing job.
+
+    It used to be started and stopped inside every single ask - honest when a
+    job was one ask, ruinous when a job became five windows: five 15 GB model
+    loads, and stop/start so close together that the next spawn died on the
+    port the last one was still letting go of. That instant death is exactly
+    why windows 3-5 of his Devour review all failed in the same second."""
+
+    def __init__(self, port=None):
+        self.pr = None
+        self.port = int(port or _DESC_PORT)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def start(self, budget=900):
+        """Bring the model up. Returns True when it answers /health.
+
+        The budget is how many seconds to allow it. Fifteen minutes is
+        right for a night's describing; a question he is watching gets a
+        far shorter one, because a wait nobody explains is a hang."""
+        import urllib.request
+        dp = _describer_paths()
+        if dp is None:
+            return False
+        exe, mdl = dp
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        _free_port(self.port)
+        t0_up = time.time()
+        for attempt in range(1 if budget < 900 else 2):
+                                        # one respawn: the port may still be
+            try:
+                mmp = _desc_mmproj()
+                pr = _popen(   # held by an instance shutting down
+                    # -ngl auto: the server fits the layer count to the VRAM
+                    # actually free at load time (--fit is on, 1 GiB margin),
+                    # KV cache and vision tower included. The hard-coded 38
+                    # that sat here was a guess - it left 24 of 62 layers on
+                    # the CPU at DDR4 speed while a third of the card sat
+                    # empty, and it could not adapt when something else held
+                    # VRAM. Same weights, same output; placement only.
+                    [exe, "-m", mdl, "--port", str(self.port),
+                     "-ngl", "auto",
+                     "-c", str(_DESC_CTX), "--no-webui", "-t", "10"]
+                    + (["--mmproj", mmp] if mmp else []),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=flags)
+            except Exception as e:
+                log(f"The describer could not be spawned: {str(e)[:120]}")
+                return False
+            if self.port == _DESC_PORT:
+                _AI["proc"] = pr    # the job pipeline's slot - the ask
+            self.pr = pr            # server has _ASK, and must not clobber
+            for _ in range(max(5, int(budget))):
+                if _AI["abort"]:
+                    self.stop()
+                    return False
+                if pr.poll() is not None:
+                    break               # died at birth - port race, most likely
+                try:
+                    urllib.request.urlopen(self.base + "/health",
+                                           timeout=2).read()
+                    # ONE LINE OF VISIBILITY. Output goes to DEVNULL and
+                    # the layer fit is automatic now, so without this a
+                    # starved load (something else holding VRAM at that
+                    # moment) is indistinguishable from a broken model.
+                    log("The describer is up on port " + str(self.port)
+                        + ": " + os.path.basename(mdl) + ", loaded in "
+                        + str(int(time.time() - t0_up)) + "s, fitted to "
+                        "the VRAM free right now.")
+                    return True
+                except Exception:
+                    time.sleep(1)
+            else:
+                self.stop()
+                return False
+            if attempt == 0:
+                time.sleep(3)           # let the old instance release the port
+        self.pr = None
+        return False
+
+    def ask(self, system, user, max_tokens=900, schema=None, images=None,
+            timeout=3600):
+        """One question to the running server. Text, or None. `images` is
+        a list of (label, base64-jpeg) shown to the model inline - each
+        preceded by its label so what it sees is anchored in time."""
+        import re as _re
+        if self.pr is None or self.pr.poll() is not None:
+            if getattr(self, "borrowed", False):
+                # someone else's server (a running describe job's): NEVER
+                # respawn it - starting a twin on its port would kill the
+                # job's own model mid-window via the port sweep
+                pass
+            # it fell over between windows (game start, abort, crash):
+            # one honest attempt to bring it back before giving up
+            elif not self.start():
+                return None
+        try:
+            if images:
+                content = [{"type": "text", "text": user}]
+                for label, b64 in images:
+                    content.append({"type": "text", "text": label})
+                    content.append({"type": "image_url", "image_url": {
+                        "url": "data:image/jpeg;base64," + b64}})
+            else:
+                content = user
+            payload = {
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": content}],
+                "max_tokens": max_tokens, "temperature": 0.4,
+                "stream": False}
+            if schema:
+                # GRAMMAR, not hope: llama-server compiles the schema to a
+                # grammar and malformed JSON becomes unsamplable. The prompt
+                # still teaches the shape - the grammar is never shown to
+                # the model, it only fences the sampler.
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema}}
+            body = json.dumps(payload).encode("utf-8")
+            req = _urlreq.Request(self.base + "/v1/chat/completions",
+                                  data=body,
+                                  headers={"content-type": "application/json"})
+            # A QUESTION HE IS SITTING IN FRONT OF IS NOT A NIGHT'S
+            # DESCRIBING JOB. An hour of patience is right for a describe
+            # that runs while he sleeps, and completely wrong for a box he
+            # is watching - there it read as "thinking..." forever.
+            with _urlreq.urlopen(req, timeout=max(5, int(timeout))) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+            txt = (d.get("choices") or [{}])[0].get("message", {})                 .get("content", "")
+            return _re.sub(r"<think>.*?</think>", "", txt, flags=_re.S).strip()
+        except Exception as e:
+            log(f"The describer could not answer: {str(e)[:140]}")
+            return None
+
+    def stop(self):
+        mine = self.pr
+        try:
+            if self.pr and self.pr.poll() is None:
+                self.pr.terminate()
+                self.pr.wait(timeout=40)
+        except Exception:
+            try:
+                self.pr.kill()
+            except Exception:
+                pass
+        self.pr = None
+        if mine is not None and _AI.get("proc") is mine:
+            _AI["proc"] = None      # only OUR child leaves the slot
+
+
+_ASR_PORT = 8908
+
+
+def _asr_gguf_paths():
+    """(llama-server, model.gguf, mmproj.gguf) for the GPU reader, or None.
+
+    The same llama-server that runs the describer; the model is the SAME
+    Qwen3-ASR the CPU path uses, as the official GGUF plus its audio
+    encoder. Files absent = feature absent = the CPU road, no ceremony."""
+    dp = _describer_paths()
+    if dp is None:
+        return None
+    exe = dp[0]
+    base = _model_file("qwen3-asr-gguf")
+    mdl = os.path.join(base, "Qwen3-ASR-1.7B-bf16.gguf")
+    mmp = os.path.join(base, "mmproj-Qwen3-ASR-1.7B-bf16.gguf")
+    if os.path.isfile(mdl) and os.path.isfile(mmp):
+        return exe, mdl, mmp
+    return None
+
+
+class _AsrServer(_DescServer):
+    """llama-server for the length of ONE transcription job.
+
+    A 4.7 GB load instead of the describer's 15.4, full offload, and the
+    same one-respawn port etiquette as its parent. Jobs are serialized by
+    the tick, so it never shares the card with the describer."""
+
+    def __init__(self, port=None):
+        self.pr = None
+        self.port = int(port or _ASR_PORT)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def start(self):
+        import urllib.request
+        gp = _asr_gguf_paths()
+        if gp is None:
+            return False
+        exe, mdl, mmp = gp
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        _free_port(self.port)
+        for attempt in range(2):
+            try:
+                pr = _popen(
+                    [exe, "-m", mdl, "--mmproj", mmp, "--port",
+                     str(self.port), "-ngl", "99", "-c", "8192",
+                     "--no-webui", "-t", "4"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=flags)
+            except Exception as e:
+                log(f"The GPU reader could not be spawned: {str(e)[:120]}")
+                return False
+            self.pr = pr
+            for _ in range(300):
+                if _AI["abort"]:
+                    self.stop()
+                    return False
+                if pr.poll() is not None:
+                    break
+                try:
+                    urllib.request.urlopen(self.base + "/health",
+                                           timeout=2).read()
+                    return True
+                except Exception:
+                    time.sleep(1)
+            else:
+                self.stop()
+                return False
+            if attempt == 0:
+                time.sleep(3)
+        self.pr = None
+        return False
+
+
+def _describe_locally(system, user, max_tokens=2000):
+    """One-shot ask - start the model, ask once, stop. Kept for callers that
+    genuinely have a single question; a windowed job uses _DescServer so the
+    model loads once for the whole recording."""
+    srv = _DescServer()
+    try:
+        if not srv.start():
+            return None
+        return srv.ask(system, user, max_tokens)
+    finally:
+        srv.stop()
+
+
+def _grab_frames(video_path, times):
+    """Keyframes for the describer's eye: one jpeg per requested second,
+    scaled for gemma, base64-encoded. Any failure just means fewer eyes -
+    the review never blocks on a picture."""
+    import base64
+    out = []
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    for t in times:
+        if _AI["abort"]:
+            break
+        jp = os.path.join(_work_dir(),
+                          f"ins_{os.getpid()}_{int(t)}.jpg")
+        try:
+            # A 32:9 RECORDING IS THE WRONG SHAPE FOR AN EYE. gemma's
+            # vision tower takes a 896x896 square; a full-width strip
+            # arrived 896x252, so three quarters of what the model looked
+            # at was padding and the picture itself was too small to read.
+            # The middle 16:9 - where the game is actually happening -
+            # goes in at 896x504 instead: same one image, twice the
+            # detail. (Corner HUD text is the OCR reader's job, not this
+            # one's.) Narrower recordings are untouched.
+            # the commas inside min() are ESCAPED: an unescaped one ends
+            # the crop filter and the whole graph fails to parse
+            vf = (r"crop=min(iw\,ih*16/9):ih:(iw-min(iw\,ih*16/9))/2:0,"
+                  r"scale=896:-2")
+            r = subprocess.run(
+                [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+                 "-ss", f"{max(0.0, t):.2f}", "-i", video_path,
+                 "-frames:v", "1", "-vf", vf, "-q:v", "5", jp],
+                capture_output=True, timeout=45, creationflags=flags)
+            if r.returncode == 0 and os.path.isfile(jp)                     and os.path.getsize(jp) > 4000:
+                with open(jp, "rb") as fh:
+                    out.append((t, base64.b64encode(fh.read())
+                                .decode("ascii")))
+        except Exception:
+            pass
+        finally:
+            try:
+                if os.path.isfile(jp):
+                    os.remove(jp)
+            except OSError:
+                pass
+    return out
+
+
+def _frame_times_for(video_path, lo, hi):
+    """Which seconds deserve an eye in this window: the loudest gold/laugh
+    moments first (that is where things HAPPEN), then an even spread, five
+    at most, a minute apart."""
+    times = []
+    try:
+        evs = (_read_sidecar(video_path, "hl") or {}).get("events") or []
+        evs = [e for e in evs if lo + 5 <= (e.get("t") or 0) <= hi - 5]
+        evs.sort(key=lambda e: -(e.get("z") or 0))
+        for e in evs[:3]:
+            times.append(float(e["t"]))
+    except Exception:
+        pass
+    span = hi - lo
+    for f in (0.25, 0.5, 0.75):
+        times.append(lo + span * f)
+    keep = []
+    for t in times:
+        if all(abs(t - k) >= 60 for k in keep):
+            keep.append(t)
+        if len(keep) >= 5:
+            break
+    return keep
+
+
+_ASK = {"srv": None, "t": 0.0}
+_ASK_PORT = 8906
+
+# ONE warm describer kept between back-to-back describes, instead of a
+# 15.4 GB load/unload (~60-90s each way) around every single job. Parked by
+# _insights_one when it finishes cleanly; dropped by _ai_abort (a game owns
+# the card now), by any other job kind starting, or after five idle minutes.
+# The parked process stays registered in _AI["proc"], so the abort path can
+# still reach it directly.
+_DESC_KEEP = {"srv": None, "t": 0.0}
+
+
+def _desc_keep_drop():
+    """Let go of the parked warm describer, if any. The stop runs on a side
+    thread - this is called on the watcher at game start, and waiting for a
+    15 GB model to unload there would delay the recording."""
+    kp = _DESC_KEEP.get("srv")
+    _DESC_KEEP["srv"] = None
+    if kp is not None:
+        threading.Thread(target=kp.stop, daemon=True).start()
+
+
+def _desc_keep_tick():
+    """A parked describer is dropped after five quiet minutes - VRAM never
+    sits reserved for a describe that is not coming."""
+    kp = _DESC_KEEP.get("srv")
+    if kp is None:
+        return
+    if _AI.get("busy") is not None:
+        return                    # the job in hand may be about to borrow it
+    srv = _ASK.get("srv")
+    if srv is not None and getattr(srv, "borrowed", False) \
+            and time.time() - (_ASK.get("t") or 0) < 120:
+        return                    # an ask is riding the warm model right now
+    if time.time() - (_DESC_KEEP.get("t") or 0) > 300:
+        _DESC_KEEP["srv"] = None
+        threading.Thread(target=kp.stop, daemon=True).start()
+        log("The warm describer dozes off - five quiet minutes.")
+
+
+def _aud_keep_tick():
+    """The parked thinker dozes off the same way the describer does -
+    five quiet minutes and its twelve gigabytes go back to the card."""
+    kp = _AUD_KEEP.get("srv")
+    if kp is None:
+        return
+    if _AI.get("busy") is not None:
+        return
+    if time.time() - (_AUD_KEEP.get("t") or 0) > 300:
+        _AUD_KEEP["srv"] = None
+        threading.Thread(target=kp.stop, daemon=True).start()
+        log("The auditor's thinker dozes off - five quiet minutes.")
+
+
+def _ask_llm(system, user, schema, max_tokens=900, wait=0):
+    """(data, why) from the tome's own model - the same contract the Claude
+    bridge answered with, minus the key, the cloud and the bill. A running
+    describe server is reused (the question queues behind the window in
+    hand); otherwise a private one wakes on its own port and dozes off
+    after ten quiet minutes."""
+    if _describer_paths() is None:
+        return None, "the describer is not installed"
+    import re as _re
+    if _AI.get("busy") is None:
+        _AI["abort"] = False       # no job is running - a stale abort flag
+    #                                from the last one must not gag the sage
+    srv = _ASK.get("srv")
+    if srv is None:
+        probe = _DescServer()
+        try:
+            _urlreq.urlopen(probe.base + "/health", timeout=1).read()
+            probe.pr = None            # a describe job owns it; never stop it
+            probe.borrowed = True      # ...and never respawn it either
+            srv = probe
+        except Exception:
+            srv = _DescServer(port=_ASK_PORT)
+            # WAKING IT IS MOST OF THE WAIT. Fifteen gigabytes onto the
+            # card takes minutes; behind a silent "thinking..." that is
+            # indistinguishable from broken.
+            if not srv.start(budget=int(wait * 0.6) if wait else 900):
+                return None, ("the sage is still waking up - it loads "
+                              "fifteen gigabytes onto the card the first "
+                              "time. Ask again in a minute and it will be "
+                              "quick.") if wait else "the sage would not wake"
+        _ASK["srv"] = srv
+    # STANDING IN A LINE HE CANNOT SEE. A running describe owns the model,
+    # and a borrowed server answers questions strictly after the window it
+    # is already working on - about sixteen minutes on his card. Waiting
+    # that out is a perfectly good choice; being given one still word and
+    # no idea a queue exists is not. Say it immediately.
+    if wait and getattr(srv, "borrowed", False):
+        _busy = _AI.get("busy")
+        if _busy:
+            _kind = {"hearing": "transcribing", "sound": "reading the sound",
+                     "thinking": "reviewing",
+                     "describing": "describing"}.get(_busy[0], _busy[0])
+            return None, ("the model is %s %s right now, and one model "
+                          "cannot do two things at once - your question "
+                          "would wait behind it, which can be a quarter of "
+                          "an hour. Pause the labours and ask again and it "
+                          "answers straight away."
+                          % (_kind, _busy[1]))
+    _ASK["t"] = time.time()
+    txt = srv.ask(system, user, max_tokens=max_tokens, schema=schema,
+                  timeout=wait or 3600)
+    _ASK["t"] = time.time()
+    if not txt:
+        _ASK["srv"] = None             # dead or gone - a fresh one next ask
+        return None, ("that took too long and I stopped waiting - the "
+                      "model is busy describing. Try again once the "
+                      "labours are quiet.") if wait else \
+                     "no answer came back - ask once more"
+    try:
+        return json.loads(_re.search(r"\{.*\}", txt, _re.S).group(0)), ""
+    except Exception:
+        return None, "the answer would not parse"
+
+
+def _ask_idle_tick():
+    """Dozes the private ask server after ten quiet minutes, so 10 GB of
+    VRAM never sits reserved for a question nobody is asking."""
+    srv = _ASK.get("srv")
+    if srv is not None and srv.pr is not None \
+            and time.time() - (_ASK.get("t") or 0) > 600:
+        try:
+            srv.stop()
+        except Exception:
+            pass
+        _ASK["srv"] = None
+
+
+def _ask_score(text, terms):
+    """How much of the question lives in this text. Case-blind, works for
+    Arabic and English alike - no stemming, just honest term hits."""
+    t = (text or "").lower()
+    return sum(t.count(w) for w in terms if w)
+
+
+_ASK_STOP = {"the", "and", "was", "were", "what", "when", "where", "who",
+             "did", "does", "how", "that", "this", "with", "for", "you",
+             "are", "all", "any", "our", "his", "her", "they", "them",
+             "recording", "video", "moment", "time", "game", "which"}
+
+
+def _ask_terms(q):
+    import re as _re
+    return [w for w in _re.split(r"[^\w\u0600-\u06ff]+", (q or "").lower())
+            if len(w) >= 3 and w not in _ASK_STOP][:24]
+
+
+def _ins_owing_raw(video_path):
+    """Does this recording still owe (part of) a review?
+
+    Owing when: no sidecar, or the recording changed since; a FAILED one with
+    tries left; an INCOMPLETE windowed one with tries left. Not owing when it
+    is complete, legacy-complete (pre-window sidecars carry no 'windows' key
+    and are taken at their word), honestly empty, or out of tries - the
+    sweep must never loop on a recording it cannot finish. The lightning
+    button does not ask this function; asking by name always works."""
+    sp = _ai_sidecar(video_path, "ins")
+    try:
+        if not os.path.isfile(sp) or                 os.path.getmtime(sp) < os.path.getmtime(video_path):
+            return True
+    except OSError:
+        return False
+    try:
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return True                    # unreadable sidecar = do it again
+    tries = int(d.get("tries") or 0)
+    if d.get("failed"):
+        return tries < 3
+    if isinstance(d.get("windows"), dict) and not d.get("complete"):
+        return tries < 3
+    # AN UPGRADE IS OWED, NEVER A WIPE. A finished review from an older
+    # engine keeps serving exactly as it is; the sweep rebuilds it into a
+    # .new side file and the swap happens only when the new one is
+    # complete. Gated on the eye: generation 3 IS the vision era.
+    if d.get("complete") and d.get("chapters") \
+            and int(d.get("gen") or 2) < _INS_GENERATION \
+            and _desc_mmproj() is not None:
+        try:
+            with open(sp + ".new", encoding="utf-8") as fh:
+                if int((json.load(fh) or {}).get("tries") or 0) >= 3:
+                    return False    # the upgrade refused three times: the
+        except Exception:           # old review simply stays
+            pass
+        return True
+    return False
+
+
+_INS_OWE_CACHE = {}
+
+
+def _ins_owing(video_path):
+    """_ins_owing_raw through a signature cache. The idle beat asks this for
+    EVERY video every five seconds, and the raw answer costs a JSON parse
+    (two once a .new exists) - ~700 opens a second on a caught-up library,
+    and a storm of cold random reads on the spun-down platter after a game.
+    The mtimes are the truth the answer is built from; while they have not
+    moved, neither has the answer."""
+    sp = _ai_sidecar(video_path, "ins")
+    try:
+        sig = (os.path.getmtime(video_path),
+               os.path.getmtime(sp) if os.path.isfile(sp) else -1.0,
+               os.path.getmtime(sp + ".new")
+               if os.path.isfile(sp + ".new") else -1.0,
+               _desc_mmproj() is not None)
+    except OSError:
+        return _ins_owing_raw(video_path)
+    key = os.path.normcase(os.path.abspath(video_path))
+    hit = _INS_OWE_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    ans = _ins_owing_raw(video_path)
+    _INS_OWE_CACHE[key] = (sig, ans)
+    return ans
+
+
+def _insights_wanted():
+    """Describing costs money per recording, so it does not happen behind his
+    back. Off means: only when he presses the button on a recording."""
+    return bool(SETTINGS.get("insights_auto"))
+
+
+def _insights_one(video_path, forced=False, fresh=False):
+    """What this recording actually was -> .ins.json sidecar. All local.
+
+    The transcript is described a WINDOW (30 min) at a time, each answer is
+    written to disk the moment it lands, and only missing windows are asked
+    for - so a review interrupted at window 2 of 5 resumes at window 2, and
+    a partial can never again masquerade as a finished one."""
+    if _describer_paths() is None:
+        return False
+    if not forced and not _insights_wanted():
+        return False
+    try:
+        with open(_ai_sidecar(video_path, "stt"), encoding="utf-8") as fh:
+            segs = (json.load(fh) or {}).get("segments") or []
+    except Exception:
+        segs = []
+    dur = _video_duration(video_path) or 0.0
+    if dur < 20:
+        # A COLD 40 GB FILE ON A BUSY SPINNING DISK can time the probe out -
+        # that is not a short video, it is a slow answer. One more try, and
+        # if it still will not say, SAY SO in the log instead of vanishing:
+        # this exact silence ate five forced describes in one evening.
+        time.sleep(3.0)
+        dur = _video_duration(video_path) or 0.0
+        if dur < 20:
+            log(f"Could not measure {os.path.basename(video_path)} "
+                f"(got {dur:.0f}s - disk busy?); the description was not "
+                f"attempted. Ask again in a moment.")
+            _AI["soft_fail"] = True     # a slow disk is not a bad recording
+            return False
+    words = sum(len((sg.get("t") or "").split()) for sg in segs)
+    if words < 12:
+        if not _ai_sidecar_fresh(video_path, "stt"):
+            # no transcript EXISTS yet - describing now would stamp a
+            # 2-hour Discord night as 'honestly nothing was said', forever
+            log(f"{os.path.basename(video_path)} has no transcript yet - "
+                f"it must be read before it can be described.")
+            _AI["soft_fail"] = True
+            return False
+        # a real transcript with nothing in it: honestly nothing to
+        # describe. BANK FIRST: a redo can legitimately shrink the words
+        # (the echo wall dropping fake lines), and stamping empty over a
+        # rich review unbanked would be the one unrecoverable write in
+        # the whole redo path.
+        try:
+            _bank_sidecar(video_path, "ins")
+        except Exception:
+            pass
+        _atomic_write_json(_ai_sidecar(video_path, "ins"),
+                           {"v": 3, "empty": True, "complete": True})
+        return True
+
+    # THE PICTURE'S length, not the container's - on a drifted recording the
+    # sound runs seconds past the last frame, and that gap is where chapters
+    # past the end used to land.
+    vdur = dur
+    try:
+        got = _av_durations(video_path)
+        if got and got[0] > 1:
+            vdur = min(dur, got[0])
+    except Exception:
+        pass
+
+    side_p = _ai_sidecar(video_path, "ins")
+    name = os.path.basename(video_path)
+    # the SHELF names the game: D:\Records\<Game>\Videos\x.mp4 - knowing it
+    # is Devour is what makes 'Azazel' a boss and not a typo
+    try:
+        pp = os.path.dirname(video_path)
+        game = (os.path.basename(os.path.dirname(pp))
+                if os.path.basename(pp).lower() in ("videos", "clips")
+                else os.path.basename(pp)) or "an unknown game"
+    except Exception:
+        game = "an unknown game"
+
+    def _line(sg, i):
+        t = int((sg.get("a") or 0) / 1000)
+        gl = " (probably the game's own audio)" if sg.get("g") else ""
+        yv = "YOU: " if sg.get("src") == "you" else ""
+        return f"[#{i} {t // 60}:{t % 60:02d}] {yv}{(sg.get('t') or '').strip()}{gl}"
+
+    def _tokens(txt):
+        # count the SCRIPT, not the characters: 3.5 chars/token is an English
+        # figure and Arabic runs nearer 1.2 - the flat count under-guessed a
+        # tenth-Arabic transcript by ~900 tokens and earned an HTTP 400
+        ar = sum(1 for c in txt if "\u0600" <= c <= "\u06ff")
+        return int(ar / 1.2 + (len(txt) - ar) / 3.5)
+
+    MAX_OUT = 900                 # 3-5 stretches is a short answer; asking
+    #                               for 2200 tokens just made every window
+    #                               take twice as long as it needed to
+    room = max(600, _DESC_CTX - MAX_OUT - 1100 - 160
+               - (1600 if _desc_mmproj() is not None else 0)
+               - (300 if os.path.isfile(_ai_sidecar(video_path, "vis"))
+                  else 0))
+    #                             ^ five frames at ~256 tokens each, plus
+    #                               their labels, when the eye is mounted -
+    #                               and below that, the block naming what
+    #                               the eye SAW in this window, once it has
+    #                               looked
+
+    # the windows tile the recording: every minute is in exactly one, so
+    # coverage is construction, not a request the model may ignore
+    WIN = 30 * 60.0
+    edges, t0 = [], 0.0
+    while t0 < vdur - 60:
+        edges.append((t0, min(vdur, t0 + WIN)))
+        t0 += WIN
+    if not edges:
+        edges = [(0.0, vdur)]
+
+    # WHAT IS ALREADY DONE. Windows survive interruption on disk; a forced
+    # ask on a COMPLETE review starts fresh (asking again is the point of
+    # the button), a forced ask on a partial finishes it.
+    prior = {}
+    try:
+        with open(side_p, encoding="utf-8") as fh:
+            prior = json.load(fh) or {}
+        # a review OLDER than its video describes footage that may no
+        # longer exist (Save&Replace cut it): its windows always 'cover'
+        # the new length, so resuming from them would relaunder deleted
+        # content as a fresh complete review. Start over instead.
+        if os.path.getmtime(side_p) < os.path.getmtime(video_path):
+            log(f"{name}: the old review predates the current video - "
+                f"describing it fresh.")
+            prior = {}
+    except Exception:
+        prior = {}
+    # THE OLD ONE STAYS UNTIL THE NEW ONE IS FINISHED. Any rebuild of a
+    # review that is already complete-with-chapters (an engine upgrade, or
+    # the lightning pressed on a done one) works in a .new side file -
+    # resumable like any window job - and only a COMPLETE result replaces
+    # what the reader is looking at.
+    upgrade = bool(prior.get("complete") and prior.get("chapters"))
+    work_p = side_p + ".new" if upgrade else side_p
+    if upgrade:
+        wdoc = {}
+        try:
+            with open(work_p, encoding="utf-8") as fh:
+                wdoc = json.load(fh) or {}
+        except Exception:
+            wdoc = {}
+        windows = wdoc.get("windows") \
+            if isinstance(wdoc.get("windows"), dict) else {}
+        # fresh means the TRANSCRIPT was just replaced in this same ask -
+        # a partial's landed windows describe words that no longer exist,
+        # so resuming would splice two transcripts into one review
+        if forced and windows and (fresh or wdoc.get("complete")):
+            windows = {}
+        tries = 0 if forced else int(wdoc.get("tries") or 0)
+    else:
+        windows = prior.get("windows") \
+            if isinstance(prior.get("windows"), dict) else {}
+        if forced and windows and (fresh or prior.get("complete")):
+            windows = {}
+        tries = 0 if forced else int(prior.get("tries") or 0)
+
+    _LANG_RE = r"\b(arabic|english|bilingual|language)\b"
+
+    def _scrub(label, what, topics=()):
+        # 'Warden's Courtyard and Arabic Discussion' - the language is never
+        # the subject. When a name mentions one, the stretch's own sentence
+        # names the chapter instead - UNLESS that sentence does it too ("The
+        # group switches to Arabic, discussing X" - measured on the real
+        # model), in which case the language CLAUSE is cut and what remains
+        # ("discussing X") is the chapter. Topics are the last resort.
+        if not re.search(_LANG_RE, label, re.I):
+            return label
+        alt = str(what or "").strip().rstrip(".")
+        if alt and not re.search(_LANG_RE, alt, re.I):
+            return alt[:80]
+        for cand in (alt, label):
+            if not cand:
+                continue
+            c = re.sub(r"[^,;.]*" + _LANG_RE + r"[^,;.]*[,;.]?\s*", "",
+                       cand, flags=re.I).strip(" -,;.")
+            c = re.sub(r"^(and|then|while|to|about)\s+", "", c,
+                       flags=re.I).strip()
+            if len(c) >= 8:
+                return (c[:1].upper() + c[1:])[:80]
+        clean = [str(x)[:40] for x in (topics or [])
+                 if str(x).strip() and not re.search(_LANG_RE, str(x), re.I)]
+        return " and ".join(clean[:2]) or "Between rounds"
+
+    def _assemble_raw(done_map):
+        raw, moms = [], []
+        for k in sorted(done_map, key=lambda x: float(x)):
+            lo = float(k)
+            hi2 = min(vdur, lo + WIN)
+            win = done_map[k]
+            # 2.66 stored a bare list; 2.67 stores {segments, moments}
+            w_segs = win.get("segments") if isinstance(win, dict) else win
+            if isinstance(win, dict):
+                moms.extend(win.get("moments") or [])
+            got_w = []
+            for sgm in (w_segs or []):
+                try:
+                    got_w.append((float(sgm.get("from")),
+                                  float(sgm.get("to")), sgm))
+                except (TypeError, ValueError):
+                    continue
+            if not got_w:
+                continue
+            # THE WHOLE WINDOW CAN COME BACK OFFSET AS ONE. Measured on Big
+            # Walk's 90-120 minute window: every stretch arrived exactly one
+            # hour late (150:20 for words spoken at 90:20). A window can also
+            # answer as if it began at zero. Try the shifts matching the
+            # observed failure modes, keep whichever puts the most stretches
+            # inside the window, and DROP what still lands outside - better
+            # absent than colliding with another window's chapters.
+            best, best_in = 0.0, -1
+            for shift in (0.0, lo, -3600.0, 3600.0, -lo):
+                inside = sum(1 for a, b, _ in got_w
+                             if lo - 60 <= a + shift <= hi2 + 60)
+                if inside > best_in:
+                    best, best_in = shift, inside
+            for a, b, sgm in got_w:
+                a, b = a + best, b + best
+                if not (lo - 60 <= a <= hi2 + 60):
+                    continue
+                raw.append((a, b, sgm))
+        raw.sort(key=lambda x: x[0])
+        moms.sort(key=lambda m: m.get("t") or 0)
+        for m in moms:      # windows stored before this scrub existed get
+            m["why"] = _devoice(_descrub(str(m.get("why") or "")))[:140]
+        return raw, moms
+
+    def _assemble(done_map, complete, tries_now):
+        """Every landed window -> one sidecar, rewritten after each window
+        so the tome shows chapters filling in while the job runs."""
+        raw, moms = _assemble_raw(done_map)
+        # ONE EVENT, ONE MOMENT. The model loves an echo - 'Fuck that!'
+        # arrived twice at 20:59 with two wordings. Twins inside 8 seconds
+        # are the same breath; the better-told one is kept.
+        kept_m = []
+        for m in moms:
+            if kept_m and (m.get("t") or 0) - (kept_m[-1].get("t") or 0) < 8.0:
+                if len(str(m.get("why") or "")) \
+                        > len(str(kept_m[-1].get("why") or "")):
+                    kept_m[-1] = m
+                continue
+            kept_m.append(m)
+        moms = kept_m
+        out = {"v": 3, "engine": "local", "gen": _INS_GENERATION,
+               "title": str(prior.get("title") or "")[:120],
+               "summary": str(prior.get("summary") or "")[:600],
+               "chapters": [], "segments": [],
+               # the old cloud pass wrote moments (gold-mark reasons) and
+               # suggested clips; the windowed writer does not produce them
+               # yet - CARRY THEM, or a re-describe silently strips features
+               # that were working
+               # our own found moments first; a legacy cloud list only
+               # when this review produced none
+               "moments": (moms[:40] if moms
+                           else list(prior.get("moments") or [])),
+               "clips": list(prior.get("clips") or []),
+               # the respelling undo ledger survives every reassembly -
+               # the audit's retell used to erase it in the same breath
+               # the audit wrote it (review 302)
+               "names_fixed": list(prior.get("names_fixed") or []),
+               "windows": done_map, "win_len": int(WIN),
+               "vdur": round(vdur, 1),
+               "complete": bool(complete), "tries": int(tries_now)}
+        if complete and not raw:
+            # every window answered with nothing: that is an EMPTY review,
+            # not a limbo one - without this flag it was never done, never
+            # owed, and counted 'left' in the tally forever
+            out["empty"] = True
+        tail = max(8.0, min(60.0, vdur * 0.03))
+        prev_end = -1.0
+        for a, b, sgm in raw[:120]:
+            a = max(0.0, min(a, vdur))
+            b = max(0.0, min(b, vdur))
+            if b <= a or a >= vdur - tail:
+                continue
+            if a < prev_end - 0.5:
+                continue
+            prev_end = b
+            tops = [str(x)[:60] for x in (sgm.get("topics") or [])
+                    if str(x).strip()]
+            label = _scrub(str(sgm.get("name") or "").strip()
+                           or str(sgm.get("what") or "").strip()
+                           or " + ".join(tops[:2]),
+                           sgm.get("what"), tops)
+            if not label:
+                continue
+            # a chapter is never its own twin: the same name landing again
+            # right after (windows can echo across their seam) EXTENDS the
+            # chapter instead of repeating it, and two starts inside five
+            # seconds are one start
+            if out["chapters"]:
+                lastc = out["chapters"][-1]
+                if label[:80] == lastc["label"] or a - lastc["t"] < 5.0:
+                    lastc["b"] = max(lastc["b"], round(b, 1))
+                    out["segments"][-1]["b"] = lastc["b"]
+                    prev_end = max(prev_end, b)
+                    continue
+            what = _descrub(str(sgm.get("what") or ""))
+            out["segments"].append({"a": round(a, 1), "b": round(b, 1),
+                                    "topics": tops[:4],
+                                    "what": what[:200],
+                                    "quote": str(sgm.get("quote") or "")[:200]})
+            out["chapters"].append({"t": round(a, 1), "b": round(b, 1),
+                                    "label": label[:80],
+                                    "what": what[:220]})
+        try:
+            sns0 = _read_sidecar(video_path, "sns") or {}
+            rt = _ins_retone(out.get("moments") or [], sns0)
+            if rt:
+                log("The tone curve retoned " + str(rt) + " moment(s) to "
+                    "excited - nobody laughed and nobody screamed, the "
+                    "room was just ALIVE.")
+        except Exception:
+            pass
+        os.makedirs(os.path.dirname(work_p), exist_ok=True)
+        _atomic_write_json(work_p, out)
+        return out
+
+    # WHAT THE EARS AND EYES ALREADY KNOW - handed to every window's ask,
+    # so the review weaves the marks in instead of ignoring them (his exact
+    # complaint: 'every function is separate').
+    _heard = []
+    try:
+        with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
+            for e0 in (json.load(fh) or {}).get("events") or []:
+                _heard.append((float(e0.get("t") or 0),
+                               str(e0.get("kind") or "loud")))
+    except Exception:
+        pass
+    _who_names = {}
+    try:
+        with open(_ai_sidecar(video_path, "sns"), encoding="utf-8") as fh:
+            _sd0 = json.load(fh) or {}
+        _who_names = _sd0.get("names") or {}
+        for e0 in _sd0.get("ocr") or []:
+            _heard.append((float(e0.get("t") or 0),
+                           "on-screen: "
+                           + str(e0.get("text") or e0.get("kind"))[:30]))
+    except Exception:
+        pass
+    _heard.sort()
+    # WHAT THE EYE ACTUALLY SAW. The looks it banked, phrased as one line
+    # each, so a chapter can be named after the corridor it happened in
+    # instead of after the only noun in the transcript.
+    _seen = []
+    try:
+        with open(_ai_sidecar(video_path, "vis"), encoding="utf-8") as fh:
+            _vd0 = json.load(fh) or {}
+        if not _vd0.get("failed"):
+            for _lk0 in (_vd0.get("looks") or []):
+                if not isinstance(_lk0, dict):
+                    continue
+                bits = str(_lk0.get("place") or "")
+                if _lk0.get("creature"):
+                    bits += (" - " if bits else "") + str(_lk0["creature"])
+                if _lk0.get("doing") and len(bits) < 55:
+                    bits += ("; " if bits else "") + str(_lk0["doing"])
+                if bits.strip():
+                    _seen.append((float(_lk0.get("t") or 0), bits[:90]))
+    except Exception:
+        pass
+    _seen.sort()
+
+    missing = [(lo, hi) for lo, hi in edges if str(int(lo)) not in windows]
+    # honest progress + guard telemetry for THIS job
+    guard_cov = guard_retry = 0
+    # "at" is WHEN this count became true - the row's estimate divides by
+    # it, and dividing by the clock instead made the time-left grow as the
+    # job ran
+    _AI["ins_prog"] = {"done": len(edges) - len(missing),
+                       "total": len(edges), "tail": False,
+                       "at": time.time()}
+    if not missing and windows:
+        _assemble(windows, True, 0)
+        log(f"Described {name}: nothing missing - review rebuilt from "
+            f"{len(windows)} window(s).")
+        return True
+
+    # a describer parked warm by the LAST describe is reused - the model
+    # loads once for a whole run of back-to-back describes
+    srv = _DESC_KEEP.get("srv")
+    _DESC_KEEP["srv"] = None
+    warm = bool(srv is not None and srv.pr is not None
+                and srv.pr.poll() is None)
+    if warm:
+        _AI["proc"] = srv.pr       # the abort path must still reach it
+    else:
+        if srv is not None:
+            srv.stop()             # parked but dead - leave cleanly
+        srv = _DescServer()
+    import re as _re
+    try:
+        if not (warm or srv.start()):
+            if _AI["abort"]:
+                return False       # a game start is not a describe failure
+            _atomic_write_json(work_p, dict({} if upgrade else prior,
+                                            v=3, failed=True,
+                                            complete=False,
+                                            windows=windows,
+                                            tries=tries + 1,
+                                            why="the describer would not start"))
+            return False
+
+        progress = False
+        for lo, hi in missing:
+            if _AI["abort"]:
+                break
+            if _AI.get("wind"):
+                # a pause is winding the job down: the banked windows
+                # stand, this one never starts, the job returns held
+                break
+            _AI["ins_prog"] = {
+                "done": sum(1 for l2, _h2 in edges
+                            if str(int(l2)) in windows),
+                "total": len(edges), "tail": False,
+                "at": time.time()}
+            part = [sg for sg in segs
+                    if lo <= (sg.get("a") or 0) / 1000.0 < hi]
+            if len(part) < 3:
+                windows[str(int(lo))] = []      # a silent half hour is done,
+                progress = True                  # not owing
+                continue
+            # fit THIS window to the context, evenly, before asking
+            n = len(part)
+            while True:
+                step = len(part) / float(n)
+                use = [part[int(i * step)] for i in range(n)]
+                body = "\n".join(_line(sg, i) for i, sg in enumerate(use))
+                if _tokens(body) <= room or n <= 24:
+                    break
+                n = max(24, int(n * room / float(max(1, _tokens(body)))) - 2)
+            imgs = []
+            if _desc_mmproj() is not None and not _AI["abort"]:
+                imgs = [(f"[frame at {int(t) // 60}:{int(t) % 60:02d}]", b)
+                        for t, b in _grab_frames(
+                            video_path, _frame_times_for(video_path, lo, hi))]
+            see = (f"You are also SHOWN {len(imgs)} frame(s) from this "
+                   f"window, each labeled with its time - use what you SEE "
+                   f"(places, bosses, menus, deaths, victories) in names, "
+                   f"whats and moments; never claim to see what is not "
+                   f"there. " if imgs else "")
+            mk_here = [(t0, k0) for t0, k0 in _heard if lo <= t0 < hi]
+            ears = ""
+            if mk_here:
+                ears = ("The tome's ears and eyes already MARKED these "
+                        "moments in this window - weave the strongest into "
+                        "your moments with a why each, citing the nearest "
+                        "line:\n" + "\n".join(
+                            f"  {int(t0 // 60)}:{int(t0 % 60):02d} {k0}"
+                            for t0, k0 in mk_here[:25]) + "\n")
+            if _who_names:
+                ears += ("Voices with names: " + ", ".join(
+                    f"speaker {k} = {v}" for k, v in _who_names.items())
+                    + " - use the names.\n")
+            saw_here = [(t0, s0) for t0, s0 in _seen if lo <= t0 < hi]
+            eyes = ""
+            if saw_here:
+                # TEN LOOKS AT MOST. This head shares its context with the
+                # transcript and five pictures; a slow night can leave a
+                # dozen looks inside one window, and pasting them all in
+                # spends exactly the room the words needed.
+                eyes = ("The tome LOOKED at this window and saw:\n"
+                        + "\n".join(
+                            f"  {int(t0 // 60)}:{int(t0 % 60):02d} {s0}"
+                            for t0, s0 in saw_here[:10])
+                        + "\nName the places when you write the chapters; "
+                          "never name one it did not see.\n")
+            # THE STORY SO FAR. Windows were described in isolation, so
+            # a window could not know what the ones before it had found:
+            # "remember the elevator?" at minute 34 landed in a window
+            # that had never seen an elevator, and a thread crossing the
+            # half-hour seam came back as two chapters cut at the clock
+            # rather than at a break. The names already found are cheap
+            # (about a hundred tokens) and they are exactly the context a
+            # reference backwards needs.
+            so_far = ""
+            try:
+                earlier = []
+                for k2 in sorted(windows, key=lambda x: float(x)):
+                    if float(k2) >= lo:
+                        continue
+                    w2 = windows[k2]
+                    for sgm2 in ((w2.get("segments")
+                                  if isinstance(w2, dict) else w2) or []):
+                        try:
+                            a2 = float(sgm2.get("from"))
+                        except (TypeError, ValueError):
+                            continue
+                        nm2 = str(sgm2.get("label") or "").strip()
+                        if nm2:
+                            earlier.append((a2, nm2))
+                earlier.sort()
+                if earlier:
+                    so_far = (
+                        "Earlier in this SAME session, already described "
+                        "(never describe these stretches again):\n"
+                        + "\n".join(
+                            f"  {int(a2 // 60)}:{int(a2 % 60):02d} {nm2}"
+                            for a2, nm2 in earlier[-8:])
+                        + "\nYou are continuing that session. If these "
+                          "people are still on something from earlier, or "
+                          "come back to it, say so plainly by its name.\n")
+            except Exception:
+                so_far = ""
+            head = (f"The game being played is {game}. This window of "
+                    f"the recording runs from minute {int(lo // 60)} to "
+                    f"minute {int(hi // 60)}. {see}{ears}{eyes}{so_far}"
+                    f"Cite lines ONLY "
+                    f"by their #numbers ({0} to {len(use) - 1}). "
+                    f"Three to five stretches.\n\n")
+            got = None
+            for _attempt in range(2):
+                txt = srv.ask(_DESC_SYSTEM, head + body, max_tokens=MAX_OUT,
+                              schema=_DESC_SCHEMA, images=imgs)
+                if txt:
+                    try:
+                        got = json.loads(
+                            _re.search(r"\{.*\}", txt, _re.S).group(0))
+                        break
+                    except Exception:
+                        got = None
+                if _attempt == 0:
+                    guard_retry += 1        # the parse retry fired
+                n = max(24, n // 2)             # send less, ask once more
+                step = len(part) / float(n)
+                use = [part[int(i * step)] for i in range(n)]
+                body = "\n".join(_line(sg, i) for i, sg in enumerate(use))
+                # fewer lines = new numbering; the head must cite the NEW
+                # top line or the model's references map to the wrong rows
+                head = (f"The game being played is {game}. This window of "
+                        f"the recording runs from minute {int(lo // 60)} to "
+                        f"minute {int(hi // 60)}. {so_far}Cite lines ONLY "
+                        f"by their #numbers ({0} to {len(use) - 1}). "
+                        f"Three to five stretches.\n\n")
+            stretches = (got or {}).get("segments") or []
+            # THE CLOCK COMES FROM THE TRANSCRIPT, NOT THE MODEL. It cited
+            # line numbers; the lines know exactly when they were spoken.
+            # Inventing from/to seconds is how "Scouting and Egg Collection"
+            # landed eight minutes before the round it describes existed.
+            def _lt(v, fallback):
+                try:
+                    return use[max(0, min(len(use) - 1, int(v)))]
+                except (TypeError, ValueError):
+                    return fallback
+            mapped = []
+            for sgm in stretches:
+                a_sg = _lt(sgm.get("from_line"), None)
+                b_sg = _lt(sgm.get("to_line"), None)
+                if a_sg is not None:
+                    sgm["from"] = round((a_sg.get("a") or 0) / 1000.0, 1)
+                if b_sg is not None:
+                    sgm["to"] = round((b_sg.get("b") or 0) / 1000.0, 1)
+                if sgm.get("from") is not None and sgm.get("to") is not None:
+                    mapped.append(sgm)
+            wmoments = []
+            for mm in ((got or {}).get("moments") or [])[:4]:
+                m_sg = _lt(mm.get("line"), None)
+                why = str(mm.get("why") or "").strip()
+                if m_sg is None or not why:
+                    continue
+                wmoments.append(
+                    {"t": round(((m_sg.get("a") or 0)
+                                 + (m_sg.get("b") or 0)) / 2000.0, 1),
+                     "why": _devoice(_descrub(why))[:140],
+                     "kind": str(mm.get("kind") or "")[:12]})
+            # THE TAIL GETS ASKED FOR. Told twice to cover every line, the
+            # model still sometimes stops a third of the way through a
+            # window (measured on his own Devour: last citation line 47 of
+            # 161). When the last cited line falls short of ~85% of the
+            # window, the uncovered remainder is asked for ONCE, renumbered,
+            # and the answers are appended - so a window's back half can no
+            # longer silently have no chapters.
+            last_line = -1
+            for sgm in stretches:
+                try:
+                    last_line = max(last_line, int(sgm.get("to_line")))
+                except (TypeError, ValueError):
+                    pass
+            if got is not None and mapped and not _AI["abort"] \
+                    and 0 <= last_line < 0.85 * (len(use) - 1) \
+                    and len(use) - 1 - last_line >= 6:
+                rest = use[last_line + 1:]
+                body2 = "\n".join(_line(sg, i) for i, sg in enumerate(rest))
+                head2 = (f"The game being played is {game}. This is the "
+                         f"REST of a window whose start you already "
+                         f"described: minute "
+                         f"{int((rest[0].get('a') or 0) // 60000)} to minute "
+                         f"{int(hi // 60)}. Cite lines ONLY by their "
+                         f"#numbers ({0} to {len(rest) - 1}). One to three "
+                         f"stretches.\n\n")
+                guard_cov += 1              # the coverage guard fired
+                ip = _AI.get("ins_prog")
+                if isinstance(ip, dict):
+                    ip["tail"] = True       # the Working row says so
+                txt2 = srv.ask(_DESC_SYSTEM, head2 + body2,
+                               max_tokens=MAX_OUT, schema=_DESC_SCHEMA)
+                got2 = None
+                if txt2:
+                    try:
+                        got2 = json.loads(
+                            _re.search(r"\{.*\}", txt2, _re.S).group(0))
+                    except Exception:
+                        got2 = None
+
+                def _lt2(v):
+                    try:
+                        return rest[max(0, min(len(rest) - 1, int(v)))]
+                    except (TypeError, ValueError):
+                        return None
+                for sgm in ((got2 or {}).get("segments") or []):
+                    a_sg = _lt2(sgm.get("from_line"))
+                    b_sg = _lt2(sgm.get("to_line"))
+                    if a_sg is None or b_sg is None:
+                        continue
+                    sgm["from"] = round((a_sg.get("a") or 0) / 1000.0, 1)
+                    sgm["to"] = round((b_sg.get("b") or 0) / 1000.0, 1)
+                    mapped.append(sgm)
+                for mm in ((got2 or {}).get("moments") or [])[:4]:
+                    m_sg = _lt2(mm.get("line"))
+                    why = str(mm.get("why") or "").strip()
+                    if m_sg is None or not why:
+                        continue
+                    wmoments.append(
+                        {"t": round(((m_sg.get("a") or 0)
+                                     + (m_sg.get("b") or 0)) / 2000.0, 1),
+                         "why": _devoice(_descrub(why))[:140],
+                         "kind": str(mm.get("kind") or "")[:12]})
+            log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} min -> "
+                f"{len(mapped)} stretch(es), {len(wmoments)} moment(s).")
+            if got is not None:
+                windows[str(int(lo))] = {"segments": mapped,
+                                         "moments": wmoments}
+                progress = True
+                tries = 0
+                # ON DISK NOW - an interruption after this line loses
+                # nothing that was already described
+                _assemble(windows, False, tries)
+
+        if guard_cov or guard_retry:
+            log(f"{name}: describer guards - {guard_retry} parse "
+                f"retr{'y' if guard_retry == 1 else 'ies'}, "
+                f"{guard_cov} coverage re-ask(s).")
+        complete = all(str(int(lo)) in windows for lo, hi in edges)
+        if complete:
+            # A TITLE FOR THE WHOLE THING, from every window's chapter
+            # names - window 1's own title kept naming a two-hour night
+            # after its first half hour.
+            names = []
+            for k in sorted(windows, key=lambda x: float(x)):
+                w = windows[k]
+                for sgm in (w.get("segments") if isinstance(w, dict)
+                            else w) or []:
+                    nm = str(sgm.get("name") or "").strip()
+                    if nm:
+                        names.append(nm)
+            title = summary = ""
+            if names:
+                t_ask = (f"These are the chapters of one session of "
+                         f"{game}, in order:\n- " + "\n- ".join(names[:40])
+                         + "\n\nReply with STRICT JSON and nothing else: "
+                           '{"title": "...", "summary": "one or two '
+                           'sentences"}. The title names what actually '
+                           "happened, in the session's own words and names - "
+                           "if it would fit a thousand other recordings it "
+                           "is wrong. Write Arabic words in Arabic letters.")
+                # NOT under _DESC_SYSTEM - that prompt demands a
+                # segments-shaped answer, so asking it for a title
+                # contradicted its own rules and it returned nothing
+                # (measured on the real model, not guessed).
+                t_sys = ("You name recordings of gaming sessions. Reply "
+                         "with STRICT JSON and nothing else, in exactly "
+                         "the shape the user asks for.")
+                t_txt = srv.ask(t_sys, t_ask, max_tokens=250,
+                                schema=_TITLE_SCHEMA)
+                if t_txt:
+                    try:
+                        t_d = json.loads(
+                            _re.search(r"\{.*\}", t_txt, _re.S).group(0))
+                        title = _descrub(str(t_d.get("title") or "").strip())
+                        summary = _descrub(str(t_d.get("summary")
+                                               or "").strip())
+                    except Exception:
+                        pass
+            prior["title"] = title or prior.get("title") or \
+                (names[0] if names else "")
+            prior["summary"] = summary or prior.get("summary") or ""
+            out = _assemble(windows, True, 0)
+            if upgrade:
+                # the moment of the swap - and the ONLY moment the old
+                # review is touched. It is BANKED first, never destroyed.
+                _bank_sidecar(video_path, "ins")
+                os.replace(work_p, side_p)
+            log(f"Described {name}: {len(out['segments'])} stretch(es) "
+                f"across {len(edges)} window(s) - {out['title'][:60]}")
+            return True
+
+        if progress:
+            # windows LANDED - this is an interruption or a soft stall, not
+            # a refusal; poisoning the path here made resume dead until the
+            # next restart
+            _AI["soft_fail"] = True
+        if not windows and prior.get("chapters"):
+            # interrupted before ANY window landed: the served review was
+            # never touched (upgrades stage in .new), so there is nothing
+            # to write and nothing was lost
+            return False
+        # not complete: keep what landed, spend a try only if NOTHING did -
+        # and an INTERRUPTION is not a failure. A game starting (or a new
+        # forced ask taking the slot) kills the server mid-answer; tonight
+        # that spent three tries on one video and the sweep gave up on it.
+        # The model never got to fail; no try is spent.
+        tries_now = tries if (progress or _AI["abort"]) else tries + 1
+        _assemble(windows, False, tries_now)
+        log(f"Description of {name} is unfinished: "
+            f"{len(windows)} of {len(edges)} window(s) done - "
+            f"it will be resumed, not redone.")
+        return False
+    finally:
+        if (not _AI["abort"] and srv.pr is not None
+                and srv.pr.poll() is None):
+            # park the warm model for the next describe. Dropped by
+            # _ai_abort (a game), by any other job kind starting, or by
+            # _desc_keep_tick after five quiet minutes.
+            _DESC_KEEP["srv"] = srv
+            _DESC_KEEP["t"] = time.time()
+        else:
+            srv.stop()
+
+
+# ===========================================================================
+#  THE EYE  (2.83)
+# ===========================================================================
+#  Looking is the expensive sense. One frame plus a small structured
+#  question costs about twenty-one seconds on his card, which is why the
+#  frames handed to a describe window were only ever garnish - grabbed,
+#  glanced at, thrown away with the answer. This pass spends the same money
+#  deliberately instead: at the loudest gold moments, at the chapter starts
+#  a finished review already found, wherever the senses heard or read
+#  something, and evenly enough that no long stretch of a night is simply
+#  invisible. What comes back is KEPT, in a .vis sidecar the timeline, the
+#  player and the describer all read.
+
+_EYE_GAP = 20.0        # two looks closer than this see the same room twice
+_EYE_EDGE = 3.0        # the first and last seconds are fades and titles
+_EYE_BATCH = 4         # frames per ask - four fit the context comfortably
+_EYE_SPAN_MIN = 30.0   # a place glimpsed once for an instant is not a stay
+_EYE_REVISIT = 900.0   # the same room an hour later is a second visit
+_EYE_GIVEUP = 8        # single frames refused before the ladder stops
+
+_EYE_SYSTEM = """You are the tome's eye. You are shown still frames from
+one recording of a game, and you say only what is ACTUALLY THERE.
+
+- "place" is where the picture is: a room, a corridor, a street, a shop, a
+  menu, a map, a loading screen. Name it the way somebody who was there
+  would - "a yellow wallpaper corridor", "an office full of cubicles",
+  "the inventory screen". Three to eight words.
+- "creature" is the thing in shot worth naming: a monster, an enemy, an
+  NPC, another player. Only when one is visibly there. Nothing in shot is
+  the ordinary case, and the honest answer for it is "none".
+- "doing" is what is happening at that instant, in a handful of words -
+  "reloading behind cover", "reading a note", "standing still".
+- Never invent a story between frames, never mention the frame, the image,
+  the screenshot or the resolution, and never describe a frame you were
+  not shown. A wrong answer is worth less than "none"."""
+
+# the shape as a GRAMMAR, so a malformed answer cannot be sampled at all -
+# the same discipline the describer's schema buys
+_EYE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "frames": {"type": "array", "maxItems": 8, "items": {
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer"},
+                "place": {"type": "string"},
+                "creature": {"type": "string"},
+                "doing": {"type": "string"}},
+            "required": ["n", "place", "creature", "doing"]}}},
+    "required": ["frames"]}
+
+# every polite way a model has of saying it saw nothing. They all mean the
+# same thing and none of them belongs on a timeline.
+_EYE_NULLS = frozenset({
+    "none", "nothing", "n/a", "na", "unknown", "null", "nil", "no",
+    "nobody", "no one", "no-one", "empty", "unclear", "unidentified",
+    "not visible", "no creature", "no creatures", "not applicable",
+    "none visible", "nothing visible", "indeterminate", "unsure"})
+
+
+def _eye_stamp(t):
+    """m:ss - the same clock the labels and the head use, so the model's
+    answers can be matched back by what it was told, not just by index."""
+    t = max(0, int(t))
+    return f"{t // 60}:{t % 60:02d}"
+
+
+def _eye_key(name):
+    """Two answers naming the same thing differently still collide here:
+    case, a leading article and stray punctuation are not identity."""
+    k = re.sub(r"^(?:a|an|the)\s+", "", str(name or "").lower().strip())
+    return re.sub(r"[^\w\u0600-\u06ff]+", " ", k).strip()
+
+
+def _eye_norm(v, cap=70):
+    """One answer, tidied.
+
+    Whitespace collapsed, a stray leading timestamp cut (the model likes to
+    echo the label back at you), the first letter lowered so the words read
+    inside a sentence, and every polite nothing treated as nothing. An
+    empty creature is NOT a creature - that one distinction is the whole
+    difference between a monster on the timeline and a false alarm."""
+    s = re.sub(r"\s+", " ", str(v or "")).strip()
+    s = re.sub(r"^\[?\s*frame\s*\d+\s*(?:at\s*)?(?:\d+:\d{2})?\s*\]?"
+               r"\s*[-:,]?\s*", "", s, flags=re.I)
+    s = re.sub(r"^\d+:\d{2}\s*[-:,]?\s*", "", s)
+    s = s.strip(" \"'.,;:-")
+    if not s or len(s) < 2 or s.lower() in _EYE_NULLS:
+        return ""
+    if s[:1].isupper() and not s[1:2].isupper():
+        # proper nouns pay a small price here; a line that reads "an office
+        # full of cubicles" in the middle of a sentence pays none
+        s = s[:1].lower() + s[1:]
+    return s[:cap]
+
+
+def _eye_looks(video_path, cap=None):
+    """The seconds worth spending an eye on.
+
+    Blended on purpose, in this order: the loudest gold moments (that is
+    where things happen), the chapter starts a review already found, what
+    the senses heard or read off the HUD, and finally an even spread so a
+    quiet hour is not invisible. A look costs ~21s, so the whole budget for
+    one recording is two dozen of them."""
+    try:
+        cap = int(cap if cap is not None else SETTINGS.get("eye_looks", 24))
+    except (TypeError, ValueError):
+        cap = 24
+    cap = max(1, min(60, cap))
+    try:
+        dur = float(_video_duration(video_path) or 0.0)
+    except Exception:
+        dur = 0.0
+    lo_t, hi_t = _EYE_EDGE, dur - _EYE_EDGE
+    if hi_t <= lo_t:
+        return []
+    # A SHARE EACH, NOT A QUEUE. Every source used to pour into one list
+    # and the first two dozen won - so on any ordinary session the gold
+    # marks took the entire budget and the chapters, the senses and the
+    # even spread were unreachable. Measured on a synthetic two-hour
+    # night: 24 looks, all of them gold, and 77 minutes never seen.
+    loud, chap, sens = [], [], []
+    try:
+        evs = (_read_sidecar(video_path, "hl") or {}).get("events") or []
+        for e in sorted(evs, key=lambda e2: -(e2.get("z") or 0))[:40]:
+            loud.append(float(e.get("t") or 0))
+    except Exception:
+        pass
+    try:
+        for c in ((_read_sidecar(video_path, "ins") or {}).get("chapters")
+                  or [])[:30]:
+            # a second in, never on the seam: a chapter starts on a cut and
+            # a cut is half a black frame
+            chap.append(float(c.get("t") or 0) + 1.0)
+    except Exception:
+        pass
+    try:
+        sns = _read_sidecar(video_path, "sns") or {}
+        for e in (sns.get("events") or [])[:30]:
+            sens.append(float(e.get("t") or 0))
+        for e in (sns.get("ocr") or [])[:20]:
+            sens.append(float(e.get("t") or 0))
+    except Exception:
+        pass
+    keep = []
+
+    def _take(src, quota):
+        n = 0
+        for t in src:
+            if n >= quota or len(keep) >= cap:
+                return
+            if not (lo_t <= t <= hi_t):
+                continue
+            if all(abs(t - k) >= _EYE_GAP for k in keep):
+                keep.append(t)
+                n += 1
+
+    # the loudest moments are where things happen, so they take the largest
+    # share - but never all of it. Whatever a thin source cannot spend is
+    # not lost: the fill below inherits it.
+    _take(loud, max(1, int(cap * 0.45)))
+    _take(chap, max(1, int(cap * 0.20)))
+    _take(sens, max(1, int(cap * 0.20)))
+    # NOTHING LONG GOES UNSEEN. Whatever budget the marks left is spent on
+    # the widest hole in the coverage, again and again - which beats a
+    # fixed grid, because a grid keeps re-buying seconds the marks already
+    # paid for.
+    while len(keep) < cap:
+        gaps, prev = [], lo_t
+        for k in sorted(keep):
+            gaps.append((k - prev, (prev + k) / 2.0))
+            prev = k
+        gaps.append((hi_t - prev, (prev + hi_t) / 2.0))
+        gaps.sort(key=lambda g: -g[0])
+        if gaps[0][0] < 2 * _EYE_GAP:
+            break                    # every hole is smaller than one look
+        keep.append(gaps[0][1])
+    return sorted(round(max(lo_t, min(hi_t, t)), 1) for t in keep)
+
+
+def _eye_json(txt):
+    """Every JSON value in a lump of text, in the order they appear.
+
+    The old parse took the first brace to the last one and loaded that,
+    which cannot read the two commonest malformed answers: two objects
+    with no array around them, and one object followed by an apology.
+    raw_decode from each opening brace, then skip past what it ate."""
+    out, i, dec = [], 0, json.JSONDecoder()
+    while i < len(txt):
+        starts = [x for x in (txt.find("{", i), txt.find("[", i)) if x >= 0]
+        if not starts:
+            break
+        j = min(starts)
+        try:
+            v, end = dec.raw_decode(txt, j)
+        except ValueError:
+            i = j + 1
+            continue
+        out.append(v)
+        i = max(end, j + 1)
+    return out
+
+
+def _eye_is_row(d):
+    """A dict that answers about one frame, whatever else it carries."""
+    return isinstance(d, dict) and any(
+        k in d for k in ("place", "creature", "doing"))
+
+
+def _eye_rows(txt):
+    """The model's answer, in whatever shape it arrived, as rows.
+
+    Measured on his Backrooms night: four asks of six died here and took
+    sixteen looks with them, because exactly one shape was accepted -
+    {"frames":[...]}. A bare list, one object per frame, a map keyed by
+    frame number and any of those wrapped in prose all mean the same
+    thing, so all of them are read now. Returns (rows, why-none): a
+    failure that cannot say why is how four of them passed unnoticed."""
+    txt = str(txt or "").strip()
+    if not txt:
+        return None, "the model answered nothing at all"
+    out = []
+    for v in _eye_json(txt):
+        for d in (v if isinstance(v, list) else [v]):
+            if _eye_is_row(d):
+                out.append(d)
+                continue
+            if not isinstance(d, dict):
+                continue
+            rows = d.get("frames")
+            if not isinstance(rows, list):
+                # any list of rows will do, and a map keyed by frame
+                # number is only a list wearing a hat - the key IS the n
+                rows = []
+                for k, v2 in d.items():
+                    if isinstance(v2, list):
+                        rows.extend(v2)
+                    elif _eye_is_row(v2):
+                        v2 = dict(v2)
+                        m = re.search(r"\d+", str(k))
+                        if m and "n" not in v2:
+                            v2["n"] = int(m.group(0))
+                        rows.append(v2)
+            out.extend(r for r in rows if _eye_is_row(r))
+    if out:
+        return out, None
+    return None, "no frame answers in: " + re.sub(r"\s+", " ", txt)[:100]
+
+
+def _eye_ask(srv, game, frames):
+    """One question about up to four frames -> (rows, why-none).
+
+    It used to return a bare None on every kind of failure, so the caller
+    counted a batch and walked on and nothing - not the log, not the
+    sidecar - ever recorded that four of six had failed or why."""
+    labels = [f"[frame {i + 1} at {_eye_stamp(t)}]"
+              for i, (t, _b) in enumerate(frames)]
+    listing = "\n".join(f"  frame {i + 1} = {_eye_stamp(t)}"
+                        for i, (t, _b) in enumerate(frames))
+    user = (f"The game being played is {game}. {len(frames)} frame(s) "
+            f"from one recording follow, in this order:\n{listing}\n\n"
+            f"For each one answer with its number n, the PLACE it shows, "
+            f"the CREATURE or person in shot if there is one, and what is "
+            f"HAPPENING at that instant. Answer 'none' where there is "
+            f"nothing to say. Answer about every frame you were shown, and "
+            f"about no others.")
+    try:
+        txt = srv.ask(_EYE_SYSTEM, user, max_tokens=60 * len(frames) + 160,
+                      schema=_EYE_SCHEMA,
+                      images=list(zip(labels, [b for _t, b in frames])))
+    except Exception as e:
+        return None, "the describer raised: " + str(e)[:100]
+    if not txt:
+        return None, ("the describer returned nothing - timed out, or it "
+                      "died mid-ask")
+    return _eye_rows(txt)
+
+
+def _eye_map(frames, rows, answered=None):
+    """The answers back onto the seconds they were about.
+
+    Pass a set as `answered` to learn which frames the model actually
+    replied about - the retry ladder needs that, because a frame it
+    called "none" is answered and a frame it ignored is not.
+
+    By n first - and a model that numbers from zero is not wrong, merely
+    zero-based, which is DETECTED rather than guessed. When n is missing or
+    nonsense the timestamp in the answer's own words is the fallback, since
+    every frame went in labelled with it; a row is spent once, so a bad
+    match cannot quietly clone itself across the whole batch."""
+    by_n = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            by_n[int(r.get("n"))] = r
+        except (TypeError, ValueError):
+            continue
+    base = 1
+    if by_n and 0 in by_n and len(frames) not in by_n:
+        base = 0
+    used, out = set(), []
+    for i, (t, _b) in enumerate(frames):
+        r = by_n.get(i + base)
+        if r is None or id(r) in used:
+            r, stamp = None, _eye_stamp(t)
+            for r2 in rows:
+                if not isinstance(r2, dict) or id(r2) in used:
+                    continue
+                if any(stamp in str(v) for v in r2.values()):
+                    r = r2
+                    break
+        if r is None and not by_n and i < len(rows):
+            # LAST RESORT, THE ORDER THEY WENT IN - and ONLY when the whole
+            # answer carried no numbering at all. Falling back to position
+            # while some rows DO have an n is how a partial answer about
+            # frames 3 and 4 got stamped onto frames 1 and 2: the right
+            # words on the wrong seconds, which is worse than a gap.
+            r2 = rows[i]
+            if isinstance(r2, dict) and id(r2) not in used:
+                r = r2
+        if r is None:
+            continue           # nothing in the answer was about this one
+        used.add(id(r))
+        if answered is not None:
+            # ANSWERED IS NOT THE SAME AS USEFUL. A frame the model
+            # honestly called none HAS been answered - re-asking it would
+            # spend twenty seconds to be told none again - while a frame
+            # it ignored has not, and that is the one worth asking alone.
+            answered.add(round(float(t), 1))
+        place = _eye_norm(r.get("place"))
+        cre = _eye_norm(r.get("creature"))
+        doing = _eye_norm(r.get("doing"), 90)
+        if not (place or cre or doing):
+            continue           # a row of polite nothings is not a sighting
+        out.append({"t": round(float(t), 1), "place": place,
+                    "creature": cre, "doing": doing})
+    return out
+
+
+def _eye_pass(srv, game, frames, st):
+    """Ask about these frames, splitting the batch when the answer fails.
+
+    One unparseable answer used to cost four looks outright, which is how
+    his Backrooms night ended with seven of twenty-four. A batch that
+    comes back with nothing is asked again as two, and those as one each;
+    a batch that answered about only half its frames re-asks the other
+    half. A single bad frame now costs one look instead of four.
+
+    The ladder stops after _EYE_GIVEUP frames have been refused on their
+    own - past that the model is not answering at all and splitting
+    further only burns the night. Counters land in st, which is what the
+    sidecar and the log finally get to tell him."""
+    if not frames or _AI["abort"]:
+        return []
+    st["asked"] += 1
+    rows, why = _eye_ask(srv, game, frames)
+    answered = set()
+    got = _eye_map(frames, rows, answered) if rows else []
+    rest = [f for f in frames if round(float(f[0]), 1) not in answered]
+    if not rest:
+        return got
+    st["why"] = why or (f"the answer named {len(answered)} of "
+                        f"{len(frames)} frames it was shown")
+    if _AI["abort"] or st["skipped"] >= _EYE_GIVEUP:
+        st["skipped"] += 1
+        return got
+    if answered:
+        # HALF AN ANSWER IS NOT AN ANSWER FOR THE OTHER HALF - the frames
+        # it ignored are asked again alone rather than written off, and
+        # only those, so the ones it already replied about are not paid
+        # for twice
+        st["retried"] += 1
+        return got + _eye_pass(srv, game, rest, st)
+    if len(frames) < 2:
+        st["skipped"] += 1
+        return []
+    st["retried"] += 1
+    half = len(frames) // 2
+    return (_eye_pass(srv, game, frames[:half], st)
+            + _eye_pass(srv, game, frames[half:], st))
+
+
+# the words that name nothing on their own. "room" is only dropped while
+# something else is left doing the naming, so "a room" stays a room.
+_EYE_STOP = frozenset({
+    "the", "and", "with", "into", "from", "between", "that", "this",
+    "its", "itself", "there", "here", "some", "another", "other", "are",
+    "was", "were", "being", "has", "have", "all", "full", "out", "off"})
+_EYE_FILLER = frozenset({
+    "room", "rooms", "area", "areas", "place", "places", "zone", "zones",
+    "spot", "spots", "section", "space", "spaces"})
+
+
+def _eye_words(name):
+    """The content words of a place name.
+
+    Case, punctuation and articles are not identity, and neither is a
+    two-letter word. The eye names the same corridor three different ways
+    in one night, so what is compared has to be the words that carry the
+    place, not the sentence they arrived in."""
+    ws = [w for w in re.split(r"[^\w\u0600-\u06ff]+",
+                              str(name or "").lower()) if len(w) >= 3]
+    ws = [w for w in ws if w not in _EYE_STOP]
+    core = [w for w in ws if w not in _EYE_FILLER]
+    return set(core or ws)
+
+
+def _eye_same_place(a, b):
+    """Two names, one place?
+
+    Half their content words shared (Jaccard >= 0.5), or one name wholly
+    inside the other - "the game board" and "a hearthstone game board"
+    are the same board. A single shared word is NOT a place: "brick"
+    alone would marry a brick room to a brick corridor, so containment
+    needs two words to count."""
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    if not inter:
+        return False
+    if inter / float(len(a | b)) >= 0.5:
+        return True
+    small = min(len(a), len(b))
+    return small >= 2 and inter == small
+
+
+def _eye_best_name(names):
+    """The clearest wording a place was given.
+
+    The longest one, because it is the most specific ("a long brick room,
+    dim lights" beats "a room") - but a single rambling answer twice the
+    length of its neighbours is not clarity, so it is passed over."""
+    ns = [str(n or "").strip() for n in names]
+    ns = [n for n in ns if n]
+    if not ns:
+        return ""
+    lens = sorted(len(n) for n in ns)
+    med = lens[len(lens) // 2]
+    cap = max(int(med * 1.6), med + 10)
+    fit = [n for n in ns if len(n) <= cap]
+    return max(fit or ns, key=len)
+
+
+def _eye_places(looks):
+    """The looks, as the places they were spent in.
+
+    Names come back free-form - "long brick room, dim lights" one minute,
+    "brick room, scattered papers" the next - so matching them exactly
+    merged nothing at all: his Backrooms night listed seven places for
+    seven looks, which made the PLACES list and THE LOOKS the same rows
+    printed twice. Names are grouped by MEANING here, the clearest
+    wording names the group, and every span of one place wears that same
+    name however the eye phrased it that minute.
+
+    A span is a run of consecutive looks in one group; the same name an
+    hour later is a second visit, not one long stay. And a lone glance
+    down a corridor is not a stay at all, so it earns no span - it is
+    still in the looks, which is where a glance belongs."""
+    placed = [lk for lk in (looks or [])
+              if isinstance(lk, dict)
+              and str(lk.get("place") or "").strip()]
+    placed.sort(key=lambda lk: float(lk.get("t") or 0))
+    groups, gid = [], []
+    for lk in placed:
+        w = _eye_words(lk.get("place"))
+        hit = -1
+        for j, g in enumerate(groups):
+            if any(_eye_same_place(w, w2) for w2 in g["w"]):
+                hit = j
+                break
+        if hit < 0:
+            groups.append({"w": [w], "names": []})
+            hit = len(groups) - 1
+        else:
+            groups[hit]["w"].append(w)
+        groups[hit]["names"].append(str(lk.get("place")))
+        gid.append(hit)
+    named = [_eye_best_name(g["names"]) for g in groups]
+    runs = []
+    for lk, g in zip(placed, gid):
+        t = round(float(lk.get("t") or 0), 1)
+        if runs and runs[-1]["_g"] == g and t - runs[-1]["b"] <= _EYE_REVISIT:
+            runs[-1]["b"] = t
+            runs[-1]["n"] += 1
+        else:
+            runs.append({"name": named[g], "a": t, "b": t, "n": 1, "_g": g})
+    spans = []
+    for sp in runs:
+        if sp["n"] >= 2 or (sp["b"] - sp["a"]) >= _EYE_SPAN_MIN:
+            sp.pop("_g", None)
+            spans.append(sp)
+    return spans
+
+
+def _merge_vis_into_hl(video_path, vis=None):
+    """Put the creatures the eye saw onto the gold timeline, kind
+    'creature'.
+
+    Lives apart from the pass for the same reason the senses' fold does: a
+    redone sound pass rebuilds the gold marks from nothing, and without a
+    re-fold every sighting the eye earned would quietly vanish.
+    Near-duplicate-guarded, so calling it twice is safe. Returns
+    (added, error_or_None)."""
+    try:
+        if vis is None:
+            vp = _ai_sidecar(video_path, "vis")
+            # FRESH OR NOTHING - the senses learned this the hard way. A
+            # sidecar older than the video describes footage a trim may
+            # have cut, and nothing downstream ever removes a mark that
+            # carries a kind.
+            try:
+                if not os.path.isfile(vp) or \
+                        os.path.getmtime(vp) < os.path.getmtime(video_path):
+                    return 0, None
+            except OSError:
+                return 0, None
+            with open(vp, encoding="utf-8") as fh:
+                vis = json.load(fh) or {}
+        if not vis or vis.get("failed"):
+            return 0, None
+        sights = [lk for lk in (vis.get("looks") or [])
+                  if isinstance(lk, dict)
+                  and str(lk.get("creature") or "").strip()][:12]
+        if not sights:
+            return 0, None
+        with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
+            hl = json.load(fh) or {}
+        gold = hl.get("events") or []
+        zs = sorted(float(g.get("z") or 0) for g in gold)
+        # A SIGHTING IS A LANDMARK, NOT A BANG. The senses' fold scores its
+        # events above every gold mark on purpose; doing that here would
+        # hand the highlight reel - top eight by z - to a dozen pictures of
+        # a corridor. Middle of the pack is where a sighting belongs.
+        mid = zs[len(zs) // 2] if zs else 8.0
+        added = changed = 0
+        for lk in sights:
+            try:
+                t2 = float(lk.get("t") or 0)
+            except (TypeError, ValueError):
+                continue
+            near = [g for g in gold if abs((g.get("t") or 0) - t2) <= 8.0]
+            if not near:
+                # a repick walks a kept mark a few seconds per pass, so a
+                # creature mark already within 12s IS this one, moved. The
+                # senses allow 20s there; the eye's own looks are only 20s
+                # apart, and 20 here would swallow real second sightings.
+                near = [g for g in gold if g.get("kind") == "creature"
+                        and abs((g.get("t") or 0) - t2) <= 12.0]
+            if near:
+                # NEVER RENAME A MARK HE ALREADY HAS. A plain loud mark
+                # carries no kind at all, so "only relabel the unlabelled"
+                # relabelled exactly the marks that matter - and because
+                # the looks land ON gold seconds by construction, the
+                # measured result was three renames per one honest add.
+                # The rename was permanent, too: a repick preserves a
+                # kind-carrying mark and deleting the sightings never undid
+                # it. An existing mark is now left exactly as it is; the
+                # panel still names the sighting sharing its second, which
+                # is where a name belongs.
+                pass
+            else:
+                gold.append({"t": round(t2, 1), "z": round(float(mid), 2),
+                             "kind": "creature"})
+                added += 1
+        if added or changed:
+            gold.sort(key=lambda g: g.get("t") or 0)
+            hl["events"] = gold
+            _atomic_write_json(_ai_sidecar(video_path, "hl"), hl)
+        if added:
+            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+        return added, None
+    except Exception as e:
+        return 0, str(e)[:120]
+
+
+def _vis_owing(video_path):
+    """Does this recording still owe the eye a look? Missing or older than
+    the video = owed; failed or unfinished with tries left = owed; complete
+    = settled. No vision tower on disk means no eye, so nothing is owed."""
+    if _desc_mmproj() is None or _describer_paths() is None:
+        return False
+    vp = _ai_sidecar(video_path, "vis")
+    try:
+        if not os.path.isfile(vp) or \
+                os.path.getmtime(vp) < os.path.getmtime(video_path):
+            return True
+        with open(vp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        if d.get("failed") or not d.get("complete"):
+            return int(d.get("tries") or 0) < 3
+        # A PASS WRITTEN BEFORE THE HONESTY GATE EXISTED CAN STILL BE A LIE.
+        # His Backrooms night says complete with tries 0 while its own
+        # counters record 24 wanted, 6 asked, 4 skipped - seven looks out of
+        # twenty-four. Trust the counters over the flag: a sidecar that saw
+        # less than half of what it set out to see is owed another look.
+        c = d.get("counters") or {}
+        want = int(c.get("wanted") or 0)
+        if want and len(d.get("looks") or []) < want * 0.5:
+            return int(d.get("tries") or 0) < 3
+        return False
+    except Exception:
+        return True
+
+
+def _eyes_one(video_path):
+    """One pass of the eye over a recording -> the .vis sidecar.
+
+    It borrows the warm describer exactly the way a review does (and never
+    respawns somebody else's server), asks about four frames at a time, and
+    keeps what comes back: where we were, what was there, what was going
+    on. A batch that fails is skipped and counted, never fatal - half a
+    night seen is worth immeasurably more than nothing seen."""
+    name = os.path.basename(video_path)
+    if _desc_mmproj() is None or _describer_paths() is None:
+        log(f"There is no eye installed, so {name} cannot be looked at - "
+            f"the vision tower is missing beside the describer.")
+        return False
+    vp = _ai_sidecar(video_path, "vis")
+    prior_tries = 0
+    try:
+        with open(vp, encoding="utf-8") as fh:
+            prior_tries = int((json.load(fh) or {}).get("tries") or 0)
+    except Exception:
+        pass
+
+    def _fail(why):
+        try:
+            os.makedirs(os.path.dirname(vp), exist_ok=True)
+            _atomic_write_json(vp, {"v": 1, "failed": True,
+                                    "tries": prior_tries + 1,
+                                    "why": str(why)[:160]})
+        except Exception:
+            pass
+        log(f"The eye failed on {name}: {str(why)[:140]}")
+        return False
+
+    def _settle(counters):
+        """Nothing to look at is an ANSWER, not a failure - written down,
+        or the sweep asks forever for a pass it can never finish."""
+        try:
+            os.makedirs(os.path.dirname(vp), exist_ok=True)
+            _bank_sidecar(video_path, "vis")
+            _atomic_write_json(vp, {"v": 1, "looks": [], "places": [],
+                                    "creatures": [], "complete": True,
+                                    "tries": 0, "counters": counters})
+        except Exception:
+            pass
+        return True
+
+    dur = _video_duration(video_path) or 0.0
+    if dur <= 0:
+        # a cold 40 GB file on a busy platter times the probe out: that is
+        # a slow answer, not a short video. The describer learned this the
+        # expensive way - five forced reviews vanished into it in a night.
+        time.sleep(3.0)
+        dur = _video_duration(video_path) or 0.0
+    if dur <= 0:
+        log(f"Could not measure {name} (disk busy?); the eye did not "
+            f"look. Ask again in a moment.")
+        _AI["soft_fail"] = True
+        return False
+    if dur < 12:
+        return _settle({"too_short": 1})
+    times = _eye_looks(video_path)
+    if not times:
+        return _settle({"nothing_to_look_at": 1})
+    # the SHELF names the game, same as the review reads it: knowing it is
+    # Devour is what makes a shape in a doorway Azazel and not a typo
+    try:
+        pp = os.path.dirname(video_path)
+        game = (os.path.basename(os.path.dirname(pp))
+                if os.path.basename(pp).lower() in ("videos", "clips")
+                else os.path.basename(pp)) or "an unknown game"
+    except Exception:
+        game = "an unknown game"
+
+    # a describer parked warm by the last describe is reused - the model
+    # loads once for the eye AND the review that follows it in this job
+    srv = _DESC_KEEP.get("srv")
+    _DESC_KEEP["srv"] = None
+    warm = bool(srv is not None and srv.pr is not None
+                and srv.pr.poll() is None)
+    if warm:
+        _AI["proc"] = srv.pr           # the abort path must still reach it
+    else:
+        if srv is not None:
+            srv.stop()                 # parked but dead - leave cleanly
+        srv = _DescServer()
+    t_start = time.time()
+    looks = []
+    st = {"asked": 0, "skipped": 0, "retried": 0, "why": ""}
+    _source_busy_add(video_path)
+    try:
+        if not (warm or srv.start()):
+            if _AI["abort"]:
+                return False       # a game starting is not a failed look
+            return _fail("the describer would not start")
+        batch_took = []            # (seconds, frames) per completed batch
+        for i in range(0, len(times), _EYE_BATCH):
+            if _AI["abort"]:
+                break
+            # SAY WHERE IT HAS GOT TO. The eye takes the better part of ten
+            # minutes before it writes a single line, and a bar that sits
+            # still for ten minutes is indistinguishable from a dead one -
+            # that exact silence is what made the describer look broken.
+            # TIME THE BATCHES THEMSELVES. The row used to divide the whole
+            # JOB's elapsed time by the looks done - so the ten minutes the
+            # senses spent before the eye even opened were billed to the
+            # eye, and the first batch carried the model's three-minute
+            # wake-up on top. It told him an hour and a half of work that
+            # was really seven minutes. Each batch is timed on its own, the
+            # first is discarded once there is a second, and the row reads
+            # from that.
+            _AI["eye_prog"] = {"done": i, "total": len(times),
+                               "at": time.time(), "batch": _EYE_BATCH,
+                               "took": list(batch_took)}
+            b0 = time.time()
+            frames = _grab_frames(video_path, times[i:i + _EYE_BATCH])
+            if _AI["abort"]:
+                break
+            if not frames:
+                st["skipped"] += 1
+                st["why"] = "ffmpeg could not reach those seconds"
+                continue
+            looks.extend(_eye_pass(srv, game, frames, st))
+            batch_took.append((time.time() - b0, len(frames)))
+        if not looks:
+            if _AI["abort"]:
+                return False
+            return _fail(f"{st['asked']} ask(s) came back with nothing"
+                         + (" - " + st["why"][:120] if st["why"] else ""))
+        looks.sort(key=lambda lk: lk["t"])
+        # PLACES ARE SPANS, not points - see _eye_places, which groups the
+        # free-form names by meaning. Matching them exactly (what stood
+        # here) merged nothing, so the panel listed one place per look.
+        places = _eye_places(looks)
+        seen_c = {}
+        for lk in looks:
+            if not lk["creature"]:
+                continue
+            slot = seen_c.setdefault(_eye_key(lk["creature"]),
+                                     {"name": lk["creature"], "ts": []})
+            slot["ts"].append(lk["t"])
+        creatures = sorted(seen_c.values(),
+                           key=lambda c: c["ts"][0] if c["ts"] else 0.0)
+        sightings = sum(len(c["ts"]) for c in creatures)
+        # NOTHING CLAIMS SUCCESS IT DID NOT EARN. This sidecar said
+        # complete:true on his Backrooms night with four asks of six
+        # failed and seven looks kept of twenty-four wanted, and because
+        # it claimed to be finished nothing ever looked again. A pass that
+        # lost more than a third of its asks is written unfinished now, so
+        # the sweep comes back to it. An interruption leaves an honest
+        # partial behind the same way, and either DOES spend a try:
+        # without that, a man who games every evening would have the eye
+        # re-look at the same night from scratch forever.
+        # JUDGE THE OUTCOME, NOT THE EFFORT. Counting failed ASKS let the
+        # retry ladder inflate its own denominator: a whole batch lost
+        # while the ladder tried hard elsewhere came out "6 of 12 - fine".
+        # What matters is how much of the night was actually seen.
+        thin = len(looks) < max(1, len(times)) * 0.6
+        complete = not (_AI["abort"] or thin)
+        doc = {"v": 1, "looks": looks, "places": places,
+               "creatures": creatures,
+               "complete": complete,
+               "tries": 0 if complete else prior_tries + 1,
+               "counters": {"wanted": len(times), "asked": st["asked"],
+                            "skipped": st["skipped"],
+                            "retried": st["retried"],
+                            "secs": int(time.time() - t_start)}}
+        if st["why"]:
+            doc["counters"]["why"] = st["why"][:120]
+        a4, e4 = _merge_vis_into_hl(video_path, doc)
+        if e4:
+            doc["counters"]["merge_failed"] = e4
+        os.makedirs(os.path.dirname(vp), exist_ok=True)
+        # NEVER OVERWRITE A BETTER PASS. An unfinished result used to skip
+        # the bank AND overwrite anyway, so a second, worse try could erase
+        # a first try that had seen twice as much, with no copy anywhere.
+        # A partial only replaces a partial when it saw MORE.
+        try:
+            with open(vp, encoding="utf-8") as fh:
+                old = json.load(fh) or {}
+        except Exception:
+            old = {}
+        if (not complete and not old.get("complete")
+                and len(old.get("looks") or []) > len(looks)):
+            doc["looks"] = old.get("looks") or []
+            doc["places"] = old.get("places") or []
+            doc["creatures"] = old.get("creatures") or []
+            doc["counters"]["kept_better"] = len(doc["looks"])
+        _bank_sidecar(video_path, "vis")
+        _atomic_write_json(vp, doc)
+        el = time.time() - t_start
+        log(f"The eye on {name}: {len(looks)} look(s) of {len(times)} "
+            f"wanted, {len(places)} place(s), {sightings} sighting(s)"
+            + (f" ({a4} new on the timeline)" if a4 else "")
+            + (f", {st['retried']} retried" if st["retried"] else "")
+            + (f", {st['skipped']} ask(s) failed: {st['why'][:120]}"
+               if st["skipped"] else "")
+            + f" - {int(el // 60)}m{int(el % 60):02d}s.")
+        return complete
+    except Exception as e:
+        return _fail(e)
+    finally:
+        _source_busy_done(video_path)
+        if (not _AI["abort"] and srv.pr is not None
+                and srv.pr.poll() is None):
+            # park the warm model: the review that follows this pass in
+            # the same job borrows it and skips a 15 GB load
+            _DESC_KEEP["srv"] = srv
+            _DESC_KEEP["t"] = time.time()
+        else:
+            srv.stop()
+
+
+# =========================================================================
+#  THE AUDITOR  (2.84)
+# =========================================================================
+#  Five passes go over one recording - the sound, the words, the senses,
+#  the eye and the review - and until now not one of them ever read
+#  another's work back. That is how a gold mark ends up on a second where
+#  nothing whatever happened; how three "music" events landed on a
+#  Backrooms night whose own senses recorded no music at all; and how one
+#  brick room got listed three times under three names, because the eye
+#  answers in free text and an equality test never merges free text.
+#
+#  It does two things. It CHECKS - arithmetic, no model - by asking every
+#  claim what any OTHER layer can show for it. Then it TELLS: one ask on
+#  the warm describer for THE THREAD, the night in five to ten beats
+#  instead of five separate lists.
+#
+#  IT WRITES NOTHING BUT ITS OWN SIDECAR, and that is the whole design.
+#  The first cut of this pass edited the .hl in place, which made it a
+#  shredder: the loudness bar is drawn from whatever marks survive, so
+#  pass two drew a higher bar from the thinner list and ate more of it.
+#  Measured on a Silksong night: 972 marks down to 483 on the first pass
+#  and still falling on the next. Reading is idempotent, writing was not.
+#  The verdict lives in the .aud and the panel draws it; the sound pass's
+#  own record is left exactly as the sound pass made it. That is also why
+#  every dropped claim is restorable - there is nothing to restore.
+#
+#  AND SO IT IS NOT BANKED. The other sidecars keep three generations
+#  because a redo destroys what it replaces; this one destroys nothing
+#  and is rebuilt from the others in about a second (measured: two full
+#  audits of a 972-mark, 4h20m night in 1.0s). A .aud.v1 nothing reads
+#  would just be dead weight - the version picker deliberately knows only
+#  stt, ins and hl, and this pass does not pretend otherwise.
+
+# 2 - the auditor also reads the transcript: who the title says was
+#     there, and which lines are not sentences.
+# 3 - the auditor CORRECTS: readable doubtful lines are written into the
+#     transcript (original kept on the line), and a person spelt one way
+#     in the title and another in the night is respelt the way the night
+#     says it. Older audits only reported, so they are owed once more.
+# 4 - the corrector reads a dossier now (conversation, tone, sights,
+#     sounds) and its answers pass a sense gate; v3 corrections were made
+#     from a bare line and some are gibberish - every v3 night re-runs,
+#     takes back what fails the gate, and tries again properly.
+# 5 - Emirati-focused prompt, standing corrections re-judged, whys
+#     must name their clue, thinker retries a dropped connection. The
+#     v4 audits (written by the old prompt, mostly without the thinker)
+#     answer a smaller question and re-run once.
+_AUD_V = 7
+_AUD_WORDS = 4.0        # a line this near is the line the mark was marking
+_AUD_SOUND = 8.0        # the senses' own fold window (_merge_sns_into_hl)
+_AUD_EYE = 12.0         # the eye's fold window (_merge_vis_into_hl)
+_AUD_REVIEW = 12.0      # a described moment sits on the LINE, not the peak
+_AUD_CHAPTER = 8.0      # a chapter starts on a cut, near enough to a mark
+_AUD_LAUGH = 8.0        # the laughter ear's own fold window
+_AUD_PLACE_GAP = 600.0  # the same room noun this soon apart is one room
+_AUD_LIVE = 0.2         # under this a layer did not cover the night at all
+_AUD_ANCHORS = 40       # what one ask can hold and still be read as a list
+_AUD_TELL = 12          # disproved claims worth naming in the ask
+
+#  THE ONLY FIVE THINGS A BEAT MAY AGREE WITH. The panel is written
+#  against this vocabulary, so nothing else may ever appear in an
+#  "agrees" list. Loudness is deliberately NOT one of them: a prominence
+#  is how the sound pass chose the mark, not a second witness to it.
+_AUD_LAYERS = ("words", "sound", "eye", "review", "laugh")
+
+_AUD_SAY = {"words": "said: ", "sound": "heard: ", "eye": "saw: ",
+            "review": "the review: ", "laugh": "the ear: "}
+
+_AUD_SILENT = {
+    "words": "no line spoken within four seconds",
+    "sound": "nothing the senses heard",
+    "eye": "nothing the eye saw",
+    "review": "nothing the review called a moment",
+    "laugh": "no laugh the ear could hear"}
+
+# words that carry no identity in any name
+_AUD_STOP = frozenset({
+    "and", "with", "into", "onto", "from", "full", "some", "very", "more",
+    "its", "that", "this", "there", "here", "over", "under", "near", "his",
+    "her", "their", "who", "what", "while", "just", "like"})
+
+# words that describe half the rooms ever recorded and so pick out none of
+# them. "long", "dim" and "dark" are how the eye says "I could not see".
+_AUD_VAGUE = frozenset({
+    "long", "big", "small", "dark", "dim", "large", "wide", "narrow",
+    "empty", "old", "new", "another", "lit", "unlit", "distant", "far",
+    "near", "open", "closed", "huge", "tiny", "light", "bright", "deep",
+    "low", "high", "tall", "short", "looking", "down", "seen", "view",
+    "area", "place", "space", "kind", "sort", "part", "side", "front",
+    "back", "next", "same", "other", "little", "several", "multiple"})
+
+# the nouns that NAME a thing without telling you which one it was. Two
+# answers sharing one of these are at least the same KIND of room (or the
+# same kind of shape in a doorway), which is what lets the time test
+# decide. Creature words live here too - "hooded figure, distant" and
+# "hooded figure, 'bazilg" are one figure, and "figure" is why.
+_AUD_PLACES = frozenset({
+    "room", "rooms", "corridor", "hallway", "hall", "garage", "office",
+    "stair", "stairwell", "stairs", "tunnel", "lobby", "basement",
+    "street", "road", "cave", "shop", "store", "menu", "map", "screen",
+    "pool", "kitchen", "bathroom", "elevator", "lift", "door", "doorway",
+    "warehouse", "parking", "courtyard", "arena", "forest", "field",
+    "cell", "vault", "bridge", "tower", "cellar", "attic", "alley",
+    "yard", "park", "house", "building", "chamber", "passage", "walkway",
+    "balcony", "roof", "rooftop", "lab", "laboratory", "library",
+    "church", "temple", "shrine", "camp", "village", "town", "city",
+    "desert", "beach", "river", "lake", "island", "dungeon", "crypt",
+    "tomb", "mine", "factory", "plant", "station", "platform", "deck",
+    "cockpit", "hangar", "bunker", "checkpoint", "gate", "entrance",
+    "exit", "landing", "foyer", "atrium", "classroom", "ward", "clinic",
+    "hospital", "morgue", "pantry", "closet", "locker", "shower",
+    "lounge", "bar", "cafe", "restaurant", "market", "mall", "terrace",
+    "hill", "valley", "canyon", "swamp", "ruins", "fortress", "castle",
+    "keep", "barracks", "workshop", "garden", "greenhouse", "maze",
+    "labyrinth", "backroom", "level", "floor", "zone", "sector", "wing",
+    "pit", "shaft", "vent", "sewer", "drain", "reactor", "boiler",
+    "furnace", "arcade", "theatre", "theater", "auditorium",
+    "figure", "entity", "person", "people", "man", "woman", "thing",
+    "creature", "shape", "monster", "enemy", "minion", "card", "hero"})
+
+
+def _aud_tokens(name):
+    """The words in a free-form name that could identify anything at all.
+    Case, articles, punctuation and plurals are not identity."""
+    out = []
+    for w in _eye_key(name).split():
+        if len(w) < 3 or w in _AUD_STOP:
+            continue
+        if len(w) > 4 and w.endswith("s"):
+            w = w[:-1]
+        out.append(w)
+    return out
+
+
+def _aud_told(name):
+    """The tokens that actually pick this thing out. "long", "dim" and
+    "room" describe half the Backrooms; "brick" does not."""
+    return [w for w in _aud_tokens(name)
+            if w not in _AUD_VAGUE and w not in _AUD_PLACES]
+
+
+def _aud_same_name(n1, n2):
+    """Are these two free-text answers naming the same thing, on the
+    words alone? The reason, in words he can read, or "" for no.
+
+    The eye called one brick room "long brick room, dim lights" at 25:30
+    and "brick room, scattered papers" at 29:25, and it named the same
+    hooded figure three different ways in three minutes. Equality never
+    merged any of it, so his seven "places" were seven headings for four
+    rooms - and the panel's PLACES list and its LOOKS list came out as
+    literally the same seven rows."""
+    k1, k2 = _eye_key(n1), _eye_key(n2)
+    if not k1 or not k2:
+        return ""
+    if k1 == k2:
+        return "the same words"
+    w1, w2 = set(_aud_tokens(n1)), set(_aud_tokens(n2))
+    shared = w1 & w2
+    if not (w1 and w2 and shared):
+        return ""
+    if w1 <= w2 or w2 <= w1:
+        return "one name says everything the other one does"
+    told = sorted(shared - _AUD_VAGUE - _AUD_PLACES)
+    nouns = sorted(shared & _AUD_PLACES)
+    if nouns and told:
+        return "both are the " + told[0] + " " + nouns[0]
+    if len(told) >= 2:
+        return "both are the " + " ".join(told[:2])
+    return ""
+
+
+def _aud_near_name(n1, t1, n2, t2):
+    """The weak reason: the same bare noun, close enough in time to be
+    one visit to one place. Kept apart from _aud_same_name because it is
+    the only rule here that can be wrong, and the fold treats it with the
+    suspicion it deserves."""
+    w1, w2 = set(_aud_tokens(n1)), set(_aud_tokens(n2))
+    nouns = sorted((w1 & w2) & _AUD_PLACES)
+    if not nouns or abs(t1 - t2) > _AUD_PLACE_GAP:
+        return ""
+    gap = int(abs(t1 - t2))
+    return ("the same " + nouns[0] + ", " + str(gap // 60) + "m"
+            + str(gap % 60).zfill(2) + "s apart")
+
+
+def _aud_pick_name(names):
+    """Which of several names for one thing to print: the one the others
+    agree with most. Longest-wins picked "hooded figure, 'bazilg" - a
+    transcription accident that happens to carry an extra word - over
+    "hooded figure, distant entity", which both the others echo."""
+    sets = [set(_aud_tokens(s)) for s in names]
+
+    def _score(i):
+        return (sum(len(sets[i] & sets[j])
+                    for j in range(len(names)) if j != i),
+                len(_aud_told(names[i])), len(str(names[i])))
+    return names[max(range(len(names)), key=_score)]
+
+
+def _aud_group(rows, name_of, time_of):
+    """Fold a list of free-text rows into the things they actually are.
+    Shared by places and creatures - the naming problem is identical and
+    so is the fix. Returns (groups in time order, the merged rows).
+
+    TWO ROUNDS, and the second one is fenced. Folding on "same noun, near
+    enough in time" in one pass chained his tiled room into his brick one
+    through a shared "room", and swallowed "a flighty scout minion" into
+    "multiple minions" through a shared "minion" - both measured. So the
+    names that plainly say the same thing group first, and only then does
+    the clock get a vote, and only between groups that are not already
+    arguing about what they are: tiled is not brick."""
+    n = len(rows)
+    parent = list(range(n))
+
+    def _find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    why_of = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _find(i) == _find(j):
+                continue
+            why = _aud_same_name(name_of(rows[i]), name_of(rows[j]))
+            if not why:
+                continue
+            parent[_find(j)] = _find(i)
+            why_of.setdefault(_find(i), why)
+    said = {}
+    for i in range(n):
+        said.setdefault(_find(i), set()).update(
+            _aud_told(name_of(rows[i])))
+    for i in range(n):
+        for j in range(i + 1, n):
+            ri, rj = _find(i), _find(j)
+            if ri == rj:
+                continue
+            a, b = said.get(ri) or set(), said.get(rj) or set()
+            if a and b and not (a & b):
+                continue          # they disagree about what they are
+            why = _aud_near_name(name_of(rows[i]), time_of(rows[i]),
+                                 name_of(rows[j]), time_of(rows[j]))
+            if not why:
+                continue
+            parent[rj] = ri
+            said[ri] = a | b
+            why_of.setdefault(ri, why)
+    buckets = {}
+    for i in range(n):
+        buckets.setdefault(_find(i), []).append(i)
+    groups, merged = [], []
+    for root in sorted(buckets, key=lambda r: time_of(rows[buckets[r][0]])):
+        idx = sorted(buckets[root], key=lambda i: time_of(rows[i]))
+        names = [str(name_of(rows[i]) or "") for i in idx]
+        best = _aud_pick_name(names)
+        groups.append((best, [rows[i] for i in idx]))
+        folded = [s for s in names if s != best]
+        if folded:
+            merged.append({"kept": best[:70],
+                           "folded": [s[:70] for s in folded],
+                           "why": why_of.get(root, "the same words")})
+    return groups, merged
+
+
+# Arabic letter -> the Latin consonant an English ear writes for it.
+# This is the whole reason the "invented name" panic was a false alarm:
+# موسى and Musa are the same name and share not one character.
+_AUD_AR = {
+    "\u0627": "a", "\u0623": "a", "\u0625": "a", "\u0622": "a",
+    "\u0628": "b", "\u062a": "t", "\u062b": "th", "\u062c": "j",
+    "\u062d": "h", "\u062e": "kh", "\u062f": "d", "\u0630": "th",
+    "\u0631": "r", "\u0632": "z", "\u0633": "s", "\u0634": "sh",
+    "\u0635": "s", "\u0636": "d", "\u0637": "t", "\u0638": "z",
+    "\u0639": "a", "\u063a": "gh", "\u0641": "f", "\u0642": "q",
+    "\u0643": "k", "\u0644": "l", "\u0645": "m", "\u0646": "n",
+    "\u0647": "h", "\u0648": "w", "\u064a": "y", "\u0649": "a",
+    "\u0629": "h", "\u0626": "a", "\u0624": "w", "\u0621": "a",
+    "\u067e": "b", "\u06a4": "f", "\u06af": "g", "\u0686": "ch",
+}
+_AUD_VOWEL = set("aeiouwy")
+# the sounds an ear genuinely swaps when writing a name down. Basil and
+# Bazil are one person; بيكم and BoKhama are not, and the difference is a
+# traded sound versus a missing one.
+_AUD_PAIRS = set()
+for _a, _b in (("s", "z"), ("s", "t"), ("t", "d"), ("k", "q"), ("k", "g"),
+               ("j", "g"), ("j", "y"), ("f", "v"), ("b", "p"), ("l", "r"),
+               ("m", "n"), ("w", "v"), ("s", "c"), ("z", "j"), ("d", "z"),
+               ("q", "g")):
+    _AUD_PAIRS.add((_a, _b))
+    _AUD_PAIRS.add((_b, _a))
+
+
+def _aud_lat(t):
+    """Everything to lower-case Latin, Arabic included."""
+    out = []
+    for ch in unicodedata.normalize("NFKD", str(t or "")):
+        if unicodedata.combining(ch):
+            continue
+        out.append(_AUD_AR.get(ch, ch))
+    return "".join(out).lower()
+
+
+def _aud_skel(t):
+    """The consonant skeleton - what survives every way of spelling a
+    name. Musa, موسى, Moosa and Mousa all come out 'ms'."""
+    w = re.sub(r"[^a-z]", "", _aud_lat(t))
+    return "".join(c for c in w if c not in _AUD_VOWEL) or w
+
+
+def _aud_phon(k, h):
+    """Same skeleton but for ONE traded sound - Basil against Bazil."""
+    if len(k) != len(h) or len(k) < 3:
+        return False
+    d = [(a, b) for a, b in zip(k, h) if a != b]
+    return len(d) == 1 and d[0] in _AUD_PAIRS
+
+
+def _aud_grounded(name, words, skels, spoken):
+    """Was this person mentioned in THIS night? Returns (verdict, how,
+    the spelling the night actually used).
+
+    Verdicts: "said" - it is there; "spelt" - it is there under another
+    spelling, which is the useful finding; "loose" - only a weak
+    cross-alphabet match; "" - nothing in the night supports it."""
+    n = re.sub(r"[^a-z]", "", _aud_lat(name))
+    if len(n) < 3:
+        return "", "too short to judge", ""
+    if n in words:
+        return "said", "said outright", ""
+    k = _aud_skel(name)
+    if len(k) >= 3 and k in skels:
+        return "said", "said in the other alphabet", spoken.get(k, "")
+    for h in skels:
+        if _aud_phon(k, h):
+            return "spelt", "said, spelt another way", spoken.get(h, "")
+    if len(k) == 2 and k in skels:
+        return "loose", "only a two-sound match", spoken.get(k, "")
+    for h in skels:
+        if len(h) >= 4 and len(k) >= 4 and abs(len(h) - len(k)) <= 1 \
+                and _aud_ed(k, h) <= 1:
+            return "loose", "close to something said", spoken.get(h, "")
+    return "", "nobody in this recording says this", ""
+
+
+def _aud_ed(a, b):
+    """Edit distance, capped - one slipped letter is still the name."""
+    if abs(len(a) - len(b)) > 2:
+        return 9
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+_AUD_VOCAB = {"at": 0.0, "freq": None, "low": None}
+_AUD_VOCAB_LOCK = threading.Lock()
+
+
+def _aud_vocab():
+    """How often the WHOLE library has ever written each word.
+
+    Two questions need it and neither can be answered from one recording.
+    Is "Confusion" a person's name or an ordinary word? - the library
+    writes "confusion" in lower case hundreds of times, so it is a word.
+    Is "Kedarrant" a word at all? - thirty thousand distinct words across
+    four hundred transcripts have never once contained it, so it is not.
+
+    Built once and kept for an hour; it costs a few seconds over the whole
+    shelf and nothing at all after that."""
+    with _AUD_VOCAB_LOCK:
+        if _AUD_VOCAB["freq"] is not None \
+                and time.time() - _AUD_VOCAB["at"] < 3600:
+            return _AUD_VOCAB["freq"], _AUD_VOCAB["low"]
+        freq, low = {}, {}
+        try:
+            d = _thumb_dir(SETTINGS.get("output_dir", ""))
+            for fn in os.listdir(d):
+                if not fn.endswith(".stt.json"):
+                    continue
+                try:
+                    with open(os.path.join(d, fn), encoding="utf-8") as fh:
+                        doc = json.load(fh)
+                except Exception:
+                    continue
+                for sg in (doc.get("segments") or []):
+                    if isinstance(sg, dict) and sg.get("nn"):
+                        continue       # struck noise feeds nothing
+                    if isinstance(sg, dict) and sg.get("pn"):
+                        # the KEPT sentences are real speech and count;
+                        # the struck static in "was" must never train
+                        # the gate that judges noise - the corrector
+                        # poisoning its own judge, again (review 303)
+                        txt = str(sg.get("t") or "").replace(
+                            "[unintelligible]", " ")
+                        for w in re.findall(r"[A-Za-z']{2,}", txt):
+                            lw = w.lower()
+                            freq[lw] = freq.get(lw, 0) + 1
+                            if w[0].islower():
+                                low[lw] = low.get(lw, 0) + 1
+                        for w in re.findall(r"[\u0600-\u06ff]{2,}",
+                                            txt):
+                            freq[w] = freq.get(w, 0) + 1
+                        continue
+                    # A CORRECTION MUST NEVER FEED THE VOCABULARY THAT
+                    # JUDGES CORRECTIONS. Last night's gibberish passed
+                    # its own sense test because writing it into the
+                    # transcript made it a "seen" word - the corrector
+                    # poisoning its own judge. Corrected lines count
+                    # their ORIGINAL text; only his own pinned lines
+                    # count as they stand, because he vouched for those.
+                    if isinstance(sg, dict) and sg.get("fx")                             and not sg.get("pin")                             and sg.get("was") is not None:
+                        txt = str(sg.get("was") or "")
+                    else:
+                        txt = str(sg.get("t") or "")
+                    for w in re.findall(r"[A-Za-z']{2,}", txt):
+                        lw = w.lower()
+                        freq[lw] = freq.get(lw, 0) + 1
+                        if w[0].islower():
+                            low[lw] = low.get(lw, 0) + 1
+                    # THE ARABIC COUNTS TOO. Four hundred transcripts of
+                    # real Gulf speech are the only authority on what is
+                    # an Arabic word HERE - and the sense gate below
+                    # tests every proposed correction against them.
+                    for w in re.findall(r"[\u0600-\u06ff]{2,}", txt):
+                        freq[w] = freq.get(w, 0) + 1
+        except Exception:
+            pass
+        _AUD_VOCAB["freq"], _AUD_VOCAB["low"] = freq, low
+        _AUD_VOCAB["at"] = time.time()
+        return freq, low
+
+
+# a word ending like this is ordinary vocabulary, whatever its case
+_AUD_SUFFIX = ("tion", "sion", "ment", "ness", "ity", "ance", "ence",
+               "ism", "ology", "ing", "ics", "ude", "ure", "age", "ship",
+               "hood", "dom", "ery", "ory", "ary")
+# where a person's name actually sits in a title
+_AUD_WITH = re.compile(
+    r"\b(?:with|featuring|feat\.?|ft\.?|joins?|joined by)\s+"
+    r"((?:[A-Z][\w'\u2019]+(?:\s*,\s*|\s+and\s+|\s+&\s+)?){1,6})")
+_AUD_POSS = re.compile(r"\b([A-Z][A-Za-z]{2,})['\u2019]s\b")
+
+
+def _aud_people(text, gamew, low):
+    """The words in this text that sit where a PERSON goes.
+
+    Restricting to those positions is the whole trick. An earlier cut
+    asked about every capitalised word and flagged 284 of 289 recordings -
+    it was calling "Confusion" and "Rocket League" invented people. His
+    complaint was never "the title used an odd word", it was "it says my
+    friend was there and he was not", and that claim only ever appears in
+    a with-list or a possessive."""
+    txt = str(text or "")
+    cand = []
+    for m in _AUD_WITH.finditer(txt):
+        for w in re.findall(r"[A-Z][\w'\u2019]+", m.group(1)):
+            cand.append(w.strip("'\u2019"))
+    for m in _AUD_POSS.finditer(txt):
+        cand.append(m.group(1))
+    out = []
+    for w in cand:
+        w = w[:-2] if w.endswith("'s") else w
+        lw = w.lower()
+        if len(w) < 3 or lw in gamew or w in out:
+            continue
+        if low.get(lw, 0) >= 3 or low.get(lw.rstrip("s"), 0) >= 3:
+            continue                   # the library writes it lower case
+        if lw.endswith(_AUD_SUFFIX):
+            continue
+        out.append(w)
+    return out
+
+
+def _aud_gamewords(video_path):
+    """Words that come off the filename, not out of the model's head.
+    "Hearthstone" in a Hearthstone title is not a claim about anybody."""
+    try:
+        stem = re.sub(r"_\d{8}_\d{6}.*$", "",
+                      os.path.splitext(os.path.basename(video_path))[0])
+    except Exception:
+        return set()
+    out = set(re.findall(r"[a-z]+", stem.lower()))
+    for p in re.findall(r"[A-Z][a-z]+", stem):
+        out.add(p.lower())
+    return out
+
+
+def _aud_names(video_path, ins, stt, low):
+    """Every person a title, summary or chapter claims was there, looked
+    up in that night's own words across both alphabets."""
+    # NO VOCABULARY, NO ACCUSATIONS. Telling a name from an ordinary word
+    # is done entirely by asking whether the library ever writes it in
+    # lower case. Without that, "Confusion" and "Early" become people who
+    # were never there - which is exactly what the first cut of this did
+    # to 284 recordings out of 289. An empty vocabulary is a reason to
+    # say nothing, never a reason to guess.
+    if len(low or {}) < 200:
+        return [], []
+    said = " ".join(str(sg.get("t") or "") for sg in (stt or [])
+                    if isinstance(sg, dict))
+    if len(said) < 40:
+        return [], []
+    words, skels, spoken = set(), set(), {}
+    for w in re.findall(r"\S+", said):
+        n = re.sub(r"[^a-z]", "", _aud_lat(w))
+        if not n:
+            continue
+        words.add(n)
+        if len(n) >= 3:
+            k = _aud_skel(n)
+            if k:
+                skels.add(k)
+                spoken.setdefault(k, w.strip(".,!?\u061f\u060c"))
+    claims = [("title", str(ins.get("title") or "")),
+              ("summary", str(ins.get("summary") or ""))]
+    wins = ins.get("windows")
+    wl = (list(wins.values()) if isinstance(wins, dict)
+          else wins if isinstance(wins, list) else [])
+    for w in wl:
+        if not isinstance(w, dict):
+            continue
+        for key in ("segments", "chapters", "moments"):
+            for sg in (w.get(key) or []):
+                if isinstance(sg, dict):
+                    claims.append(("chapter", str(sg.get("title")
+                                                  or sg.get("label") or "")))
+    gamew = _aud_gamewords(video_path)
+    rows, warn, seen = [], [], set()
+    for where, txt in claims:
+        for nm in _aud_people(txt, gamew, low):
+            if nm in seen:
+                continue
+            seen.add(nm)
+            verdict, how, spelling = _aud_grounded(nm, words, skels, spoken)
+            rows.append({"name": nm, "where": where,
+                         "verdict": verdict or "unsaid",
+                         "how": how, "said": spelling})
+    for r in rows:
+        if r["verdict"] == "unsaid":
+            warn.append("the " + r["where"] + " names " + r["name"]
+                        + ", and nobody in this recording ever says that "
+                          "name - in either alphabet")
+        elif r["verdict"] == "spelt" and r["said"]:
+            warn.append("the " + r["where"] + " spells this person "
+                        + r["name"] + "; the night itself says "
+                        + r["said"] + " - one of the two is wrong, and "
+                        "searching for either will not find the other")
+    return rows, warn
+
+
+_AUD_SKEL_IX = {"at": 0.0, "ix": None}
+
+
+def _aud_skel_index(freq):
+    """His Arabic vocabulary, indexed by consonant skeleton - so the
+    sounds of a mis-written word can look up what they might spell.
+    "Sakar" -> skr -> سكر. Built beside the vocabulary, cached with it."""
+    if _AUD_SKEL_IX["ix"] is not None \
+            and time.time() - _AUD_SKEL_IX["at"] < 3600:
+        return _AUD_SKEL_IX["ix"]
+    ix = {}
+    for w, n in (freq or {}).items():
+        if not w or not ("\u0600" <= w[0] <= "\u06ff") or n < 2:
+            continue
+        k = _aud_skel(w)
+        if len(k) >= 2:
+            ix.setdefault(k, []).append((n, w))
+    for k in ix:
+        ix[k].sort(reverse=True)
+        ix[k] = ix[k][:4]
+    _AUD_SKEL_IX["ix"] = ix
+    _AUD_SKEL_IX["at"] = time.time()
+    return ix
+
+
+def _aud_hints(g, freq):
+    """What the odd words' SOUNDS might already spell, from his own
+    nights. The answer to "Sakar late?" was سكر ليت all along - in his
+    vocabulary, findable by arithmetic. Hints, never verdicts: the model
+    still weighs them against the story."""
+    ix = _aud_skel_index(freq)
+    outs = []
+    for w in (g.get("odd") or [])[:5]:
+        k = _aud_skel(w)
+        cands = [c for _n, c in ix.get(k, [])[:3]]
+        if cands:
+            outs.append(str(w) + " could be " + " / ".join(cands))
+    return outs
+
+
+def _aud_clip(s, n=600):
+    """Cut prose at a word, never mid-word - '...the excited tone of t'
+    is how a why stops meaning anything."""
+    s = str(s or "").strip()
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    sp = cut.rfind(" ")
+    cut = cut[:sp] if sp > n * 0.6 else cut[:n - 1]
+    return cut.rstrip(" ,;:-") + "\u2026"
+
+
+def _aud_sense(heard, freq):
+    """Does this proposed correction read as language the library has
+    ever heard? Returns (ok, the words that fail).
+
+    "نافو" and "ترونوم" are not Arabic - they are English noises wearing
+    Arabic letters, and they shipped into his transcript because nothing
+    asked this question. The test is the same rarity arithmetic that
+    finds doubtful lines, pointed at the OUTPUT: Arabic tokens are
+    looked up raw and with a stripped leading ال; Latin ones lowercase.
+    Two or more never-seen words carrying most of the sentence means
+    the correction is noise, whatever the model believes."""
+    toks = re.findall(r"[\u0600-\u06ff]{2,}|[A-Za-z']{3,}",
+                      str(heard or ""))
+    if not toks:
+        return False, []
+    bad = []
+    for w in toks:
+        if re.match(r"[\u0600-\u06ff]", w):
+            # a slice, NOT lstrip: lstrip eats a character SET, so it
+            # would strip every leading alef and lam it can find and
+            # judge a word by its stump
+            w2 = w[2:] if w.startswith("\u0627\u0644") and len(w) > 3 else w
+            seen = max(freq.get(w, 0), freq.get(w2, 0),
+                       freq.get("\u0627\u0644" + w, 0))
+        else:
+            seen = freq.get(w.lower(), 0)
+        if not seen:
+            bad.append(w)
+    ok = not (len(bad) >= 2 and len(bad) / float(len(toks)) > 0.5)
+    return ok, bad[:5]
+
+
+def _aud_revert_nonsense(video_path, freq):
+    """Standing corrections that fail the sense gate are taken back.
+
+    They were written by the starved corrector - a line and a timestamp,
+    no conversation, no tone - and some of them are gibberish he can see
+    at a glance. Never a line he pinned. The original returns, the line
+    re-enters the doubtful list, and the dossier gets a proper try.
+    Returns how many were taken back."""
+    if len(freq or {}) < 1000:
+        return 0       # a broken/empty vocabulary fails EVERYTHING it
+        #                is shown - mass-reverting on it would shred
+        #                every good correction on the shelf
+    try:
+        sp = _ai_sidecar(video_path, "stt")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return 0
+    n = 0
+    for sg in (d.get("segments") or []):
+        if not isinstance(sg, dict) or sg.get("pin") or sg.get("nn") \
+                or sg.get("pn"):
+            continue     # a struck line is not a correction to re-judge
+        if not sg.get("fx") or sg.get("was") is None:
+            continue
+        ok, bad = _aud_sense(sg.get("t"), freq)
+        if ok:
+            continue
+        sg["t"] = sg.get("was")
+        for k in ("was", "fx", "fxo", "fxw"):
+            sg.pop(k, None)
+        n += 1
+    if n:
+        try:
+            _atomic_write_json(sp, d)
+            log("The auditor took back " + str(n) + " correction(s) on "
+                + os.path.basename(video_path) + " that failed the sense "
+                "test - the original lines are back and will be re-read "
+                "with their context this time.")
+        except Exception:
+            return 0
+    return n
+
+
+def _aud_garble(stt, freq):
+    """Lines carrying words the library has essentially never seen.
+
+    This is what "you can tell it doesn't make sense" looks like as
+    arithmetic. Across four hundred transcripts the library knows about
+    thirty thousand distinct words; a line where a third of the words are
+    not among them is not a sentence, it is one language being written
+    down by an ear listening for another. On the Backrooms night it finds
+    four lines out of two hundred and eighteen - Kedarrant, Almond water,
+    Jali hehe, Odey shukran - which are the four he pointed at.
+
+    It only ever SHORTLISTS. What was really said needs the model."""
+    if not freq:
+        return []
+    out = []
+    for sg in (stt or []):
+        if not isinstance(sg, dict):
+            continue
+        if sg.get("pin"):
+            continue              # he put it back himself - settled
+        if sg.get("nn") or sg.get("pn"):
+            continue              # struck (whole or split) - settled
+        # A CORRECTED LINE IS JUDGED BY ITS ORIGINAL. The corrected text
+        # is Arabic script with no Latin tokens, so it slipped past this
+        # detector entirely - which meant a bad correction could never be
+        # revisited. The original is what was doubtful; it stays the
+        # thing that gets flagged, and the standing correction rides
+        # along so the model may better it.
+        txt = str((sg.get("was") if sg.get("fx") else sg.get("t"))
+                  or "").strip()
+        ws = re.findall(r"[A-Za-z']{2,}", txt)
+        if not ws or len(txt) > 240:
+            continue
+        odd = [w for w in ws if freq.get(w.lower(), 0) <= 2]
+        if not odd or len(odd) / float(len(ws)) < 0.34:
+            continue
+        try:
+            t = float(sg.get("a") or 0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        try:
+            b_s = float(sg.get("b") or 0) / 1000.0
+        except (TypeError, ValueError):
+            b_s = t + 6.0
+        row = {"t": round(t, 1), "b": round(max(b_s, t + 0.5), 1),
+               "text": txt[:200], "odd": odd[:5]}
+        if sg.get("fx") and sg.get("was") is not None:
+            row["standing"] = str(sg.get("t") or "")[:200]
+        out.append(row)
+    out.sort(key=lambda r: -len(r["odd"]))
+    return out[:10]
+
+
+def _aud_places(vis):
+    """The eye's places, merged. Every span survives, so nothing about
+    WHEN he was there is lost by the folding."""
+    rows = [p for p in ((vis or {}).get("places") or [])
+            if isinstance(p, dict) and str(p.get("name") or "").strip()]
+    groups, merged = _aud_group(rows, lambda p: p.get("name") or "",
+                                lambda p: float(p.get("a") or 0))
+    out = []
+    for best, g in groups:
+        out.append({"name": best[:70],
+                    "spans": [[round(float(p.get("a") or 0), 1),
+                               round(float(p.get("b") or 0), 1)]
+                              for p in g],
+                    "n": sum(int(p.get("n") or 1) for p in g)})
+    return out, merged
+
+
+def _aud_creatures(vis):
+    """The eye's creatures, merged. "hooded figure, distant entity",
+    "hooded figure, distant" and "hooded figure, 'bazilg" were one hooded
+    figure on one night, counted three times."""
+    rows = [c for c in ((vis or {}).get("creatures") or [])
+            if isinstance(c, dict) and str(c.get("name") or "").strip()]
+
+    def _t0(c):
+        try:
+            return float((c.get("ts") or [0])[0] or 0)
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+    groups, merged = _aud_group(rows, lambda c: c.get("name") or "", _t0)
+    out = []
+    for best, g in groups:
+        ts = []
+        for c in g:
+            for x in (c.get("ts") or []):
+                try:
+                    ts.append(round(float(x), 1))
+                except (TypeError, ValueError):
+                    continue
+        out.append({"name": best[:70], "ts": sorted(set(ts))})
+    return out, merged
+
+
+def _aud_voice(sns, a, b):
+    """Whose line this is - by OVERLAP ONLY, or nobody.
+
+    The first cut lent a line the name of the nearest segment within
+    eight seconds when nothing overlapped it, and the thread then stated
+    that name as fact. On a two-voice night with 58 speaker segments and
+    138 utterances that is not attribution, it is invention: plenty of
+    lines have no segment under them at all, and a nameless quote is
+    worth more than a wrong one."""
+    names = (sns or {}).get("names") or {}
+    if not names:
+        return ""
+    best, bov = "", 0.0
+    for sp in ((sns or {}).get("speakers") or []):
+        if not isinstance(sp, dict):
+            continue
+        try:
+            x, y = float(sp.get("a") or 0), float(sp.get("b") or 0)
+        except (TypeError, ValueError):
+            continue
+        nm = str(names.get(str(sp.get("who"))) or "").strip()
+        if not nm:
+            continue
+        ov = min(b, y) - max(a, x)
+        if ov > bov:
+            bov, best = ov, nm
+    return best if bov > 0 else ""
+
+
+def _aud_says(t, src):
+    """Which layers can show something for this second, and the one line
+    each of them would say if asked. An empty answer is the whole point
+    of the auditor: a claim with nothing under it.
+
+    Order is fixed (_AUD_LAYERS), so the same second always answers with
+    the same list - the panel's "agrees" must not shuffle between two
+    runs over the same night."""
+    lay, det = [], {}
+    for sg in (src.get("stt") or []):
+        try:
+            a = float(sg.get("a") or 0) / 1000.0
+            b = float(sg.get("b") or 0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        if b < t - _AUD_WORDS:
+            continue
+        if a > t + _AUD_WORDS:
+            break                     # the transcript is in time order
+        txt = str(sg.get("t") or "").strip()
+        if len(txt.split()) < 2 or sg.get("g"):
+            continue                  # the game's own audio is not a voice
+        who = _aud_voice(src.get("sns"), a, b)
+        lay.append("words")
+        det["words"] = ((who + ': "' + txt[:100] + '"') if who
+                        else '"' + txt[:100] + '"')
+        break
+    sns = src.get("sns") or {}
+    for e2 in (sns.get("events") or []):
+        try:
+            if abs(float(e2.get("t") or 0) - t) <= _AUD_SOUND:
+                lay.append("sound")
+                det["sound"] = str(e2.get("kind") or "")[:20]
+                break
+        except (TypeError, ValueError):
+            continue
+    if "sound" not in det:
+        for o in (sns.get("ocr") or []):
+            try:
+                if abs(float(o.get("t") or 0) - t) <= _AUD_SOUND:
+                    lay.append("sound")
+                    det["sound"] = ("on screen: "
+                                    + str(o.get("text")
+                                          or o.get("kind") or "")[:30])
+                    break
+            except (TypeError, ValueError):
+                continue
+    best, bd = "", _AUD_EYE
+    for lk in ((src.get("vis") or {}).get("looks") or []):
+        if not isinstance(lk, dict):
+            continue
+        try:
+            d = abs(float(lk.get("t") or 0) - t)
+        except (TypeError, ValueError):
+            continue
+        if d > bd:
+            continue
+        who2 = str(lk.get("creature") or "").strip()
+        where = str(lk.get("place") or "").strip()
+        if not (who2 or where):
+            continue                  # a look that named nothing saw nothing
+        bd = d
+        if where and who2:
+            best = where + " - " + who2
+        else:
+            best = where or who2
+    if best:
+        lay.append("eye")
+        det["eye"] = best[:90]
+    ins = src.get("ins") or {}
+    for m in (ins.get("moments") or []):
+        try:
+            if abs(float(m.get("t") or 0) - t) <= _AUD_REVIEW:
+                lay.append("review")
+                det["review"] = str(m.get("why") or "")[:140]
+                break
+        except (TypeError, ValueError):
+            continue
+    if "review" not in det:
+        for c in (ins.get("chapters") or []):
+            try:
+                if abs(float(c.get("t") or 0) - t) <= _AUD_CHAPTER:
+                    lay.append("review")
+                    det["review"] = str(c.get("label") or "")[:80]
+                    break
+            except (TypeError, ValueError):
+                continue
+    for lt, kind in (src.get("laughs") or []):
+        if abs(lt - t) <= _AUD_LAUGH:
+            lay.append("laugh")
+            det["laugh"] = ("somebody screams" if kind == "scream"
+                            else "somebody laughs")
+            break
+    return [k for k in _AUD_LAYERS if k in lay], det
+
+
+def _aud_live(seen, n):
+    """Which layers actually COVERED this recording, and so have the
+    standing to condemn a claim by staying silent about it.
+
+    This is the difference between "nothing happened here" and "nobody
+    was listening". On his Drova night the transcript touches 24 of 1072
+    marks - 2% - and a first cut of this pass condemned marks for the
+    crime of silence, which is not auditing, it is deleting. A layer that
+    says nothing for four claims in five did not cover the night, and its
+    silence proves nothing about any single second of it.
+
+    A POSITIVE from such a layer still counts, always: being rare costs a
+    layer its veto, never its word. That is why the laughter ear is in
+    here - it will almost never earn standing (15 laughs in 972 marks)
+    and it must never need to, because a laugh IS evidence."""
+    return set(k for k in _AUD_LAYERS
+               if seen.get(k, 0) >= 3
+               and seen.get(k, 0) >= _AUD_LIVE * max(1, n))
+
+
+def _aud_silence(live, origin=""):
+    """Name the layers that were there and had nothing to say. Only the
+    ones that covered this night are named - being told "the eye saw
+    nothing" about a recording the eye never opened would be a lie, and
+    a layer is never quoted against its own claim."""
+    said = [_AUD_SILENT[k] for k in _AUD_LAYERS
+            if k in live and k != origin]
+    if not said:
+        return "no layer had anything for it"
+    if len(said) == 1:
+        return said[0]
+    return ", ".join(said[:-1]) + " and " + said[-1]
+
+
+def _aud_condemn(t, src, live, origin):
+    """THE ONE LAW, and it is the same law for everybody.
+
+    A claim falls only when some layer OTHER than the one that made it
+    had the standing to look, and NOTHING - live or not - found anything
+    at that second. Returns (drop?, the layers that agree, what they
+    said).
+
+    The first cut pruned unsupported gold marks while promoting
+    unsupported review text straight into the story as an anchor. A pass
+    that holds one layer to a standard it exempts another from is not an
+    audit."""
+    lay, det = _aud_says(t, src)
+    agrees = [k for k in lay if k != origin]
+    others = live - {origin}
+    return (bool(others) and not agrees), agrees, det
+
+
+def _aud_drop(t, what, why, was=None, named=False):
+    """One claim struck out, written down. He must be able to read WHY,
+    and 'was' is the whole thing verbatim - the auditor removes nothing,
+    but the panel should still be able to show exactly what it is
+    arguing with."""
+    row = {"t": (0.0 if t is None else round(float(t), 1)),
+           "what": str(what or "")[:80], "why": str(why or "")[:240]}
+    if was is not None:
+        row["was"] = was
+    if named:
+        row["named"] = True     # worth telling the model not to mention
+    return row
+
+
+def _aud_floor(dur, n):
+    """How few claims this pass is allowed to leave standing before it
+    stops auditing and starts deleting. _thin_moments' OWN budget, not a
+    number of this pass's choosing: about one mark every two and a half
+    minutes, never fewer than eight, never more than sixty. The first cut
+    wrote 5 under a comment that promised 8."""
+    return min(int(n), int(min(60, max(8, round((dur or 0) / 150.0)))))
+
+
+def _aud_check(events, src, live, dur):
+    """The checking half: every gold mark asked what any other layer can
+    show for it. Returns (rows for the survivors, the drops, how many
+    empty marks the floor put back)."""
+    keep, drops, weak = [], [], []
+    music = (src.get("sns") or {}).get("music")
+    can_music = isinstance(music, list)
+    looks = ((src.get("vis") or {}).get("looks") or [])
+    for ev in events:
+        try:
+            t = float(ev.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        kind = str(ev.get("kind") or "")
+        # A MUSIC TAG WITH NO MUSIC UNDER IT. On his Backrooms night the
+        # senses tagged three "music" events while their own sustained
+        # music spans came to nothing - the only sound in the building
+        # was fluorescent hum. Only asked when that pass actually
+        # recorded spans: the older .sns files have no music key at all,
+        # and an absent record is not a denial.
+        if kind == "music" and can_music and not _aud_in_span(t, music):
+            drops.append(_aud_drop(
+                t, 'the "music" label',
+                "the senses called this music, but their own music spans "
+                "do not cover it - nothing was playing here", ev, True))
+            continue
+        # A SIGHTING WHOSE LOOK IS GONE. The eye's fold never renames an
+        # existing mark, so a "creature" can outlive the only look that
+        # ever justified it. Asked only where the eye actually looked.
+        if kind == "creature" and looks and "eye" in live:
+            near = []
+            for lk in looks:
+                # one look with a junk clock used to raise straight out of
+                # the comprehension and fail the WHOLE audit; a bad row is
+                # a bad row, not a reason to lose the night's verdicts
+                if not isinstance(lk, dict):
+                    continue
+                if not str(lk.get("creature") or "").strip():
+                    continue
+                try:
+                    if abs(float(lk.get("t") or 0) - t) <= _AUD_EYE:
+                        near.append(lk)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not near:
+                drops.append(_aud_drop(
+                    t, 'the "creature" label',
+                    "no look within twelve seconds names anybody - the "
+                    "sighting this mark was standing on is gone",
+                    ev, True))
+                continue
+        gone, agrees, det = _aud_condemn(t, src, live, "")
+        if gone:
+            row = _aud_drop(t, ('a gold mark labelled "' + kind + '"'
+                                if kind else "a gold mark"),
+                            "nothing in it: " + _aud_silence(live), ev)
+            drops.append(row)
+            try:
+                weak.append((float(ev.get("p") or ev.get("z") or 0), row))
+            except (TypeError, ValueError):
+                weak.append((0.0, row))
+            continue
+        keep.append({"t": round(t, 1), "kind": kind, "agrees": agrees,
+                     "say": det})
+    # A RECORDING WITH NOTHING MARKED IS WORSE THAN ONE MARKED LOOSELY -
+    # _thin_moments has said so since the day it was written, and its own
+    # budget is the floor here. Below that the auditor has stopped
+    # auditing, so the loudest stop being reported as empty and a warning
+    # says out loud that they are standing on sufferance.
+    floor = _aud_floor(dur, len(events))
+    back = []
+    if events and len(keep) < floor:
+        weak.sort(key=lambda w: (-w[0], w[1]["t"]))
+        back = [row for _p, row in weak[:floor - len(keep)]]
+        # BY IDENTITY, not by value: list.remove() matches the first EQUAL
+        # dict, which on a night full of look-alike drops takes out
+        # somebody else's row and leaves this one in twice.
+        drops = [d for d in drops if not any(d is r for r in back)]
+        for row in back:
+            # NO AGREEMENT, honestly: it stands because the bar would
+            # otherwise be bare, not because anything backs it. An empty
+            # agrees list is never an anchor for the thread.
+            keep.append({"t": row["t"], "kind": "", "agrees": [],
+                         "say": {}})
+        keep.sort(key=lambda r: r["t"])
+    return keep, drops, len(back)
+
+
+def _aud_in_span(t, spans):
+    for sp in (spans or []):
+        try:
+            if float(sp[0]) - 5.0 <= t <= float(sp[1]) + 5.0:
+                return True
+        except (TypeError, ValueError, IndexError):
+            continue
+    return False
+
+
+def _aud_review(src, live):
+    """The review's own claims, put through the identical law. A chapter
+    dated eight minutes from anything anybody said is the failure this
+    catches - "Scouting and Egg Collection" landed before it happened,
+    and nothing has ever checked one since. Returns (anchors, drops)."""
+    ins = src.get("ins") or {}
+    rows, drops = [], []
+    for m in (ins.get("moments") or []):
+        if not isinstance(m, dict):
+            continue
+        try:
+            t = float(m.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        why = str(m.get("why") or "").strip()
+        if not why:
+            continue
+        gone, agrees, det = _aud_condemn(t, src, live, "review")
+        if gone:
+            drops.append(_aud_drop(t, why[:80],
+                                   "the review called this a moment, but "
+                                   + _aud_silence(live, "review"),
+                                   m, True))
+            continue
+        rows.append({"t": round(t, 1), "kind": str(m.get("kind") or ""),
+                     "agrees": agrees + ["review"],
+                     "say": dict(det, review=why[:140])})
+    for c in (ins.get("chapters") or []):
+        if not isinstance(c, dict):
+            continue
+        try:
+            t = float(c.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        label = str(c.get("label") or "").strip()
+        if not label:
+            continue
+        gone, agrees, det = _aud_condemn(t, src, live, "review")
+        if gone:
+            drops.append(_aud_drop(t, label[:80],
+                                   "a chapter starts here and "
+                                   + _aud_silence(live, "review"),
+                                   c, True))
+            continue
+        say = label + (" - " + str(c.get("what")) if c.get("what") else "")
+        rows.append({"t": round(t, 1), "kind": "chapter",
+                     "agrees": agrees + ["review"],
+                     "say": dict(det, review=say[:160])})
+    return rows, drops
+
+
+def _aud_sightings(crs, src, live):
+    """Every second the eye says somebody else was on screen, put through
+    the same law. Two of his fourteen Hearthstone sightings ("multiple
+    minions") have nothing else at that second at all."""
+    rows, drops = [], []
+    for c in (crs or []):
+        for t in (c.get("ts") or []):
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                continue
+            gone, agrees, det = _aud_condemn(t, src, live, "eye")
+            if gone:
+                drops.append(_aud_drop(
+                    t, str(c.get("name") or "")[:70],
+                    "the eye put somebody on screen here and "
+                    + _aud_silence(live, "eye"),
+                    {"name": c.get("name"), "t": round(t, 1)}, True))
+                continue
+            rows.append({"t": round(t, 1), "kind": "creature",
+                         "agrees": agrees + ["eye"],
+                         "say": dict(det,
+                                     eye=str(c.get("name") or "")[:70])})
+    return rows, drops
+
+
+def _aud_anchors(rows, dur):
+    """The moments worth telling, from every layer at once - capped and
+    SPREAD. 116 chapters cannot all be beats, and taking the first forty
+    would tell him about the first half hour of a seven-hour night."""
+    out = []
+    for r in sorted(rows, key=lambda x: (x["t"], x.get("kind") or "")):
+        if not r.get("agrees"):
+            continue          # kept on sufferance; there is nothing to say
+        # the rows arrive in time order, so the last one out is always the
+        # nearest: a gold mark, the review's moment on it and the eye's
+        # sighting of it are ONE beat, not three
+        if out and abs(r["t"] - out[-1]["t"]) <= 6.0:
+            got = out[-1]
+            for k in r["agrees"]:
+                if k not in got["agrees"]:
+                    got["agrees"].append(k)
+            got["agrees"] = [k for k in _AUD_LAYERS if k in got["agrees"]]
+            for k, v in (r.get("say") or {}).items():
+                got["say"].setdefault(k, v)
+            continue
+        out.append({"t": r["t"], "kind": r.get("kind") or "",
+                    "agrees": [k for k in _AUD_LAYERS
+                               if k in (r.get("agrees") or [])],
+                    "say": dict(r.get("say") or {})})
+    if len(out) <= _AUD_ANCHORS:
+        return out
+    span = float(dur or (out[-1]["t"] - out[0]["t"]) or 1.0)
+    gap = max(1.0, span / float(_AUD_ANCHORS))
+    pick = []
+    for r in sorted(out, key=lambda r2: (-len(r2["agrees"]), r2["t"])):
+        if len(pick) >= _AUD_ANCHORS:
+            break
+        if any(abs(r["t"] - q["t"]) < gap for q in pick):
+            continue
+        pick.append(r)
+    if len(pick) < min(12, len(out)):
+        for r in out:                     # clustered: the gap gave up
+            if len(pick) >= min(12, len(out)):
+                break
+            if r not in pick:
+                pick.append(r)
+    pick.sort(key=lambda r: r["t"])
+    return pick
+
+
+_AUD_NAME = {"words": "transcript", "sound": "senses", "eye": "eye",
+             "review": "review", "laugh": "laughter ear"}
+
+
+def _aud_warnings(src, events, live, stale, seen):
+    """What the layers themselves admit, said plainly. His .vis counters
+    read {"wanted": 24, "asked": 6, "skipped": 4} - four of six asks
+    failed and were swallowed, leaving seven looks, and the file still
+    said complete. A pass is allowed to come up short; it is not allowed
+    to come up short quietly."""
+    out = []
+    # THE VERDICT MUST DECLARE WHAT IT RESTS ON. On 223 of his 399
+    # recordings exactly one layer clears the standing bar, and it is
+    # always the transcript - so "nothing behind this mark" collapses to
+    # "he was not talking". The bar for standing is 20% coverage, which
+    # means a transcript touching 23% of the marks gets to call the other
+    # 77% empty: LiesofP 2026-01-15, 468 marks, 109 kept, 361 reported
+    # empty. Nothing is removed either way, so the verdict is left as it
+    # is and his panel decides - but it does not get to arrive quietly.
+    solo = sorted(live)
+    if len(solo) == 1 and events:
+        hit = int((seen or {}).get(solo[0], 0))
+        pct = int(round(100.0 * hit / max(1, len(events))))
+        if pct < 75:
+            out.append("the " + _AUD_NAME.get(solo[0], solo[0]) + " is the "
+                       "only layer that covered this night and it answers "
+                       "for just " + str(pct) + "% of the gold marks, so "
+                       "every 'nothing behind it' below is one layer's "
+                       "silence and not proof the mark is wrong")
+    vis, sns, ins = (src.get("vis") or {}), (src.get("sns") or {}), \
+        (src.get("ins") or {})
+    for kind in stale:
+        out.append("the " + {"stt": "transcript", "sns": "senses",
+                             "vis": "eye", "ins": "review"}.get(kind, kind)
+                   + " on disk is older than the recording, so it was not "
+                     "read - it describes footage an edit may have cut")
+    c = vis.get("counters") or {}
+    looks = len(vis.get("looks") or [])
+    want = int(c.get("wanted") or 0)
+    if want and looks < want:
+        msg = ("the eye kept " + str(looks) + " look(s) of the "
+               + str(want) + " it wanted")
+        if int(c.get("skipped") or 0):
+            msg += (" - " + str(int(c["skipped"])) + " of its "
+                    + str(int(c.get("asked") or 0))
+                    + " asks came back with nothing and were swallowed")
+        out.append(msg + ", so most of this night was never looked at")
+    if vis and vis.get("complete") is False:
+        out.append("the eye was interrupted - these are partial sightings")
+    mus = sum(1 for e in (sns.get("events") or [])
+              if str(e.get("kind") or "") == "music")
+    if mus and isinstance(sns.get("music"), list) and not sns["music"]:
+        out.append("the senses tagged " + str(mus) + " music event(s) on a "
+                   "recording with no sustained music in it at all")
+    cf = (sns.get("counters") or {}).get("clap_failed")
+    if cf:
+        out.append("the sound vocabulary failed: " + str(cf)[:90])
+    if ins and not ins.get("complete"):
+        out.append("the review is unfinished, so the thread is missing "
+                   "whatever it never described")
+    ch = len(ins.get("chapters") or [])
+    if ch > 40:
+        out.append("the review found " + str(ch) + " chapters - far more "
+                   "than the timeline can draw, which is exactly why "
+                   "there is a thread")
+    if not (src.get("stt") or []):
+        out.append("there is no transcript here, so nothing below can "
+                   "quote anybody")
+    if not events:
+        out.append("the sound pass left no marks to check")
+    elif not live:
+        out.append("nothing else covered this recording closely enough to "
+                   "judge a mark by, so every gold mark stands exactly as "
+                   "the sound pass made it")
+    return out[:8]
+
+
+_AUD_SYSTEM = """You audit the transcript of one recorded game night.
+The speakers are EMIRATI - fluent in both English and the UAE Gulf
+dialect (khaleeji), NOT standard Arabic - and they switch mid-sentence.
+Read and write the Arabic the way Emiratis actually speak it. The speech engine mis-hears: it writes Arabic down as
+English-looking noise, and sometimes mangles English too. You are given
+each doubtful line with the conversation around it, the tone of the
+room, what was seen and heard nearby, and a hint sheet of what the
+sounds might already spell in this group's own vocabulary.
+
+WORK EACH LINE IN THIS ORDER:
+
+STEP 1 - SOUND IT OUT. Say the written words aloud in your head.
+  Do these sounds already spell real Gulf Arabic? ("Sakar late?" IS
+  \u0633\u0643\u0631 \u0644\u064a\u062a - close the light. The right answer is usually the SAME
+  SOUNDS in the right script, and the hint sheet often contains it.)
+  Do they spell real English? A name or term from this game? Then the
+  line may already be right, or need only respelling - never invention.
+
+STEP 1b - TRUST THE SECOND EAR. Some lines carry "listening again to
+  only this span, the ear heard: ..." - the same recogniser replayed
+  JUST that moment from the clean microphone with Arabic pinned. A
+  readable second hearing outranks the original line and usually
+  outranks phonetic guesswork; adopt it unless the story contradicts
+  it. When the note says the second ear heard nothing readable either,
+  that is EVIDENCE OF NOISE - two ears failing the same span usually
+  means there was nothing there to hear.
+
+STEP 2 - CHECK THE STORY. What are they doing? What was said before
+  and after? Is the room calm or screaming? Did anyone laugh - a
+  strange word under laughter can be a joke, and a joke said is a joke
+  kept. A once-said real thing (a shop, a friend's nickname) is not an
+  error just because it is rare.
+
+STEP 3 - DECIDE, one of four:
+  fix      you can read it now - give the line with the mis-heard part
+           repaired and every truly-English word kept exactly as it was
+  right    you checked and the line stands as written - and your why
+           STATES WHAT THE LINE MEANS in plain English. Meaning is the
+           test: if you cannot say what the sentence means, you have
+           not read it, and you may not call it right.
+  noise    you sounded it out, read the story, heard the second ear -
+           and the sounds spell nothing in Gulf Arabic OR English. The
+           line is not speech worth keeping (rustle, crosstalk, half a
+           word). It will be struck from the record as unintelligible.
+           Saying noise is a GOOD answer: a struck line is honest; an
+           invented meaning is a lie sitting in his own transcript.
+           The strike is applied PER SENTENCE by the machine: any
+           sentence in the line whose words are all real survives on
+           its own - so never withhold noise just because one readable
+           sentence sits beside the static.
+  unclear  real words are probably in there, but you cannot settle
+           which - he can listen to the second himself
+
+RULES:
+- A line you find ALREADY RIGHT goes in checked, NEVER in fixes -
+  returning it as a fix re-applies the same text and reads as noise.
+- Repair only the broken part of a line; the rest survives unchanged.
+- Never invent words. If your Arabic is not words people actually say,
+  you have misread it - that is noise or unclear, never a fix.
+- "Plausible" is BANNED as a reason. A transcription being plausible
+  is not the same as you having read it. Either you can translate the
+  line and name the clue that anchors it, or you cannot - and then it
+  is noise or unclear, never right.
+- An earlier pass's GUESS earns no respect for being written down.
+  Judge it by STEP 1 like anything else: if the guess's words are not
+  words Emiratis actually say, the guess was noise when it was written
+  and it is noise now - say noise, and the guess is struck.
+- Fluent speakers do not produce absurd grammar. "Jumpier! Jumpier!"
+  mid-action is almost certainly "Jump here!" - broken English from a
+  fluent speaker is a mis-hearing, and Step 1 applies to English too.
+- Every answer carries "why": the SPECIFIC clue that told you - a
+  phrase said nearby, the thing they were doing, the tone. Never a
+  generic label like "common Arabic phrases"; a why that names nothing
+  is worth nothing.
+
+FOUR WORKED EXAMPLES:
+line: "Sakar late?"    (hint: Sakar could be \u0633\u0643\u0631; late could be \u0644\u064a\u062a)
+  fix: {"n": 0, "heard": "\u0633\u0643\u0631 \u0644\u064a\u062a\u061f",
+        "why": "same sounds spell the Gulf phrase close-the-light; they were fixing the lamp"}
+line: "Uh, I asked this Mikello cheesecake."   (said calmly, once)
+  right: {"n": 1, "verdict": "right",
+          "why": "he is ordering the Mikello cheesecake, a real shop order they discussed - rare because it came up once, not because it is wrong"}
+line: "Iba hna tuiyala su meel."   (an earlier pass guessed: "\u0625\u0628\u0627 \u0647\u0646\u0627 \u062a\u0648\u0644\u064a\u0644\u0627 \u0633\u0648 \u0645\u064a\u0644")
+  noise: {"n": 2, "verdict": "noise",
+          "why": "neither the sounds nor the earlier guess spell words anyone says in either language - the guess just redrew the same static in Arabic letters"}
+line: "Kedarrant."   (one clean word, and the room reacted to it)
+  unclear: {"n": 3, "verdict": "unclear",
+            "why": "probably a real name or word the story never anchors - he should hear the second himself"}
+
+Reply with STRICT JSON and nothing else:
+{"fixes":   [{"n": 0, "heard": "...", "why": "..."}],
+ "checked": [{"n": 1, "verdict": "right", "why": "..."},
+             {"n": 2, "verdict": "noise", "why": "..."},
+             {"n": 3, "verdict": "unclear", "why": "..."}]}
+Account for EVERY numbered line in exactly one of the two lists."""
+
+_AUD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "fixes": {"type": "array", "maxItems": 12, "items": {
+            "type": "object",
+            "properties": {"n": {"type": "integer"},
+                           "heard": {"type": "string"}},
+            "required": ["n", "heard"]}}},
+    "required": ["fixes"]}
+
+
+def _aud_shown(what, shown):
+    """Is this struck-out claim ALSO somewhere on the page the model is
+    reading? Then it must not be named under "none of this happened".
+
+    The eye names a creature once and sights it a dozen times, and only
+    some of those seconds fail the check. On his 2026-08-16 Hearthstone
+    night both named drops read "multiple minions on boards" - while the
+    header line naming who else was on screen said "multiple minions on
+    boards" and so did beat #1's own eye quote. Telling a model a thing
+    never happened on the same page that shows it happening is not a
+    fence, it is a contradiction, and what it costs is that beat.
+
+    Loose on purpose. Over-suppressing costs nothing (the model only ever
+    sees the anchors, so it cannot mention a drop it was not told about);
+    contradicting itself costs a beat."""
+    k = _eye_key(what)
+    if not k:
+        return True
+    for s in shown:
+        if len(s) >= 4 and (k in s or s in k):
+            return True
+    return False
+
+
+def _aud_tone(sns, t):
+    """The arousal curve at this second, read against the night's own
+    spread - "calm", "lively", "excited" or "at a peak". The tone is a
+    context clue: a scream-adjacent line reads differently from a lull."""
+    try:
+        h = (sns or {}).get("hype") or {}
+        v = h.get("v") or []
+        hop = float(h.get("hop") or 3.0)
+        if len(v) < 20:
+            return ""
+        x = float(v[max(0, min(len(v) - 1, int(t / hop)))])
+        sv = sorted(v)
+        med = sv[len(sv) // 2]
+        p90 = sv[int(len(sv) * 0.9)]
+        if x >= p90:
+            return "at a peak of excitement"
+        if x >= (med + p90) / 2:
+            return "excited"
+        if x >= med:
+            return "lively"
+        return "calm"
+    except Exception:
+        return ""
+
+
+def _aud_relisten(video_path, garble):
+    """Play each doubtful span to the reader ONCE MORE - cut from the
+    clean mic track when the night has one, with the language pinned to
+    Arabic and the Emirati register in its ear. The transcriber heard
+    these spans cold, mid-noise, guessing the language; an ear with the
+    right prior is the strongest witness the corrector can call.
+
+    Writes g["ear"] onto each row it could re-hear. Never touches the
+    transcript itself - the corrector weighs the ear like any clue."""
+    if not garble or _asr_gguf_paths() is None:
+        return 0
+    # ONE MODEL ON THE CARD, EVER - the law this family keeps breaking.
+    # A parked describer or thinker plus this reader is a spill.
+    _desc_keep_drop()
+    _aud_keep_drop()
+    names = _audio_track_names(video_path)
+    mt = _mic_track(video_path, names)
+    amap = (["-map", f"0:a:{mt}"] if mt is not None
+            else _mix_audio_args(video_path, names))
+    srv = _AsrServer(port=8912)
+    if not srv.start():
+        return 0
+    _AI["proc"] = srv.pr               # Stop and a game must reach it
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    heard = 0
+    try:
+        for g in garble[:8]:
+            if _AI["abort"]:
+                break
+            a0 = max(0.0, float(g.get("t") or 0) - 1.5)
+            b0 = float(g.get("b") or (a0 + 6.0)) + 1.5
+            wv = os.path.join(_work_dir(), "aud_ear_%d.wav" % os.getpid())
+            try:
+                rc, _o, _e = _ai_run(
+                    [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+                     "-ss", "%.2f" % a0, "-t", "%.2f" % (b0 - a0),
+                     "-i", video_path] + amap
+                    + ["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                       wv], 120, flags)
+                if rc != 0 or not os.path.isfile(wv):
+                    continue
+                import base64 as _b64
+                with open(wv, "rb") as fh:
+                    b64 = _b64.b64encode(fh.read()).decode("ascii")
+                body = json.dumps({
+                    "messages": [
+                        {"role": "system", "content":
+                         "Friends gaming on Discord. They speak Emirati "
+                         "Gulf Arabic and English, switching "
+                         "mid-sentence."},
+                        {"role": "user", "content": [
+                            {"type": "input_audio", "input_audio":
+                             {"data": b64, "format": "wav"}}]},
+                        {"role": "assistant",
+                         "content": "language Arabic<asr_text>"}],
+                    "temperature": 0, "max_tokens": 200,
+                    "repeat_penalty": 1.15}).encode("utf-8")
+                req = _urlreq.Request(
+                    srv.base + "/v1/chat/completions", body,
+                    {"Content-Type": "application/json"})
+                with _urlreq.urlopen(req, timeout=180) as r:
+                    j = json.loads(r.read().decode("utf-8"))
+                raw = ((j.get("choices") or [{}])[0].get("message")
+                       or {}).get("content") or ""
+                txt = raw.split("<asr_text>")[-1].strip()
+                if txt and len(txt) >= 2:
+                    okE, _bw = _aud_sense(txt,
+                                          (_AUD_VOCAB.get("freq") or {}))
+                    if okE:
+                        g["ear"] = txt[:160]
+                    else:
+                        # the second ear produced non-words too - that
+                        # is not a reading to adopt, it is evidence the
+                        # span holds no speech at all
+                        g["ear_junk"] = True
+                    heard += 1
+            except Exception:
+                continue
+            finally:
+                try:
+                    os.remove(wv)
+                except OSError:
+                    pass
+    finally:
+        srv.stop()
+    if heard:
+        log("The auditor re-listened to " + str(heard) + " doubtful "
+            "span(s) with an Arabic ear"
+            + (" from the clean mic." if mt is not None else "."))
+    return heard
+
+
+def _aud_look_unclear(video_path, garble):
+    """His Ragnaros rule, final step: when the sounds and the story
+    cannot settle a line, LOOK AT THE SCREEN. For up to two lines the
+    thinker left unclear, one frame at that second goes to the vision
+    model - is there a nameplate, a menu, an item that anchors what was
+    said? What it sees lands beside the verdict, so the panel can say
+    "the screen at that second shows: ..." instead of shrugging.
+
+    Runs after the thinker and only when the card can be owned; a
+    missing describer or a game in focus just means no look, never a
+    failed audit."""
+    todo = [g for g in (garble or [])
+            if g.get("verdict") == "unclear"][:2]
+    if not todo or _describer_paths() is None or _desc_mmproj() is None:
+        return 0
+    if _aud_playing() or _AI["abort"]:
+        return 0
+    _aud_keep_drop()                   # the thinker steps down first
+    srv = _DESC_KEEP.get("srv")
+    _DESC_KEEP["srv"] = None
+    warm = bool(srv is not None and srv.pr is not None
+                and srv.pr.poll() is None)
+    if not warm:
+        if srv is not None:
+            srv.stop()
+        srv = _DescServer()
+        log("The auditor is waking the describer for a LOOK at "
+            + str(len(todo)) + " unsettled second(s).")
+        if not srv.start():
+            return 0
+    n = 0
+    try:
+        for g in todo:
+            if _AI["abort"]:
+                break
+            t0 = float(g.get("t") or 0)
+            frames = [("[frame at %d:%02d]" % (int(t0) // 60,
+                                               int(t0) % 60), b)
+                      for _t, b in _grab_frames(video_path, [t0])]
+            if not frames:
+                continue
+            txt = srv.ask(
+                "You describe ONE game frame factually: any readable "
+                "names, nameplates, HUD text, items or menus; the scene "
+                "in a phrase. No speculation, no story.",
+                "The players said something unclear at this exact "
+                "second. What is on screen that could anchor it?",
+                max_tokens=140, images=frames, timeout=240)
+            if txt:
+                see = _descrub(str(txt).strip())[:120]
+                g["vwhy"] = _aud_clip(
+                    (g.get("vwhy") or "").strip()
+                    + " — the screen at that second shows: "
+                    + see, 700)
+                n += 1
+    finally:
+        if not _AI["abort"] and srv.pr is not None                 and srv.pr.poll() is None:
+            _DESC_KEEP["srv"] = srv
+            _DESC_KEEP["t"] = time.time()
+        else:
+            srv.stop()
+    if n:
+        log("The auditor looked at " + str(n) + " unsettled second(s).")
+    return n
+
+
+def _aud_dossier(g, src, ins):
+    """Everything the night knows about the seconds around ONE doubtful
+    line - the conversation (language-tagged), the tone, the nearest
+    sound, the nearest sight, the chapter. This is what was missing:
+    each line used to travel as 120 characters and a timestamp, and a
+    model given a keyhole can only transliterate."""
+    t = float(g.get("t") or 0)
+    outl = []
+    for sg in (src.get("stt") or []):
+        try:
+            a = float(sg.get("a") or 0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        if a < t - 45:
+            continue
+        if a > t + 45:
+            break
+        txt = str(sg.get("t") or "").strip()
+        if not txt:
+            continue
+        mark = ">>> " if abs(a - t) < 1.0 else "    "
+        lang = "[ar]" if str(sg.get("lang") or "") == "arabic" else "[en]"
+        outl.append(mark + lang + " " + txt[:110])
+        if len(outl) >= 14:
+            break
+    bits = []
+    tone = _aud_tone(src.get("sns"), t)
+    if tone:
+        bits.append("the room is " + tone)
+    best, bd = None, 25.0
+    for e2 in ((src.get("sns") or {}).get("events") or []):
+        try:
+            d2 = abs(float(e2.get("t") or 0) - t)
+        except (TypeError, ValueError):
+            continue
+        if d2 < bd:
+            bd, best = d2, str(e2.get("kind") or "")
+    if best:
+        bits.append("nearby sound: " + best)
+    lb, lbd = "", 60.0
+    for lk in ((src.get("vis") or {}).get("looks") or []):
+        try:
+            d2 = abs(float(lk.get("t") or 0) - t)
+        except (TypeError, ValueError):
+            continue
+        if d2 < lbd and (lk.get("place") or lk.get("creature")):
+            lbd = d2
+            lb = " - ".join(x for x in (str(lk.get("place") or ""),
+                                        str(lk.get("creature") or "")) if x)
+    if lb:
+        bits.append("on screen: " + lb[:70])
+    ch = ""
+    for c in ((ins or {}).get("chapters") or []):
+        try:
+            if float(c.get("t") or 0) <= t:
+                ch = str(c.get("label") or "")
+        except (TypeError, ValueError):
+            continue
+    if ch:
+        bits.append("chapter: " + ch[:60])
+    hints = g.get("hints") or []
+    ear = str(g.get("ear") or "").strip()
+    # the ear, then the hints, then the tone - the pack builder cuts at
+    # 900 characters and the strongest evidence must never meet the knife
+    return ((("(listening again to only this span, the ear heard: "
+              + ear + ")\n") if ear
+             else ("(the second ear replayed just this span and heard "
+                   "nothing readable either - evidence of noise)\n"
+                   if g.get("ear_junk") else ""))
+            + (("(the sounds may already spell: "
+              + "; ".join(hints[:5]) + ")\n") if hints else "")
+            + (("(" + "; ".join(bits) + ")\n") if bits else "")
+            + "\n".join(outl))
+
+
+def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
+    """The one ask, assembled. Everything the model is allowed to know is
+    in here, which is how "never mention a thing no layer saw" is kept by
+    construction rather than by asking nicely - and the check's own
+    verdict goes in with it, because the first cut told the story the
+    very claims it had just disproved."""
+    ins, sns = (src.get("ins") or {}), (src.get("sns") or {})
+    lines = []
+    for i, r in enumerate(anchors):
+        bits = []
+        for k in _AUD_LAYERS:
+            v = (r.get("say") or {}).get(k)
+            if v:
+                bits.append(_AUD_SAY[k] + str(v))
+        if not bits:
+            bits = ["a marked moment, nothing else recorded about it"]
+        lines.append("#" + str(i) + " " + _eye_stamp(r["t"]) + " ["
+                     + "+".join(r.get("agrees") or []) + "] "
+                     + " | ".join(bits))
+    head = "The game is " + str(game) + ". "
+    if dur:
+        head += "The recording runs " + str(int(dur // 60)) + " minutes. "
+    if ins.get("complete"):
+        title = str(ins.get("title") or "").strip()
+        if title:
+            head += "The review called it: " + title[:110] + ". "
+        summ = str(ins.get("summary") or "").strip()
+        if summ:
+            head += summ[:300] + " "
+    elif ins:
+        head += ("The review of this night was never finished, so do not "
+                 "lean on it. ")
+    names = [str(v) for v in (sns.get("names") or {}).values()
+             if str(v).strip()]
+    if names:
+        head += "The voices here are " + ", ".join(names[:6]) + ". "
+    if places:
+        head += ("Where the eye saw him, in order: "
+                 + "; ".join(str(p.get("name")) for p in places[:10])
+                 + ". ")
+    if crs:
+        head += ("Who else was on screen: "
+                 + "; ".join(str(c.get("name")) for c in crs[:8]) + ". ")
+    # everything the model is about to be shown, keyed the way names are
+    # compared everywhere else in this pass - built once, because a night
+    # with hundreds of named drops would otherwise re-key it hundreds of
+    # times over
+    shown = [str(p.get("name") or "") for p in (places or [])[:10]]
+    shown += [str(c.get("name") or "") for c in (crs or [])[:8]]
+    for r in anchors:
+        for v in (r.get("say") or {}).values():
+            shown.append(str(v))
+    shown = [k for k in (_eye_key(s) for s in shown) if k]
+    tail = ""
+    told = []
+    for d in drops:
+        if len(told) >= _AUD_TELL:
+            break
+        if d.get("named") and not _aud_shown(d.get("what"), shown):
+            told.append(d)
+    if told:
+        tail = ("\n\nThe check threw these out. None of them happened; "
+                "never mention any of them:\n"
+                + "\n".join("- " + _eye_stamp(d["t"]) + " " + d["what"]
+                            for d in told))
+    doubt = ""
+    if garble:
+        packs = []
+        for i, g in enumerate(garble):
+            # ph, NOT head: reusing `head` here clobbered the body's own
+            # context header, so every ask since 2.95 went out with its
+            # header replaced by the final dossier's first line
+            ph = ("(" + str(i) + ") " + _eye_stamp(g["t"]) + ' the line: "'
+                  + str(g["text"])[:150] + '"')
+            if g.get("standing"):
+                # A GUESS TO RE-JUDGE, NOT A TRUTH TO KEEP. "keep that
+                # only if right" read as permission to rubber-stamp:
+                # sakar-late stayed a latte because an earlier pass said
+                # so. The standing text now arrives as a suspect.
+                ph += ('\n    an earlier pass GUESSED: "'
+                       + str(g["standing"])[:110]
+                       + '" - judge that guess by STEP 1 like anything '
+                       'else. If the sounds spell something different, '
+                       'your fix replaces it.')
+            packs.append(ph + "\n" + _aud_dossier(g, src, src.get("ins"))
+                         [:900])
+        doubt = ("\n\nTHE DOUBTFUL LINES - the whole of your job. Each "
+                 "comes with the conversation around it (>>> marks the "
+                 "line), the tone of the room, and what was heard and "
+                 "seen nearby. Use them:\n\n" + "\n\n".join(packs))
+    return (head + tail + "\n\nWhat the night's other layers found, for "
+            "context only - do not write about any of it:\n"
+            + "\n".join(lines) + doubt
+            + "\n\nReturn only fixes.")
+
+
+def _aud_parse(got, garble):
+    """One parser for whichever thinker answered - the fixes with the
+    sense gate, and the INVESTIGATION VERDICTS: a line the model checked
+    and found already right (Mikello cheesecake - a real shop, said
+    once, seriously) or still unreadable is an answer too, and it is
+    what the panel prints instead of the rarity sentence."""
+    beats, gist, fixes = [], "", []
+    for c in (got.get("checked") or [])[:14]:
+        try:
+            ci = int(c.get("n"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= ci < len(garble or [])):
+            continue
+        v = str(c.get("verdict") or "").strip().lower()
+        if v in ("right", "unclear", "noise"):
+            row = (garble or [])[ci]
+            # A CONFIRMATION OF GIBBERISH IS NOT A CONFIRMATION. A
+            # standing guess whose words the library has never once
+            # heard cannot be voted "right" into permanence - the gate
+            # that judges fixes judges rubber-stamps too.
+            if v == "right" and row.get("standing"):
+                okC, _bw = _aud_sense(row.get("standing"),
+                                      (_AUD_VOCAB.get("freq") or {}))
+                if not okC:
+                    v = "noise"
+            row["verdict"] = v
+            row["vwhy"] = _aud_clip(str(c.get("why") or "").strip())
+    fx_raw = got.get("fixes")
+    if not isinstance(fx_raw, list):
+        return [], "", "the answer had no fixes list", True, \
+            bool(_AI["abort"]), []
+    gated = []
+    for f in fx_raw[:12]:
+        try:
+            i = int(f.get("n"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= i < len(garble or [])):
+            continue
+        heard = str(f.get("heard") or "").strip()
+        was = str((garble or [])[i].get("text") or "")
+        if len(heard) < 2 or heard == was or len(heard) > len(was) * 4 + 40:
+            continue
+        # RE-APPLYING THE STANDING TEXT IS A CONFIRMATION, NOT A FIX -
+        # it changes nothing on disk and fills What-it-changed with
+        # noise rows saying "already correct"
+        if heard == str((garble or [])[i].get("standing") or ""):
+            # ...and re-affirming a standing guess VERBATIM is the same
+            # rubber-stamp through the other door - it too meets the
+            # gate, or it becomes noise
+            okC, _bw = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}))
+            (garble or [])[i]["verdict"] = "right" if okC else "noise"
+            (garble or [])[i]["vwhy"] = \
+                _aud_clip(str(f.get("why") or "").strip())
+            continue
+        okS, badW = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}))
+        if not okS:
+            gated.append(str((garble or [])[i].get("t")))
+            log("The auditor refused its own correction at "
+                + _eye_stamp((garble or [])[i].get("t") or 0)
+                + " - \"" + heard[:60] + "\" failed the sense test ("
+                + ", ".join(badW[:3]) + " appear in no transcript).")
+            continue
+        fixes.append({"t": (garble or [])[i].get("t"), "was": was,
+                      "heard": heard[:200],
+                      "why": _aud_clip(str(f.get("why") or "").strip()),
+                      "odd": (garble or [])[i].get("odd") or []})
+    # A FIX AND A NOISE VERDICT FOR THE SAME LINE CANNOT BOTH STAND -
+    # the strike would land on the just-fixed segment and destroy the
+    # fix. The fix passed the sense gate, so the fix is the answer.
+    fixed_ts = {f.get("t") for f in fixes}
+    for g in (garble or []):
+        if g.get("verdict") == "noise" and g.get("t") in fixed_ts:
+            g.pop("verdict", None)
+            g.pop("vwhy", None)
+    return beats, gist, "", False, False, fixes
+
+
+_AUD_KEEP = {"srv": None, "t": 0.0}
+
+
+def _aud_llm_paths():
+    """(llama-server.exe, model.gguf) for the auditor's own thinker, or
+    None - in which case the audit borrows the describer exactly as it
+    always has. The runtime is the newer llama.cpp shipped as ai/llama2
+    (the main runtime is untouched); the model is Qwen3.8-27B, the one
+    he asked for by name, at the quant that fits his card."""
+    exe = os.path.join(_runtime_dir("llama2"), "llama-server.exe")
+    want = str(SETTINGS.get("audit_model")
+               or "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf")
+    mdl = _model_file(want)
+    if os.path.isfile(exe) and os.path.isfile(mdl):
+        return exe, mdl
+    return None
+
+
+def _aud_keep_drop():
+    """The parked auditor model yields the card - to a describe, an eye,
+    a game, or the sweep's end. Symmetric with _desc_keep_drop."""
+    kp = _AUD_KEEP.get("srv")
+    if kp is None:
+        return
+    _AUD_KEEP["srv"] = None
+    try:
+        threading.Thread(target=kp.stop, daemon=True).start()
+        log("The auditor's thinker steps down from the card.")
+    except Exception:
+        pass
+
+
+class _AudServer:
+    """The auditor's own model server - Qwen with its thinking ON, a
+    32k window (its hybrid attention makes long context nearly free),
+    on port 8909. Small on purpose: start, ask, stop."""
+
+    def __init__(self):
+        self.port = 8909
+        self.base = "http://127.0.0.1:%d" % self.port
+        self.pr = None
+
+    def start(self, budget=600):
+        pth = _aud_llm_paths()
+        if pth is None:
+            return False
+        exe, mdl = pth
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        _free_port(self.port)
+        try:
+            self.pr = _popen(
+                [exe, "-m", mdl, "--port", str(self.port),
+                 # 16384, MEASURED: at 32k this model spills past the
+                 # card and generation collapses to ~1 token/s (93s for
+                 # 103 tokens); at 16k it runs at full speed with room
+                 # for its thinking. The dossier ask is ~3k tokens.
+                 "-c", "16384", "--no-webui", "-t", "10",
+                 "--ctx-checkpoints", "0", "-ub", "1024",
+                 "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags)
+        except Exception as e:
+            log("The auditor's thinker could not be spawned: "
+                + str(e)[:120])
+            return False
+        _AI["proc"] = self.pr          # the abort path must reach the load
+        t0 = time.time()
+        while time.time() - t0 < budget:
+            if _AI["abort"] or self.pr.poll() is not None:
+                self.stop()
+                return False
+            try:
+                _urlreq.urlopen(self.base + "/health", timeout=2).read()
+                log("The auditor's thinker is up on port %d: %s, "
+                    "loaded in %ds." % (self.port, os.path.basename(mdl),
+                                        int(time.time() - t0)))
+                return True
+            except Exception:
+                time.sleep(1)
+        self.stop()
+        return False
+
+    def ask(self, system, user, max_tokens=2500):
+        """One question, thinking OFF - measured at 774 seconds of
+        deliberation that never reached its answer on this card. The
+        model's instruction-following and the walkthrough prompt are the
+        strength; both output fields are read anyway, belt and braces."""
+        try:
+            body = json.dumps({
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+                "max_tokens": max_tokens, "temperature": 0.4,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "stream": False}).encode("utf-8")
+            req = _urlreq.Request(self.base + "/v1/chat/completions",
+                                  data=body,
+                                  headers={"content-type":
+                                           "application/json"})
+            with _urlreq.urlopen(req, timeout=1800) as r:
+                out = json.loads(r.read().decode("utf-8"))
+            msg = (out.get("choices") or [{}])[0].get("message") or {}
+            return ((msg.get("content") or "") + "\n"
+                    + (msg.get("reasoning_content") or "")).strip()
+        except Exception as e:
+            log("The auditor's thinker did not answer: " + str(e)[:120])
+            return ""
+
+    def stop(self):
+        pr, self.pr = self.pr, None
+        if pr is not None:
+            try:
+                pr.terminate()
+            except Exception:
+                pass
+
+
+def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
+                garble=None):
+    """The one ask, and it is now ONLY about mis-heard lines - on the
+    describer the review parked warm where there is one, borrowed
+    exactly the way a review borrows it (_insights_one, line for line).
+    Returns (beats, gist, why-it-is-missing, worth-retrying, was-it-held,
+    fixes); beats and gist are always empty now and remain in the shape
+    only so the caller reads the same way it always did.
+
+    NOTHING TO ASK IS NOT A FAILURE. With the storytelling gone, a night
+    whose transcript has no doubtful lines needs no model at all - the
+    audit is pure arithmetic and finishes in seconds. That is most
+    nights, and across a twelve-hundred-recording backlog it is the
+    difference between a week of card time and an afternoon.
+
+    HELD IS NOT FAILED, and that fifth value is the whole reason it
+    exists: an abort or a game starting must not count against this
+    recording. The last cut let it, and three game starts during the
+    telling took tries to 3, after which _aud_owing went quiet and that
+    night could never be audited again by anything.
+
+    THERE IS NOT ALWAYS SOMETHING WARM. The comment here used to promise
+    the model loads once for the whole thinking job - true after a review,
+    false after a senses-only visit, which on his shelf is 345 of 399
+    recordings (355 finished reviews, 10 senses passes). A cold load for
+    one 900-token ask is a minute of the same card his games want, so it
+    is announced in the log before it happens and refused outright while
+    he is playing.
+
+    The first cut probed /health with a one-second timeout and, when the
+    probe failed, called start() - which sweeps port 8907 before spawning
+    and so put down a running describe job's model mid-window. There is
+    no probe here at all. A parked warm server is borrowed; anything else
+    means this pass owns the card, which is the only condition under
+    which it is allowed to start one."""
+    if not garble:
+        return [], "", "", False, False, []      # nothing to ask
+    # WHAT USED TO BE HERE: "if not anchors: return". That gate guarded
+    # the story ask, and it outlived the story - a night whose marks all
+    # failed the check but whose transcript still had garbled lines was
+    # sent away with "nothing survived worth telling" and its repairs
+    # were never asked for. Anchors are context for the ask now; only
+    # the garble above decides whether the model is needed at all.
+    if _AI["abort"]:
+        return [], "", "interrupted before it could be told", True, True, []
+    try:
+        pp = os.path.dirname(video_path)
+        game = (os.path.basename(os.path.dirname(pp))
+                if os.path.basename(pp).lower() in ("videos", "clips")
+                else os.path.basename(pp)) or "an unknown game"
+    except Exception:
+        game = "an unknown game"
+    # ===== THE THINKER FIRST, before any describer is touched. =========
+    # The first cut bolted this INSIDE the describer's borrow, so every
+    # thinker audit borrowed - or cold-loaded - a gemma it never asked,
+    # and parked BOTH models on a sixteen-gigabyte card. The thinker now
+    # answers on its own or steps down; the describer path below runs
+    # untouched when the thinker is absent or fails.
+    if _aud_llm_paths() is not None:
+        body = _aud_body(anchors, drops, game, dur, src, places, crs,
+                         garble)
+        asrv = _AUD_KEEP.get("srv")
+        if asrv is not None and (asrv.pr is None
+                                 or asrv.pr.poll() is not None):
+            asrv = None                # parked but dead
+        if asrv is None:
+            if _aud_playing():
+                return [], "", ("he started playing before the night "
+                                "could be told"), True, True, []
+            _desc_keep_drop()          # one model on the card, ever
+            asrv = _AudServer()
+            if not asrv.start():
+                if _AI["abort"]:
+                    return [], "", "interrupted before it could be told", \
+                        True, True, []
+                asrv = None            # would not wake - gemma may try
+        if asrv is not None:
+            _AI["proc"] = asrv.pr      # Stop and a game must reach it
+            _AUD_KEEP["srv"] = asrv
+            _AUD_KEEP["t"] = time.time()
+            txt = asrv.ask(_AUD_SYSTEM, body,
+                           max_tokens=1600 + 80 * len(garble or []))
+            if not txt and not _AI["abort"]:
+                # THE DRIVER DROPS THE SERVER SOMETIMES - a null-read
+                # crash mid-ask on this card's Vulkan, seen in the wild
+                # as a Windows error popup and an empty answer. One
+                # honest respawn before giving the night to gemma.
+                log("The thinker's server dropped mid-ask - waking it "
+                    "once more.")
+                asrv.stop()
+                asrv = _AudServer()
+                if asrv.start():
+                    _AI["proc"] = asrv.pr
+                    _AUD_KEEP["srv"] = asrv
+                    txt = asrv.ask(_AUD_SYSTEM, body,
+                                   max_tokens=1600 + 80 * len(garble or []))
+                else:
+                    asrv = None
+            _AUD_KEEP["t"] = time.time()
+            if _AI["abort"]:
+                # a game started mid-ask: held, never a burned try
+                _aud_keep_drop()
+                return [], "", "interrupted before it could be told", \
+                    True, True, []
+            if txt:
+                got = None
+                try:
+                    got = json.loads(
+                        re.search(r"\{.*\}", txt, re.S).group(0))
+                except Exception:
+                    pass
+                if got is not None:
+                    return _aud_parse(got, garble)
+            _aud_keep_drop()           # answered nothing - gemma may try
+    # ===== the describer path, exactly as it always was. ===============
+    if _describer_paths() is None:
+        # not a failure and not worth a retry - there is no model on this
+        # machine to tell it with. _aud_src carries a describer flag, so
+        # installing one is what wakes this again.
+        return [], "", ("no model on this machine could tell the night - "
+                        "the describer is not installed"), False, False, []
+    srv = _DESC_KEEP.get("srv")
+    _DESC_KEEP["srv"] = None
+    warm = bool(srv is not None and srv.pr is not None
+                and srv.pr.poll() is None)
+    if warm:
+        _AI["proc"] = srv.pr           # the abort path must still reach it
+    else:
+        if srv is not None:
+            srv.stop()                 # parked but dead - leave cleanly
+        srv = _DescServer()
+    try:
+        if not warm:
+            if _aud_playing():
+                # this job may have been spawned twenty minutes ago; the
+                # card belongs to whatever he just started
+                return [], "", ("he started playing before the night could "
+                                "be told"), True, True, []
+            log("The auditor is waking the describer to tell "
+                + os.path.basename(video_path) + " - nothing was left warm "
+                "by this job, so telling it costs a full model load.")
+        if not (warm or srv.start()):
+            return [], "", ("interrupted" if _AI["abort"]
+                            else "the describer would not start"), True, \
+                bool(_AI["abort"]), []
+        body = _aud_body(anchors, drops, game, dur, src, places, crs,
+                         garble)
+        # the doubtful lines want a little more room to come back in.
+        # NO GRAMMAR on this ask, on purpose and by measurement: the
+        # schema fence costs 2.4x on gemma's 262k vocabulary (59s vs 24s
+        # on the same night, same server), the parser below has been
+        # defensive since the day it was written, and the price of a
+        # malformed answer is one retry - the price of the grammar was
+        # 35 seconds a night across a 442-night backlog.
+        txt = srv.ask(_AUD_SYSTEM, body,
+                      max_tokens=900 + (60 * len(garble or [])))
+        if not txt:
+            return [], "", "no answer came back", True, False, []
+        try:
+            got = json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
+        except Exception:
+            return [], "", "the answer would not parse", True, False, []
+        return _aud_parse(got, garble)
+    except Exception as e:
+        return [], "", str(e)[:140], True, False, []
+    finally:
+        if (not _AI["abort"] and srv.pr is not None
+                and srv.pr.poll() is None):
+            _DESC_KEEP["srv"] = srv        # park it back where it was
+            _DESC_KEEP["t"] = time.time()
+        else:
+            srv.stop()
+
+
+def _aud_read(video_path, kind):
+    """A layer's own file - but only when it still describes THIS video.
+    A sidecar older than the recording was written about footage a trim
+    may since have cut, and auditing against it would condemn good marks
+    for failing to match a night that no longer exists. Returns
+    (the dict, was-it-stale)."""
+    try:
+        sp = _ai_sidecar(video_path, kind)
+        if not os.path.isfile(sp):
+            return {}, False
+        if os.path.getmtime(sp) < os.path.getmtime(video_path):
+            return {}, True
+    except OSError:
+        return {}, False
+    d = _read_sidecar(video_path, kind)
+    if not isinstance(d, dict) or d.get("failed"):
+        return {}, False
+    return d, False
+
+
+def _aud_src(video_path):
+    """When each layer this audit was built from last moved. The audit is
+    owed again the moment any of them does - a redone review is a
+    different night to tell.
+
+    ABSENT IS A VALUE. The first cut only recorded the layers that
+    existed and only compared the ones that exist NOW, so a layer deleted
+    since the audit was written was never noticed by either side and the
+    audit stayed 'settled' forever on evidence that had been thrown
+    away."""
+    out = {}
+    for kind in ("hl", "sns", "vis", "ins", "stt"):
+        try:
+            out[kind] = round(os.path.getmtime(
+                _ai_sidecar(video_path, kind)), 1)
+        except OSError:
+            out[kind] = 0.0
+    # installing the describer makes an untold night tellable, and
+    # nothing else in here would ever notice
+    out["desc"] = 1.0 if _describer_paths() is not None else 0.0
+    return out
+
+
+_AUD_OWE_CACHE = {}
+
+
+def _aud_owing_swept(video_path):
+    """_aud_owing behind a two-stat signature, for the sweep - which asks
+    about every settled recording every five seconds. The signature is
+    deliberately narrow (the video and the audit file): a layer that
+    moves without touching either reaches the audit through the thinking
+    worker it rode in on, and the sweep's job is only the backlog - the
+    version bump, and audits a pause orphaned."""
+    try:
+        sig = (os.path.getmtime(video_path),
+               os.path.getmtime(_ai_sidecar(video_path, "aud"))
+               if os.path.isfile(_ai_sidecar(video_path, "aud")) else -1.0,
+               # the review's clock: owing is gated on an honest review
+               # now, so a redone review must bust this cache or its
+               # audit stays un-owed forever
+               os.path.getmtime(_ai_sidecar(video_path, "ins"))
+               if os.path.isfile(_ai_sidecar(video_path, "ins")) else -1.0,
+               _describer_paths() is not None,
+               _aud_llm_paths() is not None)
+    except OSError:
+        return False
+    key = os.path.normcase(os.path.abspath(video_path))
+    hit = _AUD_OWE_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    try:
+        ans = _aud_owing(video_path)
+    except Exception:
+        ans = False
+    _AUD_OWE_CACHE[key] = (sig, ans)
+    return ans
+
+
+def _aud_owing(video_path):
+    """Does this recording still owe an audit? Missing, older than the
+    video, or built from layers that have MOVED (or gone) since = owed;
+    failed or unfinished with tries left = owed.
+
+    The source check comes FIRST on purpose: a stale .hl replaced by a
+    real one must wake this pass however many times the audit refused
+    before, or a night stays judged on a file it no longer has."""
+    # LOCKED UNTIL THE DESCRIPTION EXISTS. The audit reads every layer
+    # back - the description included - so a night without an honestly
+    # finished review has nothing complete to audit. No transcript means
+    # no review, and no review means no audit; the chain he named.
+    try:
+        if not _ins_done_honest(video_path):
+            return False
+    except Exception:
+        return False
+    ap = _ai_sidecar(video_path, "aud")
+    try:
+        if not os.path.isfile(ap) or \
+                os.path.getmtime(ap) < os.path.getmtime(video_path):
+            return True
+    except OSError:
+        return False
+    try:
+        with open(ap, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return True
+    src = d.get("src") if isinstance(d.get("src"), dict) else {}
+    now = _aud_src(video_path)
+    for k in set(now) | set(src):
+        try:
+            # half a second of slack for the rounding above and nothing
+            # more: a layer that has been rewritten must wake this, or
+            # the thread goes on describing chapters that are gone
+            if abs(float(src.get(k) or 0) - float(now.get(k) or 0)) > 0.5:
+                return True
+        except (TypeError, ValueError):
+            return True
+    if d.get("failed") or not d.get("complete"):
+        return int(d.get("tries") or 0) < 3
+    # AN OLDER AUDIT IS A SMALLER AUDIT. Version 1 never looked at the
+    # transcript at all, so a complete:true from it is a verdict on a
+    # narrower question than the one this version answers.
+    try:
+        if int(d.get("v") or 0) < _AUD_V:
+            return True
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _aud_clocked(rows, key):
+    """The rows that carry a usable clock, in time order. Every list this
+    pass walks comes off disk, and a sort key that calls float() straight
+    turns one malformed row into a failed audit for the whole night."""
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            float(r.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        out.append(r)
+    out.sort(key=lambda r: float(r.get(key) or 0))
+    return out
+
+
+def _aud_corrected(video_path):
+    """Every correction currently STANDING in the transcript, read from
+    the transcript itself - the was/fx markers on the segments. This is
+    what the panel shows, and reading it from the file is what makes a
+    re-audit unable to forget it: the first cut kept this list in the
+    .aud, a re-audit rewrote the .aud wholesale, and a line corrected
+    into Arabic then vanished from every list (no Latin words left for
+    the garble check) - corrected on disk, invisible, un-undoable."""
+    rows = []
+    try:
+        with open(_ai_sidecar(video_path, "stt"), encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return rows
+    for sg in (d.get("segments") or []):
+        if not isinstance(sg, dict):
+            continue
+        try:
+            a = round(float(sg.get("a") or 0) / 1000.0, 1)
+        except (TypeError, ValueError):
+            continue
+        if sg.get("was") is not None:
+            odd = sg.get("fxo")
+            rows.append({"t": a, "was": str(sg.get("was"))[:200],
+                         "now": str(sg.get("t") or "")[:300],
+                         "nn": bool(sg.get("nn")),
+                         "why": str(sg.get("fxw") or "")[:600],
+                         "odd": [str(x)[:30] for x in odd][:4]
+                         if isinstance(odd, list) else [],
+                         "put_back": False})
+        elif sg.get("pin"):
+            rows.append({"t": a, "was": "",
+                         "now": str(sg.get("t") or "")[:200],
+                         "odd": [], "put_back": True})
+    return rows[:40]
+
+
+def _aud_word_seen(w, freq):
+    """Is this token a word the library has ever written? Same rules as
+    the sense gate: Arabic raw plus the stripped/added leading al-;
+    Latin lowercase. <=2 sightings counts as never (the garble bar)."""
+    if re.match(r"[\u0600-\u06ff]", w):
+        w2 = w[2:] if w.startswith("\u0627\u0644") and len(w) > 3 else w
+        seen = max(freq.get(w, 0), freq.get(w2, 0),
+                   freq.get("\u0627\u0644" + w, 0))
+    else:
+        seen = freq.get(w.lower(), 0)
+    return (seen or 0) > 2
+
+
+def _aud_keep_split(text, freq):
+    """The readable sentences of a line the thinker called noise.
+
+    "she's downstairs i saw her was perfectly read.. the rest is
+    gibberish.. it should only remove the gibberish if its in the same
+    sentence, not the full sentence." The line is split at sentence
+    ends; a sentence survives only when EVERY word in it is a real
+    library word - the thinker already called the whole line noise, so
+    only the bulletproof parts are spared. Each run of struck
+    sentences collapses to one [unintelligible]. Returns
+    (kept_text, clean_count) or (None, 0) when nothing is worth
+    sparing (single-sentence lines and all-noise lines strike whole,
+    exactly as before)."""
+    parts = re.split(r"(?<=[.!?\u061f])\s+", str(text or "").strip())
+    parts = [p for p in parts if p.strip()]
+    if len(parts) < 2 or not freq:
+        return None, 0
+    out, clean = [], 0
+    for p in parts:
+        toks = re.findall(r"[A-Za-z']{2,}|[\u0600-\u06ff]{2,}", p)
+        good = bool(toks) and all(_aud_word_seen(w, freq) for w in toks)
+        if good:
+            out.append(p)
+            clean += 1
+        elif not out or out[-1] != "[unintelligible]":
+            out.append("[unintelligible]")
+    if not clean or clean == len(parts):
+        return None, 0
+    return " ".join(out), clean
+
+
+def _aud_restrike(video_path, freq):
+    """Old FULL strikes re-cut along their sentences - the retro-heal.
+
+    Every line struck whole before the splitter existed is re-read: if
+    readable sentences are buried in it, the line comes back as a
+    partial strike (pn) with those sentences restored. Never a pinned
+    line. Returns the healed lines' clocks - their windows must be
+    re-described too, or the chapters keep telling the struck-era
+    words (review 303)."""
+    try:
+        sp = _ai_sidecar(video_path, "stt")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return []
+    n = 0
+    healed_ts = []
+    for sg in (d.get("segments") or []):
+        if not isinstance(sg, dict) or sg.get("pin") or not sg.get("nn"):
+            continue
+        keep, ncl = _aud_keep_split(sg.get("was"), freq)
+        if not keep:
+            continue
+        sg["t"] = keep
+        sg.pop("nn", None)
+        sg["pn"] = 1
+        # the why must stop swearing the whole span was noise
+        _ow = str(sg.get("fxw") or "").rstrip().rstrip(".")
+        sg["fxw"] = _aud_clip(
+            (_ow + ". " if _ow else "")
+            + "The readable sentences were given back; only the static "
+            "stays struck.")
+        try:
+            healed_ts.append(float(sg.get("a") or 0) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+        n += 1
+    if n:
+        try:
+            _atomic_write_json(sp, d)
+            log("The splitter healed " + str(n) + " struck line(s) on "
+                + os.path.basename(video_path) + " - the readable "
+                "sentences are back, only the static stays struck.")
+        except Exception:
+            return []
+    return healed_ts
+
+
+def _aud_refresh_whys(video_path, garble):
+    """The re-judge's fresh reasoning lands on the standing correction
+    it just judged. The old whys were cut at 160 characters by the
+    early passes and stood in the transcript that way - "i dont have
+    anywhere else to read this, give me the full thing". Returns how
+    many were refreshed."""
+    todo = [g for g in (garble or [])
+            if g.get("standing") and str(g.get("vwhy") or "").strip()
+            and g.get("verdict") in ("right", "unclear")]
+    if not todo:
+        return 0
+    try:
+        sp = _ai_sidecar(video_path, "stt")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return 0
+    n = 0
+    for g in todo:
+        try:
+            gt = float(g.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        why = _aud_clip(str(g.get("vwhy")).strip())
+        if g.get("verdict") == "unclear":
+            why = "the auditor doubts this reading now - " + why
+        for sg in (d.get("segments") or []):
+            if not isinstance(sg, dict) or sg.get("pin")                     or not sg.get("fx") or sg.get("was") is None:
+                continue
+            try:
+                a = float(sg.get("a") or 0) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if abs(a - gt) > 2.0:
+                continue
+            # the shortlist clips standing at 200 characters - a long
+            # correction matches on its head, or it would never heal
+            stx = str(sg.get("t") or "").strip()
+            gst = str(g.get("standing") or "").strip()
+            if stx != gst and not (len(gst) >= 200
+                                   and stx.startswith(gst)):
+                continue
+            if str(sg.get("fxw") or "") != why:
+                sg["fxw"] = why
+                n += 1
+            break
+    if n:
+        try:
+            _atomic_write_json(sp, d)
+        except Exception:
+            return 0
+    return n
+
+
+def _aud_apply_strikes(video_path, garble, skip_ts=None, freq=None):
+    """The lines the thinker called noise, struck from the record.
+
+    "i would much rather the auditor just removes this - it tried and
+    it couldnt, its just jibber, so say unintelligible." The line's
+    text becomes the one honest word; the original stays under "was"
+    so Put-it-back is a field swap; nn marks it settled - the garble
+    list, the sense reverter, search and the vocabulary all step
+    around a struck line, and no later audit re-litigates it. Pinned
+    lines are never touched. Returns the count struck; marks each
+    struck garble row with struck=True."""
+    todo = [g for g in (garble or []) if g.get("verdict") == "noise"]
+    if not todo:
+        return 0
+    try:
+        sp = _ai_sidecar(video_path, "stt")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return 0
+    segs = d.get("segments") or []
+    n = 0
+    for g in todo:
+        try:
+            gt = float(g.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        was = str(g.get("text") or "").strip()
+        if not was:
+            continue
+        for sg in segs:
+            if not isinstance(sg, dict) or sg.get("pin") or sg.get("nn") \
+                    or sg.get("pn"):
+                # pn too: a partial strike still matches by its was, so
+                # a twin's noise strike would re-land HERE and the real
+                # noise twin would stay live (review 303, confirmed)
+                continue
+            try:
+                a = float(sg.get("a") or 0) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if abs(a - gt) > 2.0:
+                continue
+            # TWIN TEXTS: a repeated exclamation two seconds apart, one
+            # fixed and one called noise, matched the FIXED one first
+            # and clobbered the fresh fix. THE segment a fix just
+            # touched is not this strike's to take - and only that one:
+            # a fix's clock IS its segment's clock (rounded to 0.1), so
+            # the guard is a same-segment test, never a radius that
+            # would shield the noise twin beside it.
+            if any(abs(a - float(st)) <= 0.15 for st in (skip_ts or [])):
+                continue
+            txt = str(((sg.get("was") if sg.get("fx")
+                        and sg.get("was") is not None else sg.get("t")))
+                      or "").strip()
+            if txt != was and not (len(was) >= 200
+                                   and txt.startswith(was)):
+                continue
+            if not (sg.get("fx") and sg.get("was") is not None):
+                sg["was"] = sg.get("t")
+            # a bad standing guess dies here too - "was" already holds
+            # the true original, and the guess is what gets overwritten
+            keep, _ncl = _aud_keep_split(txt, freq or {})
+            if keep:
+                # THE READABLE SENTENCES SURVIVE - only the static in
+                # between is struck. pn, not nn: the line stays live
+                # for search and the page.
+                sg["t"] = keep
+                sg["pn"] = 1
+                sg.pop("nn", None)
+            else:
+                sg["t"] = "[unintelligible]"
+                sg["nn"] = 1
+                sg.pop("pn", None)
+            sg["fx"] = 1
+            why = str(g.get("vwhy") or "").strip()
+            sg["fxw"] = _aud_clip(why or ("two ears and the story all "
+                                          "failed this span - it holds "
+                                          "no readable speech"))
+            odd = [str(x)[:30] for x in (g.get("odd") or [])][:4]
+            if odd:
+                sg["fxo"] = odd
+            g["struck"] = True
+            n += 1
+            break
+    if n:
+        _aud_bank_orig(video_path, "stt")
+        try:
+            _atomic_write_json(sp, d)
+        except Exception:
+            return 0
+    return n
+
+
+def _aud_retell(video_path, changed_ts, refill=True):
+    """The corrected minutes get their description back - JUST those.
+
+    A fixed or struck line can change what a chapter was about, so the
+    audit re-describes the window(s) its corrections landed in - never
+    the whole night ("it doesnt do the full description just the
+    section where it made changes"). The dirty windows are cut from
+    the .ins and _insights_one refills exactly the missing ones;
+    completion re-asks the title and summary from the new chapter
+    names, so the name of the night follows its words. Interrupted
+    halfway, the .ins is simply incomplete and the sweep's own
+    thinking lane finishes it - nothing is lost. Returns how many
+    windows were sent back."""
+    if not changed_ts:
+        return 0
+    try:
+        sp = _ai_sidecar(video_path, "ins")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return 0
+    wins = d.get("windows") if isinstance(d.get("windows"), dict) else {}
+    if not wins:
+        return 0       # nothing described yet - nothing to send back
+    was_complete = bool(d.get("complete"))
+    try:
+        win = float(d.get("win_len") or 1800) or 1800.0
+    except (TypeError, ValueError):
+        win = 1800.0
+    dirty = set()
+    for t in changed_ts:
+        try:
+            lo = (float(t) // win) * win
+        except (TypeError, ValueError):
+            continue
+        for kk in (str(int(lo)), str(lo)):
+            if kk in wins:
+                dirty.add(kk)
+                break
+    if not dirty:
+        return 0
+    for k in dirty:
+        wins.pop(k, None)
+    d["complete"] = False
+    d["tries"] = 0
+    try:
+        _atomic_write_json(sp, d)
+    except Exception:
+        return 0
+    log("The audit corrected lines inside " + str(len(dirty))
+        + " described window(s) of " + os.path.basename(video_path)
+        + " - re-describing just those minutes, then the title.")
+    if not (refill and was_complete):
+        # the card is leaving, or the review was already mid-build: the
+        # MARK is on disk (instant, no model), and the sweep's own
+        # thinking lane refills the missing windows - the night
+        # self-heals instead of describing the old words forever
+        return len(dirty)
+    _aud_keep_drop()               # one model on the card, ever
+    try:
+        _insights_one(video_path, forced=True)
+    except Exception as e:
+        log("The re-describe after the audit stumbled: " + str(e)[:120])
+    return len(dirty)
+
+
+def _aud_bank_orig(video_path, kind):
+    """One disaster copy, taken before the FIRST correction ever lands on
+    this sidecar and never touched again. Undo is field-level and exact;
+    this exists for the day something is wrong in a way undo cannot see."""
+    try:
+        sp = _ai_sidecar(video_path, kind)
+        bp = sp[:-len(".json")] + ".was.json"
+        if os.path.isfile(sp) and not os.path.isfile(bp):
+            shutil.copy2(sp, bp)
+    except Exception:
+        pass
+
+
+def _aud_apply_fixes(video_path, fixes):
+    """The corrections, written into the transcript itself.
+
+    Each fix must find its line honestly: same second (within 2s) and the
+    same words the shortlist showed the model. A line already corrected
+    once is never matched again - the marker IS the idempotency. The
+    original stays on the segment under "was", so undo is a field swap.
+    Returns the count applied; annotates each fix row with applied."""
+    if not fixes:
+        return 0
+    try:
+        sp = _ai_sidecar(video_path, "stt")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return 0
+    segs = d.get("segments") or []
+    n = 0
+    for f in fixes:
+        f["applied"] = False
+        try:
+            ft = float(f.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        was = str(f.get("was") or "").strip()
+        heard = str(f.get("heard") or "").strip()
+        if not was or not heard:
+            continue
+        for sg in segs:
+            if not isinstance(sg, dict) or sg.get("pin"):
+                continue          # put back BY HIM - settled forever
+            try:
+                a = float(sg.get("a") or 0) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if abs(a - ft) > 2.0:
+                continue
+            # A RE-CORRECTION MATCHES THE ORIGINAL. The shortlist shows
+            # the original text of a standing fix, so that is what the
+            # answer is matched against - and "was" keeps the true
+            # original, never a bad correction's text.
+            txt = str(((sg.get("was") if sg.get("fx")
+                        and sg.get("was") is not None else sg.get("t")))
+                      or "").strip()
+            # the shortlist clips what it shows at 200 characters, so a
+            # long line matches on its head rather than not at all
+            if txt != was and not (len(was) >= 200
+                                   and txt.startswith(was)):
+                continue
+            if not (sg.get("fx") and sg.get("was") is not None):
+                sg["was"] = sg.get("t")
+            sg["t"] = heard
+            sg["fx"] = 1
+            why = str(f.get("why") or "").strip()
+            if why:
+                sg["fxw"] = _aud_clip(why)
+            # WHY, kept with the change. The words that flagged this line
+            # live in the shortlist, which is rebuilt from scratch every
+            # audit - so without this the panel could only ever offer a
+            # generic sentence about a specific decision.
+            odd = [str(x)[:30] for x in (f.get("odd") or [])][:4]
+            if odd:
+                sg["fxo"] = odd
+            # a line corrected INTO Arabic script is an Arabic line now -
+            # the display groups by this, nothing else does
+            ar = sum(1 for ch in heard if "\u0600" <= ch <= "\u06ff")
+            if ar > len(heard) / 2 and sg.get("lang"):
+                sg["lang"] = "arabic"
+            f["applied"] = True
+            n += 1
+            break
+    if n:
+        _aud_bank_orig(video_path, "stt")
+        try:
+            _atomic_write_json(sp, d)
+        except Exception:
+            return 0
+    return n
+
+
+def _aud_apply_names(video_path, names):
+    """A person spelt one way in the title and another in the night is
+    respelt the way the NIGHT says it - that is the spelling his search
+    can actually find. Every swap is remembered in the sidecar's
+    "names_fixed" so it can be reversed exactly, and the possessive
+    keeps its 's only when the new spelling is Latin - فيصل's is not a
+    word in either language."""
+    todo = [r for r in (names or [])
+            if r.get("verdict") == "spelt" and r.get("said")]
+    if not todo:
+        return []
+    try:
+        sp = _ai_sidecar(video_path, "ins")
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+    except Exception:
+        return []
+
+    def _fields(doc):
+        yield doc, "title"
+        yield doc, "summary"
+        for key in ("chapters", "moments"):
+            for row in (doc.get(key) or []):
+                if isinstance(row, dict):
+                    yield row, "label"
+                    yield row, "why"
+        wins = doc.get("windows")
+        wl = (list(wins.values()) if isinstance(wins, dict)
+              else wins if isinstance(wins, list) else [])
+        for w in wl:
+            if not isinstance(w, dict):
+                continue
+            for key in ("segments", "chapters", "moments"):
+                for row in (w.get(key) or []):
+                    if isinstance(row, dict):
+                        yield row, "title"
+                        yield row, "label"
+
+    fixed = []
+    for r in todo:
+        nm, said = str(r["name"]), str(r["said"])
+        latin = bool(re.match(r"^[A-Za-z]", said))
+        rx = re.compile(r"\b" + re.escape(nm) + r"(?P<poss>['\u2019]s)?\b")
+        count = 0
+        for obj, key in _fields(d):
+            v = obj.get(key)
+            if not isinstance(v, str) or nm not in v:
+                continue
+            new = rx.sub(lambda m: said + ((m.group("poss") or "")
+                                           if latin else ""), v)
+            if new != v:
+                count += len(rx.findall(v))
+                obj[key] = new
+        if count:
+            fixed.append({"from": nm, "to": said, "n": count,
+                          "why": str(r.get("how") or "")[:120]})
+    if fixed:
+        _aud_bank_orig(video_path, "ins")
+        d.setdefault("names_fixed", []).extend(fixed)
+        try:
+            _atomic_write_json(sp, d)
+        except Exception:
+            return []
+    return fixed
+
+
+def _aud_carry(garble, prior_garble):
+    """Settled verdicts ride from the last audit onto this one's
+    shortlist. A row carries only when the CLOCK and the EXACT TEXT
+    both match - any change to the line, the carry misses and the
+    model is asked fresh. Only right/unclear carry (fixes and strikes
+    already settled their lines on the transcript itself), and only
+    verdicts that brought a why. Returns how many carried."""
+    n = 0
+    for g in (garble or []):
+        if not isinstance(g, dict):
+            continue
+        for p0 in (prior_garble or []):
+            if not isinstance(p0, dict):
+                continue           # a corrupt old row must never cost
+                #                    the whole fresh shortlist
+            try:
+                # SAME SEGMENT, not merely nearby: garble clocks come
+                # from the segment itself (rounded 0.1), so a real
+                # match sits within 0.15 - a twin 0.4s away does not
+                if abs(float(p0.get("t") or 0)
+                       - float(g.get("t") or 0)) > 0.15:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if str(p0.get("text") or "") != str(g.get("text") or ""):
+                # same second, different words - keep scanning: garble
+                # clusters, and the neighbour must not shadow the row
+                # that truly matches
+                continue
+            if str(p0.get("standing") or "")                     != str(g.get("standing") or ""):
+                # the STANDING guess changed (a revert took it back, a
+                # fix replaced it) - the old verdict judged a different
+                # question; the model gets asked fresh (review 306)
+                break
+            if p0.get("verdict") in ("right", "unclear")                     and str(p0.get("vwhy") or "").strip():
+                g["verdict"] = p0.get("verdict")
+                g["vwhy"] = p0.get("vwhy")
+                g["carried"] = True
+                n += 1
+            break
+    return n
+
+
+def _audit_one(video_path, redo=False):
+    """The auditor over one recording -> the .aud sidecar.
+
+    Runs LAST, after the senses, the eye and the review, because it is
+    the only pass whose whole job is reading the others back. The
+    checking half is arithmetic and always runs; the story half is one
+    ask and is allowed to be missing.
+
+    It writes ONE file: its own. Returns True when a complete audit
+    landed."""
+    name = os.path.basename(video_path)
+    ap = _ai_sidecar(video_path, "aud")
+    prior = 0
+    try:
+        with open(ap, encoding="utf-8") as fh:
+            prior = int((json.load(fh) or {}).get("tries") or 0)
+    except Exception:
+        pass
+
+    def _beat(phase, frac, ask_eta=None):
+        # the Working row reads this; every value is a REAL checkpoint,
+        # and the ask window advances against a measured per-line cost
+        _AI["aud_prog"] = {"phase": phase, "frac": float(frac),
+                           "at": time.time(),
+                           "ask_eta": ask_eta,
+                           "lines": None}
+
+    def _put(doc):
+        try:
+            os.makedirs(os.path.dirname(ap), exist_ok=True)
+            # a replaced audit banks like a replaced transcript does -
+            # the Versions panel shows which auditor wrote each one
+            if os.path.isfile(ap) and doc.get("complete"):
+                try:
+                    _bank_sidecar(video_path, "aud")
+                except Exception:
+                    pass
+            _atomic_write_json(ap, doc)
+            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+            _AI["done_path"] = video_path
+        except Exception as e2:
+            log("The auditor could not write its own sidecar for " + name
+                + ": " + str(e2)[:120])
+    try:
+        # A STALE .hl IS NOT AN EMPTY ONE. The first cut read a stale
+        # highlights file as zero marks, audited the nothing, and wrote
+        # complete:true - a confident, wrong verdict that then stuck,
+        # because a complete audit is never asked again.
+        _beat("reading the layers", 0.04)
+        if not _ai_sidecar_fresh(video_path, "hl"):
+            _put({"v": _AUD_V, "complete": False, "tries": prior + 1,
+                  "when": int(time.time()), "thread": [], "dropped": [],
+                  "merged": [],
+                  "warnings": ["the gold marks are missing or older than "
+                               "the recording, so there was nothing "
+                               "honest to check - the sound pass has to "
+                               "run again first"],
+                  "saw": {}, "src": _aud_src(video_path)})
+            log("The auditor left " + name + " alone: its gold marks "
+                "predate the recording.")
+            _AI.pop("aud_prog", None)
+            return False
+        hl = _read_sidecar(video_path, "hl") or {}
+        # ONE BAD ROW IS ONE BAD ROW. Sorting on a raw float() meant a
+        # single mark with a junk clock raised inside the key function and
+        # took the whole audit down to "failed" - 971 honest verdicts lost
+        # to one. A mark with no clock is not a mark; it is skipped.
+        events = _aud_clocked(hl.get("events") or [], "t")
+        stale = []
+        sns, s1 = _aud_read(video_path, "sns")
+        vis, s2 = _aud_read(video_path, "vis")
+        ins, s3 = _aud_read(video_path, "ins")
+        stt_doc, s4 = _aud_read(video_path, "stt")
+        for kind, was in (("sns", s1), ("vis", s2), ("ins", s3),
+                          ("stt", s4)):
+            if was:
+                stale.append(kind)
+        stt = _aud_clocked(stt_doc.get("segments") or [], "a")
+        laughs = []
+        for e in events:
+            k = str(e.get("kind") or "")
+            if k in ("laugh", "scream"):
+                try:
+                    laughs.append((float(e.get("t") or 0), k))
+                except (TypeError, ValueError):
+                    continue
+        src = {"stt": stt, "sns": sns, "vis": vis, "ins": ins,
+               "laughs": laughs}
+        try:
+            dur = float(ins.get("vdur") or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if dur <= 0 and events:
+            dur = max(float(e.get("t") or 0) for e in events) + 30.0
+
+        # TWO PASSES, because the first is what tells us whether the
+        # second is entitled to an opinion at all.
+        seen = {}
+        for e in events:
+            try:
+                lay, _d = _aud_says(float(e.get("t") or 0), src)
+            except (TypeError, ValueError):
+                continue
+            for k in lay:
+                seen[k] = seen.get(k, 0) + 1
+        live = _aud_live(seen, len(events))
+
+        rows, drops, back = _aud_check(events, src, live, dur)
+        places, m1 = _aud_places(vis)
+        crs, m2 = _aud_creatures(vis)
+        r2, d2 = _aud_review(src, live)
+        r3, d3 = _aud_sightings(crs, src, live)
+        drops.extend(d2)
+        drops.extend(d3)
+        # in the order he will read them, which is the order they
+        # happened - the marks, the review and the eye are checked in
+        # three separate walks and arrive interleaved otherwise
+        drops.sort(key=lambda d: (d["t"], d["what"]))
+        merged = m1 + m2
+        anchors = _aud_anchors(rows + r2 + r3, dur)
+        warn = _aud_warnings(src, events, live, stale, seen)
+        if back:
+            warn.append(str(back) + " mark(s) with nothing behind them "
+                        "were left standing anyway - calling them out "
+                        "would have thinned this recording below the one-"
+                        "mark-per-two-and-a-half-minutes the sound pass "
+                        "itself aims at")
+
+        # THE MODEL HEARS ABOUT THE ONES THAT SURVIVED, and only those.
+        # A creature whose every sighting failed the check has no business
+        # in the header naming who else was on screen - that is the same
+        # leak as telling the story a claim the check just disproved,
+        # only quieter.
+        stood = set()
+        for r in r3:
+            stood.add(str((r.get("say") or {}).get("eye") or ""))
+        told_crs = [c for c in crs if str(c.get("name") or "") in stood]
+        # THE TWO CHECKS THAT READ THE WORDS THEMSELVES. Both are
+        # arithmetic and neither can fail the audit: a library with no
+        # vocabulary yet simply returns nothing to say.
+        try:
+            _freq, _low = _aud_vocab()
+        except Exception:
+            _freq, _low = {}, {}
+        try:
+            names, nwarn = _aud_names(video_path, ins, stt, _low)
+        except Exception:
+            names, nwarn = [], []
+        try:
+            _beat("checking old corrections", 0.10)
+            took_back = _aud_revert_nonsense(video_path, _freq)
+            healed_ts = []
+            try:
+                # the retro-heal: full strikes from before the splitter
+                # give their readable sentences back
+                healed_ts = _aud_restrike(video_path, _freq) or []
+                if healed_ts:
+                    took_back += 1     # the transcript moved - re-read it
+            except Exception:
+                healed_ts = []
+            if took_back:
+                # the reverted lines changed the transcript on disk -
+                # re-read it so the garble list sees the originals
+                stt_doc2, _s = _aud_read(video_path, "stt")
+                stt = _aud_clocked(stt_doc2.get("segments") or [], "a")
+                src["stt"] = stt
+            _beat("shortlisting doubtful lines", 0.16)
+            garble = _aud_garble(stt, _freq)
+            for _g in garble:
+                try:
+                    _g["hints"] = _aud_hints(_g, _freq)
+                except Exception:
+                    _g["hints"] = []
+            # SETTLED VERDICTS CARRY - the control on the audit<->retell
+            # cycle: "if i describe it again, it has to run the audit
+            # again, right?" Yes - but a re-audit of a settled night
+            # asks the model NOTHING now. Do-it-again re-judges all.
+            if garble and not redo:
+                try:
+                    with open(ap, encoding="utf-8") as fh:
+                        _pg = (json.load(fh) or {}).get("garble") or []
+                except Exception:
+                    _pg = []
+                carried = _aud_carry(garble, _pg)
+                if carried:
+                    log("The auditor carried " + str(carried)
+                        + " settled verdict(s) on " + name
+                        + " - only the unsettled lines go to the model.")
+        except Exception:
+            garble = []
+            healed_ts = []
+        warn.extend(nwarn[:4])
+        ask_rows = [g for g in (garble or []) if not g.get("carried")]
+        if ask_rows:
+            _beat("re-listening with an Arabic ear", 0.20)
+            try:
+                _aud_relisten(video_path, ask_rows)
+            except Exception as _re_e:
+                log("The re-listen stumbled: " + str(_re_e)[:100])
+        if ask_rows:
+            per = float(_AI.get("aud_ask_ema") or 14.0)
+            _beat("asking about " + str(len(ask_rows)) + " line(s)",
+                  0.22, ask_eta=60.0 + per * len(ask_rows))
+            _AI["aud_prog"]["lines"] = len(ask_rows)
+        _ask_t0 = time.time()
+        if ask_rows:
+            beats, gist, why, retry, held, fixes = _aud_thread(
+                video_path, anchors, drops, src, places, told_crs, dur,
+                ask_rows)
+        else:
+            # every doubtful line already holds a settled verdict -
+            # this audit is pure arithmetic, no model, seconds
+            beats, gist, why, retry, held, fixes = [], "", "", False,                 False, []
+        if ask_rows and not held and not why:
+            # the measured cost of THIS ask feeds the next estimate
+            _took = time.time() - _ask_t0
+            _old = float(_AI.get("aud_ask_ema") or 0.0)
+            _per = max(2.0, (_took - 60.0) / max(1, len(ask_rows)))
+            _AI["aud_ask_ema"] = (_per if not _old
+                                  else 0.6 * _old + 0.4 * _per)
+        try:
+            if ask_rows:
+                _beat("looking at what stayed unclear", 0.90)
+                _aud_look_unclear(video_path, ask_rows)
+        except Exception as _lk_e:
+            log("The auditor's look stumbled: " + str(_lk_e)[:100])
+        _beat("writing the audit", 0.94)
+        # THE EVIDENCE, QUOTED. Every anchor already carries what each
+        # layer that corroborates that second actually SAID; this used to
+        # be handed to the model and thrown away in favour of the
+        # sentence it wrote about it. Straight to the sidecar now - the
+        # audit shows quotes, and quotation cannot confabulate.
+        beats = [{"t": a["t"],
+                  "agrees": list(a.get("agrees") or []),
+                  "say": {k: str(v)[:200]
+                          for k, v in (a.get("say") or {}).items() if v}}
+                 for a in anchors if (a.get("agrees") or [])]
+        beats.sort(key=lambda b: b["t"])
+        # THE CORRECTIONS LAND NOW - before this audit stamps the layers'
+        # mtimes into its own src map, so the very writes it just made do
+        # not read back as "the transcript moved, audit it again" forever.
+        applied = _aud_apply_fixes(video_path, fixes) if fixes else 0
+        struck = _aud_apply_strikes(
+            video_path, garble,
+            [float(f.get("t") or 0) for f in (fixes or [])
+             if f.get("applied")], _freq) if garble else 0
+        try:
+            refreshed = _aud_refresh_whys(video_path, garble) \
+                if garble else 0
+            if refreshed:
+                log("The auditor refreshed " + str(refreshed) + " stored "
+                    "why(s) on " + name + " with its fresh reasoning.")
+        except Exception:
+            pass
+        _aud_apply_names(video_path, names)
+        # THE DESCRIPTION FOLLOWS THE WORDS. Lines just fixed or struck
+        # sit inside chapters written from the OLD words - those windows
+        # are re-described (only those), and the title follows.
+        retold = 0
+        try:
+            if applied or struck or healed_ts:
+                _ts = [float(f.get("t") or 0) for f in (fixes or [])
+                       if f.get("applied")]
+                _ts += [float(g.get("t") or 0) for g in (garble or [])
+                        if g.get("struck")]
+                _ts += list(healed_ts)     # healed words re-tell too
+                if _AI["abort"] or _AI.get("wind"):
+                    # the card is leaving - MARK the dirty windows now
+                    # so the corrected words never sit under chapters
+                    # written from the old ones; the sweep refills
+                    retold = _aud_retell(video_path, _ts, refill=False)
+                else:
+                    _beat("re-describing the corrected minutes", 0.96)
+                    retold = _aud_retell(video_path, _ts)
+        except Exception as _rt_e:
+            log("The re-describe after corrections stumbled: "
+                + str(_rt_e)[:100])
+        # WHAT STANDS, read back from the files themselves so that no
+        # later rewrite of this sidecar can forget work already done:
+        # the corrected lines from the transcript's own markers, and the
+        # names ledger cumulatively from the .ins.
+        corrected = _aud_corrected(video_path)
+        names_fixed = []
+        try:
+            with open(_ai_sidecar(video_path, "ins"),
+                      encoding="utf-8") as fh:
+                names_fixed = (json.load(fh) or {}).get("names_fixed") or []
+        except Exception:
+            pass
+        done = not retry
+        # A GAME STARTING IS NOT A FAILED AUDIT - the same law _insights_one
+        # learned in 2.6. The last cut counted it as one, so three game
+        # starts during the telling put tries at 3, _aud_owing fell silent,
+        # and that night could never be audited again by the sweep, by the
+        # thinking lane or by the button. Measured: abort, abort, abort ->
+        # owing False, and no way back short of rewriting a sidecar.
+        tries = prior if held else (0 if done else prior + 1)
+        if why:
+            warn.append("the night was checked but not told: " + why)
+        doc = {"v": _AUD_V, "complete": done,
+               "tries": tries,
+               "when": int(time.time()),
+               "thread": beats, "dropped": drops, "merged": merged,
+               "names": names, "garble": garble, "fixes": fixes,
+               "names_fixed": names_fixed, "corrected": corrected,
+               "warnings": warn[:14], "gist": gist,
+               "saw": {"marks": len(events), "kept": len(rows),
+                       "named": len(names),
+                       "unsaid": len([n for n in names
+                                      if n.get("verdict") == "unsaid"]),
+                       "misspelt": len([n for n in names
+                                        if n.get("verdict") == "spelt"]),
+                       "doubtful": len(garble), "fixed": len(fixes),
+                       "struck": struck, "retold": retold,
+                       "dropped": len(drops), "anchors": len(anchors),
+                       "places_in": len((vis or {}).get("places") or []),
+                       "places_out": len(places),
+                       "creatures_in": len((vis or {}).get("creatures")
+                                           or []),
+                       "creatures_out": len(crs),
+                       "lines": len(stt), "live": sorted(live)},
+               "places": places, "creatures": crs,
+               "src": _aud_src(video_path)}
+        _put(doc)
+        _AI.pop("aud_prog", None)
+        try:
+            if done:
+                _ai_note_rate("auditing", _AI.get("job_secs") or dur or 0.0,
+                              time.time() - (_AI.get("started")
+                                             or time.time()))
+        except Exception:
+            pass
+        log("The auditor on " + name + ": " + str(len(events))
+            + " mark(s) checked, " + str(len(drops))
+            + " claim(s) with nothing behind them (none removed - it "
+              "writes only its own sidecar)"
+            + (", " + str(len(merged)) + " name(s) folded" if merged
+               else "")
+            + (", " + str(len(names)) + " name(s) checked" if names
+               else "")
+            + (", " + str(len(garble)) + " doubtful line(s), "
+               + str(applied) + " corrected now, "
+               + str(struck) + " struck as unintelligible, "
+               + str(len(corrected)) + " standing"
+               if garble or corrected else "")
+            + (", " + str(len(names_fixed)) + " name(s) respelt"
+               if names_fixed else "")
+            + (", a thread of " + str(len(beats)) + " beat(s)." if beats
+               and not why else " - no thread: " + str(why or "none")))
+        return done
+    except Exception as e:
+        _put({"v": _AUD_V, "failed": True, "complete": False,
+              "tries": prior + 1, "when": int(time.time()),
+              "thread": [], "dropped": [], "merged": [],
+              "warnings": ["the auditor failed: " + str(e)[:160]],
+              "saw": {}, "src": _aud_src(video_path)})
+        log("The auditor failed on " + name + ": " + str(e)[:140])
+        _AI.pop("aud_prog", None)
+        return False
+
+
+_AUD_ASK = {"path": None, "named": False, "claim": None}
+
+
+def _aud_playing():
+    """Is he playing right now? The story half loads the 15 GB describer
+    onto the same card the game is drawing with, on a card that only has
+    16 GB - the same question every other heavy pass asks."""
+    try:
+        c = _AI.get("ctl")
+        if c is not None and getattr(c, "session", None) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(_game_has_focus())
+    except Exception:
+        return False
+
+
+def _audit_why(video_path, redo=False):
+    """Why an audit would not start right now, in his own words - or ""
+    when it would. Every one of these is invisible from the page, and a
+    press that silently does nothing is indistinguishable from a broken
+    button."""
+    if not _bg_work_allowed():
+        return ("all background work is shut down - wake it on the "
+                "Working page and this audit can run")
+    cur0 = _AUD_ASK.get("path")
+    if cur0 is not None:
+        # THE BACKLOG MADE THIS GATE A DEAD BUTTON. With every night
+        # owing a fresh audit, "already running" was true for hours at
+        # a stretch - so asked-by-name now outranks a sweep-started
+        # audit, the same law every other button follows.
+        if redo and not _AUD_ASK.get("named"):
+            pass                       # the sweep's audit steps aside
+        elif redo:
+            return ("the audit on " + os.path.basename(str(cur0))
+                    + " was asked for by name - stop it first if this "
+                    "one matters more.")
+        else:
+            return ("an audit is already running - it takes one at a "
+                    "time. Watch it on Working, or tick \u201cdo it "
+                    "again\u201d to take the card off it.")
+    if (_AI.get("held") or {}).get("auditing") and not redo:
+        return ("audits are paused - press Resume on The audit row, or "
+                "tick \u201cdo it again\u201d, which runs this one "
+                "anyway")
+    busy = _AI.get("busy")
+    if busy is not None and not redo:
+        return (AI_LABEL.get(busy[0], busy[0]) + " is running on "
+                + str(busy[1]) + " and owns the card. Press again to "
+                "take the card off it, or wait for it to finish.")
+    if busy is not None and _AI.get("busy_path")             and _AI.get("busy_path") == _AI.get("force"):
+        return (AI_LABEL.get(busy[0], busy[0]) + " is running on "
+                + str(busy[1]) + " because you asked for it by name - "
+                "stop it first if this audit matters more.")
+    if _aud_playing():
+        return ("you are playing - the auditor will not take the card "
+                "off a game. It will run when you stop.")
+    try:
+        if not _ins_done_honest(video_path):
+            return ("locked - the audit checks the description too, so "
+                    "the description must exist first. Run Describe it "
+                    "(or All of it), and the audit follows on its own.")
+    except Exception:
+        pass
+    if redo:
+        return ""                      # again means again
+    try:
+        if not _aud_owing(video_path):
+            return ("this one is already audited - open THE AUDIT to "
+                    "read it. Tick \u201cdo it again\u201d to run it "
+                    "fresh.")
+    except Exception:
+        return "the audit could not be checked"
+    return ""
+
+
+def _audit_ask(video_path, redo=False, named=None):
+    """Build one audit now, off the job pipeline - what the panel's own
+    button asks for. Returns True when a thread was actually started.
+
+    Every gate here is a bug the first cut shipped: it had no in-flight
+    guard, so every poll of the panel spawned another audit thread on the
+    same file; it never took _AI["busy"], so the sweep could start a
+    describe on top of it; and it had no gaming gate at all."""
+    if not _bg_work_allowed():
+        return False                   # the master switch is off - the
+        #                                Working page wakes it
+    held0 = _AI.get("held") or {}
+    lift_hold = False
+    if held0.get("auditing"):
+        if not redo:
+            return False               # audits are paused; the sweep waits
+        # asking by name lifts the hold - but only when the audit truly
+        # STARTS. Lifting here meant a press that then lost the card
+        # silently restarted the whole shelf-wide backlog (review 302).
+        lift_hold = True
+    if _AUD_ASK.get("claim") is not None:
+        return False                   # a takeover is mid-flight; even the
+        #                                same path must not ride it - two
+        #                                threads passing this gate started
+        #                                two audits of one night (review 302)
+    cur = _AUD_ASK.get("path")
+    if cur is not None:
+        # ASKED BY NAME OUTRANKS THE SWEEP'S OWN AUDIT. The backlog
+        # keeps an audit running for hours, and "one at a time, always"
+        # made the button dead that whole time. A sweep-started audit
+        # is put down (a later sweep re-offers it); one HE asked for by
+        # name is never eaten by another of his asks.
+        if not redo or _AUD_ASK.get("named"):
+            return False
+        _AUD_ASK["claim"] = video_path     # the sweep may not refill the card
+        _AUD_ASK["claim_t"] = time.time()
+        log("You asked for an audit by name - the sweep's audit on "
+            + os.path.basename(str(cur)) + " is put down for it (a "
+            "later sweep re-offers that one).")
+        _ai_abort()
+        for _ in range(150):           # its worker clears the slot going out
+            if _AUD_ASK.get("path") is None:
+                break
+            time.sleep(0.1)
+        if _AUD_ASK.get("path") is not None:
+            _AUD_ASK["claim"] = None
+            return False               # it would not let go - do not stack
+    if _AI.get("busy") is not None:
+        # ASKED BY NAME OUTRANKS THE SWEEP - the law every other button
+        # already follows. A background job is put down politely (its
+        # progress banks, the sweep re-offers it); a job HE asked for by
+        # name is never eaten by another of his asks.
+        if not redo or (_AI.get("busy_path")
+                        and _AI.get("busy_path") == _AI.get("force")):
+            _AUD_ASK["claim"] = None
+            return False
+        log("You asked for an audit by name - "
+            + str((_AI.get("busy") or ("", "?"))[1])
+            + " is put down for it (its progress is kept).")
+        _AUD_ASK["claim"] = video_path     # the freed card is spoken for
+        _AUD_ASK["claim_t"] = time.time()
+        _ai_abort()
+        for _ in range(100):           # the worker clears busy on its way out
+            if _AI.get("busy") is None:
+                break
+            time.sleep(0.1)
+        if _AI.get("busy") is not None:
+            _AUD_ASK["claim"] = None
+            return False               # it would not let go - do not stack
+    if _aud_playing():
+        _AUD_ASK["claim"] = None
+        return False
+    try:
+        if not redo and not _aud_owing(video_path):
+            _AUD_ASK["claim"] = None
+            return False
+    except Exception:
+        _AUD_ASK["claim"] = None
+        return False
+    if held0.get("auditing") and not lift_hold:
+        # Stop was pressed DURING the takeover's wait - his last order
+        # stands, and the freed card stays down
+        _AUD_ASK["claim"] = None
+        return False
+    if lift_hold:
+        held0["auditing"] = False
+        log("You asked for an audit by name, so the hold on audits is "
+            "lifted.")
+    # asked again = Stop's leave-it-alone memo on this night ends, the
+    # promise its own comment always made and no audit door ever kept
+    try:
+        (_AI.get("failed") or {}).pop(video_path, None)
+    except Exception:
+        pass
+    _AUD_ASK["path"] = video_path
+    _AUD_ASK["named"] = bool(redo) if named is None else bool(named)
+    _AUD_ASK["claim"] = None
+    # THE WORKING ROW SAYS WHICH JOB THIS IS. It rides the thinking lane
+    # (so Pause and Stop reach it like everything else), but wearing the
+    # review's bare name made "is the audit doing anything?" unanswerable
+    # from the page.
+    _AI["busy"] = ("thinking",
+                   "the audit \u00b7 " + os.path.basename(video_path))
+    _AI["busy_path"] = video_path
+    _AI["abort"] = False
+    _AI["started"] = time.time()
+    _AI["job_secs"] = 0.0
+
+    def work():
+        done_ok = False
+        try:
+            done_ok = bool(_audit_one(video_path, redo=redo))
+        except Exception as e:
+            log("The auditor stumbled on " + os.path.basename(video_path)
+                + ": " + str(e)[:120])
+        finally:
+            live = _AI.pop("aud_live", None)
+            if live and live[0] == video_path and not done_ok \
+                    and _AI.get("abort"):
+                # INTERRUPTED, NOT FINISHED - back to the line, in its
+                # own place. Stop, pause-for-play and a game starting
+                # all reach the audit through here (review 308)
+                try:
+                    with _AI_FORCE_LOCK:
+                        q3 = list(_AI.get("force_queue") or [])
+                        at3 = min(max(0, live[2] if len(live) > 2
+                                      else 0), len(q3))
+                        q3.insert(at3, (live[0], "audit",
+                                        bool(live[1]), []))
+                        _AI["force_queue"] = q3
+                    _ai_state_save()
+                    log("The audit on " + os.path.basename(video_path)
+                        + " was interrupted - it waits in the line "
+                        "where it stood.")
+                except Exception:
+                    pass
+            _AUD_ASK["path"] = None
+            _AUD_ASK["named"] = False
+            if _AI.get("busy_path") == video_path:
+                _AI["busy"] = None
+                _AI["busy_path"] = None
+                _AI["started"] = 0.0
+            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+            _AI["done_path"] = video_path
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def _aud_public(d):
+    """The .aud as the panel is allowed to see it, and ONLY that.
+
+    The contract is fixed and the panel is written against it, so this
+    builds the answer key by key instead of handing the sidecar over:
+    nothing new on disk can ever leak a shape the panel does not expect,
+    and nothing on disk can leave a promised key missing."""
+    d = d if isinstance(d, dict) else {}
+
+    def _list(obj, key):
+        """A LIST OR NOTHING. `or []` only catches None and a falsy value;
+        a .aud holding a number where a list belongs - half-written, hand-
+        edited, or written by a version that is not this one - walked
+        straight into `for r in 7` and raised TypeError out of the bridge.
+        Measured: _aud_public({"dropped": 7}) threw, and Api.audit had no
+        guard round it, so the one call that promises the panel a shape
+        handed it a rejected promise instead."""
+        v = (obj or {}).get(key) if isinstance(obj, dict) else None
+        return v if isinstance(v, list) else []
+    thread = []
+    for b in _list(d, "thread"):
+        if not isinstance(b, dict):
+            continue
+        try:
+            t = round(float(b.get("t") or 0), 1)
+        except (TypeError, ValueError):
+            continue
+        say = b.get("say")
+        say = ({k: str(v)[:200] for k, v in say.items()
+                if k in _AUD_LAYERS and v} if isinstance(say, dict) else {})
+        thread.append({"t": t, "what": str(b.get("what") or "")[:240],
+                       "say": say,
+                       "agrees": [k for k in _AUD_LAYERS
+                                  if k in (_list(b, "agrees") or [])]})
+    dropped = []
+    for r in _list(d, "dropped"):
+        if not isinstance(r, dict):
+            continue
+        try:
+            t = round(float(r.get("t") or 0), 1)
+        except (TypeError, ValueError):
+            continue
+        dropped.append({"t": t, "what": str(r.get("what") or "")[:80],
+                        "why": str(r.get("why") or "")[:240]})
+    merged = []
+    for r in _list(d, "merged"):
+        if not isinstance(r, dict):
+            continue
+        merged.append({"kept": str(r.get("kept") or "")[:70],
+                       "folded": [str(x)[:70] for x in _list(r, "folded")]})
+    # WHO THE TITLE SAYS WAS THERE. Only the two verdicts worth his
+    # attention travel: a name the night says outright needs no reporting,
+    # and sending all seventy-five of them would bury the two that matter.
+    names = []
+    for r in _list(d, "names"):
+        if not isinstance(r, dict):
+            continue
+        v = str(r.get("verdict") or "")
+        if v not in ("unsaid", "spelt"):
+            continue
+        names.append({"name": str(r.get("name") or "")[:40],
+                      "where": str(r.get("where") or "")[:16],
+                      "verdict": v,
+                      "how": str(r.get("how") or "")[:120],
+                      "said": str(r.get("said") or "")[:40]})
+    # THE DOUBTFUL LINES AND THE PROPOSALS, kept apart on purpose. A
+    # proposal is not a transcript and must never be able to arrive
+    # looking like one, so it travels in its own list keyed by the second
+    # and the panel is what puts the two beside each other.
+    garble = []
+    for r in _list(d, "garble"):
+        if not isinstance(r, dict):
+            continue
+        try:
+            t = round(float(r.get("t") or 0), 1)
+        except (TypeError, ValueError):
+            continue
+        garble.append({"t": t, "text": str(r.get("text") or "")[:200],
+                       "verdict": str(r.get("verdict") or "")[:12],
+                       "standing": bool(r.get("standing")),
+                       "vwhy": str(r.get("vwhy") or "")[:800],
+                       "odd": [str(x)[:30] for x in _list(r, "odd")][:5]})
+    fixes = []
+    for r in _list(d, "fixes"):
+        if not isinstance(r, dict):
+            continue
+        try:
+            t = round(float(r.get("t") or 0), 1)
+        except (TypeError, ValueError):
+            continue
+        heard = str(r.get("heard") or "")[:200]
+        if heard:
+            fixes.append({"t": t, "heard": heard,
+                          "applied": bool(r.get("applied")),
+                          "undone": bool(r.get("undone"))})
+    names_fixed = []
+    for r in _list(d, "names_fixed"):
+        if isinstance(r, dict) and r.get("from") and r.get("to"):
+            names_fixed.append({"from": str(r["from"])[:40],
+                                "to": str(r["to"])[:40],
+                                "why": str(r.get("why") or "")[:120]})
+    corrected = []
+    for r in _list(d, "corrected"):
+        if not isinstance(r, dict):
+            continue
+        try:
+            t = round(float(r.get("t") or 0), 1)
+        except (TypeError, ValueError):
+            continue
+        corrected.append({"t": t, "was": str(r.get("was") or "")[:200],
+                          "now": str(r.get("now") or "")[:300],
+                          "nn": bool(r.get("nn")),
+                          "why": str(r.get("why") or "")[:600],
+                          "odd": [str(x)[:30]
+                                  for x in _list(r, "odd")][:4],
+                          "put_back": bool(r.get("put_back"))})
+    return {"v": _AUD_V, "thread": thread, "dropped": dropped,
+            "merged": merged, "names": names, "garble": garble,
+            "fixes": fixes, "names_fixed": names_fixed,
+            "corrected": corrected,
+            "warnings": [str(w)[:240] for w in _list(d, "warnings") if w],
+            "complete": bool(d.get("complete"))}
+
+
+def _thin_moments(events, dur):
+    """Which of the candidate moments actually earn a gold mark.
+
+    Three promises, in order of how much they matter:
+
+      1. A MARK MUST BE NOTABLE FOR THIS RECORDING. The score bar is set
+         from the night's own spread - well above its median moment - so a
+         talkative hour with no real peaks yields a handful of marks
+         instead of one per sentence. The first eight are always let
+         through, because a recording with nothing marked at all is worse
+         than one marked loosely.
+      2. NO STRETCH OWNS THE BAR. At most three marks in any ten minutes,
+         however loud the argument was. This is the one that fixes "every
+         other thing is a gold mark".
+      3. A HONEST BUDGET. About one every two and a half minutes, never
+         more than sixty - the old rule said one a MINUTE while its own
+         comment claimed one per five.
+    """
+    if not events:
+        return []
+    zs = sorted(float(e.get("z") or 0) for e in events)
+    med = zs[len(zs) // 2]
+    top = zs[int(len(zs) * 0.9)] if len(zs) >= 5 else zs[-1]
+    bar = med + 0.6 * max(0.0, top - med)
+    keep_n = int(min(60, max(8, round(dur / 150.0))))
+    min_gap = max(8.0, min(45.0, dur / 120.0))
+    chosen = []
+    for ev in sorted(events, key=lambda e: -(e.get("z") or 0)):
+        if len(chosen) >= keep_n:
+            break
+        try:
+            t = float(ev.get("t") or 0)
+            z = float(ev.get("z") or 0)
+        except (TypeError, ValueError):
+            continue
+        if z < bar and len(chosen) >= 8:
+            continue
+        if any(abs(t - c["t"]) < min_gap for c in chosen):
+            continue
+        if sum(1 for c in chosen if abs(t - c["t"]) <= 300.0) >= 3:
+            continue
+        chosen.append(ev)
+    chosen.sort(key=lambda e: float(e.get("t") or 0))
+    # THE TEN-MINUTE PROMISE, KEPT BOTH WAYS. The test above only asks
+    # about the marks chosen SO FAR, so a later mark could settle between
+    # an earlier pair and leave four inside one ten-minute window - which
+    # is what his Drova night actually did. Sweep it afterwards: while any
+    # window holds four, the weakest of them goes.
+    while True:
+        drop, drop_z = -1, None
+        for a in range(len(chosen)):
+            win = [b for b in range(len(chosen))
+                   if abs(float(chosen[b]["t"])
+                          - float(chosen[a]["t"])) <= 300.0]
+            if len(win) <= 3:
+                continue
+            for b in win:
+                z2 = float(chosen[b].get("z") or 0)
+                if drop_z is None or z2 < drop_z:
+                    drop, drop_z = b, z2
+        if drop < 0:
+            break
+        chosen.pop(drop)
+    return chosen
+
+
+def _pick_moments(es, hop_s, said=(), hot_said=()):
+    """The moments worth a gold mark, from the loudness envelope.
+
+    PROMINENCE, not loudness. A peak counts by how far it rises above the
+    quietest points on either side of it within a minute - the same measure
+    that makes a hill a mountain rather than a bump on a plateau. A constant
+    wall of game music has no prominence anywhere in it, so a session like
+    Hearthstone stops producing marks at random; a shout in an otherwise
+    quiet stretch has a lot, and gets one.
+
+    The old test was `is this louder than the last 30 seconds`, which in a
+    loud game is answered yes by every drum hit."""
+    import numpy as np
+
+    n = len(es)
+    if n < int(20 / hop_s):
+        return []
+    # ~1s smoothing: below that this measures transients, not moments
+    w = max(3, int(round(1.0 / hop_s)))
+    sm = np.convolve(es, np.ones(w, dtype=np.float32) / w, mode="same")
+
+    lo = float(np.percentile(sm, 20))
+    hi = float(np.percentile(sm, 99))
+    if hi - lo < 4.0:
+        return []            # a flat recording genuinely has no moments
+
+    # candidates: local maxima that are loud FOR THIS RECORDING
+    bar = float(np.percentile(sm, 88))
+    span = max(1, int(round(2.0 / hop_s)))          # peaks 2s apart at most
+    cands = []
+    i = span
+    while i < n - span:
+        v = sm[i]
+        if v >= bar and v >= sm[i - span:i + span + 1].max():
+            cands.append(i)
+            i += span
+        else:
+            i += 1
+
+    # how far does each rise above its own surroundings?
+    near = int(round(45.0 / hop_s))                 # look a minute either way
+    wide = int(round(90.0 / hop_s))
+    out = []
+    for i in cands:
+        a, b = max(0, i - near), min(n, i + near + 1)
+        left = sm[a:i + 1].min() if i > a else sm[i]
+        right = sm[i:b].min() if b > i + 1 else sm[i]
+        prominence = float(sm[i] - max(left, right))
+        wa, wb = max(0, i - wide), min(n, i + wide + 1)
+        contrast = float(sm[i] - np.median(sm[wa:wb]))
+        if prominence < 3.5 or contrast < 3.0:
+            continue                                # a bump, not a moment
+        # how long does it hold up? a real event sustains, a click does not
+        half = sm[i] - prominence / 2.0
+        j = i
+        while j > a and sm[j] > half:
+            j -= 1
+        k2 = i
+        while k2 < b - 1 and sm[k2] > half:
+            k2 += 1
+        held = (k2 - j) * hop_s
+        if held < 0.4:
+            continue
+        t = i * hop_s
+        score = prominence + contrast * 0.5 + min(held, 6.0) * 0.6
+        # something SAID near a peak is the strongest hint there is that a
+        # human found it interesting - it is why you spoke
+        if any(abs(t - q) <= 4.0 for q in hot_said):
+            score += 6.0
+        elif any(abs(t - q) <= 3.0 for q in said):
+            score += 2.0
+        out.append({"t": round(max(0.0, t - 0.4), 2),
+                    "z": round(score, 2),
+                    "p": round(prominence, 1)})
+    return out
+
+
 def _highlights_one(video_path):
     """Loudness-burst highlight pass -> .hl.json sidecar. 8kHz mono PCM is
     streamed straight out of ffmpeg (no temp file), a 50ms RMS envelope is
@@ -8168,12 +18066,35 @@ def _highlights_one(video_path):
     SR, FRAME, HOP = 8000, 400, 200            # 50ms window, 25ms hop
     _source_busy_add(video_path)
     proc = None
+    # THE SAME READ FEEDS TWO EARS. The envelope pass already streams the
+    # whole file off the (spinning) library disk; the laughter model needs
+    # 32kHz audio of the same file. One ffmpeg, two outputs - the second
+    # lands as a wav on the scratch SSD and the disk head is bothered once.
+    law = None
+    lw = _laugh_paths()
+    if lw is not None:
+        law = os.path.join(_work_dir(),
+                           f"laugh_{os.getpid()}_{threading.get_ident()}.wav")
     try:
-        proc = subprocess.Popen(
-            [SETTINGS["ffmpeg_path"], "-loglevel", "error", "-i", video_path,
-             "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        cmd = [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+               "-i", video_path,
+               "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
+        if law:
+            cmd += ["-vn", "-ac", "1", "-ar", "32000",
+                    "-c:a", "pcm_s16le", law]
+        errt = bytearray()
+        proc = _popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=flags)
+
+        def _drain_e():
+            try:
+                for raw_e in proc.stderr:
+                    errt.extend(raw_e)
+                    del errt[:-2048]
+            except Exception:
+                pass
+        threading.Thread(target=_drain_e, daemon=True).start()
         _AI["proc"] = proc
         if _AI["abort"]:
             try:
@@ -8199,73 +18120,160 @@ def _highlights_one(video_path):
             carry = x[n * HOP:]
         proc.wait(timeout=30)
         _AI["proc"] = None
-        if not env or _AI["abort"]:
+        if _AI["abort"]:
+            return False
+        if not env:
+            # died before ANY pipe data. The classic cause is the laugh
+            # wav's second output failing to open (scratch full, permissions,
+            # a vanished drive) - transient, so it must not poison this video
+            # for the whole session; the soft cap still hardens at three.
+            for ln in bytes(errt).decode("utf-8", "ignore").splitlines()[-2:]:
+                log("  ffmpeg(sound): " + ln)
+            log(f"Sound pass on {os.path.basename(video_path)} produced no "
+                f"audio at all - will retry.")
+            _AI["soft_fail"] = True
+            return False
+        if proc.returncode != 0:
+            # a decode that died mid-file used to ship marks + a sound curve
+            # covering only the decoded prefix - fresh, wrong, permanent
+            for ln in bytes(errt).decode("utf-8", "ignore").splitlines()[-2:]:
+                log("  ffmpeg(sound): " + ln)
+            log(f"Sound pass on {os.path.basename(video_path)}: ffmpeg "
+                f"exited {proc.returncode} - nothing was written.")
             return False
         e = np.concatenate(env)
+        got_s = len(e) * HOP / float(SR)
+        pd = _probe_duration(video_path) or 0
+        if pd > 60 and got_s < pd * 0.9:
+            log(f"Sound pass on {os.path.basename(video_path)} decoded only "
+                f"{got_s:.0f}s of {pd:.0f}s - nothing was written.")
+            return False
         if len(e) < 400:                       # < ~10s of audio: nothing to mark
             os.makedirs(os.path.dirname(_ai_sidecar(video_path, "hl")),
                         exist_ok=True)
             _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                               {"v": 1, "events": []})
+                               {"v": 2, "events": []})
+            # the tiny clip still gets its curve - without one it stayed
+            # 'coarse' forever: every Everything/sound ask re-decoded it,
+            # rewrote the same sidecar, and never converged
+            try:
+                if len(e):
+                    dur0 = len(e) * HOP / float(SR)
+                    _atomic_write_json(
+                        _ai_sidecar(video_path, "lvl"),
+                        {"v": 2, "dur": round(dur0, 2),
+                         "floor": int(round(float(np.percentile(e, 5)))),
+                         "peak": int(round(float(e.max()))),
+                         "db": [int(round(float(x))) for x in e]})
+            except Exception as e2:
+                log(f"Could not write the loudness curve for "
+                    f"{os.path.basename(video_path)}: {e2}")
+                _AI["soft_fail"] = True
+                return False
             return True
-        # smooth 0.5s; robust baseline = rolling median approximated by a
-        # coarse percentile grid (windows of 30s, recomputed each window)
         k = np.ones(20, dtype=np.float32) / 20.0
         es = np.convolve(e, k, mode="same")
-        W = 1200
-        med = np.empty_like(es)
-        mad = np.empty_like(es)
-        for i in range(0, len(es), W // 4):
-            a, b = max(0, i - W // 2), min(len(es), i + W // 2)
-            seg = es[a:b]
-            m = np.median(seg)
-            med[i:i + W // 4] = m
-            mad[i:i + W // 4] = np.median(np.abs(seg - m)) + 1e-6
-        z = (es - med) / (1.4826 * mad)
-        floor = np.percentile(es, 10) + 12.0
-        rise = np.concatenate([np.zeros(20), es[20:] - es[:-20]])
-        hot = (z >= 2.5) & (es >= -35.0) & (es >= floor) & (rise >= 6.0)
-        # sustained 0.3s (12 hops) -> candidate; then 8s min gap, best-z wins
-        events = []
-        run = 0
-        last_t = -1e9
-        for i in range(len(hot)):
-            run = run + 1 if hot[i] else 0
-            if run == 12:
-                t = i * HOP / SR
-                if t - last_t >= 8.0:
-                    events.append({"t": round(max(0.0, t - 0.3), 2),
-                                   "z": round(float(z[i]), 2)})
-                    last_t = t
+        said, hot_said = _speech_times(video_path)
+        events = _pick_moments(es, HOP / float(SR), said, hot_said)
         # A REEL, NOT A BARCODE. Every burst 8s apart used to survive (up to
         # 200 of them), which on a 2h session painted the whole seek bar gold
         # and marked nothing in particular. Keep only the strongest moments,
         # spaced out in proportion to the video's length: the loudest first,
         # each at least MINGAP from one already kept.
         dur = len(es) * HOP / float(SR)
-        keep_n = int(min(30, max(5, round(dur / 300.0))))     # ~1 per 5 min
-        # spacing grows with the video but never below the 8s the
-        # candidates already honour - a flat 20s floor threw away real
-        # moments in short clips (proved by the 3-burst battery)
-        min_gap = max(8.0, min(60.0, dur / 120.0))
-        chosen = []
-        for ev in sorted(events, key=lambda e: -e["z"]):
-            if len(chosen) >= keep_n:
-                break
-            if all(abs(ev["t"] - c["t"]) >= min_gap for c in chosen):
-                chosen.append(ev)
-        events = sorted(chosen, key=lambda e: e["t"])
+        events = _thin_moments(events, dur)
+
+        # THE EAR FOR LAUGHTER. The loudness contest happens above; this is
+        # a different question - "did somebody LAUGH or SCREAM" - answered
+        # by a model that knows the sound itself, in any language. Additive
+        # and fail-open: if the worker dies, the gold marks ship without it.
+        if law and lw and os.path.isfile(law) and not _AI["abort"]:
+            lj, ctl = law + ".json", law + ".ctl"
+            try:
+                try:
+                    with open(ctl, "w", encoding="utf-8") as fh:
+                        json.dump({"threads": _reader_threads()}, fh)
+                except Exception:
+                    pass
+                pr2 = _popen(
+                    [lw[0], lw[1], law, lj, lw[2]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    creationflags=flags)
+                _AI["proc"] = pr2
+                try:
+                    _err = pr2.communicate(timeout=max(900, int(dur)))[1]
+                except subprocess.TimeoutExpired:
+                    pr2.kill()
+                    pr2.communicate(timeout=30)
+                    raise
+                _AI["proc"] = None
+                if pr2.returncode == 0:
+                    with open(lj, encoding="utf-8") as fh:
+                        lev = (json.load(fh) or {}).get("events") or []
+                    added = 0
+                    # a laugh's own score lives in 0..~0.3 while the gold
+                    # z-scores run 15-50 (measured, not guessed) - a laugh
+                    # must sit ABOVE this session's own gold ceiling or the
+                    # viewer's top-30 cut silently deletes every quiet laugh
+                    ceil = max([g.get("z") or 0 for g in events] + [10.0])
+                    for ev in lev:
+                        z2 = round(ceil + 1.0 + float(ev["p"]), 2)
+                        near = [g for g in events
+                                if abs(g["t"] - ev["t"]) <= 8.0]
+                        if near:
+                            near[0]["kind"] = ev["kind"]
+                            near[0]["z"] = max(near[0].get("z") or 0, z2)
+                        else:
+                            events.append({"t": round(float(ev["t"]), 1),
+                                           "z": z2, "kind": ev["kind"]})
+                            added += 1
+                    events.sort(key=lambda e: e["t"])
+                    if lev:
+                        log(f"Laughter ear on "
+                            f"{os.path.basename(video_path)}: "
+                            f"{len(lev)} moment(s), {added} new mark(s).")
+                else:
+                    tail = (_err or b"")[-200:].decode("utf-8", "replace")
+                    log(f"The laughter ear failed (gold marks unaffected): "
+                        f"{tail.strip()[:160]}")
+            except Exception as e2:
+                log(f"The laughter ear failed (gold marks unaffected): "
+                    f"{str(e2)[:140]}")
+            finally:
+                _AI["proc"] = None
+                for p2 in (law, lj, lj + ".prog", ctl):
+                    try:
+                        if p2 and os.path.isfile(p2):
+                            os.remove(p2)
+                    except OSError:
+                        pass
+
+        if _AI["abort"]:
+            # aborted during the laugh pass: writing now would ship a
+            # laughter-less sidecar as finished forever (fresh mtime = the
+            # sweep never returns). The job re-runs whole at the next idle.
+            return False
         os.makedirs(os.path.dirname(_ai_sidecar(video_path, "hl")),
                     exist_ok=True)
+        _bank_sidecar(video_path, "hl")    # a redo keeps the one it replaces
         _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                           {"v": 1, "events": events})
+                           {"v": 2, "events": events})
         # THE LOUDNESS CURVE, free: the envelope is already in hand from the
         # pass above, so drawing it costs one more sidecar and no more work.
-        # Squeezed to ~1800 points (a seven-hour session is a million) by
-        # taking the PEAK of each bucket - averaging would flatten exactly the
-        # spikes worth seeing - and stored as whole dB.
+        #
+        # RESOLUTION IS PER SECOND, NOT PER FILE. This used to be a flat 1800
+        # points for any recording - fine for a two-minute clip, useless for a
+        # seven-hour session where it meant one sample every FOURTEEN SECONDS.
+        # Zoom the timeline into thirty seconds of that and you are looking at
+        # two samples stretched across the whole bar, which is why it drew flat
+        # steps instead of sound. Eight samples a second, capped so a very long
+        # session cannot produce an enormous sidecar: a 27-minute recording
+        # gets 13,000 points instead of 1,800, and a seven-hour one gets 40,000
+        # instead of 1,800 - one every 0.6s rather than every 14s.
+        # The PEAK of each bucket is kept, never the average: averaging flattens
+        # exactly the spikes worth seeing.
         try:
-            pts = 1800
+            pts = int(max(1800, min(40000, (dur or 0) * 8)))
             n = len(es)
             if n:
                 idx = np.linspace(0, n, pts + 1).astype(int)
@@ -8273,12 +18281,39 @@ def _highlights_one(video_path):
                            for i in range(pts)]
                 curve = [int(round(float(b.max()))) for b in buckets if len(b)]
                 _atomic_write_json(_ai_sidecar(video_path, "lvl"),
-                                   {"v": 1, "dur": round(dur, 2),
+                                   {"v": 2, "dur": round(dur, 2),
                                     "floor": int(round(float(np.percentile(es, 5)))),
                                     "peak": int(round(float(es.max()))),
                                     "db": curve})
-        except Exception:
-            pass
+        except Exception as e2:
+            # the editor draws no sound shape without this file, and a fresh
+            # hl above made the sweep call the whole pass done forever
+            log(f"Could not write the loudness curve for "
+                f"{os.path.basename(video_path)}: {e2}")
+            _AI["soft_fail"] = True
+            return False
+        # NOT when this same ask is about to redo the senses: folding
+        # here would resurrect the OUTGOING .sns - the exact result the
+        # press asked to replace - and the senses merge can only add,
+        # never remove, so a wrong mark could never be shed.
+        # ...and only when the senses REALLY will rerun: with no describer
+        # or no senses worker on disk the thinking job never comes, and
+        # skipping the fold would drop every sense mark for good instead
+        # of replacing it.
+        _redo_all = (_AI.get("force") == video_path
+                     and bool(_AI.get("force_redo"))
+                     and (_AI.get("force_want") or "") == "all"
+                     and _describer_paths() is not None
+                     and _senses_paths() is not None)
+        if not _redo_all:
+            _a3, _e3 = _merge_sns_into_hl(video_path)
+            if _a3:
+                log(f"Re-folded {_a3} sense mark(s) into the fresh gold.")
+            # the sightings ride the same road, and for the same reason:
+            # this rebuild starts the gold marks from nothing
+            _a4, _e4 = _merge_vis_into_hl(video_path)
+            if _a4:
+                log(f"Re-folded {_a4} sighting(s) into the fresh gold.")
         log(f"Highlights for {os.path.basename(video_path)}: "
             f"{len(events)} moment(s).")
         return True
@@ -8294,6 +18329,173 @@ def _highlights_one(video_path):
                 proc.wait(timeout=5)
         except Exception:
             pass
+        # the 32k wav is consumed and removed on the happy path; every
+        # OTHER path (short audio, abort, crash) must not leave 400 MB
+        # of it on the scratch drive per video
+        try:
+            if law and os.path.isfile(law):
+                os.remove(law)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# WHAT AN ASK STILL OWES - one answer, read by the button AND by the beat.
+# ---------------------------------------------------------------------------
+_LVL_COARSE_CACHE = {}
+
+_WANT_SAID = {"all": "everything", "sound": "sound & gold moments",
+              "words": "a transcript", "think": "a description",
+              "audit": "a fresh audit"}
+
+
+def _lvl_coarse_cached(video_path):
+    """_lvl_is_coarse behind an mtime cache.
+
+    The batch button now asks this once per selected recording, and on his
+    spinning library disk 1,248 cold JSON opens measured 13.0s (3.0s warm).
+    The forced loop was already paying that every beat, on the watcher
+    thread that has to keep noticing when a game starts."""
+    sp = _ai_sidecar(video_path, "lvl")
+    try:
+        # SIZE AS WELL AS TIME. A rewrite that lands on the same mtime - a
+        # restored file, a fast rewrite inside one clock tick - is
+        # invisible to a stamp alone, and the cache would then serve an
+        # answer about a curve that no longer exists.
+        _st = os.stat(sp)
+        sig = (_st.st_mtime, _st.st_size)
+    except OSError:
+        return True                 # no curve at all is work still owed
+    hit = _LVL_COARSE_CACHE.get(sp)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    try:
+        ans = _lvl_is_coarse(video_path)
+    except Exception:
+        ans = True
+    if len(_LVL_COARSE_CACHE) > 4000:
+        _LVL_COARSE_CACHE.clear()
+    _LVL_COARSE_CACHE[sp] = (sig, ans)
+    return ans
+
+
+def _force_blocked(want):
+    """The reason this ask can NEVER run, in his words, or None.
+
+    prioritise used to answer "already done" when the truth was "you
+    switched that off in Settings" - one sentence for two opposite
+    situations, and neither of them was what had happened."""
+    want = str(want or "all").lower()
+    if not _bg_work_allowed():
+        return ("all background work is shut down - wake it on the "
+                "Working page first")
+    if want == "sound" and not SETTINGS.get("ai_highlights", True):
+        return "marking loud moments is switched off in Settings"
+    if want == "words":
+        if not SETTINGS.get("ai_transcribe", True):
+            return "transcribing is switched off in Settings"
+        if _reader_paths() is None:
+            return "the reader is not installed"
+    if want == "think" and _describer_paths() is None:
+        return "the describer is not installed"
+    if want == "audit" and _describer_paths() is None \
+            and _aud_llm_paths() is None:
+        return "no thinker is installed to audit with"
+    if want == "all" and not (SETTINGS.get("ai_highlights", True)
+                              or (SETTINGS.get("ai_transcribe", True)
+                                  and _reader_paths() is not None)
+                              or _describer_paths() is not None):
+        return "every kind of reading is switched off or missing"
+    return None
+
+
+def _force_off_reason(path, want="all"):
+    """When nothing is owed, was it FINISHED or was it SWITCHED OFF?
+
+    _force_blocked answers for an ask that can never run at all. This
+    answers the subtler one: under "All of it" the reader and the
+    describer may be perfectly happy while the only job still outstanding
+    is the sound - and if marking loud moments is switched off, "already
+    done" is a lie about a recording that owes work it is not allowed to
+    do. Returns his sentence, or None when the ask really is finished."""
+    if str(want or "all").lower() != "all":
+        return None
+    try:
+        if (not SETTINGS.get("ai_highlights", True)
+                and (not _ai_sidecar_fresh(path, "hl")
+                     or _lvl_coarse_cached(path))):
+            return ("it still owes its sound pass, but marking loud "
+                    "moments is switched off in Settings")
+        if (not SETTINGS.get("ai_transcribe", True)
+                and not _ai_sidecar_fresh(path, "stt")):
+            return ("it still owes a transcript, but transcribing is "
+                    "switched off in Settings")
+    except Exception:
+        return None
+    return None
+
+
+def _force_owes(path, want="all", redo=False):
+    """Which jobs this recording still owes under this ask - a set drawn
+    from listening / hearing / thinking. Empty means honestly nothing.
+
+    THIS IS THE BUTTON HE SAID WAS BROKEN. ai_force_many said yes to
+    anything: "Asked for sound on 10 recordings", ok:true, a queue set -
+    and then the beat's own test found nothing owed and cleared all ten in
+    a single pass, in silence. 1,248 of his 1,252 recordings already carry
+    a fresh sound curve, so the sound ask was a no-op on 99.7% of the
+    shelf and never said so. Both sides read this one function now, so
+    "it started" and "it had work to do" cannot drift apart again."""
+    owe = set()
+    want = str(want or "all").lower()
+    if want == "audit":
+        # an audit is owed when the sidecars say so, when he said
+        # "again", or when the night is not READY yet (its review
+        # still landing) - queued now, it runs the moment it can
+        try:
+            if not _ins_done_honest(path):
+                # NOT DESCRIBED YET: an audit here could never run -
+                # it was owed forever and refused forever. The night
+                # owes a DESCRIPTION, and that chain ends with the
+                # audit anyway, which is what he asked for
+                return {"thinking"}
+            if redo or _aud_owing(path):
+                return {"auditing"}
+        except Exception:
+            return {"auditing"}
+        return set()
+    if want not in ("all", "sound", "words", "think", "audit"):
+        want = "all"
+    redo = bool(redo)
+    if want in ("all", "sound") and SETTINGS.get("ai_highlights", True):
+        try:
+            if (redo or not _ai_sidecar_fresh(path, "hl")
+                    or _lvl_coarse_cached(path)):
+                owe.add("listening")
+        except Exception:
+            owe.add("listening")       # cannot tell = go and look
+    if (want in ("all", "words") and SETTINGS.get("ai_transcribe", True)
+            and _reader_paths() is not None):
+        try:
+            if redo or not _ai_sidecar_fresh(path, "stt"):
+                owe.add("hearing")
+        except Exception:
+            owe.add("hearing")
+    if _describer_paths() is not None:
+        try:
+            # asked for BY NAME always describes again - that is what the
+            # button is for. Under "All of it" the senses, the eye and the
+            # auditor count too: prioritise only ever asked about the
+            # review, so a night owing just its senses was told it was done
+            if want == "think" or (want == "all"
+                                   and (redo or _ins_owing(path)
+                                        or _sns_owing(path)
+                                        or _vis_owing(path)
+                                        or _aud_owing(path))):
+                owe.add("thinking")
+        except Exception:
+            pass
+    return owe
 
 
 def _ai_tick(ctl):
@@ -8301,28 +18503,123 @@ def _ai_tick(ctl):
     missing a sidecar and process it. Same discipline as the SDR queue -
     never while recording, saving, or while the user is watching. One video
     per tick keeps every pause instant."""
+    _AI["ctl"] = ctl        # the reader's budget asks it whether he is playing
+    # A FORCED ASK IS NOT SUBJECT TO THE TWO SWITCHES. With Transcribe and
+    # Mark-loud-moments both off in Settings this returned at the first
+    # line, before the forced loop below could run - so pressing
+    # "Describe it" set a queue that nothing on earth would ever drain.
+    # The button was dead and said nothing at all.
+    if not _bg_work_allowed():
+        # THE MASTER SWITCH IS OFF. Everything background stands down -
+        # the sweep, the line, forced asks, all of it - but the card is
+        # RELEASED, never stranded: the parked models still doze off.
+        _ask_idle_tick()
+        _desc_keep_tick()
+        try:
+            _aud_keep_tick()
+        except Exception:
+            pass
+        return
     if not (SETTINGS.get("ai_transcribe", True)
-            or SETTINGS.get("ai_highlights", True)):
+            or SETTINGS.get("ai_highlights", True)
+            or _AI.get("force") or _AI.get("force_queue")):
         return
     if _AI["busy"] is not None:
         return
+    if _AUD_ASK.get("claim"):
+        if time.time() - (_AUD_ASK.get("claim_t") or 0) < 45:
+            return      # a by-name ask is taking the card - do not refill
+        _AUD_ASK["claim"] = None   # a takeover needs ~15s; a claim this
+        #                            old leaked out of a failure, and left
+        #                            standing it would silence every lane
+    if _AUD_ASK.get("path") is not None:
+        return          # an audit owns the card
+    if _SLATE_BUSY[0] > 0:
+        return                 # a slate is clearing sidecars - let it finish
     # ASKED FOR means asked for. The idle rules below exist so the reader
     # never steals a frame from a game you did not ask it to interrupt - but
     # when you point at one recording and say do this now, waiting for a quiet
     # moment is just the silence again. A forced job ignores them and runs
     # while you record, watch or save. It still runs BELOW NORMAL, so the game
     # keeps the CPU it needs.
-    forced_now = bool(_AI.get("force"))
-    if not forced_now:
+    # FORCED MEANS STARTABLE. A queue holding only held-lane items used
+    # to keep this true, which returned every beat before the sweep - so
+    # pausing ONE lane silently paused all three and walked the whole
+    # library every five seconds for nothing.
+    def _takeable(it):
+        """Could this waiting item actually START on this beat? A row
+        that cannot (its lane is held, or it is an audit still serving
+        its minute of deferral) must NOT make the beat read forced -
+        a forced beat never sweeps, so an undrainable line would have
+        starved every other lane forever (review 308, critical)."""
+        w = it[1] if len(it) > 1 else "all"
+        if not _ai_lanes_free(w):
+            return False
+        if str(w or "").lower() == "audit":
+            d0 = (_AI.get("aud_defer") or {}).get(it[0], 0)
+            if time.time() - d0 < 60:
+                return False
+        return True
+
+    forced_now = bool(_AI.get("force")) or any(
+        _takeable(it) for it in (_AI.get("force_queue") or []))
+    always = bool(SETTINGS.get("always_read"))
+    held = _AI.setdefault("held", {"listening": False, "hearing": False})
+    for _k in ("listening", "hearing", "thinking"):
+        held.setdefault(_k, False)     # three lanes, ALWAYS - a two-key
+    #                                    dict makes "both audio lanes
+    #                                    held" read as a full stop
+    if held and all(held.values()) and not _AI.get("force"):
+        # HELD IS HELD. A queued batch used to keep forced_now true, so a
+        # full hold still walked the whole library every beat to then do
+        # nothing with it. Asking by name still works - the ask itself
+        # lifts the hold now, so a live force is the only thing that may
+        # pass this gate.
+        # The doze ticks still run: a full hold is exactly when he wants
+        # the card back, and these are what release the warm describer
+        # and the ask server - skipping them parked 15 GB on the card
+        # for the whole pause.
+        _ask_idle_tick()
+        _desc_keep_tick()
+        try:
+            _aud_keep_tick()   # the parked thinker dozes too - a full
+        except Exception:      # hold is exactly when he wants the card
+            pass
+        return
+    if not forced_now and not always:
+        # OFF MEANS "NOT WHILE RECORDING". That is what he means by the
+        # switch, and it is now what it does. Recording, saving and
+        # finishing an edit all keep their veto: the first is his whole
+        # point, and the other two have his video file open.
         if ctl.session is not None or ctl.saving > 0 or _FINISHING["busy"]:
             return
-        if time.time() - _MEDIA.get("last_read", 0) < 20:
-            return
+        # WHAT USED TO BE HERE: a fourth gate that also refused to work
+        # for twenty seconds after he opened ANY recording. The tome is
+        # only open while he is looking at it, so that moment barely
+        # exists - a thousand recordings sat unread for weeks behind it,
+        # and the switch was the only way to lift it, which made a
+        # politeness rule into a choice between never working and working
+        # mid-game. The heavy passes still guard themselves: the
+        # describer will not load fifteen gigabytes onto the card while a
+        # game has focus, switch or no switch.
     if _TRIM_BUSY[0] > 0:
+        # NOT a politeness gate, and the switch does not lift it: an export has
+        # the source file open and reading it underneath is how you get a
+        # half-written clip.
         return                      # never open a source mid-edit, ever
     if time.time() - _AI["t_last"] < 5:
         return
+    if _AI.get("wind") and _AI.get("busy") is None:
+        _AI["wind"] = False            # the job wound down; the hold stands
+        _AI["wind_src"] = None
     _AI["t_last"] = time.time()
+    _ask_idle_tick()
+    _desc_keep_tick()
+    try:
+        _aud_keep_tick()
+    except Exception:
+        pass
+    _self_check_daily()
     out = SETTINGS.get("output_dir", "")
     if not out or not os.path.isdir(out):
         return
@@ -8335,25 +18632,178 @@ def _ai_tick(ctl):
         vids = [p for p, _m in vids]
     except Exception:
         return
-    do_stt = SETTINGS.get("ai_transcribe", True) and _whisper_paths()
-    do_hl = SETTINGS.get("ai_highlights", True)
+    do_stt = (SETTINGS.get("ai_transcribe", True) and _reader_paths()
+              and not (held.get("hearing") and not forced_now))
+    do_hl = (SETTINGS.get("ai_highlights", True)
+             and not (held.get("listening") and not forced_now))
+    # thinking needs a key AND the other two to have been here first - it is
+    # given their output to work from
+    # describing is LOCAL now - it needs the describer on disk, not a key.
+    # This was still demanding a Claude key file, which is both wrong and the
+    # kind of thing that leaves a row saying "starting..." forever.
+    # DESCRIBING IS THE HEAVY ONE. It loads a 15 GB model onto the GPU - the
+    # same GPU the game is drawing with, on a card that only has 16 GB. It
+    # waits while a game is being PLAYED, whatever the background-work switch
+    # says, unless you asked for this one by name.
+    # PLAYED, not merely open: this asked find_active_game() ("does a game
+    # process exist"), so Hearthstone idling behind the tome silently blocked
+    # every describe - the sweep would finish a video's sound and words, find
+    # describing gated, and wander off to the next video's cheap jobs. The
+    # reader learned this exact lesson in 2.55; the describer now asks the
+    # same question it does: what is he LOOKING at.
+    playing = (ctl.session is not None or _game_has_focus())
+    do_ins = (SETTINGS.get("insights_auto", True)
+              and not (held.get("thinking") and not forced_now)
+              and _describer_paths() is not None
+              and (not playing or forced_now))
     def _spawn(kind, path, mt):
         # WORKER THREAD - a transcription can take minutes and the watcher
         # must keep detecting games throughout; _ai_abort() kills the job
         # the instant one appears.
+        if _AI.pop("_qdirty", None):
+            _ai_state_save()           # the line changed hands - write
+            #                            it down BEFORE the work starts
         _AI["busy"] = (kind, os.path.basename(path))
+        _AI["busy_path"] = path        # Stop needs to know what to let go of
         _AI["abort"] = False
+        _AI["started"] = time.time()
+        _AI["job_secs"] = 0.0          # the real figure lands on the worker
 
         def work():
             ok = False
+            _ask_srv_drop()        # the card belongs to this job now
+            if kind != "thinking":
+                _desc_keep_drop()  # ...and to this job's KIND of model
+            # the probe belongs HERE: on the watcher thread it stalled game
+            # detection for up to 15s per spawn (an uncached ffprobe against
+            # a spun-down platter, up to three times per video)
+            try:
+                _AI["job_secs"] = float(_video_duration(path) or 0.0)
+            except Exception:
+                _AI["job_secs"] = 0.0
+            t0 = time.time()
             try:
                 if kind == "hearing":
                     ok = _transcribe_one(path)
+                elif kind == "thinking":
+                    # the parked thinker steps down before the senses,
+                    # the eye and the describer want the card - the audit
+                    # at the chain's end reloads it if it needs it
+                    try:
+                        _aud_keep_drop()
+                    except Exception:
+                        pass
+                    # the SENSES go first: their events land in the gold
+                    # marks, so the describer that follows narrates what the
+                    # ears and the HUD reader found - one cohesive review
+                    fw = (_AI.get("force_want")
+                          if _AI.get("force") == path else None)
+                    fredo = bool(_AI.get("force_redo")) and fw is not None
+                    ok_sns = True
+                    if not _AI.get("wind") \
+                            and (_sns_owing(path) or (fredo and fw == "all")):
+                        ok_sns = _senses_one(path)
+                    # THE EYE GOES BETWEEN. The senses hear, the eye looks,
+                    # and only then does the describer write - so a chapter
+                    # can be named after the room it happened in. A redo-all
+                    # looks again too; that is what the press means.
+                    ok_vis = True
+                    if not _AI.get("wind") \
+                            and (_vis_owing(path) or (fredo and fw == "all")):
+                        ok_vis = _eyes_one(path)
+                    # asked BY NAME describes again; a gap-fill "all" only
+                    # describes what a description is owed on - without the
+                    # _ins_owing arm, a senses-only visit under "All of it"
+                    # quietly redid finished reviews
+                    forced_think = (fw == "think"
+                                    or (fw == "all"
+                                        and (fredo or _ins_owing(path))))
+                    if _AI.get("wind"):
+                        # a pause is winding this chain down: what ran
+                        # is banked, nothing later starts, and the job
+                        # ends HELD - never failed, no tries burned
+                        ok = True
+                    elif _ins_owing(path) or forced_think:
+                        # fresh: a redo-all just replaced the transcript,
+                        # so any partial description on disk is spliced
+                        # history - start it over, never resume it
+                        ok = _insights_one(path, forced=forced_think,
+                                           fresh=(fredo and fw == "all"))
+                    else:
+                        ok = ok_sns and ok_vis   # a senses/eye visit
+                    # THE AUDITOR GOES LAST, over everything the passes
+                    # above it have just written - it is the only one
+                    # whose job is reading the others back. It never
+                    # changes this job's verdict: a review that landed is
+                    # a review that landed, even on a night the story
+                    # half could not be told.
+                    if not _AI["abort"] and not _AI.get("wind") \
+                            and not (_AI.get("held") or {}).get("auditing") \
+                            and (_aud_owing(path)
+                                 or (fredo and fw == "all")):
+                        try:
+                            # a redo-all re-judges everything, like the
+                            # button; a sweep visit carries what stands
+                            _audit_one(path,
+                                       redo=(fredo and fw == "all"))
+                        except Exception as _ae:
+                            log("The auditor stumbled on "
+                                + os.path.basename(path) + ": "
+                                + str(_ae)[:120])
                 else:
                     ok = _highlights_one(path)
+            except Exception:
+                # A JOB THAT DIES MUST SAY SO. An uncaught exception here
+                # used to kill the worker thread in perfect silence - the
+                # ask looked satisfied, nothing was written, and a forced
+                # press seemed to do nothing at all. Tonight that cost five
+                # describe attempts in a row.
+                import traceback
+                tb = traceback.format_exc().strip().splitlines()
+                log(f"The {kind} job on {os.path.basename(path)} CRASHED: "
+                    + " | ".join(tb[-3:]))
             finally:
-                if not ok and not _AI["abort"]:
+                if ok and not _AI["abort"]:
+                    if kind == "hearing":
+                        _ai_note_speech(_AI.get("job_secs") or 0.0,
+                                        _AI.get("last_speech_s") or 0.0,
+                                        time.time() - t0)
+                    _ai_note_rate(kind, _AI.get("job_secs") or 0.0,
+                                  time.time() - t0)
+                soft = bool(_AI.pop("soft_fail", None))   # consume ALWAYS
+                if ok:
+                    # a success forgives old soft strikes - three
+                    # lifetime hiccups must not damn a healthy file
+                    _AI.setdefault("soft_n", {}).pop(path, None)
+                if soft and not ok:
+                    n = _AI.setdefault("soft_n", {}).get(path, 0) + 1
+                    _AI["soft_n"][path] = n
+                    if n >= 3:      # three gentle refusals = a real refusal;
+                        soft = False    # without this a cold file re-ran the
+                #                        whole job every idle beat forever
+                if not ok and not _AI["abort"] and not soft \
+                        and not _AI.get("wind"):
                     _AI["failed"][path] = mt   # skip until the file changes
+                if _AI.get("force") == path and not _AI["abort"] \
+                        and not _AI.get("wind"):
+                    # a wound-down kind is HELD, not done - marking it
+                    # ran made waking from a shutdown dissolve the ask
+                    # as satisfied (review 307)
+                    _AI.setdefault("force_ran", set()).add(kind)
+                # A LANDED JOB ANNOUNCES ITSELF. The UI's little marks cache
+                # their first answer per recording; this counter is how they
+                # learn a sidecar just changed under them without a restart.
+                _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+                _AI["done_path"] = path
+                _AI.pop("ins_prog", None)      # the window bar dies with it
+                _AI.pop("eye_prog", None)      # and so does the eye's
+                _AI["_counts"] = None          # the tally just moved
+                _AI["started"] = 0.0
+                _AI["busy_path"] = None        # a stale path poisoned
+                #                                three by-name checks
+                # busy is released LAST: an audit takeover waits on this
+                # exact write, so everything above stays this worker's own
+                # and can never zero the successor's clock (review 302)
                 _AI["busy"] = None
         threading.Thread(target=work, daemon=True).start()
 
@@ -8361,25 +18811,190 @@ def _ai_tick(ctl):
     # thousand recordings, so the one you are looking at can be days down the
     # queue. A forced path jumps the line and stops being forced the moment it
     # has nothing left owing.
-    fp = _AI.get("force")
-    if fp:
+    # NEXT IN LINE. A batch from Everything is a queue of asks; the moment
+    # one is satisfied the next takes its place, and nothing else in this
+    # function has to know a batch is happening.
+    # ONE LOOP OWNS THE FORCED WORK. Clearing a satisfied ask now hands the
+    # next queued item over IN THE SAME BEAT instead of falling through into
+    # the sweep - which used to run with this beat's gates already bypassed
+    # by forced_now, spawning one arbitrary background job (up to and
+    # including the 15 GB describer) the moment your ask finished.
+    entered_forced = forced_now
+    while True:
+        with _AI_FORCE_LOCK:
+            if not _AI.get("force"):
+                q = list(_AI.get("force_queue") or [])
+                take = None
+                for i0, it0 in enumerate(q):
+                    p0, w0 = it0[0], it0[1]
+                    if not os.path.isfile(p0):
+                        take = i0          # gone from disk - drop it below
+                        break
+                    # A HELD LANE HOLDS THE QUEUE TOO. Pausing used to stop
+                    # item N only for item N+1 to start five seconds later.
+                    # An item whose lane is held stays exactly where it is,
+                    # in order, and waits for Resume.
+                    if not _ai_lanes_free(w0):
+                        continue
+                    vet = _AI.get("veto")
+                    if vet and vet[0] == os.path.basename(p0) \
+                            and time.time() - vet[1] < 15:
+                        continue   # a delete/edit is releasing this file
+                    if str(w0 or "").lower() == "audit":
+                        # a waiting audit re-knocks once a minute; a
+                        # night that is not ready stays IN ITS PLACE
+                        # while the rest of the line flows past it
+                        d0 = (_AI.get("aud_defer") or {}).get(p0, 0)
+                        if time.time() - d0 < 60:
+                            continue
+                    take = i0
+                    break
+                if take is not None:
+                    it0 = q.pop(take)
+                    _AI["_qdirty"] = True
+                    p0, w0 = it0[0], it0[1]
+                    if os.path.isfile(p0) \
+                            and str(w0 or "").lower() == "audit":
+                        # audits never ride force/_spawn - they have
+                        # their own door and manage the card themselves.
+                        # The INDEX rides along: a refused item goes
+                        # back exactly where it was, or a deferred
+                        # group came back reversed every minute
+                        _AI["aud_item"] = (p0, bool(it0[2])
+                                           if len(it0) > 2 else False,
+                                           take)
+                    elif os.path.isfile(p0):
+                        _AI["force"] = p0
+                        _AI["force_want"] = w0
+                        _AI["force_redo"] = (bool(it0[2])
+                                             if len(it0) > 2 else False)
+                        # the ask's memory of what already ran survives a
+                        # pause - without it, resuming a redo did the
+                        # sound and the whole transcription over again
+                        _AI["force_ran"] = (set(it0[3])
+                                            if len(it0) > 3 else set())
+                        _AI["failed"].pop(p0, None)   # asking again clears it
+                _AI["force_queue"] = q
+
+        ad = _AI.pop("aud_item", None)
+        if ad is not None:
+            why0 = ""
+            try:
+                why0 = _audit_why(ad[0], redo=ad[1])
+            except Exception:
+                why0 = "the audit could not be checked"
+            if not why0 and _audit_ask(ad[0], redo=ad[1],
+                                       named=False):
+                # REMEMBERED WHILE IT RUNS: an interrupted queue audit
+                # goes back to the line instead of vanishing - it does
+                # not ride `force`, so every other requeue path misses
+                # it (review 308, critical)
+                _AI["aud_live"] = (ad[0], ad[1],
+                                   ad[2] if len(ad) > 2 else 0)
+                if _AI.pop("_qdirty", None):
+                    _ai_state_save()
+                return                 # one job per beat, as always
+            # not ready (or the card was taken in the race): back to
+            # ITS OWN PLACE, stamped so it re-knocks in a minute - the
+            # line's row shows the why, nothing is silent
+            with _AI_FORCE_LOCK:
+                q2 = list(_AI.get("force_queue") or [])
+                at = min(max(0, ad[2] if len(ad) > 2 else 0), len(q2))
+                q2.insert(at, (ad[0], "audit", ad[1], []))
+                _AI["force_queue"] = q2
+            _AI.setdefault("aud_defer", {})[ad[0]] = time.time()
+            _AI["_qdirty"] = True
+            continue
+        fp = _AI.get("force")
+        if not fp:
+            break
+        want = _AI.get("force_want") or "all"      # all | sound | words
+        # ONE OF EACH PER ASK. Without this a forced job that finished still
+        # counted as owed on the very next beat, and the reader looped on it
+        # for as long as you left it.
+        ran = _AI.get("force_ran") or set()
+        # REDO from the player: freshness is no excuse - the point of the
+        # press is a new result (the old one banks as a version on write)
+        redo = bool(_AI.get("force_redo"))
         try:
-            owed_stt = do_stt and not _ai_sidecar_fresh(fp, "stt")
-            owed_hl = do_hl and not _ai_sidecar_fresh(fp, "hl")
+            # THE SAME ANSWER THE BUTTON GAVE. These two tests used to be
+            # written out separately and drifted apart - which is exactly
+            # how the lightning came to answer "moved to the front of the
+            # queue" and then quietly do nothing. One function now; the
+            # gates above (held, the two switches) still get their say
+            # through do_stt / do_hl.
+            owe = _force_owes(fp, want, redo)
+            owed_stt = bool(do_stt and "hearing" in owe
+                            and "hearing" not in ran)
+            owed_hl = bool(do_hl and "listening" in owe
+                           and "listening" not in ran)
+            owed_ins = bool("thinking" in owe and "thinking" not in ran)
             mt = os.path.getmtime(fp) if os.path.isfile(fp) else None
         except OSError:
-            owed_stt = owed_hl = False
+            owed_stt = owed_hl = owed_ins = False
             mt = None
-        if mt is None or not (owed_stt or owed_hl):
-            _AI["force"] = None            # done, or gone - back to the sweep
+        if mt is None or not (owed_stt or owed_hl or owed_ins):
+            _AI["force"] = None            # satisfied, or gone
+            _AI["force_want"] = None
+            _AI["force_redo"] = False
+            continue                       # the next queued item, this beat
         elif _AI["failed"].get(fp) == mt:
             _AI["force"] = None            # it refused this exact file before
-            log(f"Cannot read {os.path.basename(fp)}; back to the usual order.")
+            _AI["force_want"] = None
+            _AI["force_redo"] = False
+            log(f"Cannot read {os.path.basename(fp)}; taking the next.")
+            continue
         else:
-            _spawn("hearing" if owed_stt else "marking", fp, mt)
+            # listening first here too - it is seconds of work, and it is what
+            # the editor needs before anything else
+            # sound first (seconds), then words, then the description, which
+            # needs the other two to have happened
+            # A HOLD HOLDS THE NEXT KIND TOO. The queue and the job
+            # in hand honour the pause; the live ask picking its next
+            # kind did not, so pausing the review while the words ran
+            # started the hour-long review anyway five seconds later -
+            # the exact bug this pause was built to fix, back through
+            # the front door. Held kinds are simply not owed right now;
+            # if that leaves nothing to start, the ask goes back to the
+            # FRONT of the queue - with its memory of what already ran -
+            # and waits for Resume.
+            held0 = _AI.get("held") or {}
+            owed_hl = owed_hl and not held0.get("listening")
+            owed_stt = owed_stt and not held0.get("hearing")
+            owed_ins = owed_ins and not held0.get("thinking")
+            if not (owed_stt or owed_hl or owed_ins):
+                with _AI_FORCE_LOCK:
+                    _AI["force_queue"] = ([(fp, want, redo, sorted(ran))]
+                                          + list(_AI.get("force_queue")
+                                                 or []))
+                    _AI["force"] = None
+                    _AI["force_want"] = None
+                    _AI["force_redo"] = False
+                break
+            kind0 = ("listening" if owed_hl else
+                     ("hearing" if owed_stt else "thinking"))
+            # AN ASK ANNOUNCES ITS START. "Asked for all" followed by
+            # minutes of silence read as a dead button - the describer
+            # logs nothing until its first window lands, ~12 minutes in.
+            nice0 = {"listening": "the sound", "hearing": "the words",
+                     "thinking": "the senses & the review"}[kind0]
+            log(f"Starting {nice0} on {os.path.basename(fp)}"
+                + (" - done fresh, the old banks as a version" if redo
+                   else "") + ".")
+            _spawn(kind0, fp, mt)
             return
 
+    # A BEAT THAT ARRIVED FORCED NEVER SWEEPS: its gates were passed on the
+    # strength of the ask, and the ask is spent. The ordinary sweep gets the
+    # next beat, judged on its own merits.
+    if _AI.pop("_qdirty", None):
+        _ai_state_save()               # dirt from a drop/clear beat
+    if entered_forced:
+        return
+
     for p in vids:
+        if _AI.get("force") or _AI.get("force_queue"):
+            return             # an ask landed mid-walk - it owns the next beat
         if _queued_finish_badge(p):
             continue                       # HDR master still awaiting SDR
         try:
@@ -8395,11 +19010,45 @@ def _ai_tick(ctl):
         if veto and veto[0] == os.path.basename(p) \
                 and time.time() - veto[1] < 15:
             continue               # a delete/edit is working on this file
+        # LISTENING BEFORE READING, always. One pass over the audio gives
+        # both the sound curve and the gold moments in seconds; a transcript
+        # takes minutes. Doing it the other way round meant the sound graph
+        # for a video you opened was stuck behind the reader on a video you were
+        # not looking at - which is the wait that made the editor unusable.
+        if do_hl and (not _ai_sidecar_fresh(p, "hl")
+                      or not _ai_sidecar_fresh(p, "lvl")):
+            _spawn("listening", p, mt)
+            return                          # one job per tick
         if do_stt and not _ai_sidecar_fresh(p, "stt"):
             _spawn("hearing", p, mt)
-            return                          # one job per tick
-        if do_hl and not _ai_sidecar_fresh(p, "hl"):
-            _spawn("marking", p, mt)
+            return
+        # LOOKING IS ASKED FOR, NEVER SWEPT UP. A look costs ~21 seconds
+        # of the same GPU his games want, and two dozen of them per
+        # recording across a twelve-hundred-recording shelf is a hundred
+        # hours nobody asked for - with no counter moving, because the
+        # tally judges a review by its .ins alone. _vis_owing deliberately
+        # does NOT appear here: the eye runs when he presses for it.
+        if (do_ins and (_ins_owing(p) or _sns_owing(p))
+                and _ai_sidecar_fresh(p, "hl") and _ai_sidecar_fresh(p, "stt")):
+            _spawn("thinking", p, mt)
+            return
+        # AN AUDIT-ONLY NIGHT IS STILL OWED. The line above dispatches
+        # thinking for review/senses debts only, so a pause-orphaned
+        # audit - or the version-bump backlog - waited forever unless
+        # something else happened to that recording. _audit_ask carries
+        # every guard already (one at a time, not while busy, not while
+        # playing) and runs the audit ALONE - the eye cannot fire from
+        # here.
+        if (SETTINGS.get("insights_auto", True)
+                and not playing
+                and not (_AI.get("held") or {}).get("auditing")
+                and _aud_owing_swept(p)
+                and _ai_sidecar_fresh(p, "hl")
+                and _ai_sidecar_fresh(p, "stt")):
+            # its OWN gate, not do_ins: holding the review lane used to
+            # silently stop every audit too - the lanes are siblings,
+            # not parent and child
+            _audit_ask(p)
             return
 
 
@@ -8408,32 +19057,161 @@ def _queued_finish_badge(path):
         if not SETTINGS.get("sdr_finish", True):
             return False       # a disabled queue never drains - don't let it
         ap = os.path.normcase(os.path.abspath(path))   # gate the AI forever
-        return any(os.path.normcase(os.path.abspath(it.get("path", ""))) == ap
-                   for it in _load_finish_queue())
+        return any(os.path.normcase(os.path.abspath(q0)) == ap
+                   for q0 in _queued_finish_paths())
     except Exception:
         return False
 
 
-def _ai_pending_counts():
-    """(transcripts pending, highlights pending) - cheap enough for state()
-    consumers to poll occasionally; cached 30s."""
-    now = time.time()
-    c = _AI.get("_counts")
-    if c and now - c[2] < 30:
-        return c[0], c[1]
-    out = SETTINGS.get("output_dir", "")
-    stt = hl = 0
+
+
+def _ins_done_honest(video_path):
+    """Is this recording's review actually FINISHED - complete with content,
+    or honestly empty? Partial, failed and tries-spent sidecars all answer
+    no. This is the display truth (tally, flags); the sweep keeps its own
+    owing-judge, which may give up where this still says not-done."""
     try:
-        for d, kind in _library_dirs(out):
+        with open(_ai_sidecar(video_path, "ins"), encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        if d.get("failed"):
+            return False
+        return bool(d.get("complete")) and (bool(d.get("chapters"))
+                                            or bool(d.get("empty")))
+    except Exception:
+        return False
+
+
+_AUD_VCACHE = {}
+
+
+def _aud_done_current(video_path):
+    """Is this night's audit finished AND by the current auditor? Cheap
+    on purpose - the tally calls it per video every 30s, so the version
+    read is cached against the sidecar's own clock."""
+    ap = _ai_sidecar(video_path, "aud")
+    try:
+        st = os.stat(ap)
+    except OSError:
+        return False
+    key = (st.st_mtime, st.st_size)
+    hit = _AUD_VCACHE.get(ap)
+    if hit and hit[0] == key:
+        return hit[1]
+    ok = False
+    try:
+        with open(ap, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        ok = bool(d.get("complete")) and int(d.get("v") or 0) >= _AUD_V
+    except Exception:
+        ok = False
+    _AUD_VCACHE[ap] = (key, ok)
+    if len(_AUD_VCACHE) > 4000:
+        _AUD_VCACHE.clear()
+    return ok
+
+
+def _ai_tally():
+    """One walk of the library, answering everything the Working page asks:
+    how many videos each job still owes, and HOW MANY SECONDS OF VIDEO those
+    are - because ten two-minute clips and ten seven-hour sessions are not
+    the same amount of work, and an estimate built on file counts would lie
+    by an order of magnitude. Cached 30s; the walk is two stats per video."""
+    now = time.time()
+    c = _AI.get("_tally")
+    if c and now - c["t"] < 30:
+        return c
+    total = 0
+    left = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
+    secs = {"listening": 0.0, "hearing": 0.0, "thinking": 0.0,
+            "auditing": 0.0}
+    done = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
+    gaveup = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
+    try:
+        for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
             for v in _scan_dir_mp4s(d, kind):
-                if not _ai_sidecar_fresh(v["path"], "stt"):
-                    stt += 1
-                if not _ai_sidecar_fresh(v["path"], "hl"):
-                    hl += 1
+                total += 1
+                p = v["path"]
+                for job, side in (("hearing", "stt"), ("listening", "hl"),
+                                  ("thinking", "ins")):
+                    # DONE MEANS FINISHED, not "given up on". "Not owed"
+                    # counted a review that failed its three tries as done -
+                    # the Working page said "3 of 1,229 done" and all three
+                    # were empty wrecks invisible in every list. A review is
+                    # done when it is COMPLETE (or honestly empty).
+                    if (_ins_done_honest(p)) if side == "ins" \
+                            else _ai_sidecar_fresh(p, side):
+                        done[job] += 1
+                    elif side == "ins" and not _ins_owing(p) \
+                            and os.path.isfile(_ai_sidecar(p, "ins")):
+                        gaveup[job] += 1   # tried three times, let go - not
+                        #                    'left', or the backlog number
+                        #                    could never reach zero
+                    else:
+                        left[job] += 1
+                        # the duration is already in the library scan; falling
+                        # back to a probe here would stat-storm the whole disk
+                        secs[job] += _secs_no_probe(v)
+                # THE AUDIT COUNTS LIKE EVERY OTHER LABOUR - but only on
+                # nights it is UNLOCKED for (an honest review exists).
+                # The version matters: an audit from an older auditor
+                # answered a smaller question and reads as owed.
+                try:
+                    if _ins_done_honest(p):
+                        if _aud_done_current(p):
+                            done["auditing"] += 1
+                        else:
+                            left["auditing"] += 1
+                            secs["auditing"] += _secs_no_probe(v)
+                except Exception:
+                    pass
     except Exception:
         pass
-    _AI["_counts"] = (stt, hl, now)
-    return stt, hl
+    out = {"t": now, "total": total, "gaveup": gaveup}
+    for job in ("listening", "hearing", "thinking", "auditing"):
+        out[job] = {"left": left[job], "done": done[job], "secs": secs[job]}
+    _AI["_tally"] = out
+    return out
+
+
+def _moment_of(path, why, question):
+    """Where in this recording those words were said, in milliseconds.
+
+    The model quotes from the transcript when it explains a match, so the
+    quote is a key back into it. Score every line on how many of the
+    distinctive words it shares, and take the best - falling back to the
+    question's own words, then to the start."""
+    try:
+        with open(_ai_sidecar(path, "stt"), encoding="utf-8") as fh:
+            segs = (json.load(fh) or {}).get("segments") or []
+    except Exception:
+        return 0
+    if not segs:
+        return 0
+    stop = {"the", "and", "a", "an", "of", "to", "in", "is", "it", "that",
+            "this", "for", "on", "was", "with", "at", "he", "she", "they",
+            "you", "i", "we", "his", "her", "them", "there", "here", "what",
+            "when", "where", "moment", "moments", "video", "recording",
+            "clip", "find", "funny", "about", "some", "from", "have", "has"}
+
+    def words(t):
+        return {w for w in "".join(
+            (c.lower() if c.isalnum() else " ") for c in str(t or "")).split()
+            if len(w) > 3 and w not in stop}
+
+    for probe in (words(why), words(question)):
+        if not probe:
+            continue
+        best, score = None, 0
+        for sg in segs:
+            hit = len(probe & words(sg.get("t")))
+            if hit > score:
+                best, score = sg, hit
+        if best is not None and score >= 1:
+            try:
+                return int(best.get("a") or 0)
+            except Exception:
+                return 0
+    return 0
 
 
 def _search_index():
@@ -8453,7 +19231,8 @@ def _search_index():
                     data = json.load(fh)
                 base = name[:-len(".stt.json")]
                 rows = [(s["a"], s["t"].lower(), s["t"])
-                        for s in data.get("segments", []) if s.get("t")]
+                        for s in data.get("segments", [])
+                        if s.get("t") and not s.get("nn")]
                 if rows:
                     idx[base] = rows
             except Exception:
@@ -8654,6 +19433,28 @@ def _video_duration(path):
         with _DUR_LOCK:
             _DUR_CACHE[key] = (mt, float(d))
     return d
+
+
+def _secs_no_probe(item):
+    """Seconds of video, WITHOUT touching the disk. The duration cache holds
+    a real figure for anything already browsed; for the rest, size against the
+    bitrate LORE recorded at is close enough to size a queue with - and an
+    estimate that costs nothing beats a truth that costs an hour of ffprobe."""
+    _dur_load_once()
+    try:
+        key = os.path.normcase(os.path.abspath(item.get("path", "")))
+        mt = item.get("mtime") or 0
+        with _DUR_LOCK:
+            hit = _DUR_CACHE.get(key)
+        if hit and abs(hit[0] - mt) < 2:
+            return float(hit[1])
+    except Exception:
+        pass
+    try:
+        mbps = float(SETTINGS.get("bitrate_mbps") or 15) or 15.0
+        return max(0.0, float(item.get("size") or 0) * 8.0 / (mbps * 1e6))
+    except Exception:
+        return 0.0
 
 
 def _scan_dir_mp4s(directory, kind):
@@ -9054,7 +19855,12 @@ def _show_toast(root, title, sub):
 
         wl, wt, wr, wb = _popup_workarea() or _screen_workarea(top)
         m = max(18, int(H * 0.28))
-        fx, fy = max(wl, wr - W - m), max(wt, wb - H - m)
+        # BOTTOM-RIGHT, where he expects it. A build once moved this to
+        # bottom-center on an ultrawide theory ("the eye lives in the
+        # middle"); in practice a card surfacing mid-screen reads as a
+        # glitch, and he asked for the corner back by name.
+        fx = max(wl, wr - W - m)
+        fy = max(wt, wb - H - m)
         top.geometry(f"{W}x{H}+{fx}+{fy}")
         show_img(seq[0])
         top.update_idletasks()
@@ -9267,6 +20073,11 @@ def _start_media_server():
                 self.send_header("Content-Type", "video/mp4")
                 self.send_header("Content-Length", str(length))
                 self.send_header("Accept-Ranges", "bytes")
+                # the player's boost/night graph routes this stream through
+                # WebAudio, which outputs silence from cross-origin media
+                # unless the response is CORS-clean. local + tokened, so *
+                # gives away nothing.
+                self.send_header("Access-Control-Allow-Origin", "*")
                 # Let the browser CACHE the ranges it fetches. With no-store it
                 # threw everything away and re-downloaded on every seek - that was
                 # the "skip and it buffers" lag. stream_url carries the file mtime,
@@ -9460,10 +20271,12 @@ class _JsApi:
         busy = _AI.get("busy")
         stt_on = bool(SETTINGS.get("ai_transcribe", True))
         hl_on = bool(SETTINGS.get("ai_highlights", True))
-        have = _whisper_paths() is not None
+        have = _reader_paths() is not None
         # the same gates _ai_tick obeys, said in the reader's own words
         why = ""
-        if not (stt_on or hl_on):
+        if SETTINGS.get("bg_shutdown"):
+            why = "all background work is shut down"
+        elif not (stt_on or hl_on):
             why = "off"
         elif busy is None:
             if ctl.session is not None:
@@ -9472,32 +20285,975 @@ class _JsApi:
                 why = "waiting for a recording to finish saving"
             elif _TRIM_BUSY[0] > 0:
                 why = "waiting for your edit"
-            elif time.time() - _MEDIA.get("last_read", 0) < 20:
-                why = "waiting while you watch"
+        if why == "waiting for your edit":
+            pass          # the edit gate holds whatever the switch says - an
+            #               export has the source open, and saying nothing
+            #               showed an idle reader with no reason for hours
+        elif SETTINGS.get("always_read"):
+            why = ""                    # nothing is holding it back
+        elif why:
+            why += " \u2014 turn on Read anytime to work through it regardless"
+        if all((_AI.get("held") or {}).values()):
+            why = "held by you"
         forced = _AI.get("force")
-        out = {"stt_on": stt_on, "hl_on": hl_on, "whisper": have, "why": why,
+        # what the job in hand has managed so far. There is no progress signal
+        # inside the reader or the audio pass, so this is elapsed against what
+        # this machine has historically taken for a video this long - honest
+        # as an estimate, and never allowed to claim it has finished.
+        job = None
+        if busy:
+            started = _AI.get("started") or 0
+            vsecs = _AI.get("job_secs") or 0
+            elapsed = max(0.0, time.time() - started) if started else 0.0
+            rate = (_hearing_secs_per_video_sec() if busy[0] == "hearing"
+                    else _ai_rate(busy[0]))
+            eta = (vsecs * rate) if (rate and vsecs) else None
+            pct = (min(99, int(elapsed / eta * 100))
+                   if (eta and eta > 0) else None)
+            left = (max(0, round(eta - elapsed))
+                    if (eta and eta > elapsed) else None)
+            # WHERE IT HAS REALLY GOT TO. The reader writes this beside its own
+            # scratch after every utterance. Before, this was elapsed against a
+            # GUESS, capped at 99 - so a job that ran longer than predicted sat
+            # at 99% saying nothing, for as long as it took. (The reader did
+            # print its progress, and a comment here claimed the app watched
+            # it; the app reads that pipe with communicate(), which returns
+            # only once the process has exited. Nobody ever saw a line of it.)
+            try:
+                pf = _AI.get("prog_file")
+                if pf and os.path.isfile(pf):
+                    with open(pf, encoding="utf-8") as fh:
+                        pr = json.load(fh)
+                    tot = float(pr.get("audio_total") or 0)
+                    did = float(pr.get("audio_done") or 0)
+                    if tot > 0 and did > 0 and not _AI.get("prog_t0"):
+                        _AI["prog_t0"] = time.time()  # transcription began HERE
+                    if tot > 0:
+                        frac = max(0.0, min(1.0, did / tot))
+                        pct = min(99, int(frac * 100))
+                        # extrapolate only the time spent TRANSCRIBING - the
+                        # model load, the VAD and the audio extraction happen
+                        # once and do not scale with the recording
+                        gen = time.time() - (_AI.get("prog_t0") or started)
+                        if frac > 0.02 and gen > 5:
+                            left = max(0, round(gen / frac - gen))
+            except Exception:
+                pass
+            job = {"kind": busy[0], "label": AI_LABEL.get(busy[0], busy[0]),
+                   "name": busy[1], "elapsed": round(elapsed),
+                   "video_secs": round(vsecs),
+                   "pct": pct, "left_s": left}
+            # THE HEARTBEAT. The freshest real progress signal this job
+            # has produced - so the page can say "alive Ns ago" or "may
+            # be stuck" instead of making him stare at a frozen percent
+            _hb = 0.0
+            for _pk in ("ins_prog", "aud_prog", "eye_prog"):
+                _pv = _AI.get(_pk)
+                if isinstance(_pv, dict):
+                    _hb = max(_hb, float(_pv.get("at") or 0))
+            _pf = _AI.get("prog_file")
+            if _pf:
+                try:
+                    _hb = max(_hb, os.path.getmtime(_pf))
+                except OSError:
+                    pass
+            job["beat_at"] = round(_hb, 1) if _hb else None
+            # the describer KNOWS how many windows are done - an honest
+            # fraction beats elapsed-vs-guess stuck at 99
+            # THE EYE COMES FIRST AND TAKES MINUTES. While it is looking
+            # there are no windows to count yet, so the row would show the
+            # elapsed-vs-guess bar and no word about what is happening.
+            ep = _AI.get("eye_prog") if busy[0] == "thinking" else None
+            if ep and int(ep.get("total") or 0) > 0 and not _AI.get("ins_prog"):
+                done_l = int(ep.get("done") or 0)
+                tot_l = int(ep["total"])
+                job["look_done"] = done_l
+                job["look_total"] = tot_l
+                job["pct"] = max(1, min(60, int(done_l / tot_l * 60)))
+                # FROM THE BATCHES, NOT THE CLOCK. Dividing the job's whole
+                # elapsed by the looks done charged the eye for the senses
+                # pass that ran before it and for the model's one-off
+                # wake-up: it read "1h 31m left" on a job with seven
+                # minutes in it. Time the batches, throw away the first
+                # (it carries the load), and say what the rest cost.
+                raw = [x for x in (ep.get("took") or [])
+                       if isinstance(x, (list, tuple)) and len(x) == 2
+                       and x[1]]
+                # THE FIRST BATCH IS NOT EVIDENCE. It carries the model's
+                # one-off wake-up - three and a half minutes on his card -
+                # and using it alone read 47 minutes on a job with six
+                # left. Until a SECOND batch lands there is nothing clean
+                # to measure, so the row says what this machine is known
+                # to do and marks it a guess.
+                clean = raw[1:] if len(raw) > 1 else []
+                if clean:
+                    per = (sum(float(a) for a, _n in clean)
+                           / max(1, sum(int(n) for _a, n in clean)))
+                    job["left_guess"] = False
+                else:
+                    per = 21.5
+                    job["left_guess"] = True
+                job["left_s"] = max(0, round(per * (tot_l - done_l)))
+            ap0 = (_AI.get("aud_prog")
+                   if str(busy[1] or "").startswith("the audit \u00b7")
+                   else None)
+            if ap0:
+                frac = float(ap0.get("frac") or 0.0)
+                # the ask is one long call: it advances live against the
+                # measured per-line cost, and 94% is the ceiling until
+                # the write lands - 100 only ever means done
+                if ap0.get("ask_eta"):
+                    adv = min(0.70, (time.time() - float(ap0.get("at") or 0))
+                              / float(ap0["ask_eta"]) * 0.70)
+                    frac = min(0.93, frac + adv)
+                    job["left_s"] = max(0, round(
+                        float(ap0["ask_eta"])
+                        - (time.time() - float(ap0.get("at") or 0)))) or None
+                job["pct"] = max(1, min(94, int(frac * 100)))
+                job["note"] = str(ap0.get("phase") or "")
+            ip = _AI.get("ins_prog") if busy[0] == "thinking" else None
+            if ip and int(ip.get("total") or 0) > 0:
+                done_w = int(ip.get("done") or 0)
+                tot_w = int(ip["total"])
+                job["win_done"] = done_w
+                job["win_total"] = tot_w
+                job["tail"] = bool(ip.get("tail"))
+                # HOW LONG THIS ONE TAKES - said plainly, because the only
+                # other number on the row is the whole shelf's and reading
+                # "150 hours of work" beside one 36-minute recording is how
+                # a job that is going fine looks broken.
+                #
+                # Windows land minutes apart, so a bar that only moves when
+                # one lands sits at 1% for a quarter of an hour and says
+                # nothing about whether it is alive. The finished windows
+                # are the truth; the one in hand is filled in by how long
+                # its neighbours took (or the machine's own average rate
+                # until one has), and never allowed to reach the next
+                # window's share.
+                rate = _ai_rate("thinking") or 0.0     # work-secs per video-sec
+                # what the finished windows COST, timed when they landed -
+                # dividing the running clock by them instead made the time
+                # left grow as the job ran
+                landed = float(ip.get("at") or 0.0)
+                since = max(0.0, (time.time() - landed) if landed else 0.0)
+                per_w = ((elapsed - since) / done_w) if done_w else (
+                    (vsecs * rate / tot_w) if (vsecs and rate) else 0.0)
+                spent = since if done_w else elapsed
+                frac = float(done_w)
+                if per_w > 0 and done_w < tot_w:
+                    frac += max(0.0, min(0.95, spent / per_w))
+                job["pct"] = max(1, min(99, int(frac / tot_w * 100)))
+                if per_w > 0 and done_w < tot_w:
+                    job["left_s"] = max(
+                        0, round(per_w * (tot_w - done_w) - spent))
+                    job["left_guess"] = not done_w   # a guess until one lands
+                else:
+                    job["left_s"] = None
+        if SETTINGS.get("bg_shutdown"):
+            why = "all background work is shut down"
+        out = {"stt_on": stt_on, "hl_on": hl_on, "reader": have, "why": why,
+               "paused": bool(_AI.get("paused")),
+               "held": dict(_AI.get("held")
+                            or {"listening": False, "hearing": False}),
+               "catchup": bool(SETTINGS.get("always_read")),
+               "always_read": bool(SETTINGS.get("always_read")),
                "forced": (os.path.basename(forced) if forced else None),
-               "busy": ({"kind": busy[0], "name": busy[1]} if busy else None)}
-        c = _AI.get("_read")
-        fresh = c and time.time() - c["t"] < 20
-        if not fresh and ctl.session is None:
-            total = stt = hl = 0
+               "forced_want": _AI.get("force_want") or None,
+               "busy": ({"kind": busy[0], "name": busy[1]} if busy else None),
+               "job": job, "kinds": [],
+               "done_rev": int(_AI.get("done_rev") or 0),
+               "done_path": _AI.get("done_path") or None,
+               "queued": len(_AI.get("force_queue") or []),
+               "shutdown": bool(SETTINGS.get("bg_shutdown")),
+               "next": (_ai_next_sweep()
+                        if ctl.session is None and busy is None
+                        else None)}
+        if ctl.session is None:
+            t = _ai_tally()
+            out["total"] = t["total"]
+            has_key = os.path.isfile(_key_path())
+            for kind, side, label in (("listening", "hl", "Sound & gold moments"),
+                                      ("hearing", "stt", "Transcripts"),
+                                      ("thinking", "ins", "Titles, chapters & clips"),
+                                      ("auditing", "aud", "The audit")):
+                k = t[kind]
+                # the reader is priced by talking, everything else by length
+                rate = (_hearing_secs_per_video_sec() if kind == "hearing"
+                        else _ai_rate(kind))
+                on = (hl_on if kind == "listening" else
+                      (stt_on and have) if kind == "hearing" else
+                      (_describer_paths() is not None
+                       or _aud_llm_paths() is not None)
+                      if kind == "auditing" else
+                      # LOCAL now - the only requirements are the switch and
+                      # the model on disk; the old Claude key kept this row
+                      # dark on any machine without one
+                      (bool(SETTINGS.get("claude_insights", True))
+                       and _describer_paths() is not None))
+                out["kinds"].append({
+                    "kind": kind, "label": label, "on": bool(on),
+                    # true once this machine has timed a job of this kind
+                    "measured": bool(_AI["rate"].get(kind)),
+                    "done": k["done"], "left": k["left"], "total": t["total"],
+                    "pct": (int(k["done"] / t["total"] * 100) if t["total"] else 100),
+                    # x realtime, the way a person would say it
+                    "speed": (round(1.0 / rate, 1) if rate else None),
+                    # seconds of wall clock for everything still owed
+                    "eta_s": (round(k["secs"] * rate) if rate else None),
+                    "backlog_s": round(k["secs"]),
+                })
+            # the old flat fields, still used by the Settings plate
+            out.update({"stt_done": t["hearing"]["done"],
+                        "hl_done": t["listening"]["done"]})
+        return out
+
+    def insights(self, path):
+        """A recording's title, summary, chapters, described moments and
+        suggested clips - or None if Claude has not been here yet."""
+        p = self._safe_path(path)
+        if not p:
+            return None
+        d = _read_sidecar(p, "ins")           # one shape, one reader
+        if d is None:
+            return None
+        return None if d.get("empty") else d
+
+    def ask_video(self, path, question):
+        """A question about ONE recording, answered from what was said in it.
+        This is the transcript panel's Ask - far cheaper than the library one
+        because it only ever carries a single transcript."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "unknown recording"}
+        q = str(question or "").strip()
+        if not q:
+            return {"ok": False, "why": "ask something"}
+        try:
+            with open(_ai_sidecar(p, "stt"), encoding="utf-8") as fh:
+                segs = (json.load(fh) or {}).get("segments") or []
+        except Exception:
+            segs = []
+        if not segs:
+            return {"ok": False, "why": "this one has not been read yet"}
+        # the local window is 8k tokens, not 200k: keep every line that
+        # shares words with the question (plus its neighbours for context),
+        # then pad with the rest evenly until the budget is spent
+        terms = _ask_terms(q)
+        keep_idx = set()
+        for i, sg in enumerate(segs):
+            if terms and _ask_score(sg.get("t") or "", terms):
+                keep_idx.update((i - 1, i, i + 1))
+        lines, budget = [], 15_000
+        rows_all = []
+        for i, sg in enumerate(segs):
+            t = int(sg.get("a") or 0) // 1000
+            rows_all.append((i, f"[{t // 60}:{t % 60:02d}] "
+                                f"{sg.get('t') or ''}"))
+        picked = [r for i, r in rows_all if i in keep_idx]
+        rest = [r for i, r in rows_all if i not in keep_idx]
+        step = max(1, len(rest) // max(1, 260 - len(picked)))
+        ordered = sorted(set(picked + rest[::step]),
+                         key=lambda r: rows_all.index(
+                             next(x for x in rows_all if x[1] == r)))
+        for row in ordered:
+            budget -= len(row)
+            if budget <= 0:
+                break
+            lines.append(row)
+        tool = {"name": "answer",
+                "description": "Answer from this recording's transcript.",
+                "input_schema": {"type": "object", "properties": {
+                    "answer": {"type": "string",
+                               "description": "A sentence or two, plainly."},
+                    "hits": {"type": "array", "items": {"type": "object",
+                             "properties": {
+                                 "t": {"type": "number",
+                                       "description": "seconds into the "
+                                                      "recording"},
+                                 "quote": {"type": "string",
+                                           "description": "what was said "
+                                                          "there"}},
+                             "required": ["t", "quote"]}}},
+                    "required": ["answer", "hits"]}}
+        data, why = _ask_llm(
+            "You answer questions about ONE game recording using only the "
+            "timestamped transcript given. Quote what was actually said and "
+            "give the time it was said. If the transcript does not answer the "
+            "question, say so plainly and return no hits. Never invent a "
+            "quote or a time. Reply with STRICT JSON only.",
+            f"Question: {q}\n\nTranscript:\n" + "\n".join(lines),
+            tool["input_schema"], max_tokens=900, wait=150)
+        if data is None:
+            return {"ok": False, "why": why}
+        hits = []
+        for h in (data.get("hits") or [])[:20]:
+            try:
+                hits.append({"t_ms": int(max(0.0, float(h.get("t") or 0))
+                                         * 1000),
+                             "text": str(h.get("quote") or "")[:200]})
+            except Exception:
+                continue
+        return {"ok": True, "answer": str(data.get("answer") or "")[:600],
+                "hits": hits}
+
+    _ASK_SHELF = {"at": 0.0, "rows": None, "order": None}
+
+    def ask_library(self, question):
+        """A question about the whole library, in plain English.
+
+        Everything LORE knows in one page - every title and summary it has -
+        goes with the question, and the answer names the recordings and the
+        seconds to jump to. Falls back to the plain word search when there is
+        no key, so the box is never dead."""
+        q = str(question or "").strip()
+        if not q:
+            return {"ok": False, "why": "ask something"}
+
+        # A DESCRIPTION IF THERE IS ONE, THE TRANSCRIPT IF NOT. Waiting for
+        # every recording to be described before the question box works would
+        # mean waiting days; what was actually SAID is already on disk and
+        # answers most questions perfectly well.
+        # REMEMBER THE SHELF. Every question used to walk 1,253
+        # recordings and open up to 1,900 sidecars before the model saw a
+        # word - tens of seconds off a spinning disk, and paid all over
+        # again for the next question. The shelf does not change while he
+        # is typing.
+        _sh = _JsApi._ASK_SHELF
+        vids = []
+        if _sh["rows"] is not None and time.time() - _sh["at"] < 120:
+            rows, order = list(_sh["rows"]), list(_sh["order"])
+        else:
             try:
                 for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
-                    for v in _scan_dir_mp4s(d, kind):
-                        total += 1
-                        if _ai_sidecar_fresh(v["path"], "stt"):
-                            stt += 1
-                        if _ai_sidecar_fresh(v["path"], "hl"):
-                            hl += 1
+                    vids.extend(_scan_dir_mp4s(d, kind))
             except Exception:
-                total = stt = hl = 0
-            c = {"total": total, "stt": stt, "hl": hl, "t": time.time()}
-            _AI["_read"] = c
-        if c:
-            out.update({"total": c["total"], "stt_done": c["stt"],
-                        "hl_done": c["hl"]})
+                pass
+            vids.sort(key=lambda v: -(v.get("mtime") or 0))
+            rows, order = [], []
+        budget = 520_000
+        for v in vids:
+            if budget <= 0 or len(order) >= 1900:
+                break
+            line = ""
+            try:
+                with open(_ai_sidecar(v["path"], "ins"), encoding="utf-8") as fh:
+                    ins = json.load(fh)
+                if not ins.get("empty") and ins.get("title"):
+                    line = f"{ins['title']}. {ins.get('summary', '')}"
+            except Exception:
+                pass
+            if not line:
+                try:
+                    with open(_ai_sidecar(v["path"], "stt"),
+                              encoding="utf-8") as fh:
+                        segs = (json.load(fh) or {}).get("segments") or []
+                    said = " ".join((sg.get("t") or "") for sg in segs).strip()
+                    if len(said) >= 25:
+                        line = "said: " + said[:260]
+                except Exception:
+                    pass
+            if not line:
+                continue                      # nothing known about this one
+            i = len(order)
+            order.append(v["path"])
+            when = _dt.datetime.fromtimestamp(
+                v.get("mtime") or 0).strftime("%d %b %Y")
+            game = _parse_clip_name(os.path.basename(v["path"])) or ""
+            row = f"[{i}] {when} {game} - {line}"
+            budget -= len(row)
+            rows.append(row)
+        if vids:                       # freshly walked - keep it warm
+            _sh["rows"], _sh["order"] = list(rows), list(order)
+            _sh["at"] = time.time()
+        if not rows:
+            return {"ok": False,
+                    "why": "nothing has been read or described yet",
+                    "hits": _search_words(q)[:40]}
+        tool = {
+            "name": "answer",
+            "description": "Answer using only the recordings listed.",
+            "input_schema": {"type": "object", "properties": {
+                "answer": {"type": "string",
+                           "description": "A sentence or two, in plain words."},
+                "hits": {"type": "array", "items": {"type": "object",
+                         "properties": {
+                             "i": {"type": "integer",
+                                   "description": "the [n] of the recording"},
+                             "t": {"type": "number",
+                                   "description": "seconds to jump to, if known"},
+                             "why": {"type": "string"}},
+                         "required": ["i", "why"]}}},
+                "required": ["answer", "hits"]}}
+        # the local window holds ~120 entries, not 1,900: rank every row
+        # by how much of the question it carries and renumber the keepers
+        terms = _ask_terms(q)
+        scored = sorted(range(len(rows)),
+                        key=lambda i: (-_ask_score(rows[i], terms), i))
+        keep = [i for i in scored if _ask_score(rows[i], terms)][:100]
+        if len(keep) < 40:                     # pad with the newest
+            keep += [i for i in range(len(rows)) if i not in keep][:40]
+        keep = keep[:120]
+        keep_set = sorted(keep, key=lambda i: i)
+        order2, rows2 = [], []
+        for i in keep_set:
+            j = len(order2)
+            order2.append(order[i])
+            rows2.append(f"[{j}]" + rows[i][rows[i].index("]") + 1:])
+        order, rows = order2, rows2
+        data, why = _ask_llm(
+            "You help someone search their own game recordings. You are given "
+            "a numbered list; each entry is either a title and summary, or - "
+            "marked 'said:' - the actual words spoken during it. "
+            "Answer ONLY from that list. Pick the recordings that genuinely "
+            "match and say why in a few words, quoting what was said where it "
+            "helps. If none match, say so plainly and return no hits. "
+            "Never invent a recording, a quote or a time. "
+            "Reply with STRICT JSON only.",
+            f"Question: {q}\n\nRecordings:\n" + "\n".join(rows),
+            tool["input_schema"], max_tokens=1200, wait=150)
+        if data is None:
+            return {"ok": False, "why": why, "hits": _search_words(q)[:40]}
+        out = []
+        for h in (data.get("hits") or [])[:20]:
+            try:
+                i = int(h.get("i"))
+                if not (0 <= i < len(order)):
+                    continue
+                path = order[i]
+                # THE ANSWER USED TO OPEN THE VIDEO AT 0:00. The model is only
+                # REQUIRED to give the recording and the reason - a time is
+                # optional and it usually omits one - so this was almost always
+                # zero, and a zero start means 'do not seek'. When there is no
+                # time, find one: the words it gave as its reason are quoted
+                # from the transcript, so look them up in that recording's own
+                # transcript and jump to where they were actually said.
+                ms = int(float(h.get("t") or 0) * 1000)
+                why = str(h.get("why") or "")[:160]
+                if ms <= 0:
+                    ms = _moment_of(path, why, q)
+                out.append({"path": path,
+                            "file": os.path.splitext(
+                                os.path.basename(path))[0],
+                            "t_ms": max(0, ms),
+                            "text": why})
+            except Exception:
+                continue
+        return {"ok": True, "answer": str(data.get("answer") or "")[:600],
+                "hits": out}
+
+    def have_flags(self, paths):
+        """Which results each of these recordings already has. Asked for a
+        whole page at once, so hovering a card never costs a round trip."""
+        out = {}
+        for raw in (paths or [])[:400]:
+            p = self._safe_path(raw)
+            if not p:
+                continue
+            row = {}
+            for key, side in (("hl", "hl"), ("stt", "stt"), ("lvl", "lvl")):
+                row[key] = os.path.isfile(_ai_sidecar(p, side))
+            # an AI review only counts when it is FINISHED with chapters.
+            # Judging by title alone lit the flag on a HALF-done redo (a
+            # restarted full-redo keeps the old title while its windows are
+            # still being rebuilt) - "cancelled 50% in and it thinks it's
+            # complete", in his words.
+            row["ins"] = False
+            try:
+                with open(_ai_sidecar(p, "ins"), encoding="utf-8") as fh:
+                    d = json.load(fh) or {}
+                row["ins"] = (bool(d.get("complete")) and not d.get("failed")
+                              and bool(d.get("chapters")))
+            except Exception:
+                pass
+            # AUDITED means audited BY THIS AUDITOR. An audit from an
+            # older version answered a smaller question (v1-2 never read
+            # the transcript), so it reads as not-audited - which is the
+            # truth, and what makes the filter chip useful for finding
+            # the backlog.
+            row["aud"] = False
+            try:
+                with open(_ai_sidecar(p, "aud"), encoding="utf-8") as fh:
+                    d2 = json.load(fh) or {}
+                row["aud"] = (bool(d2.get("complete"))
+                              and int(d2.get("v") or 0) >= _AUD_V)
+            except Exception:
+                pass
+            out[raw] = row
         return out
+
+    def ai_refusals(self):
+        """The refusals shelf: every recording the tome has GIVEN UP on and
+        why. Reviews that spent their three tries (the tally's gave-up rule)
+        plus files the reader refused outright this session. Asking again by
+        name always works - that is what the shelf's button does."""
+        out = []
+        failed = dict(_AI.get("failed") or {})
+        try:
+            for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                for v in _scan_dir_mp4s(d, kind):
+                    p = v["path"]
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if failed.get(p) == mt:
+                        # the reader's own memo: this exact file refused
+                        out.append({"path": p, "kind": "file",
+                                    "why": "would not read - left alone "
+                                           "until the file changes"})
+                        continue
+                    # the tally's gave-up rule: a review sidecar exists, it
+                    # is not honestly finished, and nothing is owed any more
+                    if (os.path.isfile(_ai_sidecar(p, "ins"))
+                            and not _ins_done_honest(p)
+                            and not _ins_owing(p)):
+                        why = "tried three times and gave up"
+                        try:
+                            with open(_ai_sidecar(p, "ins"),
+                                      encoding="utf-8") as fh:
+                                dd = json.load(fh) or {}
+                            if dd.get("failed"):
+                                why = "refused three times"
+                            elif (isinstance(dd.get("windows"), dict)
+                                    and not dd.get("complete")):
+                                why = "stopped part-way three times"
+                        except Exception:
+                            pass
+                        out.append({"path": p, "kind": "ins", "why": why})
+        except Exception:
+            pass
+        return out
+
+    def ai_whynot(self, path):
+        """Why has this one not been read yet - per job, in plain words,
+        plus whichever gate holds the reader back at this moment and where
+        the recording stands in the sweep. The card's question mark asks."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "unknown file"}
+        ctl = self._ctl
+        held = _AI.get("held") or {}
+        kinds = []
+        if _ai_sidecar_fresh(p, "hl"):
+            kinds.append({"kind": "hl", "done": True, "owed": False,
+                          "why": "finished"})
+        else:
+            why = ("switched off"
+                   if not SETTINGS.get("ai_highlights", True)
+                   else "held by you" if held.get("listening")
+                   else "waiting its turn")
+            kinds.append({"kind": "hl", "done": False, "owed": True,
+                          "why": why})
+        if _ai_sidecar_fresh(p, "stt"):
+            kinds.append({"kind": "stt", "done": True, "owed": False,
+                          "why": "finished"})
+        else:
+            why = ("switched off"
+                   if not SETTINGS.get("ai_transcribe", True)
+                   else "the reader is not installed"
+                   if _reader_paths() is None
+                   else "held by you" if held.get("hearing")
+                   else "waiting its turn")
+            kinds.append({"kind": "stt", "done": False, "owed": True,
+                          "why": why})
+        tries = 0
+        ins_failed = False
+        partial = False
+        try:
+            with open(_ai_sidecar(p, "ins"), encoding="utf-8") as fh:
+                dd = json.load(fh) or {}
+            tries = int(dd.get("tries") or 0)
+            ins_failed = bool(dd.get("failed"))
+            partial = (isinstance(dd.get("windows"), dict)
+                       and not dd.get("complete"))
+        except Exception:
+            pass
+        if _ins_done_honest(p):
+            kinds.append({"kind": "ins", "done": True, "owed": False,
+                          "tries": tries, "why": "finished"})
+        else:
+            owed = _ins_owing(p)
+            if _describer_paths() is None:
+                why = "the describer is not installed"
+            elif not owed and (ins_failed or partial):
+                why = ("gave up after three tries - asking by name "
+                       "still works")
+            elif ins_failed or partial:
+                why = (("failed" if ins_failed else "part-done")
+                       + " - try %d of 3" % max(1, tries))
+            elif held.get("thinking"):
+                why = "held by you"
+            elif not SETTINGS.get("insights_auto", True):
+                why = "only on request - the bolt asks for it"
+            elif ctl.session is not None or _game_has_focus():
+                why = "waits while a game has the screen"
+            else:
+                why = "waiting its turn"
+            kinds.append({"kind": "ins", "done": False, "owed": bool(owed),
+                          "tries": tries, "why": why})
+        # the gate holding the reader back RIGHT NOW, in ai_status's words
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            mt = None
+        gate = ""
+        if _AI.get("busy_path") == p:
+            gate = "being read right now"
+        elif _queued_finish_badge(p):
+            gate = "waiting for its standard-colour version first"
+        elif mt is not None and (_AI.get("failed") or {}).get(p) == mt:
+            gate = "it refused before - left alone until the file changes"
+        elif held and all(held.values()):
+            gate = "held by you"
+        elif _AI.get("busy"):
+            gate = "busy with " + str((_AI.get("busy"))[1])
+        elif not SETTINGS.get("always_read"):
+            if ctl.session is not None:
+                gate = "resting while you play"
+            elif ctl.saving > 0 or _FINISHING["busy"]:
+                gate = "waiting for a recording to finish saving"
+            elif _TRIM_BUSY[0] > 0:
+                gate = "waiting for your edit"
+            elif time.time() - _MEDIA.get("last_read", 0) < 20:
+                gate = "waiting while you watch"
+        # where it stands in the sweep's newest-first walk (one scan, no
+        # sidecar stats - a click must not storm a spun-down platter)
+        pos = total = None
+        try:
+            vids = []
+            for d2, k2 in _library_dirs(SETTINGS.get("output_dir", "")):
+                for v2 in _scan_dir_mp4s(d2, k2):
+                    vids.append((v2["path"], v2.get("mtime") or 0))
+            vids.sort(key=lambda pm: -pm[1])
+            total = len(vids)
+            ap = os.path.normcase(os.path.abspath(p))
+            for i2, (p2, _m2) in enumerate(vids):
+                if os.path.normcase(os.path.abspath(p2)) == ap:
+                    pos = i2
+                    break
+        except Exception:
+            pass
+        # and its place in an asked-for batch, if it is in one
+        asked = None
+        try:
+            ap = os.path.normcase(os.path.abspath(p))
+            for i3, q0 in enumerate(_AI.get("force_queue") or []):
+                if os.path.normcase(os.path.abspath(q0[0])) == ap:
+                    asked = i3
+                    break
+        except Exception:
+            pass
+        return {"ok": True, "path": p, "kinds": kinds, "gate": gate,
+                "queue": pos, "total": total, "asked": asked}
+
+    def ai_spend(self):
+        """What the AI has cost so far and what it is allowed to cost. An
+        estimate per request, not a bill - but it is the number that stops
+        LORE, so it is the honest one to show."""
+        return {"spent_cents": round(_ai_spent(), 2),
+                "budget_cents": round(_ai_budget(), 2),
+                "auto_describe": bool(SETTINGS.get("insights_auto"))}
+
+    def ai_spend_reset(self):
+        """New month, new wallet."""
+        _persist_setting("ai_spent_cents", 0.0)
+        log("AI spending counter reset to zero.")
+        return {"ok": True}
+
+    def claude_key_status(self):
+        """Is there a key, and when was it put in. NEVER the key itself -
+        there is deliberately no call that can return it."""
+        have = os.path.isfile(_key_path())
+        return {"saved": bool(have),
+                "added": SETTINGS.get("claude_key_added") or "",
+                "tail": SETTINGS.get("claude_key_tail") or ""}
+
+    def claude_key_set(self, key):
+        """Take a key, encrypt it, and forget the plain text immediately."""
+        ok, why = _key_save(str(key or ""))
+        return {"ok": ok, "why": why, **self.claude_key_status()}
+
+    def claude_key_forget(self):
+        """Throw it away without ever showing it."""
+        _key_forget()
+        return {"ok": True, **self.claude_key_status()}
+
+    def ai_catchup(self, on=None):
+        """Read the library whether or not you are busy. Persisted, so it is
+        still set tomorrow."""
+        want = (not SETTINGS.get("always_read")) if on is None else bool(on)
+        SETTINGS["always_read"] = want
+        try:
+            save_settings(SETTINGS)
+        except Exception:
+            pass
+        if want:
+            _AI["paused"] = False        # you cannot hold it and chase it at once
+            for k in _AI.setdefault("held", {}):
+                _AI["held"][k] = False
+            _AI["failed"].clear()        # give everything one more chance
+            if _AI.get("wind_src") != "shutdown":
+                # chasing again cancels a catchup/pause wind-down -
+                # NEVER the master switch's: always-read and shutdown
+                # are different questions (review 307)
+                _AI["wind"] = False
+                _AI["wind_src"] = None
+        else:
+            # OFF MEANS OFF, INCLUDING THE JOB IN HAND. This used to set
+            # a flag and nothing else, so a review already running kept
+            # the card for another hour and the switch read as broken.
+            # It winds down instead of dying: the window in hand banks,
+            # then it holds - and the sweep finishes it at the next idle
+            # stretch, which is what "only when idle" means. A job asked
+            # for BY NAME is spared, the same law a game start follows.
+            busy = _AI.get("busy")
+            # named is named, whichever ledger holds the name: a forced
+            # describe lives in _AI["force"], a by-name audit only in
+            # _AUD_ASK - both are jobs he pointed at, both are spared
+            named = bool(_AI.get("busy_path")
+                         and _AI.get("busy_path") == _AI.get("force"))
+            try:
+                named = named or bool(
+                    _AUD_ASK.get("named") and _AUD_ASK.get("path")
+                    and _AUD_ASK.get("path") == _AI.get("busy_path"))
+            except Exception:
+                pass
+            if busy is not None and not named:
+                _AI["wind"] = True
+                _AI["wind_src"] = "catchup"
+                log("Always-read off - " + str(busy[1]) + " finishes the "
+                    "piece in hand, banks it, and waits for you to stop "
+                    "playing. Nothing is lost.")
+        log("Always-read " + ("ON - the tome reads while you play and watch."
+                              if want else "off - back to reading only when idle."))
+        _ai_state_save()
+        return {"ok": True, "catchup": want, "always_read": want}
+
+    def ai_pause(self, on=None, kind=None):
+        """Hold ONE of the reader's jobs, or both - INCLUDING the one in
+        hand. It used to leave a running job to finish, which was written
+        when a job was a two-minute transcript; a review chain today can
+        run an hour past the press, and "left to finish" after Pause is
+        indistinguishable from Pause being broken. The job in hand now
+        stops at its next safe point: everything finished so far is
+        banked, no tries are burned, nothing is memoed as failed, and a
+        forced ask goes back to the front of the queue so Resume restarts
+        it by itself. Paused work WAITS - it is never lost."""
+        held = _AI.setdefault("held", {"listening": False, "hearing": False})
+        for _k in ("listening", "hearing", "thinking", "auditing"):
+            held.setdefault(_k, False)     # four lanes, always
+        if kind in ("listening", "hearing", "thinking", "auditing"):
+            held[kind] = (not held.get(kind)) if on is None else bool(on)
+            log(f"{AI_LABEL.get(kind, kind)}: "
+                + ("held." if held[kind] else "carrying on."))
+        else:
+            want = (not all(held.values())) if on is None else bool(on)
+            for k in held:
+                held[k] = want
+            log("Reader " + ("held." if want else "carrying on."))
+        _AI["paused"] = all(held.values())        # the old flat flag, kept true
+        busy = _AI.get("busy")
+        stopped = None
+        _lane = _ai_effective_lane(busy[0], busy[1]) if busy else None
+        if busy and not held.get(_lane) \
+                and _AI.get("wind_src") not in ("catchup", "shutdown"):
+            # RESUME CLEARS THE WIND - he pressed Resume; the job in
+            # hand must carry on past its next seam, not stop at it.
+            # NEVER the catchup switch's wind: he said "stop working
+            # while I play", and a press on an unrelated pause card is
+            # not him taking that back (review-caught).
+            _AI["wind"] = False
+            _AI["wind_src"] = None
+        if busy and held.get(_lane):
+            # THE JOB IN HAND IS OF THE LANE HE JUST HELD. Interrupt it the
+            # way Stop does - _ai_abort kills the ask in flight and every
+            # pass banks at that checkpoint - but unlike Stop: the queue
+            # stays, nothing is memoed failed, and a forced ask is put back
+            # at the FRONT so Resume picks it up exactly where it stopped.
+            path = _AI.get("busy_path")
+            with _AI_FORCE_LOCK:
+                if path and _AI.get("force") == path:
+                    _AI["force_queue"] = ([(path,
+                                            _AI.get("force_want") or "all",
+                                            bool(_AI.get("force_redo")),
+                                            sorted(_AI.get("force_ran")
+                                                   or set()))]
+                                          + list(_AI.get("force_queue")
+                                                 or []))
+                    _AI["force"] = None
+                    _AI["force_want"] = None
+                    _AI["force_redo"] = False
+            # WIND DOWN, NEVER CUT DOWN. 2.91 killed the piece in flight,
+            # which threw away minutes of a window the model had nearly
+            # finished. Pause now lets the piece in hand COMPLETE and
+            # bank; the loops check the flag between pieces and hold
+            # there. Stop remains the instant one.
+            _AI["wind"] = True
+            _AI["wind_src"] = "pause"
+            stopped = busy[1]
+            log("Pausing " + AI_LABEL.get(busy[0], busy[0]) + " on "
+                + busy[1] + " - the piece in hand finishes and banks, "
+                "then it holds. Nothing is lost.")
+        _ai_state_save()
+        return {"ok": True, "paused": bool(_AI["paused"]),
+                "held": dict(held), "stopped": stopped}
+
+    def ai_stop_current(self):
+        """Stop the job in hand and STAND ITS LANE DOWN - and nothing
+        disappears. The old Stop threw the whole waiting line away,
+        memoed the night as failed, and the sweep started the next one
+        five seconds later - "the shit goes into a black void.. its
+        just gone and replaced by something else." Now: the piece in
+        hand aborts (everything banked survives on disk), its lane
+        holds until Resume, a job asked for BY NAME goes back to the
+        FRONT of the line where it stays visible, and the line itself
+        is untouched - the queue panel's own Let-go is the door for
+        dropping waiting rows."""
+        busy = _AI.get("busy")
+        if not busy:
+            return {"ok": False, "why": "nothing running"}
+        kind, name = busy
+        lane = _ai_effective_lane(kind, name)
+        chain_tail = (lane == "auditing"
+                      and not str(name or "").startswith(
+                          "the audit \u00b7"))
+        held2 = _AI.setdefault("held", {"listening": False,
+                                        "hearing": False})
+        for _k in ("listening", "hearing", "thinking", "auditing"):
+            held2.setdefault(_k, False)
+        # STOP MEANS QUIET. Holding only the stopped lane let the
+        # sweep start another lane's job five seconds later, which is
+        # indistinguishable from Skip - his words, twice. Every lane
+        # stands down; Resume on a row brings that one back, and the
+        # bolt lifts whatever it needs.
+        for _k in ("listening", "hearing", "thinking", "auditing"):
+            held2[_k] = True
+        if chain_tail:
+            # the audit TAIL of a describe chain: the ask lives on the
+            # thinking lane. Holding only auditing let the very next
+            # beat pop the ask back and REDO the whole describe from
+            # scratch (review 307, critical). Both lanes stand down.
+            held2["thinking"] = True
+        _AI["paused"] = all(held2.values())
+        path = _AI.get("busy_path")
+        requeued = False
+        with _AI_FORCE_LOCK:
+            if path and _AI.get("force") == path:
+                # asked for by name: back to the front of the line,
+                # with its memory of what already ran - stopped,
+                # visible, never vanished
+                _ran = set(_AI.get("force_ran") or set())
+                if chain_tail:
+                    # the describe finished (the chain reached its
+                    # audit) - Resume must never redo it; the audit
+                    # itself returns through the sweep, which owes it
+                    _ran.add("thinking")
+                _AI["force_queue"] = ([(path,
+                                        _AI.get("force_want") or "all",
+                                        bool(_AI.get("force_redo")),
+                                        sorted(_ran))]
+                                      + list(_AI.get("force_queue")
+                                             or []))
+                _AI["force"] = None
+                _AI["force_want"] = None
+                _AI["force_redo"] = False
+                requeued = True
+        _ai_abort()
+        log("Stopped " + AI_LABEL.get(kind, kind) + " on " + str(name)
+            + " - every lane stands down; nothing else starts until you "
+            "press Resume"
+            + ("; the job waits at the front of the line" if requeued
+               else "") + ". Nothing was thrown away.")
+        _ai_state_save()
+        return {"ok": True, "stopped": name, "kind": kind, "lane": lane,
+                "requeued": requeued, "queued_dropped": 0}
+
+    def ai_shutdown(self, on=None):
+        """THE MASTER SWITCH. Everything background stands down - the
+        sweep, the waiting line (frozen, not dropped), forced asks,
+        audits, the SDR finisher - until it is turned back on. The
+        job in hand winds down (its piece banks first); the parked
+        models are released from the card at once. Persisted, so a
+        restart wakes into the same silence."""
+        want = (not SETTINGS.get("bg_shutdown")) if on is None else bool(on)
+        SETTINGS["bg_shutdown"] = want
+        try:
+            save_settings(SETTINGS)
+        except Exception:
+            pass
+        if want:
+            # A PAUSE FOR PLAY GIVES THE CARD BACK NOW. Winding down
+            # meant a describer window could hold fifteen gigabytes for
+            # another quarter of an hour after he asked for his machine
+            # back - "i wanted more of a pause so i can play". The
+            # servers die at once; the ask returns to the front of the
+            # line; nothing is memoed failed, so the piece in hand is
+            # simply re-done when he lets it work again.
+            busy = _AI.get("busy")
+            path = _AI.get("busy_path")
+            with _AI_FORCE_LOCK:
+                if path and _AI.get("force") == path:
+                    _AI["force_queue"] = ([(path,
+                                            _AI.get("force_want")
+                                            or "all",
+                                            bool(_AI.get("force_redo")),
+                                            sorted(_AI.get("force_ran")
+                                                   or set()))]
+                                          + list(_AI.get("force_queue")
+                                                 or []))
+                    _AI["force"] = None
+                    _AI["force_want"] = None
+                    _AI["force_redo"] = False
+            _ai_abort()                # the card is his in about a second
+            try:
+                _ask_srv_drop()
+                _desc_keep_drop()
+                _aud_keep_drop()
+            except Exception:
+                pass
+            if busy is not None:
+                log("Paused everything for you - " + str(busy[1])
+                    + " let go of the card at once; what it had already "
+                    "written stays written, and it picks that piece up "
+                    "again when you let it work.")
+            log("ALL BACKGROUND WORK IS PAUSED - the card is yours; "
+                "recording is untouched.")
+        else:
+            if _AI.get("wind_src") == "shutdown":
+                _AI["wind"] = False
+                _AI["wind_src"] = None
+            _AI["t_last"] = 0
+            log("Background work is awake again.")
+        _ai_state_save()
+        return {"ok": True, "shutdown": want}
+
+    def ai_queue_drop(self, path):
+        """Let ONE waiting row out of the line - the middle Stop never
+        had. The job in hand is not droppable from here; Stop owns
+        that."""
+        p = str(path or "")
+        with _AI_FORCE_LOCK:
+            q = list(_AI.get("force_queue") or [])
+            q2 = [it for it in q if it[0] != p]
+            _AI["force_queue"] = q2
+            n = len(q) - len(q2)
+        if n:
+            log("Let " + os.path.basename(p) + " out of the line.")
+            _ai_state_save()
+        return {"ok": bool(n), "n": len(q2),
+                "why": "" if n else "not in the line"}
+
+    def ai_queue_clear(self):
+        """Empty the waiting line WITHOUT touching the job in hand -
+        the middle between moving one row and Stop."""
+        with _AI_FORCE_LOCK:
+            n = len(_AI.get("force_queue") or [])
+            _AI["force_queue"] = []
+        if n:
+            log("Let the whole line go - " + str(n) + " waiting "
+                "item(s).")
+            _ai_state_save()
+        return {"ok": True, "dropped": n}
 
     def search_words(self, query):
         """Search every transcript for the words - the tome's AI search.
@@ -9508,25 +21264,569 @@ class _JsApi:
         except Exception:
             return []
 
-    def prioritise(self, path):
+    def prioritise(self, path, want="all"):
+        # an audit is a LINE job, never a force - setting force for it
+        # aborted whatever was running and then dropped the ask on the
+        # next beat, silently (review 308)
+        if str(want or "").lower() == "audit":
+            return self.ai_force_many([path], "audit", True)
         """Put this recording at the FRONT of the reader's queue - the one you
-        are looking at now, rather than whatever the sweep happens to reach."""
+        are looking at now, rather than whatever the sweep happens to reach.
+        `want` picks WHAT to run: all, sound (the curve + gold moments) or
+        words (the transcript). Asking for just the sound is the common case:
+        it is seconds of work and it is what the editor needs."""
         p = self._safe_path(path)
         if not p:
             return {"ok": False, "why": "unknown file"}
-        stt_left = bool(SETTINGS.get("ai_transcribe", True)
-                        and _whisper_paths() and not _ai_sidecar_fresh(p, "stt"))
-        hl_left = bool(SETTINGS.get("ai_highlights", True)
-                       and not _ai_sidecar_fresh(p, "hl"))
-        if not (stt_left or hl_left):
-            return {"ok": False, "why": "already done"}
-        _AI["force"] = p
-        _AI["failed"].pop(p, None)     # asking again clears an old refusal
+        want = str(want or "all").lower()
+        if want not in ("all", "sound", "words", "think", "audit"):
+            want = "all"
+        # SAY WHICH IT IS. "already done" was also the answer when the job
+        # was switched off in Settings or its worker was not installed -
+        # two opposite situations wearing one sentence, and the refusals
+        # shelf's "Ask again" row just sat there looking ignored.
+        blocked = _force_blocked(want)
+        if blocked:
+            return {"ok": False, "why": blocked}
+        # THE SAME TEST THE BEAT USES. This one asked only about the review
+        # under "All of it", so a recording owing just its senses, the eye
+        # or the auditor was told it was finished while the sweep would
+        # happily have run it.
+        owe = _force_owes(p, want, False)
+        stt_left = "hearing" in owe
+        hl_left = "listening" in owe
+        think_left = "thinking" in owe
+        if not owe:
+            return {"ok": False,
+                    "why": _force_off_reason(p, want) or "already done",
+                    "already": 1}
+        _ai_unhold_for(want)           # "this one, now" outranks "wait"
+        with _AI_FORCE_LOCK:
+            _AI["force"] = p
+            _AI["force_want"] = want
+            _AI["force_redo"] = False
+            _AI["force_ran"] = set()   # this ask has run nothing yet
+            _AI["_qdirty"] = True
+            _AI["failed"].pop(p, None)  # asking again clears an old refusal
         if _AI.get("busy"):
             _ai_abort()                # let go of the current one, take this
         _AI["t_last"] = 0              # and start on the very next beat
-        log(f"Moved to the front of the queue: {os.path.basename(p)}")
-        return {"ok": True, "stt": stt_left, "hl": hl_left}
+        # SAY WHAT IT DOES. "Moved to the front of the queue" is what
+        # queuing sounds like, and it is the one thing this does not do: it
+        # stops whatever is running and starts yours instead.
+        was = (_AI.get("busy") or (None, None))[1]
+        log(f"Starting now on {os.path.basename(p)}"
+            + (f" - {was} was let go of" if was else "")
+            + f" ({want}).")
+        return {"ok": True, "stt": stt_left, "hl": hl_left,
+                "think": think_left}
+
+    def ai_force_many(self, paths, want="all", redo=False):
+        """Do ONE kind of work to a whole selection, in order.
+
+        The single-recording button sets one forced path; asking it for forty
+        just set it forty times and kept the last. This lays them out as a
+        queue instead, and the reader takes the next the moment it finishes
+        the one in hand.
+
+        redo=True is the player's meaning of the button: do it AGAIN, even
+        when a fresh result exists (the old one banks as a version first).
+        Without it, forcing "all" on a finished recording satisfied itself
+        against nothing owed and cleared silently - four presses in a row
+        once did four times nothing. The Everything-page batch keeps
+        redo=False: there, "All of it" means fill in whatever is missing."""
+        if want not in ("all", "sound", "words", "think", "audit"):
+            want = "all"
+        out = []
+        for p in (paths or []):
+            sp = self._safe_path(p)
+            if sp and os.path.isfile(sp) and sp not in out:
+                out.append(sp)
+        if not out:
+            return {"ok": False, "why": "nothing to do"}
+        blocked = _force_blocked(want)
+        if blocked:
+            return {"ok": False, "why": blocked}
+        # ONLY WHAT IS ACTUALLY OWED GOES IN THE QUEUE, AND NOTHING OWED
+        # MUST SAY SO. This is his "i do do these and nothing happens": the
+        # queue was filled with whatever it was handed, ok:true went back,
+        # and the beat then cleared all ten in one pass because every one
+        # of them was already done. 1,248 of his 1,252 have a fresh sound
+        # curve, so that was very nearly every press.
+        # It is also what stops the beat walking a 1,252-long queue and
+        # opening a JSON per row (13.0s cold on his disk) on the watcher
+        # thread, every five seconds, for nothing.
+        todo = [p for p in out if _force_owes(p, want, redo)]
+        already = len(out) - len(todo)
+        if not todo:
+            said = _WANT_SAID.get(want, want)
+            if already == 1:
+                why = "it already has " + said + " - nothing to do"
+            else:
+                why = ("all " + str(already) + " already have " + said
+                       + " - nothing to do")
+            return {"ok": False, "n": 0, "already": already,
+                    "want": want, "why": why}
+        _ai_unhold_for(want)           # "these, now" outranks "wait"
+        with _AI_FORCE_LOCK:
+            # THE LINE IS HIS. A press used to REPLACE everything still
+            # waiting - which, now that the line is a named, persisted
+            # thing he curates, threw away work he believed he owned
+            # (review 308). It appends; a path already waiting for this
+            # same job is not doubled.
+            q0 = list(_AI.get("force_queue") or [])
+            have = {(it[0], str(it[1] if len(it) > 1 else "all"))
+                    for it in q0}
+            added = [(p, want, bool(redo), []) for p in todo
+                     if (p, want) not in have]
+            replaced = 0
+            _AI["force_queue"] = q0 + added
+            _AI["_qdirty"] = True
+            _AI["force"] = None        # let the queue hand over the first
+            _AI["force_want"] = None
+            _AI["force_redo"] = False
+            for p in todo:
+                _AI["failed"].pop(p, None)
+        _AI["t_last"] = 0
+        if _AI.get("busy"):
+            _ai_abort()                # start on the selection now
+        note = ("Asked for " + want + (" (again, fresh)" if redo else "")
+                + " on " + str(len(todo)) + " recording"
+                + ("" if len(todo) == 1 else "s"))
+        if already:
+            note += " - " + str(already) + " already had it"
+        if replaced:
+            note += "; " + str(replaced) + " still waiting were let go"
+        log(note + ".")
+        return {"ok": True, "n": len(todo), "want": want,
+                "already": already, "replaced": replaced}
+
+    def ai_force_queue_len(self):
+        """How many of the batch are still waiting - the bar counts down."""
+        return len(_AI.get("force_queue") or []) + (1 if _AI.get("force") else 0)
+
+    def models_status(self):
+        """What the tome's mind is made of, what is here, and what it
+        would cost to finish it. The page asks this on a beat while a
+        download runs."""
+        sets = []
+        for it in _MODEL_SETS:
+            ok, got, tot = _model_have(it)
+            sets.append({"key": it["key"], "tier": it["tier"],
+                         "title": it["title"], "what": it["what"],
+                         "have": ok, "bytes": tot, "on_disk": got,
+                         "licence": it.get("licence", "")})
+        for rt in _RUNTIME_SETS:
+            homes = rt["into"]
+            if isinstance(homes, str):
+                homes = [homes]
+            have = all(os.path.isfile(os.path.join(
+                _runtime_dir(h), "llama-server.exe")) for h in homes)
+            sets.append({"key": rt["key"], "tier": rt["tier"],
+                         "title": rt["title"], "what": rt["what"],
+                         "have": have, "bytes": rt["bytes"],
+                         "on_disk": rt["bytes"] if have else 0,
+                         "licence": ""})
+        dl = None
+        if _DL.get("busy"):
+            dl = {"item": _DL.get("item") or "", "file":
+                  _DL.get("file") or "", "done": _DL.get("done") or 0,
+                  "total": _DL.get("total") or 0,
+                  "state": _DL.get("state") or "",
+                  "err": _DL.get("err") or ""}
+        where = _models_dir(True)
+        return {"ok": True, "sets": sets, "where": where,
+                "busy": bool(_DL.get("busy")), "dl": dl,
+                # A FAILURE MUST OUTLIVE THE JOB. The error and the busy
+                # flag used to die in the same instant, so a fetch that
+                # fell over left the panel showing nothing at all.
+                "last_err": str(_DL.get("last_err") or ""),
+                "free": _free_bytes(where)}
+
+    def models_forget_error(self):
+        """He has seen it; stop showing it."""
+        _DL["last_err"] = ""
+        return {"ok": True}
+
+    def models_fetch(self, keys=None):
+        """Go and get them. One thread, one file at a time, resumable -
+        a 13 GB model over a domestic line is an overnight job and it
+        must survive being interrupted."""
+        with _DL_LOCK:
+            # ONE FETCHER. Two presses landing together both passed the
+            # old check and both ran; the first to finish then cleared
+            # busy for the other (review 309).
+            if _DL.get("busy"):
+                return {"ok": False, "why": "already fetching"}
+            _DL["busy"] = True
+        want = [str(k) for k in (keys or [])]
+        jobs = []
+        for it in _MODEL_SETS:
+            if it["key"] in want and not _model_have(it)[0]:
+                jobs.append(("model", it))
+        for rt in _RUNTIME_SETS:
+            homes = rt["into"]
+            if isinstance(homes, str):
+                homes = [homes]
+            if rt["key"] in want and not all(os.path.isfile(
+                    os.path.join(_runtime_dir(h), "llama-server.exe"))
+                    for h in homes):
+                jobs.append(("runtime", rt))
+        if not jobs:
+            _DL["busy"] = None
+            return {"ok": False, "why": "everything asked for is "
+                                        "already here"}
+        need = 0
+        for kind, it in jobs:
+            if kind == "runtime":
+                # the zip AND what it unpacks to - budgeting only the
+                # download let a full disk kill the extraction
+                need += it["bytes"] * 4
+            else:
+                _ok, got0, tot0 = _model_have(it)
+                need += max(0, tot0 - got0)
+        free = _free_bytes(_models_dir(True))
+        if free and need > free - (2 << 30):
+            _DL["busy"] = None
+            return {"ok": False,
+                    "why": "there is not enough room - it needs "
+                           + _human_bytes(need) + " and the drive has "
+                           + _human_bytes(free)}
+        _DL.update({"cancel": False, "done": 0,
+                    "total": need, "base": 0, "item": "", "file": "",
+                    "state": "starting", "err": ""})
+
+        def work():
+            try:
+                for kind, it in jobs:
+                    if _DL["cancel"]:
+                        break
+                    _DL["item"] = it["title"]
+                    if kind == "runtime":
+                        _DL["state"] = "fetching the runtime"
+                        _DL["file"] = "llama.cpp"
+                        homes = it["into"]
+                        if isinstance(homes, str):
+                            homes = [homes]
+                        zp = os.path.join(_data_dir(),
+                                          "runtime", "_llama.zip")
+                        try:
+                            os.makedirs(os.path.dirname(zp),
+                                        exist_ok=True)
+                        except Exception as e:
+                            _DL["err"] = str(e)[:160]
+                            _DL["last_err"] = _DL["err"]
+                        if _dl_one(it["zip"], zp, it["bytes"]):
+                            try:
+                                import zipfile
+                                for h in homes:
+                                    dest = os.path.join(
+                                        _data_dir(), "runtime", h)
+                                    os.makedirs(dest, exist_ok=True)
+                                    with zipfile.ZipFile(zp) as z:
+                                        z.extractall(dest)
+                                os.remove(zp)
+                                log("The model runtime is in place ("
+                                    + ", ".join(homes) + ").")
+                            except Exception as e:
+                                _DL["err"] = str(e)[:160]
+                                _DL["last_err"] = _DL["err"]
+                                log("The runtime would not unpack: "
+                                    + str(e)[:120])
+                        _DL["base"] = _DL["done"]
+                        continue
+                    for rel, url, size in it["files"]:
+                        if _DL["cancel"]:
+                            break
+                        _root = _models_dir(True)
+                        dest = (os.path.join(_root, it["dir"], rel)
+                                if it["dir"]
+                                else os.path.join(_root, rel))
+                        if os.path.isfile(dest) \
+                                and os.path.getsize(dest) == size:
+                            continue          # already here, in full
+                        _DL["file"] = os.path.basename(rel)
+                        _DL["state"] = "downloading"
+                        _DL["base"] = _DL["done"]
+                        if not _dl_one(url, dest, size):
+                            if _DL["cancel"]:
+                                break
+                            log("Could not fetch " + rel + ": "
+                                + (_DL.get("err") or "?"))
+                            _DL["state"] = "stopped"
+                            _DL["last_state"] = "stopped"
+                            _DL["last_err"] = (_DL.get("err")
+                                               or "it would not fetch")
+                            return
+                        _DL["base"] = _DL["done"]
+                    ok2, _g, _t = _model_have(it)
+                    if ok2:
+                        log(it["title"] + " is here.")
+                _DL["state"] = ("stopped" if _DL["cancel"]
+                                else "done")
+                _DL["last_state"] = _DL["state"]
+                if not _DL["cancel"]:
+                    log("Everything asked for has been fetched.")
+            finally:
+                _DL["busy"] = None
+                _AI["t_last"] = 0      # there may be work it can do now
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "n": len(jobs), "bytes": need}
+
+    def models_cancel(self):
+        """Stop fetching. What has landed stays landed, and a part-way
+        file keeps its place - pressing again carries on from there."""
+        if not _DL.get("busy"):
+            return {"ok": False, "why": "nothing is being fetched"}
+        _DL["cancel"] = True
+        return {"ok": True}
+
+    def models_where(self, path=None):
+        """Read or move the mind's home. Moving only points at the new
+        place - it never drags 30 GB behind it."""
+        if path:
+            p = str(path)
+            if not os.path.isdir(p):
+                try:
+                    os.makedirs(p, exist_ok=True)
+                except Exception as e:
+                    return {"ok": False, "why": str(e)[:120]}
+            SETTINGS["models_dir"] = p
+            try:
+                save_settings(SETTINGS)
+            except Exception:
+                pass
+        return {"ok": True, "where": _models_dir(),
+                "free": _free_bytes(_models_dir())}
+
+    def ai_queue_list(self):
+        """The forced queue as the Working page shows it - what is waiting,
+        in order. The job in hand is not in here; Stop owns that."""
+        with _AI_FORCE_LOCK:
+            q = list(_AI.get("force_queue") or [])
+        held = _AI.get("held") or {}
+        rows = []
+        for it in q:
+            w = it[1] if len(it) > 1 else "all"
+            lanes = _ai_want_lanes(w)
+            row = {"name": os.path.basename(it[0]),
+                   "path": it[0], "want": w,
+                   "redo": bool(it[2]) if len(it) > 2 else False,
+                   "held": any(held.get(k) for k in lanes)}
+            if str(w).lower() == "audit" and not row["held"]:
+                # the row says why it waits - the whisper he never saw,
+                # standing still long enough to read
+                try:
+                    row["wait"] = _audit_why(it[0],
+                                             redo=row["redo"])[:90]
+                except Exception:
+                    pass
+            rows.append(row)
+        nx = None
+        try:
+            if _AI.get("busy") is None                     and getattr(self._ctl, "session", None) is None:
+                nx = _ai_next_sweep()
+        except Exception:
+            nx = None
+        return {"ok": True, "queue": rows, "next": nx,
+                "shutdown": bool(SETTINGS.get("bg_shutdown"))}
+
+    def ai_queue_move(self, path, delta):
+        """Move one waiting row sooner (delta<0) or later (delta>0)."""
+        try:
+            delta = int(delta)
+        except (TypeError, ValueError):
+            return {"ok": False, "why": "bad direction"}
+        with _AI_FORCE_LOCK:
+            q = list(_AI.get("force_queue") or [])
+            idx = [i for i, pw in enumerate(q) if pw[0] == path]
+            if not idx:
+                return {"ok": False, "why": "not in the queue"}
+            i = idx[0]
+            j = max(0, min(len(q) - 1, i + (1 if delta > 0 else -1)))
+            if i != j:
+                q.insert(j, q.pop(i))
+                _AI["force_queue"] = q
+        _ai_state_save()
+        return {"ok": True, "n": len(q)}
+
+    def hdr_optout(self, path):
+        """Leave this recording HDR - out of the SDR queue and NEVER queued
+        again (the choice is persisted). The file already plays correctly
+        in modern players; this only skips the standard copy. No
+        split-frame preview here on purpose - it would decode both gradings
+        for a choice a sentence can explain."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "unknown recording"}
+        ap = os.path.normcase(os.path.abspath(p))
+        outs = [str(x) for x in (SETTINGS.get("sdr_optout") or [])]
+        if ap not in outs:
+            outs.append(ap)
+            _persist_setting("sdr_optout", outs)
+        with _FINISH_Q_LOCK:
+            try:
+                q = _load_finish_queue(strict=True)
+            except Exception:
+                return {"ok": False, "why": "the queue could not be read"}
+            q2 = [it for it in q
+                  if os.path.normcase(os.path.abspath(it["path"])) != ap]
+            if len(q2) != len(q):
+                _save_finish_queue(q2)
+        log("Left as HDR by choice: " + os.path.basename(p))
+        return {"ok": True}
+
+    def weld_evening(self, paths):
+        """Weld one evening's recordings into ONE new file, losslessly
+        (stream copy, no re-encode). On demand only; the originals are
+        untouched and the weld appears on the same shelf when done."""
+        got = []
+        for p in (paths or []):
+            sp = self._safe_path(p)
+            if sp and os.path.isfile(sp):
+                got.append(sp)
+        if len(got) < 2:
+            return {"ok": False, "why": "pick at least two recordings"}
+        if _AI.get("weld_busy"):
+            return {"ok": False, "why": "a weld is already running"}
+        if self._ctl is not None and self._ctl.session is not None:
+            # tens of GB of read+write on the library drive would fight the
+            # recorder - the same manners vault_tidy and echo_test keep
+            return {"ok": False, "why": "recording"}
+        got.sort(key=lambda q: os.path.getmtime(q))
+        raw = _parse_clip_name(os.path.basename(got[0])) or "Evening"
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.dirname(got[0])
+        # '_edit' is a suffix _parse_clip_name already knows: the weld lands
+        # in the SAME chapter as its sources and under the same cap pin
+        # ('_evening' parsed as a new game and built a phantom shelf)
+        final = os.path.join(out_dir,
+                             f"{raw.replace(' ', '')}_edit_{stamp}.mp4")
+        tmp = os.path.join(
+            out_dir, f"{raw.replace(' ', '')}_edit_{stamp}.__tmp.mp4")
+        _AI["weld_busy"] = True
+
+        def work():
+            for q in got:
+                _source_busy_add(q)
+            try:
+                ok = _concat_copy(SETTINGS["ffmpeg_path"], got, tmp)
+                if ok:
+                    # _concat_copy salvages a bad join by dropping the last
+                    # piece - for a weld that is a SHORT evening, so say so
+                    try:
+                        want = sum((_video_duration(q) or 0) for q in got)
+                        have = _video_duration(tmp) or 0
+                        if want > 60 and have < want * 0.9:
+                            log(f"The weld came up short ({have / 60:.0f} "
+                                f"of {want / 60:.0f} min) - one piece would "
+                                f"not join; keeping what did.")
+                    except Exception:
+                        pass
+                    os.replace(tmp, final)
+                    _record_made_file(final)
+                    log(f"Welded {len(got)} recordings into "
+                        f"{os.path.basename(final)} - the originals are "
+                        f"untouched.")
+                else:
+                    log("The evening would not weld (mixed formats, most "
+                        "likely) - nothing was changed.")
+            except Exception as e:
+                log(f"Weld failed: {e}")
+            finally:
+                try:
+                    if os.path.isfile(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                for q in got:
+                    _source_busy_done(q)
+                _AI["weld_busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "name": os.path.basename(final), "n": len(got)}
+
+    def export_diary(self, dir=None):
+        """One Markdown note per recording - the title, the chapters with
+        timestamps, the gold moments with their reasons and a players line
+        to fill in. Game names are [[wikilinks]], so Obsidian threads the
+        nights together. Defaults to a Diary folder beside the library;
+        runs in the background and the log says when it is done."""
+        base = str(dir or "").strip() or os.path.join(
+            SETTINGS.get("output_dir", "") or _here(), "Diary")
+        if _AI.get("diary_busy"):
+            return {"ok": False, "why": "a diary export is already running"}
+        _AI["diary_busy"] = True
+
+        def _ts(x):
+            x = int(max(0, float(x or 0)))
+            return f"{x // 60}:{x % 60:02d}"
+
+        def work():
+            n = wrote = 0
+            try:
+                os.makedirs(base, exist_ok=True)
+                for d, kindd in _library_dirs(SETTINGS.get("output_dir",
+                                                           "")):
+                    for v in _scan_dir_mp4s(d, kindd):
+                        p = v["path"]
+                        n += 1
+                        try:
+                            ins = _read_sidecar(p, "ins") or {}
+                            raw = _parse_clip_name(os.path.basename(p)) \
+                                or "Unknown game"
+                            when = _dt.datetime.fromtimestamp(
+                                os.path.getmtime(p))
+                            title = str(ins.get("title") or "").strip() \
+                                or f"{raw} - {when:%d %b %Y}"
+                            lines = [f"# {title}", "",
+                                     f"[[{raw}]] - "
+                                     f"{when:%A %d %B %Y, %H:%M}",
+                                     f"Recording: {os.path.basename(p)}",
+                                     "", "Players: ", ""]
+                            if ins.get("summary"):
+                                lines += [str(ins["summary"]).strip(), ""]
+                            chs = ins.get("chapters") or []
+                            if chs:
+                                lines.append("## Chapters")
+                                for c in chs:
+                                    what = str(c.get("what") or "").strip()
+                                    lines.append(
+                                        f"- [{_ts(c.get('t'))}] "
+                                        + str(c.get("label") or "").strip()
+                                        + (f" - {what}" if what else ""))
+                                lines.append("")
+                            moms = ins.get("moments") or []
+                            if moms:
+                                lines.append("## Gold moments")
+                                for m in moms:
+                                    why = str(m.get("why") or "").strip()
+                                    lines.append(
+                                        f"- [{_ts(m.get('t'))}] "
+                                        + (why or "a loud moment"))
+                                lines.append("")
+                            body = "\n".join(lines)
+                            mdp = os.path.join(
+                                base, os.path.splitext(
+                                    os.path.basename(p))[0] + ".md")
+                            try:
+                                with open(mdp, encoding="utf-8") as fh:
+                                    if fh.read() == body:
+                                        continue   # unchanged - left alone
+                            except Exception:
+                                pass
+                            with open(mdp, "w", encoding="utf-8",
+                                      newline="\n") as fh:
+                                fh.write(body)
+                            wrote += 1
+                        except Exception:
+                            continue
+                log(f"Diary written: {wrote} of {n} note(s) refreshed "
+                    f"in {base}.")
+            finally:
+                _AI["diary_busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "dir": base, "started": True}
 
     def levels(self, path):
         """The recording's loudness curve: {dur, floor, peak, db[]} where db is
@@ -9537,8 +21837,9 @@ class _JsApi:
             return None
         try:
             if _ai_sidecar_fresh(p, "lvl"):
-                with open(_ai_sidecar(p, "lvl"), encoding="utf-8") as fh:
-                    return json.load(fh)
+                d = _read_sidecar(p, "lvl")   # one shape, one reader
+                if d is not None:
+                    return d
         except Exception:
             pass
         return None
@@ -9550,8 +21851,7 @@ class _JsApi:
             return []
         try:
             if _ai_sidecar_fresh(p, "hl"):
-                with open(_ai_sidecar(p, "hl"), encoding="utf-8") as fh:
-                    return json.load(fh).get("events", [])
+                return (_read_sidecar(p, "hl") or {}).get("events") or []
         except Exception:
             pass
         return []
@@ -9568,6 +21868,540 @@ class _JsApi:
         except Exception:
             pass
         return []
+
+    def ai_versions(self, path):
+        """Every kept version of this recording's transcript, review and
+        gold marks - the current one plus up to three banked by redos."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False}
+        import datetime as _dt2
+
+        def _note(kind, fp, is_cur=False):
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    d = json.load(fh) or {}
+                if kind == "stt":
+                    return f"{len(d.get('segments') or [])} lines"
+                if kind == "ins":
+                    return f"{len(d.get('chapters') or [])} chapters"
+                if kind == "aud":
+                    fx = len(d.get("fixes") or [])
+                    st = int((d.get("saw") or {}).get("struck") or 0)
+                    n = (f"auditor v{int(d.get('v') or 0)}"
+                         + (f" \u00b7 {fx} fixed" if fx else "")
+                         + (f" \u00b7 {st} struck" if st else ""))
+                    # "i wanna know what version the audits are so i
+                    # know if i need a re-audit" - say it outright,
+                    # and whether a fresh pass is already on its way
+                    if is_cur and int(d.get("v") or 0) < _AUD_V:
+                        n += (f" \u00b7 v{_AUD_V} is installed, a "
+                              "fresh pass is owed - the sweep brings it")
+                    return n
+                return f"{len(d.get('events') or [])} marks"
+            except Exception:
+                return ""
+        kinds = {}
+        for kind in ("stt", "ins", "hl", "aud"):
+            cur = _ai_sidecar(p, kind)
+            rows = []
+            if os.path.isfile(cur):
+                rows.append({"v": 0, "cur": True,
+                             "when": _dt2.datetime.fromtimestamp(
+                                 os.path.getmtime(cur)).strftime("%d %b %H:%M"),
+                             "note": _note(kind, cur, True)})
+            for n in (1, 2, 3):
+                fp = cur + f".v{n}"
+                if os.path.isfile(fp):
+                    rows.append({"v": n, "cur": False,
+                                 "when": _dt2.datetime.fromtimestamp(
+                                     os.path.getmtime(fp)).strftime(
+                                         "%d %b %H:%M"),
+                                 "note": _note(kind, fp)})
+            if rows:
+                kinds[kind] = rows
+        return {"ok": True, "kinds": kinds}
+
+    def ai_version_use(self, path, kind, v):
+        """Make a banked version the one the tome shows - the current one
+        takes its place in the bank (a straight swap, nothing destroyed)."""
+        p = self._safe_path(path)
+        kind = str(kind or "")
+        try:
+            v = int(v)
+        except Exception:
+            return {"ok": False}
+        if not p or kind not in ("stt", "ins", "hl", "aud") \
+                or v not in (1, 2, 3):
+            return {"ok": False}
+        cur = _ai_sidecar(p, kind)
+        old = cur + f".v{v}"
+        if not os.path.isfile(old):
+            return {"ok": False, "why": "that version is gone"}
+        try:
+            with open(old, encoding="utf-8") as fh:
+                doc = json.load(fh) or {}
+            if kind == "ins":
+                # chosen BY HAND: the sweep must not call it an old
+                # generation and quietly rebuild over the choice
+                doc["gen"] = _INS_GENERATION
+            swap = None
+            if os.path.isfile(cur):
+                with open(cur, encoding="utf-8") as fh:
+                    swap = json.load(fh)
+            _atomic_write_json(cur, doc)       # fresh mtime = stays fresh
+            if swap is not None:
+                _atomic_write_json(old, swap)
+            else:
+                os.remove(old)
+            _AI["index"] = None
+            _AI["_tally"] = None
+            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+            _AI["done_path"] = p
+            log(f"Version switched: {kind} of {os.path.basename(p)} "
+                f"now shows the one from the bank.")
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "why": str(e)}
+
+    def ai_version_del(self, path, kind, v):
+        """Forget one banked version for good."""
+        p = self._safe_path(path)
+        kind = str(kind or "")
+        try:
+            v = int(v)
+        except Exception:
+            return {"ok": False}
+        if not p or kind not in ("stt", "ins", "hl", "aud") \
+                or v not in (1, 2, 3):
+            return {"ok": False}
+        try:
+            fp = _ai_sidecar(p, kind) + f".v{v}"
+            if os.path.isfile(fp):
+                os.remove(fp)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "why": str(e)}
+
+    def senses(self, path):
+        """The senses sidecar for the player: hype curve, voices, HUD
+        events, names. Embeddings stay server-side (similar_moments)."""
+        p = self._safe_path(path)
+        if not p:
+            return None
+        try:
+            with open(_ai_sidecar(p, "sns"), encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            if d.get("failed"):
+                return None
+            inp = None
+            try:
+                with open(_ai_sidecar(p, "inp"), encoding="utf-8") as fh:
+                    ss = (json.load(fh) or {}).get("s") or []
+                if len(ss) > 2400:            # the curve needs ~2k points max
+                    ss = ss[::max(1, len(ss) // 2400)]
+                inp = ss or None
+            except Exception:
+                pass
+            return {"hype": d.get("hype"), "speakers": d.get("speakers") or [],
+                    "names": d.get("names") or {},
+                    "events": d.get("events") or [],
+                    "ocr": d.get("ocr") or [], "inp": inp}
+        except Exception:
+            return None
+
+    def visions(self, path):
+        """What the eye saw: every look, the places as spans, and the
+        creatures it named. None while it has not looked yet."""
+        p = self._safe_path(path)
+        if not p:
+            return None
+        d = _read_sidecar(p, "vis")
+        if not d or d.get("failed"):
+            return None
+        looks = d.get("looks") or []
+        places = d.get("places") or []
+        # REPAIRED ON READ. Every .vis written before this grouped places
+        # by exact name, so free-form wording never merged and the panel
+        # printed one "place" per look - the same seven rows as THE LOOKS,
+        # twice over. Regrouping here fixes what is already on disk
+        # without spending another hour of looking. The file itself is
+        # left alone: a read is not a write, and a re-look rewrites it.
+        try:
+            if looks:
+                places = _eye_places(looks)
+        except Exception:
+            places = d.get("places") or []
+        return {"looks": looks,
+                "places": places,
+                "creatures": d.get("creatures") or [],
+                "complete": bool(d.get("complete"))}
+
+    def audit(self, path, run=False, redo=False):
+        """What the auditor made of this recording, in the one shape the
+        panel is written against:
+
+          {"v", "thread":[{t, what, agrees}], "dropped":[{t, what, why}],
+           "merged":[{kept, folded}], "warnings":[...], "complete"}
+
+        "agrees" is drawn from exactly words/sound/eye/review/laugh.
+        Nothing in "dropped" was deleted from anything - the auditor
+        writes only its own sidecar, so every one of those claims is
+        still exactly where its own pass left it.
+
+        run=True builds one now on a side thread, but only when nothing
+        else owns the card and he is not playing; the answer to THIS call
+        is whatever is already on disk."""
+        # NEVER A NULL AND NEVER A THROW, on any path out. The shape IS
+        # the contract, so a recording nobody has audited yet - or one the
+        # panel asked about by a name that is not in the library, or one
+        # whose sidecar is junk - answers in it and says so in a warning,
+        # rather than handing the panel a null or a rejected promise it
+        # would have to guess the meaning of.
+        try:
+            p = self._safe_path(path)
+            if not p:
+                return dict(_aud_public({}),
+                            warnings=["that recording is not in the "
+                                      "library"])
+            d = _read_sidecar(p, "aud")
+            started, why = None, ""
+            if run:
+                # SAY WHETHER IT STARTED. This used to fire and discard
+                # the answer, so the page could not tell "auditing now"
+                # from "refused because you are playing".
+                try:
+                    why = _audit_why(p, redo=bool(redo))
+                    started = (not why) and bool(_audit_ask(
+                        p, redo=bool(redo)))
+                    if started:
+                        log("Auditing " + os.path.basename(p)
+                            + " on its own - the layers it already has.")
+                    elif not why:
+                        why = ("something else took the card first - "
+                               "try again in a moment")
+                except Exception as e2:
+                    started, why = False, str(e2)[:120]
+            if not isinstance(d, dict):
+                out = dict(_aud_public({}),
+                           warnings=["the auditor has not been over this "
+                                     "recording yet"])
+                if run:
+                    out["started"] = bool(started)
+                    if why:
+                        out["warnings"] = [why]
+                return out
+            out = _aud_public(d)
+            if run:
+                out["started"] = bool(started)
+                if why:
+                    out["warnings"] = [why] + list(out.get("warnings") or [])
+            return out
+        except Exception as e:
+            log("Api.audit could not read the audit: " + str(e)[:120])
+            return dict(_aud_public({}),
+                        warnings=["the audit on disk could not be read: "
+                                  + str(e)[:120]])
+
+    def aud_unfix(self, path, t, heard=None):
+        """Put ONE corrected transcript line back the way it was heard.
+        The original never left - it has been sitting on the segment
+        under "was" since the correction landed - so undo is a field
+        swap. The audit's own row is marked undone so the panel stops
+        showing a correction that is no longer there."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "unknown file"}
+        try:
+            t = float(t or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "why": "no clock"}
+        try:
+            sp = _ai_sidecar(p, "stt")
+            with open(sp, encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            # THE CLOSEST MATCHING LINE, NOT THE FIRST NEARBY ONE.
+            # Garbled speech clusters, so two corrections 1.5 seconds
+            # apart are ordinary - "first within two seconds" reverted
+            # and PINNED the wrong one. The row's own corrected text
+            # travels with the press and has to match.
+            hit, best = None, 2.0
+            for sg in (d.get("segments") or []):
+                if not isinstance(sg, dict) or sg.get("was") is None:
+                    continue
+                try:
+                    a = float(sg.get("a") or 0) / 1000.0
+                except (TypeError, ValueError):
+                    continue
+                if abs(a - t) > best:
+                    continue
+                _ht = str(sg.get("t") or "").strip()
+                _hh = str(heard or "").strip()
+                # the panel clips what it shows at 300 - a long partial
+                # strike matches on its head, or Put-it-back would
+                # refuse the very row it rendered
+                if heard and _ht != _hh and not (len(_hh) >= 200
+                                                 and _ht.startswith(_hh)):
+                    continue
+                hit, best = sg, abs(a - t)
+            if hit is None:
+                return {"ok": False, "why": "no corrected line there"}
+            hit["t"] = hit.pop("was")
+            hit.pop("fx", None)
+            # a STRUCK line comes all the way back: the nn flag is what
+            # hides it from search, the vocabulary and the said column,
+            # and the why/odd markers belong to the strike, not to him
+            hit.pop("nn", None)
+            hit.pop("pn", None)
+            hit.pop("fxw", None)
+            hit.pop("fxo", None)
+            # PINNED. He heard the second and chose this reading; the
+            # next audit would otherwise flag the same line again and
+            # re-apply the very correction he just removed. A pin says
+            # the argument is settled, and by him.
+            hit["pin"] = 1
+            _atomic_write_json(sp, d)
+        except Exception as e:
+            return {"ok": False, "why": str(e)[:120]}
+        # the audit's row stops claiming a correction that is gone now
+        try:
+            ap = _ai_sidecar(p, "aud")
+            with open(ap, encoding="utf-8") as fh:
+                a2 = json.load(fh) or {}
+            # ONE press, ONE row - the blanket two-second sweep also
+            # marked the neighbour "put back" while its correction still
+            # stood in the transcript
+            best_f, bd = None, 2.0
+            for f in (a2.get("fixes") or []):
+                try:
+                    d2 = abs(float(f.get("t") or 0) - t)
+                except (TypeError, ValueError):
+                    continue
+                if d2 > bd:
+                    continue
+                if heard and str(f.get("heard") or "").strip() \
+                        != str(heard).strip():
+                    continue
+                best_f, bd = f, d2
+            if best_f is not None:
+                best_f["applied"] = False
+                best_f["undone"] = True
+            # a STRUCK line's record lives in garble, not fixes - and
+            # the corrected snapshot must stop swearing the strike still
+            # stands. Rebuilt from the transcript itself, which the
+            # swap above just restored.
+            for g2 in (a2.get("garble") or []):
+                try:
+                    if abs(float(g2.get("t") or 0) - t) > 2.0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if g2.get("verdict") == "noise":
+                    g2.pop("verdict", None)
+                    g2.pop("vwhy", None)
+                    g2.pop("struck", None)
+                    g2["undone"] = True
+            try:
+                a2["corrected"] = _aud_corrected(p)
+            except Exception:
+                pass
+            # AN UNDO IS NOT NEW EVIDENCE. The rewrite above moved the
+            # transcript's mtime, and _aud_owing would read that as "the
+            # transcript changed, audit it again" - a whole model ask
+            # bought by one press of Put-it-back. Refresh the stamp: the
+            # auditor has seen everything this file now says.
+            try:
+                if isinstance(a2.get("src"), dict):
+                    a2["src"]["stt"] = round(os.path.getmtime(sp), 1)
+            except OSError:
+                pass
+            _atomic_write_json(ap, a2)
+        except Exception:
+            pass
+        log("Put a line back as it was heard at "
+            + _eye_stamp(t) + " in " + os.path.basename(p) + ".")
+        return {"ok": True}
+
+    def hype(self, path):
+        """The excitement flow - the arousal curve the senses have been
+        computing all along (nine thousand readings on one Big Walk) and
+        no page could ask for. Downsampled to what a ribbon can draw,
+        with the peaks named so a click can land on one."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False}
+        try:
+            with open(_ai_sidecar(p, "sns"), encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            h = d.get("hype") or {}
+            v = [float(x) for x in (h.get("v") or [])]
+            hop = float(h.get("hop") or 3.0)
+        except Exception:
+            return {"ok": False, "why": "the senses have not heard this "
+                                        "one yet"}
+        if len(v) < 8:
+            return {"ok": False, "why": "too short to have a flow"}
+        step = max(1, len(v) // 1600)
+        vd = [round(max(v[i:i + step]), 3) for i in range(0, len(v), step)]
+        sv = sorted(v)
+        p90 = sv[int(len(sv) * 0.9)]
+        peaks = []
+        for i in range(2, len(v) - 2):
+            if v[i] >= p90 and v[i] == max(v[i - 2:i + 3]):
+                t = round(i * hop, 1)
+                if not peaks or t - peaks[-1] > 45:
+                    peaks.append(t)
+        return {"ok": True, "hop": hop * step, "v": vd,
+                "peaks": peaks[:40],
+                "median": round(sv[len(sv) // 2], 3), "p90": round(p90, 3)}
+
+    def sns_rename(self, path, who, name):
+        """Give a clustered voice its real name - stored in the sidecar's
+        names map, and it now survives a redo for real: the pass banks a
+        voiceprint per voice and the next one carries each name onto the
+        voice it matches, so a renumbered cluster no longer costs him the
+        name. (The old wording here promised that outright while the pass
+        was wiping the map on every run.) Sidecars written before 2.84
+        have no prints; those names are carried by number once, and earn a
+        print on that run."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False}
+        try:
+            sp = _ai_sidecar(p, "sns")
+            with open(sp, encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            nm = d.get("names") or {}
+            name = str(name or "").strip()[:24]
+            if name:
+                nm[str(int(who))] = name
+            else:
+                nm.pop(str(int(who)), None)
+            d["names"] = nm
+            _atomic_write_json(sp, d)
+            return {"ok": True, "names": nm}
+        except Exception as e:
+            return {"ok": False, "why": str(e)}
+
+    def similar_moments(self, path, t):
+        """Moments across the library that SOUND like this second - cosine
+        over the stored CLAP embeddings. Small: embeddings are 128-d and
+        only every other window is kept."""
+        p = self._safe_path(path)
+        if not p:
+            return []
+        try:
+            import numpy as np
+            with open(_ai_sidecar(p, "sns"), encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            embs = d.get("emb") or []
+            if not embs:
+                return []
+            t = float(t or 0)
+            q = min(embs, key=lambda e: abs((e.get("t") or 0) - t))
+            qv = np.asarray(q.get("v") or [], dtype=float)
+            if not qv.size:
+                return []
+            qv /= (np.linalg.norm(qv) or 1)
+            hits = []
+            for dpath, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                for v in _scan_dir_mp4s(dpath, kind):
+                    sp2 = _ai_sidecar(v["path"], "sns")
+                    if not os.path.isfile(sp2):
+                        continue
+                    try:
+                        with open(sp2, encoding="utf-8") as fh:
+                            e2 = (json.load(fh) or {}).get("emb") or []
+                        if not e2:
+                            continue
+                        M = np.asarray([x.get("v") or [] for x in e2],
+                                       dtype=float)
+                        if M.ndim != 2 or M.shape[1] != qv.size:
+                            continue
+                        M = M / (np.linalg.norm(M, axis=1, keepdims=True)
+                                 + 1e-9)
+                        sim = M @ qv
+                        bi = int(sim.argmax())
+                        same = os.path.normcase(v["path"])                             == os.path.normcase(p)
+                        bt = float(e2[bi].get("t") or 0)
+                        if same and abs(bt - t) < 60:
+                            continue       # itself
+                        hits.append({"path": v["path"],
+                                     "name": os.path.basename(v["path"]),
+                                     "t": bt, "sim": round(float(sim[bi]), 3)})
+                    except Exception:
+                        continue
+            hits.sort(key=lambda h: -h["sim"])
+            return hits[:8]
+        except Exception:
+            return []
+
+    def bind_montage(self, path):
+        """One tap: the strongest gold moments become a stitched highlight
+        reel beside the recording - the multi-piece editor does the work."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "bad path"}
+        try:
+            with open(_ai_sidecar(p, "hl"), encoding="utf-8") as fh:
+                evs = (json.load(fh) or {}).get("events") or []
+        except Exception:
+            return {"ok": False, "why": "no gold moments yet"}
+        if not evs:
+            return {"ok": False, "why": "no gold moments yet"}
+        top = sorted(evs, key=lambda e: -(e.get("z") or 0))[:8]
+        segs = sorted([[max(0.0, float(e.get("t") or 0) - 8),
+                        float(e.get("t") or 0) + 8] for e in top])
+        merged = []
+        for a, b in segs:
+            if merged and a <= merged[-1][1] + 1.5:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        return self.edit_video(p, merged, replace=False)
+
+    def user_marks(self, path):
+        """The reader's own gold: [{t}] seconds, from the 'usr' sidecar.
+        Its own kind on purpose - an AI redo rewrites stt/hl/ins and must
+        never touch what was marked by hand. No freshness gate either: a
+        mark set yesterday is still the reader's mark today."""
+        p = self._safe_path(path)
+        if not p:
+            return []
+        try:
+            sp = _ai_sidecar(p, "usr")
+            if os.path.isfile(sp):
+                with open(sp, encoding="utf-8") as fh:
+                    marks = json.load(fh).get("marks", [])
+                return [m for m in marks
+                        if isinstance(m, dict)
+                        and isinstance(m.get("t"), (int, float))]
+        except Exception:
+            pass
+        return []
+
+    def user_marks_set(self, path, marks):
+        """Replace the recording's user marks. Atomic, so a crash mid-save
+        can never eat them."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "not in the library"}
+        clean = []
+        for m in (marks or [])[:500]:
+            try:
+                t = float(m.get("t"))
+            except Exception:
+                continue
+            if t >= 0:
+                clean.append({"t": round(t, 2)})
+        clean.sort(key=lambda m: m["t"])
+        try:
+            os.makedirs(os.path.dirname(_ai_sidecar(p, "usr")), exist_ok=True)
+            _atomic_write_json(_ai_sidecar(p, "usr"), {"marks": clean})
+            return {"ok": True, "n": len(clean)}
+        except Exception as e:
+            log(f"Could not save your marks: {e}")
+            return {"ok": False, "why": str(e)}
 
     def meta(self, paths):
         """Durations for the videos on the open page (cached probes)."""
@@ -9592,6 +22426,15 @@ class _JsApi:
             ctl.click_feedback("on", "starting", secs=12.0)
             ctl.watching.set()
             ctl.force_record.set()
+        return True
+
+    def record_drop(self):
+        """Stop the recording and throw it away - no file, no queue entry."""
+        ctl = self._ctl
+        if ctl.eff_status() not in ("recording", "paused", "starting"):
+            return False
+        ctl.click_feedback("off", "watching")
+        ctl.drop_now.set()
         return True
 
     def pause_toggle(self):
@@ -9647,12 +22490,50 @@ class _JsApi:
                 log(f"open file failed: {e}")
         return False
 
+    def snapshot_frame(self, path, t):
+        """Save the frame at t seconds as a full-resolution PNG beside the
+        recording (<name>_snap_<mmss>.png) - the player's Snapshot button.
+        ffmpeg does the grab because the streamed <video> element is
+        CORS-tainted for canvas capture, and HDR recordings go through the
+        same measured SDR conversion as thumbnails and Discord copies, so
+        the picture matches what the player showed."""
+        p = self._safe_path(path)
+        if not p:
+            return {"ok": False, "why": "not in the library"}
+        try:
+            t = max(0.0, float(t or 0))
+        except Exception:
+            t = 0.0
+        mm, ss = int(t // 60), int(t % 60)
+        base = os.path.splitext(os.path.basename(p))[0]
+        out = os.path.join(os.path.dirname(p), f"{base}_snap_{mm:02d}{ss:02d}.png")
+        vf = []
+        trc = _probe_color_trc(p)
+        if _is_hdr_trc(trc):
+            vf = ["-vf", _hdr_to_sdr_vf(trc)]
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            r = subprocess.run(
+                [SETTINGS["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{t:.3f}", "-i", p, "-frames:v", "1"] + vf + ["-update", "1", out],
+                capture_output=True, text=True, timeout=30, creationflags=flags)
+            if r.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+                log(f"Snapshot saved: {os.path.basename(out)}")
+                return {"ok": True, "path": out, "name": os.path.basename(out)}
+            for ln in (r.stderr or "").splitlines()[-2:]:
+                log("  ffmpeg(snap): " + ln)
+        except subprocess.TimeoutExpired:
+            log("snapshot timed out")
+        except Exception as e:
+            log(f"snapshot failed: {e}")
+        return {"ok": False, "why": "the frame would not save"}
+
     def reveal(self, path):
         p = self._safe_path(path)
         if p:
             try:
                 flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                subprocess.Popen(["explorer", "/select,", p], creationflags=flags)
+                _popen(["explorer", "/select,", p], creationflags=flags)
                 return True
             except Exception as e:
                 log(f"reveal failed: {e}")
@@ -9686,7 +22567,7 @@ class _JsApi:
             # Shelf layout is <out>/<Game>/{Videos,Clips}/file - climb to the
             # game folder only when that exact shape holds (a direct child of
             # the library); flat recordings just open their own folder.
-            if (os.path.basename(folder) in ("Videos", "Clips")
+            if (os.path.basename(folder) in ("Videos", "Clips", "Edits")
                     and os.path.abspath(os.path.dirname(parent)) == out):
                 target = parent
             target = os.path.abspath(target)
@@ -9705,7 +22586,12 @@ class _JsApi:
         try:
             _AI["veto"] = (os.path.basename(p), time.time())  # keep the tick
             busy = _AI.get("busy")                            # off this file
-            if busy and os.path.basename(p) == busy[1]:
+            if busy and (_AI.get("busy_path") == p
+                     or os.path.basename(p) == busy[1]):
+            # busy_path is the honest comparand - the display name grew a
+            # "the audit · " prefix and the basename match stopped seeing
+            # audits, so deletes and Save&Replace let them run on and
+            # write sidecars for files that no longer existed
                 _ai_abort()
                 for _ in range(20):
                     if _AI.get("busy") is None:
@@ -9730,7 +22616,8 @@ class _JsApi:
         ap = os.path.normcase(os.path.abspath(p))
 
         def _forget():
-            for kind in ("stt", "hl", "lvl"):
+            for kind in ("stt", "hl", "lvl", "ins", "usr", "sns", "inp",
+                         "vis", "aud"):
                 try:
                     os.remove(_ai_sidecar(p, kind))
                 except OSError:
@@ -9739,7 +22626,7 @@ class _JsApi:
             try:
                 with _MANIFEST_LOCK:
                     owned, existed = _load_manifest()
-                    if existed and ap in owned:
+                    if existed and owned and ap in owned:
                         owned.discard(ap)
                         _save_manifest(owned)
             except Exception:
@@ -9748,7 +22635,7 @@ class _JsApi:
                 # locked pair: unlocked, this rewrite could erase an entry a
                 # finishing clip appended between our load and our save
                 with _FINISH_Q_LOCK:
-                    q = [it for it in _load_finish_queue()
+                    q = [it for it in _load_finish_queue(strict=True)
                          if os.path.normcase(os.path.abspath(it.get("path", ""))) != ap]
                     _save_finish_queue(q)
             except Exception:
@@ -9809,6 +22696,58 @@ class _JsApi:
         log(f"delete failed: {last}")
         return {"ok": False, "why": "locked", "detail": str(last or "")}
 
+    CLIPPER_MAX_S = 15          # Discord's free upload will not take more
+
+    def clip_to_discord(self, path, start=0.0, seconds=15.0, note=None):
+        """Send ONE span of a recording to Discord - the Clipper.
+
+        The original is never touched: a compressed copy of just those seconds
+        is built in the temp folder, posted, and deleted."""
+        p = self._safe_path(path)
+        if not p or not os.path.isfile(p):
+            return {"ok": False, "why": "gone"}
+        if not SETTINGS.get("discord_webhook", "").strip():
+            # the one refusal worth its own answer - the player turns this
+            # into "add a webhook in Sharing" rather than a shrug
+            return {"ok": False, "why": "no webhook"}
+        try:
+            a = max(0.0, float(start))
+            n = max(0.5, min(float(seconds), float(self.CLIPPER_MAX_S)))
+        except (TypeError, ValueError):
+            return {"ok": False, "why": "bad span"}
+        ctl = self._ctl
+
+        def work():
+            ctl.notify("Discord", f"Sending {n:.0f}s from "
+                                  f"{os.path.basename(p)}\u2026")
+            _source_busy_add(p)
+            try:
+                small = _compress_for_discord(
+                    p, int(SETTINGS.get("discord_max_mb", 9) or 9),
+                    length_s=n,
+                    quality_mbps=int(SETTINGS.get("discord_quality_mbps",
+                                                  0) or 0),
+                    start_s=a)
+            finally:
+                _source_busy_done(p)
+            if not small:
+                ctl.notify("Discord", "Couldn't fit those seconds under the "
+                                      "size limit - raise it in Sharing.")
+                return
+            base = os.path.splitext(os.path.basename(p))[0]
+            mm, ss = divmod(int(a), 60)
+            ok = _post_to_discord(
+                small, content=(str(note).strip()[:300] if note
+                                else f"\U0001F3AE {base} @ {mm}:{ss:02d}"))
+            try:
+                os.remove(small)
+            except Exception:
+                pass
+            ctl.notify("Discord \u2713",
+                       "Sent." if ok else "Upload failed - check the webhook.")
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "seconds": n}
+
     def post_discord(self, path):
         """Send any saved video to the Discord webhook (compressed copy, the
         original stays untouched) - the same pipeline as the clip hotkey."""
@@ -9821,6 +22760,233 @@ class _JsApi:
             _maybe_post_discord(ctl, p)
         threading.Thread(target=work, daemon=True).start()
         return True
+
+    # ---------------- the vault (2.76) ----------------
+    def vault_scan(self, force=False):
+        """Disk truth for the vault page, cached ~10 minutes. The walk runs
+        on a worker so the bridge never blocks on a spinning drive; while it
+        walks, the previous numbers (if any) ride along with busy=True."""
+        now = time.time()
+        if _VAULT["busy"]:
+            return {"ok": True, "busy": True, "res": _VAULT["res"],
+                    "age_s": int(now - _VAULT["t"]) if _VAULT["res"] else None}
+        if _VAULT["res"] is not None and not force and now - _VAULT["t"] < 600:
+            return {"ok": True, "busy": False, "res": _VAULT["res"],
+                    "age_s": int(now - _VAULT["t"])}
+        _VAULT["busy"] = True
+
+        def work():
+            try:
+                _VAULT["res"] = _vault_walk()
+                _VAULT["t"] = time.time()
+            except Exception as e:
+                log(f"The vault could not be measured: {e}")
+            finally:
+                _VAULT["busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "busy": True, "res": _VAULT["res"],
+                "age_s": int(now - _VAULT["t"]) if _VAULT["res"] else None}
+
+    def cap_dryrun(self):
+        """What the storage cap WOULD take next, without taking anything.
+        Mirrors enforce_storage_cap's selection - manifest-owned files only,
+        oldest first, pinned games passed over - but never deletes and never
+        seeds the manifest."""
+        cap_gb = SETTINGS.get("max_storage_gb", 0) or 0
+        if cap_gb <= 0:
+            return {"ok": True, "cap_gb": 0, "would": [], "pinned_skipped": 0}
+        out = SETTINGS.get("output_dir", "")
+        with _MANIFEST_LOCK:
+            owned, _existed = _load_manifest()
+        if owned is None:
+            return {"ok": False,
+                    "why": "the ownership records could not be read"}
+        if not owned:
+            return {"ok": True, "cap_gb": cap_gb, "would": [],
+                    "pinned_skipped": 0,
+                    "why": "nothing is known to be LORE's own yet"}
+        rows = []
+        for folder, _kind in _library_dirs(out):
+            try:
+                for f in os.listdir(folder):
+                    fp = os.path.join(folder, f)
+                    if f.lower().endswith(".mp4") \
+                            and os.path.normcase(os.path.abspath(fp)) in owned \
+                            and os.path.isfile(fp):
+                        try:
+                            rows.append((os.path.getmtime(fp),
+                                         os.path.getsize(fp), fp))
+                        except OSError:
+                            continue
+            except Exception:
+                continue
+        rows.sort()
+        total = sum(r[1] for r in rows)
+        cap = cap_gb * (1024 ** 3)
+        pinned = _cap_pinned_keys()
+        would, skipped = [], 0
+        for mt, sz, fp in rows:
+            if total <= cap:
+                break
+            if pinned and _cap_game_key(fp) in pinned:
+                skipped += 1
+                continue
+            total -= sz
+            would.append({"name": os.path.basename(fp), "size": sz,
+                          "mtime": mt})
+        return {"ok": True, "cap_gb": cap_gb,
+                "total_bytes": sum(r[1] for r in rows),
+                "would": would[:40], "pinned_skipped": skipped}
+
+    def cold_shelf(self, days=90):
+        """The oldest recordings nothing has touched in days+ - archive
+        candidates with their total size. Last-opened times come from the
+        player (recorded from 2.76 on, on every open); a recording never
+        opened falls back to its file mtime."""
+        try:
+            days = max(7, int(days or 90))
+        except Exception:
+            days = 90
+        opens = _opens_load()
+        now = time.time()
+        cold, total = [], 0
+        try:
+            for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                for v in _scan_dir_mp4s(d, kind):
+                    k = os.path.normcase(os.path.abspath(v["path"]))
+                    last = max(v["mtime"], opens.get(k, 0))
+                    if now - last > days * 86400:
+                        total += v["size"]
+                        cold.append({"name": v["file"], "path": v["path"],
+                                     "size": v["size"], "kind": kind,
+                                     "last": last})
+        except Exception:
+            pass
+        cold.sort(key=lambda r: r["last"])
+        return {"ok": True, "days": days, "n": len(cold), "bytes": total,
+                "items": cold[:30]}
+
+    def vault_tidy(self):
+        """One pull of the bell: chain the EXISTING maintenance verbs on a
+        worker - free safe staging leftovers (cache_clean), sweep orphan
+        temps (_sweep_orphan_temp), then the self-healing shelving and
+        manifest re-aim (_migrate_library_layout) - with a readable per-step
+        report. Each verb already keeps the promise that footage existing
+        nowhere else is never touched. Refused while recording: the sweep's
+        salvage pass must never weld a live paused session's segments."""
+        if _TIDY["busy"]:
+            return {"ok": False, "why": "already tidying"}
+        if self._ctl.session is not None:
+            return {"ok": False, "why": "recording"}
+        _TIDY.update({"busy": True, "step": "staging leftovers", "report": []})
+        api_self = self
+
+        def work():
+            rep = []
+            try:
+                try:
+                    r = api_self.cache_clean()
+                    rep.append(f"Staging: {r.get('removed', 0)} leftover(s) "
+                               f"freed ({(r.get('freed', 0) or 0) / 1e9:.1f} GB), "
+                               f"{r.get('kept', 0)} kept - no other copy exists.")
+                except Exception as e:
+                    rep.append(f"Staging: could not be cleared ({e}).")
+                _TIDY["step"] = "temp litter"
+                try:
+                    _sweep_orphan_temp()
+                    rep.append("Temp litter: swept - empty scratch and stale "
+                               "work files are gone; rescues run on their own.")
+                except Exception as e:
+                    rep.append(f"Temp litter: sweep failed ({e}).")
+                _TIDY["step"] = "shelves and records"
+                try:
+                    _migrate_library_layout()
+                    rep.append("Shelves and ownership records: checked, and "
+                               "re-aimed where they had drifted.")
+                except Exception as e:
+                    rep.append(f"Shelf self-heal failed ({e}).")
+            finally:
+                _TIDY.update({"busy": False, "step": "", "report": rep,
+                              "t": time.time()})
+                log("Vault tidy finished. " + " ".join(rep))
+                _VAULT["t"] = 0.0     # the numbers just changed: re-measure
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True}
+
+    def vault_tidy_status(self):
+        return {"ok": True, "busy": _TIDY["busy"], "step": _TIDY["step"],
+                "report": list(_TIDY["report"]), "t": _TIDY["t"]}
+
+    # ---------------- the echo test (2.76) ----------------
+    def echo_test(self):
+        """Five seconds from the configured sources, captured exactly the way
+        a recording captures them - the same AudioRecorder and device picks
+        (LORE records audio via WASAPI, not ffmpeg devices, so the honest
+        test walks the same path) - then encoded small for playback. That one
+        capture also feeds the level meters: deliberately no continuous live
+        tap, so the recorder never has to fight its own settings page."""
+        if _ECHO["busy"]:
+            return {"ok": False, "why": "already listening"}
+        if self._ctl.session is not None:
+            return {"ok": False, "why": "recording"}
+        out = SETTINGS.get("output_dir", "")
+        if not out or not os.path.isdir(out):
+            return {"ok": False, "why": "the library folder is not reachable"}
+        if not SETTINGS.get("capture_system") and not SETTINGS.get("capture_mic"):
+            return {"ok": False, "why": "both sources are switched off above"}
+        _ECHO.update({"busy": True, "res": None})
+        api_self = self
+
+        def work():
+            res = {"ok": False, "why": "the capture failed"}
+            rec = None
+            try:
+                tdir = _thumb_dir(out)
+                os.makedirs(tdir, exist_ok=True)
+                rec = AudioRecorder(tdir, tag="echo")
+                rec.start()
+                time.sleep(5.2)
+                rec.stop()
+                res = {"ok": True, "mic": None, "system": None}
+                for kind, wav in (("mic", rec.mic_wav),
+                                  ("system", rec.system_wav)):
+                    if not wav or not os.path.isfile(wav):
+                        continue
+                    tr = _echo_analyze(wav) or {}
+                    m4a = os.path.join(tdir, f"echo_{kind}.m4a")
+                    try:
+                        flags = (subprocess.CREATE_NO_WINDOW
+                                 if os.name == "nt" else 0)
+                        subprocess.run([SETTINGS["ffmpeg_path"], "-y",
+                                        "-hide_banner", "-loglevel", "error",
+                                        "-i", wav, "-c:a", "aac",
+                                        "-b:a", "160k", m4a],
+                                       capture_output=True,
+                                       creationflags=flags, timeout=30)
+                    except Exception:
+                        pass
+                    play = m4a if (os.path.isfile(m4a)
+                                   and os.path.getsize(m4a) > 1000) else wav
+                    tr["url"] = api_self.stream_url(play)
+                    res[kind] = tr
+                if res["mic"] is None and res["system"] is None:
+                    res = {"ok": False,
+                           "why": "no device produced any audio"}
+            except Exception as e:
+                res = {"ok": False,
+                       "why": f"the capture failed ({str(e)[:80]})"}
+            finally:
+                try:
+                    if rec is not None and not getattr(rec, "_finalized", False):
+                        rec.stop()
+                except Exception:
+                    pass
+                _ECHO.update({"busy": False, "res": res, "t": time.time()})
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True}
+
+    def echo_test_status(self):
+        return {"ok": True, "busy": _ECHO["busy"], "res": _ECHO["res"]}
 
     # ---------------- settings ----------------
     def get_settings(self):
@@ -9882,6 +23048,78 @@ class _JsApi:
                 log(f"Autostart toggle failed: {e}")
         return self.get_settings()
 
+    def settings_defaults(self):
+        # 2.76 O1: the factory values, so the tome can mark changed rows
+        return {k: v for k, v in DEFAULTS.items() if not k.startswith("_")}
+
+    def settings_export(self):
+        """2.76 O2: write the current profile (settings + the games/ignore
+        lists) to a JSON file the reader picks. Machine-specific keys -
+        output_dir, ffmpeg_path, window_bounds - stay home: they are this
+        PC's geography, not a preference."""
+        try:
+            import webview
+            if self._win is None:
+                return {"ok": False, "why": "no window"}
+            res = self._win.create_file_dialog(webview.SAVE_DIALOG,
+                                               save_filename="lore-settings.json")
+            p = res[0] if isinstance(res, (list, tuple)) and res else res
+            if not p:
+                return {"ok": False, "why": "cancelled"}
+            p = str(p)
+            if not p.lower().endswith(".json"):
+                p += ".json"
+            skip = ("window_bounds", "output_dir", "ffmpeg_path")
+            data = {k: v for k, v in SETTINGS.items()
+                    if not k.startswith("_") and k not in skip}
+            _atomic_write_json(p, {"lore_settings": 1,
+                                   "settings": data,
+                                   "games": read_games_lines(),
+                                   "ignore": read_ignore_lines()})
+            log(f"Settings exported to {p}")
+            return {"ok": True, "path": p, "name": os.path.basename(p)}
+        except Exception as e:
+            log(f"settings export failed: {e}")
+            return {"ok": False, "why": "could not write the file"}
+
+    def settings_import(self):
+        """2.76 O2: read a profile written by settings_export. Only keys the
+        tome knows are taken, and everything imported passes through the same
+        sanitiser a hand-edited settings.json gets."""
+        try:
+            import webview
+            if self._win is None:
+                return {"ok": False, "why": "no window"}
+            res = self._win.create_file_dialog(webview.OPEN_DIALOG,
+                                               file_types=("JSON files (*.json)",))
+            p = res[0] if isinstance(res, (list, tuple)) and res else res
+            if not p:
+                return {"ok": False, "why": "cancelled"}
+            with open(str(p), encoding="utf-8") as fh:
+                obj = json.load(fh)
+            if not isinstance(obj, dict):
+                return {"ok": False, "why": "not a settings file"}
+            src = obj.get("settings") if isinstance(obj.get("settings"), dict) else obj
+            skip = ("window_bounds", "output_dir", "ffmpeg_path")
+            keep = {k: v for k, v in src.items()
+                    if k in DEFAULTS and k not in skip}
+            got_games = isinstance(obj.get("games"), list)
+            got_ignore = isinstance(obj.get("ignore"), list)
+            if not keep and not got_games and not got_ignore:
+                return {"ok": False, "why": "nothing in it the tome knows"}
+            if got_games:
+                write_games_lines([str(x) for x in obj["games"]])
+            if got_ignore:
+                write_ignore_lines([str(x) for x in obj["ignore"]])
+            if keep:
+                self.set_settings(keep)
+            log(f"Settings imported from {p} ({len(keep)} keys)")
+            return {"ok": True, "applied": len(keep),
+                    "settings": self.get_settings()}
+        except Exception as e:
+            log(f"settings import failed: {e}")
+            return {"ok": False, "why": "could not read the file"}
+
     def set_games(self, lines):
         try:
             write_games_lines([str(x) for x in (lines or [])])
@@ -9937,6 +23175,7 @@ class _JsApi:
         p = self._safe_path(path)
         if not p or not _MEDIA.get("port"):
             return None
+        _note_open(p)   # the cold-shelf view reads these: watched, and when
         import base64
         b = base64.urlsafe_b64encode(p.encode("utf-8")).decode("ascii")
         try:
@@ -10109,6 +23348,12 @@ class _JsApi:
         flash of un-shaped leather ever appears."""
         self._settled = True      # the tome is up; the watchdog stands down
         try:
+            if _QUIT_STATE["requested"]:
+                # quit was chosen while the window was still being born -
+                # never leave a live tome floating over a dead recorder
+                if self._win is not None:
+                    self._win.destroy()
+                return True
             if self._reveal_ok and self._win is not None:
                 self._win.show()
                 _fit_maximize_bounds()   # so Aero snap-to-top spares the taskbar
@@ -10159,9 +23404,11 @@ class _JsApi:
                             if not _FINISHING.get("busy"):
                                 break
                             time.sleep(0.1)
-                    q = [x for x in _load_finish_queue()
-                         if os.path.abspath(x.get("path", "")) != os.path.abspath(p)]
-                    _save_finish_queue(q)
+                    with _FINISH_Q_LOCK:
+                        q = [x for x in _load_finish_queue(strict=True)
+                             if os.path.abspath(x.get("path", ""))
+                             != os.path.abspath(p)]
+                        _save_finish_queue(q)
                 except Exception:
                     pass
             try:
@@ -10212,9 +23459,11 @@ class _JsApi:
                         # the file is SDR now - drop any pending restoration
                         try:
                             ap = os.path.abspath(out)
-                            q = [x for x in _load_finish_queue()
-                                 if os.path.abspath(x.get("path", "")) != ap]
-                            _save_finish_queue(q)
+                            with _FINISH_Q_LOCK:
+                                q = [x for x in _load_finish_queue(strict=True)
+                                     if os.path.abspath(x.get("path", ""))
+                                     != ap]
+                                _save_finish_queue(q)
                         except Exception:
                             pass
                         # its face changed: refresh the cached thumbnail
@@ -10226,7 +23475,11 @@ class _JsApi:
                                 os.path.splitext(os.path.basename(out))[0] + ".jpg")
                             if os.path.isfile(tp):
                                 os.remove(tp)
-                            for kind in ("stt", "hl", "lvl"):
+                            # usr too: the reader's own diamonds cite clocks
+                            # that no longer exist in the reshaped file
+                            for kind in ("stt", "hl", "lvl", "ins",
+                                         "usr", "sns", "inp", "vis",
+                                         "aud"):
                                 try:
                                     os.remove(_ai_sidecar(out, kind))
                                 except OSError:
@@ -10271,7 +23524,7 @@ class _JsApi:
         return {"ok": True, "name": os.path.basename(out)}
 
     def edit_video(self, path, segments, replace=False, to_discord=False,
-                   cap_mb=0, mute=None):
+                   cap_mb=0, mute=None, crop=None):
         """The multi-part editor. `segments` is the list of [start,end] seconds to
         KEEP, in order (the UI turns a keep/remove choice into this list). Each
         piece is re-encoded to the user's current bitrate/encoder, the pieces are
@@ -10281,6 +23534,7 @@ class _JsApi:
         piece has encoded and stitched into a verified temp file."""
         if not _EDIT_JOB.get("done", True):
             return {"ok": False, "why": "an edit is already running"}
+        _EDIT_JOB["procs"] = []          # nothing of the last job is still ours
         p = self._safe_path(path)
         if not p:
             return {"ok": False, "why": "bad path"}
@@ -10343,9 +23597,11 @@ class _JsApi:
                                 if not _FINISHING.get("busy"):
                                     break
                                 time.sleep(0.1)
-                        q = [x for x in _load_finish_queue()
-                             if os.path.abspath(x.get("path", "")) != os.path.abspath(p)]
-                        _save_finish_queue(q)
+                        with _FINISH_Q_LOCK:
+                            q = [x for x in _load_finish_queue(strict=True)
+                                 if os.path.abspath(x.get("path", ""))
+                                 != os.path.abspath(p)]
+                            _save_finish_queue(q)
                     except Exception:
                         pass
                 os.makedirs(out_dir, exist_ok=True)
@@ -10381,6 +23637,12 @@ class _JsApi:
                         log(f"That is {vkbps} kbps for {total / 60:.0f} minutes - "
                             f"very low. Mark a shorter piece, or raise the cap.")
                         _EDIT_JOB["thin"] = vkbps
+                # The crop rides in front of everything else, and it is the
+                # reason a capped clip can look good: the same bits over a
+                # smaller frame are more bits per pixel.
+                crop_f = _crop_filter(crop, p)
+                if crop_f:
+                    log(f"Cropping to {crop_f.split('=', 1)[1]} (w:h:x:y).")
                 vf0 = "format=nv12"
                 trc = _probe_color_trc(p)
                 if _is_hdr_trc(trc):
@@ -10443,7 +23705,7 @@ class _JsApi:
                                       + ("" if vf0 == "format=nv12"
                                          else "," + vf0.rsplit(",", 1)[0])
                                       + ",format=nv12")
-                        enc_args = ["-vf", vf_cap, "-c:v", enc,
+                        enc_args = ["-vf", _vf_chain(crop_f, vf_cap), "-c:v", enc,
                                     "-b:v", f"{kb}k",
                                     # a tight ceiling and a small buffer keep
                                     # VBR from banking bits and spending them
@@ -10452,7 +23714,7 @@ class _JsApi:
                                     "-bufsize", f"{int(kb * 2)}k",
                                     "-c:a", "aac", "-b:a", "128k"]
                     else:
-                        enc_args = ["-vf", vf0, "-c:v", enc,
+                        enc_args = ["-vf", _vf_chain(crop_f, vf0), "-c:v", enc,
                                     *encoder_quality_flags(enc, br),
                                     "-c:a", "aac", "-b:a", "192k"]
                     copy_args = (["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
@@ -10462,15 +23724,16 @@ class _JsApi:
                     if af:
                         enc_args = enc_args + ["-af", af]
                     # a cap can only be met by re-encoding
-                    can_copy = (vf0 == "format=nv12") and cap <= 0
+                    # a cropped frame is a different frame - nothing to copy
+                    can_copy = (vf0 == "format=nv12") and cap <= 0 and not crop_f
                     cmd = [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
                            "-loglevel", "error",
                            "-ss", f"{s:.3f}", "-i", p, "-t", f"{seg_dur:.3f}",
                            *(copy_args if can_copy else enc_args),
                            "-progress", "pipe:1", "-nostats", part]
-                    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                          stderr=subprocess.DEVNULL,
-                                          creationflags=flags, text=True, bufsize=1)
+                    pr = _edit_watch(_popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        creationflags=flags, text=True, bufsize=1))
                     for line in pr.stdout:
                         if _EDIT_JOB["cancel"]:
                             try:
@@ -10498,7 +23761,7 @@ class _JsApi:
                                "-loglevel", "error",
                                "-ss", f"{s:.3f}", "-i", p, "-t", f"{seg_dur:.3f}",
                                *enc_args, "-progress", "pipe:1", "-nostats", part]
-                        pr = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                        pr = _popen(cmd, stdout=subprocess.PIPE,
                                               stderr=subprocess.DEVNULL,
                                               creationflags=flags, text=True,
                                               bufsize=1)
@@ -10525,7 +23788,8 @@ class _JsApi:
                 if len(parts) == 1:
                     os.replace(parts[0], tmp_final)
                     parts = []
-                elif not _concat_copy(SETTINGS["ffmpeg_path"], parts, tmp_final):
+                elif not _concat_copy(SETTINGS["ffmpeg_path"], parts, tmp_final,
+                                      watch=_edit_watch):
                     raise RuntimeError("stitch failed")
                 if not (os.path.isfile(tmp_final) and os.path.getsize(tmp_final) > 10_000):
                     raise RuntimeError("empty result")
@@ -10553,16 +23817,22 @@ class _JsApi:
                         # so pressing it during a squeeze did nothing until the
                         # encode finished on its own - which on a long clip is
                         # the better part of an hour.
-                        fp = subprocess.Popen(
+                        fp = _edit_watch(_popen(
                             [SETTINGS["ffmpeg_path"], "-y", "-hide_banner",
                              "-loglevel", "error", "-i", tmp_final,
-                             "-vf", _cap_vf(vf0, nkb), "-c:v", enc, "-b:v", f"{nkb}k",
+                             # NOT vf0 and NOT the crop: this pass re-encodes
+                             # the finished file, which has already been cropped
+                             # and already tone-mapped. Feeding it vf0 ran the
+                             # HDR tone-map a second time and washed the picture
+                             # out on every size-capped HDR clip.
+                             "-vf", _cap_vf("format=nv12", nkb),
+                             "-c:v", enc, "-b:v", f"{nkb}k",
                              "-maxrate", f"{int(nkb * 1.1)}k",
                              "-bufsize", f"{int(nkb * 2)}k",
                              "-c:a", "aac", "-b:a", "128k",
                              "-progress", "pipe:1", "-nostats", fit],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            creationflags=flags, text=True, bufsize=1)
+                            creationflags=flags, text=True, bufsize=1))
                         try:
                             for line in fp.stdout:
                                 if _EDIT_JOB["cancel"]:
@@ -10618,8 +23888,20 @@ class _JsApi:
                         got = float((rp.stdout or "").strip() or 0)
                     except Exception:
                         got = 0.0
-                    if got and abs(got - total) > max(1.0, total * 0.04):
-                        raise RuntimeError(f"stitch incomplete: {got:.1f}s of {total:.1f}s")
+                    # SHORT IS A FAULT; LONG IS ARITHMETIC. A copy cut cannot
+                    # begin mid-GOP: every piece snaps back to the keyframe
+                    # before its mark, and the recorder forces one every 4
+                    # seconds. So a Reel of a dozen moments legitimately
+                    # comes out seconds LONGER than the spans asked for -
+                    # his 128s montage measured 142s and this guard called
+                    # it broken. What it is actually here to catch is
+                    # _concat_copy salvaging a bad join by dropping a piece,
+                    # which always makes the result SHORTER.
+                    tol = max(1.0, total * 0.04)
+                    over = max(tol, 4.0 * len(segs))
+                    if got and (total - got > tol or got - total > over):
+                        raise RuntimeError(
+                            f"stitch wrong: {got:.1f}s of {total:.1f}s")
                 # last exit before the commit: a Cancel during the stitch must
                 # still win - past os.replace the original is gone for good
                 if _EDIT_JOB["cancel"]:
@@ -10635,7 +23917,24 @@ class _JsApi:
                         except PermissionError:
                             time.sleep(0.2)
                     else:
-                        raise PermissionError("original still in use")
+                        # the original is still held open (often the tome's
+                        # own player streaming it). The verified hour of
+                        # encoding is NOT thrown away with it - it becomes a
+                        # clip beside the original instead of feeding the
+                        # finally block's cleanup.
+                        alt = os.path.join(out_dir,
+                                           f"{base}_edit_{stamp}.mp4")
+                        os.replace(tmp_final, alt)
+                        _record_made_file(alt)
+                        _EDIT_JOB.update({"pct": 100, "phase": "done",
+                                          "ok": True, "done": True})
+                        log("Replace blocked (the original is still open) - "
+                            f"the edit was saved beside it: {alt}")
+                        ctl.notify("Saved as a new clip",
+                                   "The original was still in use, so your "
+                                   "edit sits beside it: "
+                                   + os.path.basename(alt))
+                        return
                 else:
                     os.replace(tmp_final, out)
                 # the result is now IN PLACE - the save has committed (irreversibly,
@@ -10645,15 +23944,19 @@ class _JsApi:
                 try:
                     if replace:
                         ap = os.path.abspath(out)
-                        q = [x for x in _load_finish_queue()
-                             if os.path.abspath(x.get("path", "")) != ap]
-                        _save_finish_queue(q)
+                        with _FINISH_Q_LOCK:
+                            q = [x for x in _load_finish_queue(strict=True)
+                                 if os.path.abspath(x.get("path", "")) != ap]
+                            _save_finish_queue(q)
                         tp = os.path.join(
                             _thumb_dir(os.path.dirname(out)),
                             os.path.splitext(os.path.basename(out))[0] + ".jpg")
                         if os.path.isfile(tp):
                             os.remove(tp)
-                        for kind in ("stt", "hl", "lvl"):
+                        # usr too: hand-made marks cite clocks that no longer
+                        # exist in the reshaped file
+                        for kind in ("stt", "hl", "lvl", "ins", "usr",
+                                     "sns", "inp", "vis", "aud"):
                             try:
                                 os.remove(_ai_sidecar(out, kind))
                             except OSError:
@@ -10710,10 +24013,226 @@ class _JsApi:
                 "ok": j.get("ok", False), "why": j.get("why", ""),
                 "name": j.get("name", "")}
 
-    def edit_cancel(self):
-        """Ask the running edit to stop; the worker kills ffmpeg and cleans up."""
-        _EDIT_JOB["cancel"] = True
+    def ai_redo(self, kinds=None):
+        """Run a reading job again over the WHOLE library. Transcripts are left
+        alone unless asked for by name - they take days and have not changed."""
+        want = [k for k in (kinds or ["listening", "thinking"])
+                if k in _JOB_SIDES]
+        if not want:
+            return {"ok": False, "why": "nothing chosen"}
+
+        def work():
+            gone = _redo_sweep(want)
+            log("Re-reading: cleared " + str(gone) + " result(s) for "
+                + ", ".join(AI_LABEL.get(k, k) for k in want)
+                + " - they go back in the queue.")
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "kinds": want}
+
+    def game_names_check(self):
+        """Check every game's name now, instead of waiting for the daily one."""
+        if _AI.get("_names_busy"):
+            return {"ok": False, "why": "already checking"}
+
+        def work():
+            _AI["_names_busy"] = True
+            try:
+                _game_names_sweep(True)
+            except Exception as e:
+                log(f"Game-name check failed: {e}")
+            finally:
+                _AI["_names_busy"] = False
+        threading.Thread(target=work, daemon=True).start()
         return {"ok": True}
+
+    def drift_scan(self):
+        """Look through the library for recordings whose sound has slipped
+        away from the picture. Reading two numbers per file - no decoding."""
+        if _DRIFT["busy"]:
+            return {"ok": False, "why": "already working"}
+        # busy from THIS INSTANT, not from whenever the thread gets a slice
+        _DRIFT.update({"mode": "scan", "busy": True, "cancel": False,
+                       "done": 0, "total": 0, "fixed": 0, "name": "scanning"})
+
+        def work():
+            _DRIFT.update({"busy": True, "cancel": False, "done": 0,
+                           "fixed": 0, "hits": [], "name": "scanning",
+                           "mode": "scan"})
+            vids = []
+            try:
+                for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+                    vids.extend(v["path"] for v in _scan_dir_mp4s(d, kind))
+            except Exception:
+                pass
+            _DRIFT["total"] = len(vids)
+            for i, p in enumerate(vids):
+                if _DRIFT["cancel"]:
+                    break
+                _DRIFT["done"] = i + 1
+                _DRIFT["name"] = os.path.basename(p)
+                got = _av_durations(p)
+                if got and abs(got[1] - got[0]) >= 0.5:
+                    _DRIFT["hits"].append({"path": p, "off": round(got[1] - got[0], 2)})
+            _DRIFT.update({"busy": False, "scanned": True, "name": ""})
+            log(f"Drift scan: {len(_DRIFT['hits'])} of {len(vids)} recordings "
+                f"have their sound out of step.")
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True}
+
+    def drift_status(self):
+        h = _DRIFT["hits"]
+        return {"busy": _DRIFT["busy"], "scanned": _DRIFT["scanned"],
+                "mode": _DRIFT["mode"],
+                "done": _DRIFT["done"], "total": _DRIFT["total"],
+                "fixed": _DRIFT["fixed"], "name": _DRIFT["name"],
+                "hits": len(h),
+                "worst": max((abs(x["off"]) for x in h), default=0),
+                "list": sorted(h, key=lambda x: -abs(x["off"]))[:12]}
+
+    def drift_repair(self, only=None):
+        """Put the sound back in step. Lossless: the picture is copied through
+        untouched, only its timing is corrected."""
+        if _DRIFT["busy"]:
+            return {"ok": False, "why": "already working"}
+        todo = [h["path"] for h in _DRIFT["hits"]]
+        if only:
+            todo = [p for p in todo if os.path.basename(p) == str(only)]
+        if not todo:
+            return {"ok": False, "why": "nothing to repair - run a scan first"}
+
+        # busy from THIS INSTANT (see drift_scan)
+        _DRIFT.update({"mode": "repair", "busy": True, "cancel": False,
+                       "done": 0, "total": len(todo), "fixed": 0,
+                       "name": os.path.basename(todo[0])})
+
+        def work():
+            _DRIFT.update({"busy": True, "cancel": False, "done": 0,
+                           "total": len(todo), "fixed": 0,
+                           "mode": "repair"})
+            for i, p in enumerate(todo):
+                if _DRIFT["cancel"]:
+                    break
+                _DRIFT["done"] = i + 1
+                _DRIFT["name"] = os.path.basename(p)
+                if _drift_repair_one(p):
+                    _DRIFT["fixed"] += 1
+            _DRIFT["hits"] = [h for h in _DRIFT["hits"]
+                              if os.path.basename(h["path"]) in
+                              {os.path.basename(x) for x in todo[_DRIFT["done"]:]}]
+            _DRIFT.update({"busy": False, "name": ""})
+            log(f"Re-sync finished: {_DRIFT['fixed']} recording(s) repaired.")
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "queued": len(todo)}
+
+    def drift_stop(self):
+        _DRIFT["cancel"] = True
+        pr = _DRIFT.get("proc")
+        try:
+            if pr and pr.poll() is None:
+                pr.kill()
+        except Exception:
+            pass
+        return {"ok": True}
+
+    def cache_audit(self):
+        """What the staging folder is holding, split into what can go and what
+        cannot. Nothing is deleted by asking."""
+        safe, orphan = _cache_survey()
+        return {
+            "safe_n": len(safe), "safe_bytes": sum(r["size"] for r in safe),
+            "orphan_n": len(orphan),
+            "orphan_bytes": sum(r["size"] for r in orphan),
+            "orphans": sorted(
+                [{"name": r["name"], "size": r["size"],
+                  "salvageable": r["salvageable"]} for r in orphan],
+                key=lambda r: -r["size"])[:20],
+        }
+
+    def cache_clean(self):
+        """Delete ONLY the leftovers whose finished recording is in the
+        library. Anything that exists nowhere else is left exactly where it
+        is - that footage has no other copy."""
+        safe, orphan = _cache_survey()
+        freed, gone = 0, 0
+        for r in safe:
+            try:
+                sz = r["size"]
+                if os.path.isdir(r["path"]):
+                    shutil.rmtree(r["path"], ignore_errors=True)
+                else:
+                    os.remove(r["path"])
+                if not os.path.exists(r["path"]):
+                    freed += sz
+                    gone += 1
+            except Exception:
+                pass
+        log(f"Staging cleared: {gone} leftover(s), {freed / 1e9:.1f} GB freed. "
+            f"{len(orphan)} kept - no finished copy exists of those.")
+        return {"ok": True, "removed": gone, "freed": freed,
+                "kept": len(orphan)}
+
+    def cache_salvage(self, name):
+        """Weld an abandoned assembly back into a real recording. This is the
+        opposite of cleaning: the footage exists only here, so it is rescued
+        into the library rather than lost."""
+        safe, orphan = _cache_survey()
+        row = next((r for r in orphan if r["name"] == str(name)), None)
+        if not row:
+            return {"ok": False, "why": "not found, or already saved"}
+        if not row["salvageable"]:
+            return {"ok": False, "why": "no pieces to weld"}
+        if not _EDIT_JOB.get("done", True):
+            return {"ok": False, "why": "something else is being written"}
+        segs = sorted(f for f in os.listdir(row["path"])
+                      if f.startswith("seg_") and f.endswith(".mp4"))
+        segs = [os.path.join(row["path"], f) for f in segs
+                if os.path.getsize(os.path.join(row["path"], f)) > 1000]
+        if not segs:
+            return {"ok": False, "why": "the pieces are empty"}
+        game = _parse_clip_name(row["name"] + ".mp4") or "Unsorted"
+        out_dir = os.path.join(SETTINGS.get("output_dir", ""), game, "Videos")
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, row["name"] + ".mp4")
+        if os.path.exists(out):
+            return {"ok": False, "why": "a recording of that name already exists"}
+
+        def work():
+            _EDIT_JOB.update({"done": False, "cancel": False, "pct": 0,
+                              "phase": "rescuing", "name": row["name"],
+                              "procs": []})
+            try:
+                tmp = out + ".__tmp.mp4"
+                ok = _concat_copy(SETTINGS["ffmpeg_path"], segs, tmp,
+                                  watch=_edit_watch)
+                if ok and os.path.isfile(tmp) and os.path.getsize(tmp) > 10_000:
+                    os.replace(tmp, out)
+                    log(f"Rescued {row['name']} from the staging folder "
+                        f"({os.path.getsize(out) / 1e9:.1f} GB).")
+                    _EDIT_JOB["pct"] = 100
+                else:
+                    log(f"Could not rescue {row['name']}.")
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            except Exception as e:
+                log(f"Rescue failed for {row['name']}: {e}")
+            finally:
+                _EDIT_JOB["done"] = True
+                _EDIT_JOB["procs"] = []
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "pieces": len(segs)}
+
+    def edit_cancel(self):
+        """Stop the running edit - properly. Setting the flag alone only
+        reached whichever loop happened to be watching it; the stitch ran
+        through a helper nothing tracked, so five ffmpeg processes were left
+        chewing through the library disk long after the cancel."""
+        _EDIT_JOB["cancel"] = True
+        killed = _edit_kill_children()
+        if killed:
+            log(f"Edit stopped; {killed} ffmpeg process(es) ended with it.")
+        return {"ok": True, "stopped": killed}
 
     def resize_to(self, w, h):
         """The brass grip on the cover corner drives the real window. Clamped
@@ -10743,6 +24262,7 @@ class _JsApi:
 
     def hide(self):
         self._settled = True      # dismissed on purpose; watchdog stands down
+        _save_window_bounds()     # B4: resting in the tray is the everyday close
         try:
             if self._win is not None:
                 # The book CLOSES as it rests, so the next opening always
@@ -10823,6 +24343,7 @@ def _request_quit(ctl, api, win):
         return
     _QUIT_STATE["requested"] = True
     api._quitting[0] = True
+    _save_window_bounds()      # B4: the real quit is the other close
 
     def work():
         with ctl.lock:
@@ -10851,6 +24372,23 @@ def _request_quit(ctl, api, win):
         deadline = time.time() + 300
         while _TRIM_BUSY[0] > 0 and time.time() < deadline:
             time.sleep(0.2)
+        if _TRIM_BUSY[0] > 0:
+            # the deadline passed with the export still going: kill its
+            # ffmpegs rather than orphan them - the daemon worker dies with
+            # the process, but its children would hold the source file
+            # through the next launch
+            log("Quit: an export outlived the wait - stopping its ffmpeg.")
+            try:
+                _edit_kill_children()
+            except Exception:
+                pass
+        try:
+            _DRIFT["cancel"] = True     # a drift repair must not outlive us
+            drp = _DRIFT.get("proc")
+            if drp is not None and drp.poll() is None:
+                drp.terminate()
+        except Exception:
+            pass
         _UI_QUIT.set()          # every save is flushed; the popups may rest now
         try:
             # read the window at destroy time, not call time: a quit clicked
@@ -10911,6 +24449,10 @@ def _start_tray(ctl, api, show_cb):
         ctl.click_feedback("off", "watching")
         ctl.stop_now.set()
 
+    def on_drop(icon=None, item=None):
+        ctl.click_feedback("off", "watching")
+        ctl.drop_now.set()
+
     def on_toggle(icon=None, item=None):
         api.pause_toggle()
 
@@ -10932,7 +24474,8 @@ def _start_tray(ctl, api, show_cb):
         Menu.SEPARATOR,
         Item("Start recording", on_start, enabled=not_recording),
         Item(toggle_label, on_toggle, enabled=has_rec),
-        Item("Stop & save recording", on_stop, enabled=has_rec),
+        Item("Stop and keep it", on_stop, enabled=has_rec),
+        Item("Stop and throw it away", on_drop, enabled=has_rec),
         Menu.SEPARATOR,
         Item("Save a clip", clip_menu, enabled=recording),
         Item("Open recordings folder", on_folder),
@@ -11006,10 +24549,89 @@ def _work_area_size():
     return 1920, 1040
 
 
+def _saved_window_bounds():
+    """2.76 B4: the tome's remembered resting rect [x, y, w, h] in LOGICAL px,
+    honoured only while it still lands on a live monitor - an unplugged second
+    screen must never strand the book off-desktop."""
+    try:
+        b = SETTINGS.get("window_bounds")
+        if not isinstance(b, (list, tuple)) or len(b) != 4:
+            return None
+        x, y, w, h = [int(v) for v in b]
+        if w < 860 or h < 645 or w > 20000 or h > 20000:
+            return None
+        if os.name != "nt":
+            return None
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        try:
+            scale = (u.GetDpiForSystem() or 96) / 96.0
+        except Exception:
+            scale = 1.0
+        # the drag leather is the top rim: while ITS middle sits on a monitor
+        # the reader can always pull the book wherever they like
+        class _PT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+        pt = _PT(int((x + w // 2) * scale), int((y + 24) * scale))
+        if not u.MonitorFromPoint(pt, 0):     # MONITOR_DEFAULTTONULL
+            return None
+        return (x, y, w, h)
+    except Exception:
+        return None
+
+
+def _save_window_bounds():
+    """2.76 B4: remember where the tome rests - called from hide() (the
+    everyday close to tray) and the real quit. Maximized, minimized and
+    theater rects are not resting places and are skipped."""
+    try:
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+        h = _lore_hwnd()
+        if not h:
+            return
+        u = ctypes.windll.user32
+        if u.IsZoomed(h) or u.IsIconic(h):
+            return
+        r = wintypes.RECT()
+        if not u.GetWindowRect(h, ctypes.byref(r)):
+            return
+        # theater (borderless fullscreen) covers the whole monitor - skip it
+        class _MI(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+        mon = u.MonitorFromWindow(h, 2)       # MONITOR_DEFAULTTONEAREST
+        mi = _MI()
+        mi.cbSize = ctypes.sizeof(_MI)
+        if mon and u.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            if (r.left <= mi.rcMonitor.left and r.top <= mi.rcMonitor.top
+                    and r.right >= mi.rcMonitor.right
+                    and r.bottom >= mi.rcMonitor.bottom):
+                return
+        try:
+            scale = (u.GetDpiForWindow(h) or 96) / 96.0
+        except Exception:
+            scale = 1.0
+        b = [int(r.left / scale), int(r.top / scale),
+             int((r.right - r.left) / scale), int((r.bottom - r.top) / scale)]
+        if b[2] < 860 or b[3] < 645:
+            return
+        if list(SETTINGS.get("window_bounds") or []) == b:
+            return                            # unchanged - spare the disk
+        _persist_setting("window_bounds", b)
+    except Exception:
+        pass
+
+
 def _tome_window_size():
-    """The book ALWAYS opens at the same size:
-    16:9 and about nine inches of book - the user's explicit ask, replacing
-    remembered sizes (the grip still resizes freely within a session)."""
+    """The book opens where it was last left (2.76 B4) when that spot still
+    lands on a live monitor; otherwise the classic compact 16:9 volume."""
+    b = _saved_window_bounds()
+    if b:
+        return b[2], b[3]
     aw, ah = _work_area_size()
     w, h = 1152, 648                      # 16:9, a compact volume (his call)
     if w > aw:
@@ -11257,6 +24879,7 @@ def lore_app(show_window=True):
     lines exist because a heavily-loaded PC can take minutes over the encoder
     probes - without them a slow start is indistinguishable from a hang."""
     if not _hold_singleton_mutex() or not _claim_lock():
+        log("Lore is already running - asking it to show its tome instead.")
         _signal_show()   # another copy is running: ask it to open its tome
         return
     load_settings()
@@ -11335,7 +24958,8 @@ def lore_app(show_window=True):
 
     _start_ui_pump(ctl, show_tome)
 
-    t = threading.Thread(target=_watch_core, args=(ctl,), daemon=True)
+    t = threading.Thread(target=_watch_core_guarded, args=(ctl,),
+                         daemon=True)
     _WATCH_THREAD["t"] = t
     t.start()
 
@@ -11447,7 +25071,8 @@ def lore_app(show_window=True):
             time.sleep(20.0)
             try:
                 if (api._reveal_ok and not api._settled
-                        and api._win is not None):
+                        and api._win is not None
+                        and not _QUIT_STATE["requested"]):
                     api._win.show()
             except Exception:
                 pass
@@ -11465,6 +25090,13 @@ def lore_app(show_window=True):
         pass
 
     log("Recorder is up; opening the tome window…")
+    _names_daily()          # a quick name check, at most once every 24 hours
+    _self_check_daily()     # one health line a day in the log
+    _free_now_so_turn_it_on()  # describing costs nothing now
+    _clean_slate_if_needed()   # once: forget everything the old reader wrote
+    _ins_slate_if_needed()  # once per generation: re-anchor every review
+    _hl_slate_if_needed()   # once per generation: re-mark with the ear
+    _stt_reader_note()      # once per reader: what the walls can reach
 
     def _after_gui_up():
         # Runs once the GUI loop owns the form: blacken the native faces so
@@ -11527,8 +25159,15 @@ def lore_app(show_window=True):
                 u = ctypes.windll.user32
                 scale = (u.GetDpiForWindow(h) or 96) / 96.0
                 lw, lh = _tome_window_size()
-                u.SetWindowPos(h, 0, 0, 0, int(lw * scale), int(lh * scale),
-                               0x0002 | 0x0004 | 0x0010)  # NOMOVE|NOZORDER|NOACTIVATE
+                b = _saved_window_bounds()
+                if b:
+                    # 2.76 B4: wake where the tome was left - position and size
+                    u.SetWindowPos(h, 0, int(b[0] * scale), int(b[1] * scale),
+                                   int(lw * scale), int(lh * scale),
+                                   0x0004 | 0x0010)  # NOZORDER|NOACTIVATE
+                else:
+                    u.SetWindowPos(h, 0, 0, 0, int(lw * scale), int(lh * scale),
+                                   0x0002 | 0x0004 | 0x0010)  # NOMOVE|NOZORDER|NOACTIVATE
         except Exception:
             pass
     try:
@@ -11550,6 +25189,14 @@ def lore_app(show_window=True):
         _UI_QUIT.set()            # saves flushed - the popup pump may close
         _stop_media_server()
         _release_lock()
+        log("LORE closed cleanly.")
+        # pystray's pump and setup threads are NON-daemon and its stop() is
+        # a no-op when the tray never finished booting - interpreter
+        # shutdown then blocks joining a wedged thread forever: a windowless
+        # Lore.exe survived FIVE DAYS that way while games went unrecorded.
+        # Saves are flushed and the lock is released; nothing above matters
+        # more than actually exiting.
+        os._exit(0)
 
 
 

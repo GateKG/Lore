@@ -1,2 +1,2 @@
 @echo off
-start "" "%~dp0Records.exe"
+start "" "%~dp0Lore.exe"

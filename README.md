@@ -57,18 +57,48 @@ with PyInstaller, and compiles `installer.iss` into a single shareable
 
 Friends need nothing installed — the installer carries everything.
 
-## Repo map
+## The folder
+
+**What is in the build right now → [`CURRENT-BUILD.md`](CURRENT-BUILD.md)**
+— version, file sizes, what ships, which models it needs and what has
+been set aside. It is *generated* (`python tools\build_report.py`), so
+it cannot quietly go stale. Re-run it after every build.
 
 ```
-lore.py            the backend (see the section banners inside)
-ui.html            the frontend (data layer → views → player/editor → boot)
-build.bat          one-click build → LoreSetup.exe
-installer.iss      Inno Setup script
-version.txt        version resource stamped into Lore.exe
-known_games.txt    baked list of windowed games the watcher recognises
-lore.ico           the app icon (drawn in code — see _tome_mark in lore.py)
-app_launchers/     tiny optional .bat helpers (autostart, tray commands)
-HOW-TO-RUN.txt     drop-in update notes for an already-installed copy
+THE SOURCE — this is the whole app
+  lore.py            the backend (see the section banners inside)
+  ui.html            the frontend (data layer → views → player/editor → boot)
+  ai/*.py            the workers that run in their own Python env:
+                       asr_worker    transcription
+                       senses_worker sounds, voices, the excitement curve
+                       laugh_worker  laughter
+                       ocr_worker    on-screen text
+
+BUILDING
+  build.bat          one-click build → LoreSetup.exe
+  Lore.spec          the PyInstaller recipe
+  installer.iss      Inno Setup script
+  version.txt        version resource stamped into Lore.exe
+  requirements-lock.txt   pinned build/runtime deps
+  known_games.txt    baked list of windowed games the watcher recognises
+  lore.ico           the app icon
+  app_launchers/     tiny optional .bat helpers (autostart, tray commands)
+  tools/             build_report.py and other small utilities
+
+NOT IN THE REPO (too big, or generated)
+  ai/models/         ~35 GB of local models. NEVER committed and never
+                     shipped in the installer — the app downloads what
+                     it needs. See CURRENT-BUILD.md for the list.
+  ai/venv/           the workers' Python environment
+  ai/llama*/         llama.cpp server binaries
+  ffmpeg/            recording engine (licensing + size)
+  dist/, build/, installer_output/    build output
+
+HISTORY — kept, never deleted
+  _archive/          everything set aside, each folder with a REASON.txt
+                     and a WHY.txt; _archive/MANIFEST.json records where
+                     each item came from, so anything can walk back.
+  docs/              older notes: HANDOFF, AUDIT, changelogs
 ```
 
 ## Credits
