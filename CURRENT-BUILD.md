@@ -5,19 +5,19 @@
 | | |
 |---|---|
 | **Version** | `3.09` (backend) / `3.09` (UI) |
-| **Stamped** | 2026-08-24 23:03 |
-| **Last commit** | 1d75bb7 LORE v2.30 - Stop reaches the squeeze pass |
-| **lore.py** | 1.1 MB, 25,164 lines, saved 2026-08-24 23:03 |
+| **Stamped** | 2026-08-24 23:35 |
+| **Last commit** | 35bf295 LORE v3.09 - the auditor tells the truth, and the tome fetches its own mind |
+| **lore.py** | 1.1 MB, 25,300 lines, saved 2026-08-24 23:30 |
 | **ui.html** | 0.9 MB, 13,187 lines, saved 2026-08-24 22:53 |
-| **Built exe** | 8.8 MB, 2026-08-24 22:56 |
-| **dist\Lore total** | 0.08 GB |
+| **Built exe** | 13.2 MB, 2026-08-24 23:33 |
+| **dist\Lore total** | 0.27 GB |
 
 ## What ships
 
 | Piece | Where | Size |
 |---|---|---|
-| The app | `dist\Lore\Lore.exe` | 8.8 MB |
-| Its libraries | `dist\Lore\_internal` | 75.1 MB |
+| The app | `dist\Lore\Lore.exe` | 13.2 MB |
+| Its libraries | `dist\Lore\_internal` | 261.3 MB |
 | The tome (UI) | `ui.html` | 0.9 MB |
 | ffmpeg | `ffmpeg` | 433.5 MB |
 | Workers | `ai` | 12.33 GB |
@@ -44,5 +44,6 @@ Nothing is deleted — `_archive\` keeps it with the reason. See `_archive\MANIF
 | `_archive\build-logs` | 0.00 GB | one line each of a build that already shipped |
 | `_archive\experiments` | 50.86 GB | shootout scaffolding and one-off comparison reports |
 | `_archive\models-retired` | 68.53 GB | models tried and set aside - see WHY.txt for each |
+| `_archive\notes` | 0.00 GB | private handover notes from older versions (1.2.7, 1.16.3, 2.46) - they |
 | `_archive\old-source` | 0.00 GB | superseded source and stale backups |
 | `_archive\retired-runtimes` | 0.65 GB | no code path reaches these any more |
