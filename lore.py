@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.15"
+APP_VERSION = "3.16"
 
 try:
     import psutil
@@ -4948,6 +4948,15 @@ def _hl_slate_if_needed():
 
 
 _INS_GENERATION = 3
+
+# WHAT EACH LAYER IS WORTH RIGHT NOW. These were loose literals at the
+# write sites, which is exactly how a version quietly drifts away from
+# the thing that judges it. One name each, written where the sidecar is
+# made AND where the shelf decides gold from silver.
+_STT_V = 3          # the reader's sidecar shape (and the qwen3-asr era)
+_STT_ENGINE = "qwen3-asr"
+_HL_V = 2           # gold moments
+_LVL_V = 2          # the loudness curve behind the sound graph
 
 # WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
 # learns to hear something it could not hear before; 2 is the reader
@@ -11637,7 +11646,7 @@ def _repick_moments(video_path):
             events.append(kv)
     events.sort(key=lambda e: e["t"])
     _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                       {"v": 2, "events": events})
+                       {"v": _HL_V, "events": events})
     log(f"Gold moments for {os.path.basename(video_path)} re-picked with the "
         f"words: {before if before >= 0 else '?'} -> {len(events)}.")
     return True
@@ -11814,7 +11823,8 @@ def _transcribe_one(video_path):
         # app and in ui.html goes through .get("segments"), so an extra
         # key beside it changes nothing for them.
         _atomic_write_json(_ai_sidecar(video_path, "stt"),
-                           {"v": 3, "model": data.get("model") or "qwen3-asr",
+                           {"v": _STT_V,
+                            "model": data.get("model") or _STT_ENGINE,
                             "engine": "qwen3-asr", "counters": cnt,
                             "reader": int(data.get("reader") or 1),
                             "segments": segs})
@@ -18402,7 +18412,7 @@ def _highlights_one(video_path):
             os.makedirs(os.path.dirname(_ai_sidecar(video_path, "hl")),
                         exist_ok=True)
             _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                               {"v": 2, "events": []})
+                               {"v": _HL_V, "events": []})
             # the tiny clip still gets its curve - without one it stayed
             # 'coarse' forever: every Everything/sound ask re-decoded it,
             # rewrote the same sidecar, and never converged
@@ -18411,7 +18421,7 @@ def _highlights_one(video_path):
                     dur0 = len(e) * HOP / float(SR)
                     _atomic_write_json(
                         _ai_sidecar(video_path, "lvl"),
-                        {"v": 2, "dur": round(dur0, 2),
+                        {"v": _LVL_V, "dur": round(dur0, 2),
                          "floor": int(round(float(np.percentile(e, 5)))),
                          "peak": int(round(float(e.max()))),
                          "db": [int(round(float(x))) for x in e]})
@@ -18507,7 +18517,7 @@ def _highlights_one(video_path):
                     exist_ok=True)
         _bank_sidecar(video_path, "hl")    # a redo keeps the one it replaces
         _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                           {"v": 2, "events": events})
+                           {"v": _HL_V, "events": events})
         # THE LOUDNESS CURVE, free: the envelope is already in hand from the
         # pass above, so drawing it costs one more sidecar and no more work.
         #
@@ -21094,6 +21104,59 @@ class _JsApi:
             row = {}
             for key, side in (("hl", "hl"), ("stt", "stt"), ("lvl", "lvl")):
                 row[key] = os.path.isfile(_ai_sidecar(p, side))
+            # THE SAME THREE STATES, FOR THE OTHER TWO LAYERS. His rule
+            # was never only about the audit: a transcript from an older
+            # reader is real work that is nonetheless owed again, and it
+            # must not look identical to a night nobody has read.
+            row["stt_lvl"] = 0
+            row["stt_why"] = ""
+            if row["stt"]:
+                try:
+                    with open(_ai_sidecar(p, "stt"),
+                              encoding="utf-8") as fh:
+                        d3 = json.load(fh) or {}
+                    _sv = int(d3.get("v") or 0)
+                    _eng = str(d3.get("engine") or "")
+                    if _sv >= _STT_V and (not _eng
+                                          or _eng == _STT_ENGINE):
+                        row["stt_lvl"] = 2
+                    else:
+                        row["stt_lvl"] = 1
+                        row["stt_why"] = (
+                            "read by " + (_eng or "an older reader")
+                            if _eng and _eng != _STT_ENGINE else
+                            "written by an older reader (v%d)" % _sv)
+                except Exception:
+                    row["stt_lvl"] = 1
+                    row["stt_why"] = "its transcript could not be read"
+            row["hl_lvl"] = 0
+            row["hl_why"] = ""
+            if row["hl"]:
+                try:
+                    with open(_ai_sidecar(p, "hl"),
+                              encoding="utf-8") as fh:
+                        d4 = json.load(fh) or {}
+                    _hv = int(d4.get("v") or 0)
+                    _lv = 0
+                    if row.get("lvl"):
+                        try:
+                            with open(_ai_sidecar(p, "lvl"),
+                                      encoding="utf-8") as fh:
+                                _lv = int((json.load(fh)
+                                           or {}).get("v") or 0)
+                        except Exception:
+                            _lv = 0
+                    if _hv >= _HL_V and _lv >= _LVL_V:
+                        row["hl_lvl"] = 2
+                    else:
+                        row["hl_lvl"] = 1
+                        row["hl_why"] = (
+                            "there is no loudness curve behind it"
+                            if _lv < _LVL_V and row.get("lvl") is False
+                            else "an older pass made it")
+                except Exception:
+                    row["hl_lvl"] = 1
+                    row["hl_why"] = "its sound pass could not be read"
             # an AI review only counts when it is FINISHED with chapters.
             # Judging by title alone lit the flag on a HALF-done redo (a
             # restarted full-redo keeps the old title while its windows are

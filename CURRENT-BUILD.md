@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.15` (backend) / `3.15` (UI) |
-| **Stamped** | 2026-08-25 20:19 |
-| **Last commit** | 1e75bee LORE v3.13 - silver: it is there, and a pass is owed |
-| **lore.py** | 1.1 MB, 25,705 lines, saved 2026-08-25 20:12 |
-| **ui.html** | 0.9 MB, 13,269 lines, saved 2026-08-25 20:14 |
-| **Built exe** | 13.2 MB, 2026-08-25 20:17 |
+| **Version** | `3.16` (backend) / `3.16` (UI) |
+| **Stamped** | 2026-08-25 20:34 |
+| **Last commit** | e07d4d8 LORE v3.15 - what the review caught before he ran 3.14 |
+| **lore.py** | 1.1 MB, 25,768 lines, saved 2026-08-25 20:28 |
+| **ui.html** | 0.9 MB, 13,283 lines, saved 2026-08-25 20:28 |
+| **Built exe** | 13.2 MB, 2026-08-25 20:32 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships

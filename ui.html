@@ -2772,7 +2772,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.15'};},
+      webhook:true,version:'3.16'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2917,7 +2917,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.15'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.16'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3370,6 +3370,7 @@ function avMatch(v){
        row whose pen is lit, and "not audited" cannot hide a silver
        scale that is asking for exactly that */
     const lv=(k==='ins')?(f.ins_lvl|0):(k==='aud')?(f.aud_lvl|0)
+            :(k==='stt')?(f.stt_lvl|0):(k==='hl')?(f.hl_lvl|0)
             :(f[k]?2:0);
     if(w>0 && !lv)return false;
     if(w<0 && lv)return false;
@@ -3551,8 +3552,13 @@ function avSideMark(){
    put back; empty is nothing yet. Two states made those look identical
    and there was no way to know a re-run was owed. */
 function markPaint(b,f,k){
+  /* ALL FOUR LAYERS ANSWER THE SAME QUESTION now - a transcript
+     written by an older reader is real work that is owed again, and
+     must not look like a night nobody has read. */
   const lvl=(k==='aud')?(f.aud_lvl|0)
            :(k==='ins')?(f.ins_lvl|0)
+           :(k==='stt')?(f.stt_lvl|0)
+           :(k==='hl') ?(f.hl_lvl|0)
            :(f[k]?2:0);
   b.classList.toggle('on',lvl===2);
   b.classList.toggle('part',lvl===1);
@@ -3560,11 +3566,17 @@ function markPaint(b,f,k){
     /* SILVER SAYS WHY, in the backend's own words: the audit either
        never read this description or read an older one. Either way
        the answer is the same - run the audit again (\u26a1 Audit only). */
-    const why=(k==='aud'?f.aud_why:f.ins_why)||'a fresh pass is owed';
-    b.title=(k==='aud'
-      ? 'audited at v'+(f.aud_v||'?')+', but '+why
-      : 'described \u2014 but '+why)
-      +' \u2014 run the audit again (\u26a1 \u2192 Audit only)';
+    const why=({aud:f.aud_why,ins:f.ins_why,
+                stt:f.stt_why,hl:f.hl_why}[k])||'a fresh pass is owed';
+    const DO={aud:'run the audit again (\u26a1 \u2192 Audit only)',
+              ins:'run the audit again (\u26a1 \u2192 Audit only)',
+              stt:'read it again (\u26a1 \u2192 Transcripts)',
+              hl:'listen again (\u26a1 \u2192 Sound & gold moments)'};
+    const HEAD={aud:'audited at v'+(f.aud_v||'?')+', but ',
+                ins:'described \u2014 but ',
+                stt:'there is a transcript \u2014 but ',
+                hl:'there is a sound pass \u2014 but '};
+    b.title=(HEAD[k]||'')+why+' \u2014 '+(DO[k]||'');
   }else if(lvl===2){
     b.title=(k==='aud')
       ? 'audited by v'+(f.aud_v||'?')+' against this description'
@@ -3584,7 +3596,7 @@ function avStatLine(list){
   list.forEach(v=>{bytes+=(v.size||0);
     const f=_have.get(v.path);
     if(!f){unknown++;return;}       /* [44] not looked at is not "missing" */
-    if(!f.stt)noStt++; if(!f.hl)noHl++;
+    if(!(f.stt_lvl|0))noStt++; if(!(f.hl_lvl|0))noHl++;
     /* COUNT WHAT THE MARK SHOWS. This read the old complete-only
        boolean, so a night with ninety-four chapters and a lit pen was
        still counted "not described" in the same header - which is the
@@ -3800,10 +3812,12 @@ function qlookShow(v){
   card.append(el('div','qlmarks',esc(['hl','stt','ins','aud']
     .map(k=>{
       const lvl=(k==='aud')?(f.aud_lvl|0):(k==='ins')?(f.ins_lvl|0)
+               :(k==='stt')?(f.stt_lvl|0):(k==='hl')?(f.hl_lvl|0)
                :(f[k]?2:0);
       if(lvl===2)return AV_HAS[k];
-      if(lvl===1)return (k==='aud'?'audited, older':'described, '
-        +'audit owed');
+      if(lvl===1)return ({aud:'audited, older',
+        ins:'described, audit owed', stt:'transcript, older reader',
+        hl:'sound pass, older'}[k]||'older');
       return AV_NOT[k];
     }).join('  \u00b7  '))));
   q.append(card); q.classList.add('on');
