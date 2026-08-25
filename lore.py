@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.16"
+APP_VERSION = "3.17"
 
 try:
     import psutil
@@ -12272,6 +12272,10 @@ RULES:
   sentence does.
 - "name" is what you would CALL that stretch if it were a chapter in a book:
   three to seven words, the real words and names from the transcript.
+- A PERSON'S NAME MUST BE HEARD. Call someone by name ONLY if that exact
+  name appears in the transcript lines you were given; otherwise write
+  "a friend" or "someone in the call". Inventing a plausible name is the
+  one unforgivable error - a wrong name becomes the story.
   "The Cleave and the Goat Demon", "Gate keeps opening the wrong door".
   Never a list, never joined with "+", never "General chat".
 - NEVER mention the language, in ANY field - not in names, not in "what",
@@ -12340,6 +12344,77 @@ _DESC_SCHEMA = {
                 "why": {"type": "string"}},
             "required": ["line", "kind", "why"]}}},
     "required": ["segments"]}
+
+_TITLE_COMMON = frozenset(
+    "The A An And Or But With Without For From Into Onto Over Under "
+    "After Before When While His Her Their Our They She He It We You "
+    "Not No Yes This That These Those First Last Final New Old Big "
+    "Little Long Short Night Session Part Chapter Game Boss Level Run "
+    "Walk Fish How What Who Why Where Vs".split())
+
+
+def _title_unheard(title, heard, game=""):
+    """Latin proper-noun-looking words in a title that were never heard
+    or seen. `heard` is everything honest: the transcript, the eye's
+    readings, the screen text and the game's own name.
+
+    Only LATIN capitalised tokens are judged - Arabic script carries no
+    capitals to lie with, and judging it here would strip real words.
+    Common English title-words are exempt, and so is any word of the
+    game's name."""
+    ok = set(w.lower() for w in _TITLE_COMMON)
+    for w in re.findall(r"[A-Za-z][a-z']+", str(game or "")):
+        ok.add(w.lower())
+    hay = str(heard or "").lower()
+    bad = []
+    for m in re.finditer(r"\b([A-Z][A-Za-z']{2,})\b", str(title or "")):
+        w = m.group(1)
+        # BoKhama slipped the first net: an internal capital broke the
+        # lowercase-only tail. All-caps stays exempt (DPS, HDR, LORE) -
+        # acronyms are jargon, not people.
+        if w.isupper():
+            continue
+        if w.lower() in ok or w.lower() in (x.lower() for x in bad):
+            continue
+        if w.lower() in hay:
+            continue
+        # ORDINARY ENGLISH IS NOT A PERSON. "Nights" or "Checks" in a
+        # title are title-case words, not invented friends - and the
+        # library itself knows the difference: across 1,264 nights of
+        # transcripts, real words recur (nights: 16, checks: 5) while
+        # invented people do not (bokhama: 0, musa: 1). Three is the
+        # line, measured on his shelf.
+        try:
+            _fr, _ = _aud_vocab()
+            if int((_fr or {}).get(w.lower(), 0)) >= 3:
+                continue
+        except Exception:
+            pass
+        bad.append(w)
+    return bad
+
+
+def _ins_heard_corpus(video_path, extra=""):
+    """Everything a title may honestly draw a name from: the words that
+    were HEARD and the things the eye SAW."""
+    parts = [str(extra or "")]
+    try:
+        with open(_ai_sidecar(video_path, "stt"), encoding="utf-8") as fh:
+            parts += [str(seg.get("t") or "")
+                      for seg in (json.load(fh) or {}).get(
+                          "segments") or []]
+    except Exception:
+        pass
+    for kind in ("vis", "sns"):
+        try:
+            with open(_ai_sidecar(video_path, kind),
+                      encoding="utf-8") as fh:
+                parts.append(json.dumps(json.load(fh),
+                                        ensure_ascii=False))
+        except Exception:
+            pass
+    return " ".join(parts)
+
 
 _TITLE_SCHEMA = {
     "type": "object",
@@ -13663,7 +13738,10 @@ def _insights_one(video_path, forced=False, fresh=False):
                            'sentences"}. The title names what actually '
                            "happened, in the session's own words and names - "
                            "if it would fit a thousand other recordings it "
-                           "is wrong. Write Arabic words in Arabic letters.")
+                           "is wrong. Write Arabic words in Arabic letters. "
+                           "Never name a person unless that name is in the "
+                           "chapter list above - unheard names are the one "
+                           "unforgivable error.")
                 # NOT under _DESC_SYSTEM - that prompt demands a
                 # segments-shaped answer, so asking it for a title
                 # contradicted its own rules and it returned nothing
@@ -13682,6 +13760,49 @@ def _insights_one(video_path, forced=False, fresh=False):
                                                or "").strip())
                     except Exception:
                         pass
+                # NAMES MUST BE HEARD. "Big Walk with BoKhama, Ahmed,
+                # Faisal, and Musa" - and two of those people appear
+                # nowhere in 168,000 characters of transcript. One
+                # re-ask with the offenders named; if the model
+                # insists, the invention is replaced, not believed.
+                if title:
+                    heard = _ins_heard_corpus(
+                        video_path, extra=game + " " + " ".join(names))
+                    bad = _title_unheard(title, heard, game)
+                    if bad:
+                        t2 = srv.ask(
+                            t_sys, t_ask
+                            + "\n\nThese names are NOT in this session "
+                            "and must not appear: "
+                            + ", ".join(bad)
+                            + ". Use only names from the chapter list, "
+                            "or 'a friend'.",
+                            max_tokens=250, schema=_TITLE_SCHEMA)
+                        try:
+                            t_d2 = json.loads(_re.search(
+                                r"\{.*\}", t2, _re.S).group(0))
+                            cand = _descrub(str(
+                                t_d2.get("title") or "").strip())
+                            if cand and not _title_unheard(
+                                    cand, heard, game):
+                                title = cand
+                                summary = _descrub(str(
+                                    t_d2.get("summary")
+                                    or summary).strip())
+                                bad = []
+                        except Exception:
+                            pass
+                    if bad:
+                        for w in bad:
+                            title = re.sub(
+                                r"\b" + re.escape(w) + r"\b",
+                                "a friend", title)
+                        title = re.sub(r"\s{2,}", " ",
+                                       title).strip(" ,-")
+                        log("The title tried to invent "
+                            + ", ".join(bad) + " - nobody by that "
+                            "name was heard, so it says 'a friend' "
+                            "instead.")
             prior["title"] = title or prior.get("title") or \
                 (names[0] if names else "")
             prior["summary"] = summary or prior.get("summary") or ""

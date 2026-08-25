@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.16` (backend) / `3.16` (UI) |
-| **Stamped** | 2026-08-25 20:34 |
-| **Last commit** | e07d4d8 LORE v3.15 - what the review caught before he ran 3.14 |
-| **lore.py** | 1.1 MB, 25,768 lines, saved 2026-08-25 20:28 |
-| **ui.html** | 0.9 MB, 13,283 lines, saved 2026-08-25 20:28 |
-| **Built exe** | 13.2 MB, 2026-08-25 20:32 |
+| **Version** | `3.17` (backend) / `3.17` (UI) |
+| **Stamped** | 2026-08-25 21:09 |
+| **Last commit** | 4bb0330 LORE v3.16 - all four marks answer the same question |
+| **lore.py** | 1.1 MB, 25,889 lines, saved 2026-08-25 21:03 |
+| **ui.html** | 0.9 MB, 13,283 lines, saved 2026-08-25 21:04 |
+| **Built exe** | 13.2 MB, 2026-08-25 21:07 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
