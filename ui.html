@@ -883,6 +883,11 @@ body.reduced .proj-glare::after{animation:none}
 /* ------------------------------------------------------------ appendix */
 .set-rows{display:flex;flex-direction:column;gap:9px;overflow-y:auto;overflow-x:hidden;max-height:100%;
   margin:auto 0;padding-right:6px}
+/* A PLATE INSIDE A COLUMN IS NOT A COLUMN. Nested .set-rows inherited
+   max-height:100% and margin:auto while setting overflow:visible - so
+   a 30-row plate painted past its clamped box and the next section
+   landed underneath it, "floating in the middle of random buttons". */
+.set-rows .set-rows{max-height:none;margin:0;padding-right:0}
 .set-rows::-webkit-scrollbar{width:5px}
 .set-rows::-webkit-scrollbar-thumb{background:rgba(110,88,50,.4);border-radius:3px}
 .srow{display:flex;align-items:center;gap:12px;min-height:32px;flex:0 0 auto}
@@ -933,6 +938,16 @@ body.reduced .proj-glare::after{animation:none}
 .sdiv{display:flex;align-items:center;gap:10px;margin-top:6px;
   font-size:10px;letter-spacing:.3em;color:var(--ink-faint);text-transform:uppercase;flex:0 0 auto}
 .sdiv::after{content:"";flex:1;height:1px;background:linear-gradient(to right,rgba(90,70,40,.4),transparent)}
+.pingrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  gap:6px;width:100%}
+.pinchip{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:6px 10px;border-radius:8px;border:1px solid rgba(140,110,70,.3);
+  background:rgba(232,181,99,.05);color:var(--ink);cursor:pointer;
+  font:500 12px var(--serif);text-align:left;min-width:0}
+.pinchip i{font:italic 10.5px var(--serif);color:var(--ink-faint);flex:0 0 auto}
+.pinchip:hover{background:rgba(232,181,99,.14)}
+.pinchip.on{background:var(--gold);border-color:var(--gold);color:#241806}
+.pinchip.on i{color:#5a4318}
 .tgl{position:relative;width:42px;height:21px;border-radius:11px;cursor:pointer;flex:0 0 auto;
   background:linear-gradient(180deg,#b7a281,#8f7c5c);
   box-shadow:inset 0 1px 3px rgba(60,40,15,.6);transition:background .25s}
@@ -1257,6 +1272,10 @@ body.vfull.vseen #vstage video{max-width:calc(100vw - 352px)}
 .qnote{font:italic 11.5px var(--serif);color:#c9b184;padding:3px 2px}
 .qletgo{margin-top:7px;align-self:flex-start}
 .sdbar{margin-bottom:6px}
+.heldban{display:flex;align-items:center;gap:10px;padding:8px 11px;
+  border-radius:9px;margin-bottom:7px;
+  background:rgba(214,148,46,.14);border:1px solid rgba(214,148,46,.5)}
+.heldban span{flex:1;font:600 11.5px var(--ui);color:#e8a33d}
 .sdbar .lname{color:#d8c49a}
 .tnoise{font-family:var(--serif);font-style:italic;color:#c9a15e;
   opacity:.85;margin:2px 0}
@@ -2772,7 +2791,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.17'};},
+      webhook:true,version:'3.18'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2865,6 +2884,7 @@ function makeMock(){
         aud:i%3===2, aud_lvl:i%3===2?2:(i%3===0?1:0), aud_v:i%3===0?6:7,
         aud_why:'it read an older description'};});
       return o;},
+    ai_resume_all:async()=>({ok:true,woke:['listening']}),
     models_status:async()=>({ok:true,where:'C:/mock/models',
       free:900e9,busy:false,dl:null,sets:[
         {key:'reader',tier:'reader',title:'The reader',
@@ -2917,7 +2937,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.17'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.18'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3851,7 +3871,8 @@ function whynotShow(ev,path){
     let a=null; try{ if(api.ai_whynot)a=await api.ai_whynot(path); }catch(e){}
     const b=m.querySelector('.wnbody'); if(!b)return;
     if(!a||!a.ok){b.textContent=(a&&a.why)||'the tome could not say';return;}
-    const NAME={hl:'sound & gold',stt:'transcript',ins:'AI review'};
+    const NAME={hl:'sound & gold',stt:'transcript',ins:'AI review',
+      aud:'the audit'};
     b.innerHTML='';
     (a.kinds||[]).forEach(k=>{
       const row=el('div','wnrow');
@@ -4322,7 +4343,8 @@ function renderVid(v,hue,delayIdx){
   /* a <b>, deliberately not an <i>: markHave paints every i in this box
      from its dataset, and would dress the question mark as a fourth flag */
   {const wq=el('b','whyq','?');
-   wq.title='Why has this not been read yet?';
+   wq.title='What is this recording still waiting for? \u2014 press '
+     +'for each job\u2019s reason and its place in line';
    wq.addEventListener('click',e=>{e.stopPropagation();whynotShow(e,v.path);});
    have.append(wq);}
   fr.append(have);
@@ -6088,6 +6110,31 @@ function workPlate(){
       if(ai){ holdBtn(o,kind); catchBtn(o,k); redoBtn(o,kind); }
     };
     try{if(ai&&window._paintShutdown)window._paintShutdown(!!ai.shutdown);}catch(e){}
+    /* HOLDS MAY NEVER HIDE AGAIN. Four lanes silently standing down
+       ate a week of his asks; if anything is held, an amber banner
+       names it with one button to wake everything. */
+    try{
+      const hh=(ai&&ai.held)||{};
+      const dn={listening:'sound',hearing:'transcripts',
+                thinking:'AI review',auditing:'the audit'};
+      const down=Object.keys(dn).filter(k=>hh[k]);
+      let hb=$('#heldbanner');
+      if(down.length&&!(ai&&ai.shutdown)){
+        if(!hb){hb=el('div','heldban');hb.id='heldbanner';
+          const tx=el('span');hb.append(tx);
+          const rb=el('button','wbtn primary','Resume everything');
+          rb.addEventListener('click',async()=>{
+            try{await api.ai_resume_all();}catch(e){}
+            whisper('everything resumed');});
+          hb.append(rb);
+          box.prepend(hb);}
+        hb.querySelector('span').textContent=
+          '\u26a0 standing down: '+down.map(k=>dn[k]).join(', ')
+          +' \u2014 nothing runs on '
+          +(down.length===1?'this lane':'these lanes')
+          +' until Resume.';
+      }else if(hb){hb.remove();}
+    }catch(e){}
     try{if(ai&&window._paintAnyread)window._paintAnyread(
       !!ai.always_read,!!ai.shutdown);}catch(e){}
     if(ai&&!ai.reader&&!(ai.kinds||[]).length)
@@ -6338,16 +6385,27 @@ function capPinsPlate(){
   const games=sortedGames();
   if(!games.length){box.append(el('div','shint','no chapters yet — pins appear once games are recorded'));return box;}
   const pinned=()=>((S.settings&&S.settings.settings.cap_pinned_games)||[]).map(String);
-  games.slice(0,30).forEach(g=>{
-    const t=el('div','tgl'+(pinned().includes(g.key)?' on':''));
-    t.addEventListener('click',()=>{t.classList.toggle('on');
-      const on=t.classList.contains('on');
+  /* A CHIP, NOT A ROW. One game per row with a naked toggle made a
+     wall of ninety rows; the chip IS the toggle - press it, it turns
+     gold, done. Every game fits on one screen. */
+  const grid=el('div','pingrid');
+  games.forEach(g=>{
+    const c=el('button','pinchip'+(pinned().includes(g.key)?' on':''),
+      esc(g.display)+' <i>'+g.count+'</i>');
+    c.title=(pinned().includes(g.key)
+      ?'pinned — the cap never takes its recordings. Press to unpin.'
+      :'press to pin — the shelf-space cap will never take this '
+       +'game\u2019s recordings');
+    c.addEventListener('click',()=>{c.classList.toggle('on');
+      const on=c.classList.contains('on');
       const cur=pinned().filter(k=>k!==g.key);
       if(on)cur.push(g.key);
       queueSave({cap_pinned_games:cur});
-      whisper(on?g.display+' is pinned — the cap will never take it':g.display+' unpinned');});
-    row(box,g.display,t,g.count+' recording'+(g.count===1?'':'s'));
+      whisper(on?g.display+' is pinned — the cap will never take it'
+                :g.display+' unpinned');});
+    grid.append(c);
   });
+  box.append(grid);
   return box;
 }
 /* the cold shelf: untouched 90+ days - archive candidates with a total */
@@ -6602,16 +6660,39 @@ function renderSet(cL,cR,app,spreadIdx){
     divider(R,'What is captured');
     row(R,'Capture',ctlSeg('capture_scope',[['screen','The whole screen'],['window','Only the game window']]));
     hint(R,'Only-the-game-window is EXPERIMENTAL. On an SDR desktop LORE now captures the WINDOW ITSELF (Windows Graphics Capture — the OBS way): overlays, popups and Steam messages physically cannot appear in the video, and the recording follows the window anywhere. On an HDR desktop, or for very large windows, the proven screen-region capture takes over — HDR included — where things covering the window are recorded too. Alt-tabbing or minimising just PAUSES the recording; resizing starts a fresh video.');
-    divider(R,'Claude');
-    R.append(claudeKeyPlate());
-    hint(R,'Optional. LORE reads and listens entirely on your own PC and always '
-        +'will — this is only for the extra things a key unlocks. It is '
-        +'encrypted by Windows to this account on this machine, and once it is '
-        +'in there is deliberately no way to read it back out, not even here: '
-        +'you can only replace it or throw it away.');
     divider(R,'The tome reads itself');
-    row(R,'Transcribe recordings',ctlToggle('ai_transcribe'));
-    row(R,'Mark loud moments',ctlToggle('ai_highlights'));
+    row(R,'Transcribe recordings',ctlToggle('ai_transcribe'),
+        'what was said, searchable, in both languages');
+    row(R,'Mark loud moments',ctlToggle('ai_highlights'),
+        'the gold ticks on the player\u2019s timeline');
+    row(R,'Describe recordings by itself',ctlToggle('insights_auto'),
+        'titles, chapters and moments \u2014 the audit follows each '
+        +'description on its own');
+    hint(R,'These switches are what runs AT ALL. Everything live \u2014 '
+      +'what is working right now, the waiting line, Pause, Stop, '
+      +'Resume \u2014 is on the Working page, one place for all of it. '
+      +'All of this runs on your own machine and never while a game '
+      +'is on.');
+    /* A SAVED KEY MAY NOT HIDE. The Claude section left, but a key
+       that was pasted before still quietly pays to name NEW games -
+       so if one exists, it says so, with the only control that
+       matters. If none exists, nothing appears at all. */
+    (async()=>{
+      let ks=null;try{if(api.claude_key_status)ks=await api.claude_key_status();}catch(e){}
+      if(!ks||!ks.saved)return;
+      const b=el('button','wbtn','Forget it');
+      let armed=false;
+      b.addEventListener('click',async()=>{
+        if(!armed){armed=true;b.textContent='sure?';
+          setTimeout(()=>{armed=false;b.textContent='Forget it';},2600);
+          return;}
+        try{await api.claude_key_forget();}catch(e){}
+        whisper('the key is gone');
+        if(!S.turning)renderSpread(S.idx);});
+      row(R,'A Claude key is saved',b,
+        'used only to name newly-met games \u2014 everything else is '
+        +'local. It cannot be read back, only forgotten.');
+    })();
     hint(R,'The tome reads English and Arabic together, in the same sentence, and works out which is which by itself — there is nothing to choose.');
     hint(R,'How far it has read, what it is working on right now, how fast '
          + 'and how long is left — and Hold, to make it wait — all live on the '
@@ -6789,7 +6870,9 @@ function renderSet(cL,cR,app,spreadIdx){
                      :((r&&r.why)||'the diary could not be written'));
       setTimeout(()=>{db.disabled=false;db.textContent='Write the diary';},4000);
     });
-    row(L,'Diary (Obsidian)',db);
+    row(L,'Diary (Obsidian)',db,
+        'turns the shelf into Markdown notes \u2014 nothing is changed '
+        +'or uploaded, it only writes files');
     hint(L,'One Markdown note per recording \u2014 the title, the chapters with '
       +'timestamps, the gold moments with their reasons, and a players line to '
       +'fill in. Game names are [[wikilinks]], so Obsidian threads the nights '
@@ -6904,6 +6987,10 @@ function renderSet(cL,cR,app,spreadIdx){
     hint(R,'A pinned game still counts against the shelf-space cap, but the cap never takes its recordings. The cap itself lives under Echoes.');
     R.append(capPinsPlate());
     divider(R,'The cold shelf');
+    hint(R,'Recordings nobody has opened in months \u2014 the ones to '
+      +'archive somewhere cheaper, or let the cap take first. Pressing '
+      +'the button lists the deepest sleepers with their sizes; it '
+      +'never moves or deletes anything itself.');
     R.append(coldPlate());
   }
 }
@@ -8177,7 +8264,7 @@ function snsWhoNumAt(t){
 }
 function snsWhoAt(t){
   const n=snsWhoNumAt(t); if(n==null)return null;
-  if(!n)return 'unknown voice';      /* honest beats a wrong name */
+  if(!n)return 'a voice';            /* honest beats a wrong name */
   return ((_sns.names||{})[String(n)])||('Voice '+n);
 }
 function snsWireWho(){
@@ -8743,6 +8830,21 @@ function saidWire(body){
     try{vd.currentTime=ln.t;}catch(e2){}
     if(vd.paused)vd.play().catch(()=>{});
   });
+  /* HIS SCROLL WINS. The playhead-follow used to yank the list the
+     moment the active line moved - mid-read, over and over, "very
+     jarring". Any hand on the wheel parks the follower for 4s. */
+  const hold=()=>{_said.hold=performance.now();};
+  body.addEventListener('wheel',hold,{passive:true});
+  body.addEventListener('touchstart',hold,{passive:true});
+  body.addEventListener('keydown',hold);
+  body.addEventListener('pointerdown',e=>{
+    if(e.target&&e.target.closest&&e.target.closest('.sline'))return;
+    hold();},{passive:true});
+  /* the follower's own writes must never read as the user - and any
+     scroll that is NOT ours (scrollbar drag, momentum) parks it */
+  body.addEventListener('scroll',()=>{
+    if(_said.prog){_said.prog=false;return;}
+    hold();},{passive:true});
   let pend=false;
   body.addEventListener('scroll',()=>{
     if(pend)return; pend=true;
@@ -8793,7 +8895,9 @@ function saidRender(center){
     const wn=ln.g?null:snsWhoNumAt(ln.t);
     if(who){ const w=el('u',wn?'swho':'swho unk',who);
       w.title=wn?'click to name this voice'
-               :(wn===0?'someone spoke here - the ears cannot tell who'
+               :(wn===0?'people talking over each other - when voices '
+                        +'overlap, the ears cannot honestly say whose '
+                        +'line this is, so it is not guessed'
                        :'your own mic track says this one is you');
       if(wn)w.dataset.t=String(ln.t);
       r.append(b,w,p); }
@@ -8864,13 +8968,18 @@ function saidFollow(now){
   _said.at=i;
   const vi=_said.pos?_said.pos[i]:-1;
   if(vi==null||vi<0)return;           /* filtered out of sight - nothing to light */
-  if(vi<_said.w0||vi>=_said.w1){saidRender(vi);return;}  /* rebuild centred on it */
+  if(vi<_said.w0||vi>=_said.w1){
+    if(_said.hold&&performance.now()-_said.hold<7000)return;
+    _said.prog=true;
+    saidRender(vi);return;}          /* rebuild centred on it */
   const n=els[i]; if(!n)return;
   n.classList.add('now');
+  if(_said.hold&&performance.now()-_said.hold<7000)return;
   const body=$('#vsaid .vsaidbody');
   const r=n.getBoundingClientRect(),br=body.getBoundingClientRect();
-  if(r.top<br.top+8||r.bottom>br.bottom-8)
-    body.scrollTop+=(r.top-br.top)-body.clientHeight*0.38;
+  if(r.top<br.top+8||r.bottom>br.bottom-8){
+    _said.prog=true;
+    body.scrollTop+=(r.top-br.top)-body.clientHeight*0.38;}
 }
 /* our own "fullscreen" is a plain body class, not the HTML Fullscreen API - the
    API half-worked on this frameless WebView2 and could strand a click-blocking

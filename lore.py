@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.17"
+APP_VERSION = "3.18"
 
 try:
     import psutil
@@ -1293,14 +1293,37 @@ def _pad_check():
                 # rate, hundreds per poll, with the pad flat on the desk:
                 # the old bare packet test read that as a human forever
                 # and silently defeated the AFK pause.
-                if prev is not None and (
+                # ACTIVITY IS MOVEMENT, NOT POSITION. The sticks
+                # were never stored, so they could only be compared
+                # against the dead zone - and a pad resting with any
+                # drift past it read as a human on every poll, for
+                # ever, which is why a 95-minute recording kept rolling
+                # through 35 minutes of an empty chair. A constant
+                # offset is a constant; only a CHANGE is a person.
+                # MOVEMENT is a person - and so is a HELD input.
+                # Pure delta read a pinned throttle and a hard-held
+                # stick as idle, which would have paused a recording
+                # mid-cruise. Triggers count by position (they rest at
+                # zero; drift never touches them) and a stick past
+                # 25,000 is physically held - drift never reaches
+                # near-full deflection. Resting drift still reads
+                # idle, which was the whole point.
+                if prev is not None and len(prev) >= 8 and (
                         g.wButtons != prev[0]
                         or g.bLeftTrigger > 30 or g.bRightTrigger > 30
-                        or abs(g.sThumbLX) > 7849 or abs(g.sThumbLY) > 7849
-                        or abs(g.sThumbRX) > 8689 or abs(g.sThumbRY) > 8689):
+                        or abs(g.sThumbLX - prev[4]) > 3200
+                        or abs(g.sThumbLY - prev[5]) > 3200
+                        or abs(g.sThumbRX - prev[6]) > 3200
+                        or abs(g.sThumbRY - prev[7]) > 3200
+                        or abs(g.sThumbLX) > 25000
+                        or abs(g.sThumbLY) > 25000
+                        or abs(g.sThumbRX) > 25000
+                        or abs(g.sThumbRY) > 25000):
                     _PAD["active_t"] = now
                 _PAD["last"][i] = (g.wButtons, g.bLeftTrigger,
-                                   g.bRightTrigger, st.dwPacketNumber)
+                                   g.bRightTrigger, st.dwPacketNumber,
+                                   g.sThumbLX, g.sThumbLY,
+                                   g.sThumbRX, g.sThumbRY)
             else:
                 _PAD["conn"].discard(i)
                 _PAD["last"].pop(i, None)
@@ -1392,6 +1415,35 @@ def _inp_beat(session):
         pass
 
 
+_AFK_DEAF = {"since": 0.0, "said": 0.0}
+
+
+def _afk_deaf_seconds(ctl, session):
+    """How long the recording has been capturing SILENCE.
+
+    The last line of defence behind the idle clock. Whatever the pads,
+    the drivers or the OS claim about whether a human is present, a
+    recording whose sound has been digital silence for a long stretch
+    is filming an empty chair - and that is knowable from the audio
+    itself, with no guessing about input at all."""
+    try:
+        aud = getattr(session, "audio", None)
+        if aud is None:
+            return 0.0
+        now = time.time()
+        heard = 0.0
+        with aud._ring_lock:
+            for r in aud.rings:
+                heard = max(heard, float(r.get("last_sound") or 0))
+        if not heard:
+            # nothing has EVER been heard: date the quiet from the
+            # session's own start, not from the epoch
+            heard = float(getattr(ctl, "rec_t0", 0) or now)
+        return max(0.0, now - heard)
+    except Exception:
+        return 0.0
+
+
 def _afk_track(ctl, session, current):
     """Auto-pause the recording when the user has been away for the set
     time, and resume the moment they're back - hands-off, like the rest of
@@ -1405,6 +1457,15 @@ def _afk_track(ctl, session, current):
     except Exception:
         thresh = 240
     idle = _afk_idle_seconds()
+    try:
+        # A VOICE IS A PERSON. He talks through cutscenes with his
+        # friends; a mic heard in the last minute holds the countdown
+        # even when both hands are off the pad.
+        _mheard = _MICWATCH.get("last_sound")
+        if _mheard:
+            idle = min(idle, max(0.0, time.time() - float(_mheard)))
+    except Exception:
+        pass
     if getattr(session, "afk_paused", False):
         if idle < 5.0:
             # They're back. ONLY clear the flag - the watcher's suspended
@@ -1417,6 +1478,17 @@ def _afk_track(ctl, session, current):
         return
     if session.suspended:
         return                             # user/window pause: not ours
+    # THE BACKSTOP: whatever the pads and drivers claim about whether a
+    # human is here, a recording whose SOUND has been digital silence
+    # for twice the threshold is filming an empty chair. Tonight's
+    # Rocket League ran 35 minutes past -91 dB because one input signal
+    # lied; no single signal gets to hold the recorder open again.
+    deaf = _afk_deaf_seconds(ctl, session)
+    if idle < thresh and deaf >= max(600.0, thresh * 2.0):
+        log("AFK: not a sound on any track for %d min and no real "
+            "input - pausing. (An input device was claiming you were "
+            "here; the silence outvoted it.)" % int(deaf // 60))
+        idle = deaf
     if idle >= thresh:
         session.afk_paused = True
         _loop_sound(ctl, "off")            # chime symmetry with the resume
@@ -2053,8 +2125,15 @@ class AudioRecorder:
                 # IS THERE ANYTHING THERE AT ALL? Exact digital silence
                 # strips to nothing; a live microphone never does, not
                 # even in a quiet room.
-                if kind == "mic" and in_data.strip(b"\x00"):
+                if in_data.strip(b"\x00"):
+                    # EVERY ring stamps its clock. When only the mic
+                    # did, a noise-gated mic made "deaf" measure the
+                    # session's AGE - and the backstop then paused a
+                    # recording he was actively playing, every few
+                    # polls, for the rest of the night (review 318,
+                    # critical). A booming game is not deafness.
                     ring["last_sound"] = now
+                if kind == "mic" and in_data.strip(b"\x00"):
                     if ring["heard"] is None:
                         ring["heard"] = now
                         _MICWATCH["heard"] = now
@@ -8370,6 +8449,7 @@ def _watch_core(ctl):
     gb_hr = SETTINGS["bitrate_mbps"] / 8 * 3600 / 1024
     _ai_rates_load()
     _ai_state_load()
+    _ai_state_merge()
     log(f"Watching ({SETTINGS['detection_mode']}). {SETTINGS['framerate']}fps "
         f"{SETTINGS['bitrate_mbps']}Mbps VBR (~{gb_hr:.0f} GB/hr max) "
         f"{SETTINGS['_encoder_resolved']}/{SETTINGS['amf_quality']}. "
@@ -10384,6 +10464,13 @@ def _ai_want_lanes(want):
         return ("thinking",)
     if w == "audit":
         return ("auditing",)
+    # THREE WORKING LANES, ON PURPOSE. Widening this to four made
+    # _ai_lanes_free freeze every "all" batch whenever ONLY the audit
+    # lane was held - a describe queue stopped dead by a lane it does
+    # not need to START. The audit-hold problem is solved where it
+    # belongs instead: _ai_ask_unhold lifts the audit lane explicitly
+    # for every ask whose chain ends in one, and the chain's tail logs
+    # when a held audit makes it skip.
     return ("listening", "hearing", "thinking")   # "all" and anything odd
 
 
@@ -10494,6 +10581,48 @@ def _ai_state_save():
         pass
 
 
+def _ai_state_merge():
+    """An update's repair rows fold in BEHIND whatever he has queued.
+
+    The 3.17 installer copied its rows OVER ai_state.json, which is
+    where his queued work went - two hundred asks, clobbered by eight
+    of mine. An update may suggest work; it may never replace his."""
+    mp = os.path.join(_data_dir(), "ai_state.merge.json")
+    if not os.path.isfile(mp):
+        return
+    try:
+        with open(mp, encoding="utf-8") as fh:
+            doc = json.load(fh) or {}
+        rows = []
+        with _AI_FORCE_LOCK:
+            have = {(it[0], str(it[1] if len(it) > 1 else "all"))
+                    for it in (_AI.get("force_queue") or [])}
+        for it in (doc.get("queue") or []):
+            if (isinstance(it, list) and it
+                    and isinstance(it[0], str)
+                    and os.path.isfile(it[0])
+                    and (it[0], str(it[1] if len(it) > 1
+                                    else "all")) not in have):
+                rows.append((it[0],
+                             str(it[1]) if len(it) > 1 else "all",
+                             bool(it[2]) if len(it) > 2 else False,
+                             [str(x) for x in it[3]]
+                             if len(it) > 3 else []))
+        if rows:
+            with _AI_FORCE_LOCK:
+                _AI["force_queue"] = list(_AI.get("force_queue")
+                                          or []) + rows
+            _ai_state_save()
+            log("The update suggested " + str(len(rows)) + " job(s) - "
+                "added BEHIND everything you queued yourself.")
+    except Exception:
+        pass
+    try:
+        os.remove(mp)
+    except OSError:
+        pass
+
+
 def _ai_state_load():
     """Boot: the line and the holds come back exactly as they were
     left. Paths that no longer exist fall out quietly."""
@@ -10511,12 +10640,23 @@ def _ai_state_load():
                           str(it[1]) if len(it) > 1 else "all",
                           bool(it[2]) if len(it) > 2 else False,
                           [str(x) for x in it[3]] if len(it) > 3 else []))
-        h = doc.get("held") or {}
+        # A HOLD IS "NOT RIGHT NOW", AND IT DIES WITH THE TOME.
+        # Restoring it made a single Stop press - pressed to free the
+        # card for one game - silence every lane for ever, across every
+        # restart, with nothing on screen to say why. Measured on his
+        # own machine: all four held, queue empty, nothing run in days.
+        # The MASTER SWITCH is the persistent one; it has its own
+        # button and its own banner, and it still persists below.
         held = _AI.setdefault("held", {"listening": False,
                                        "hearing": False})
         for k in ("listening", "hearing", "thinking", "auditing"):
-            held[k] = bool(h.get(k))
-        _AI["paused"] = all(held.values())
+            held[k] = False
+        _AI["paused"] = False
+        if any((doc.get("held") or {}).values()):
+            log("The lanes that were standing down are awake again - a "
+                "hold means 'not right now', and the tome has restarted "
+                "since. (To stop background work until you say "
+                "otherwise, use Pause it all on the Working page.)")
         with _AI_FORCE_LOCK:
             _AI["force_queue"] = q
         if q:
@@ -10531,6 +10671,28 @@ def _ai_lanes_free(want):
     needs held? Held lanes make queued work WAIT - never disappear."""
     held = _AI.get("held") or {}
     return not any(held.get(k) for k in _ai_want_lanes(want))
+
+
+def _ai_ask_unhold(want):
+    """A thing he asked for BY NAME is never held.
+
+    _ai_want_lanes("all") returns the three working lanes and never
+    "auditing" - so an "All of it" ask would describe a night and then
+    sit behind a held audit lane for ever. An ask lifts every lane its
+    chain can reach."""
+    lanes = set(_ai_want_lanes(want))
+    if want in ("all", "think", "audit"):
+        lanes.add("auditing")      # the chain ends in an audit
+    held = _AI.setdefault("held", {"listening": False, "hearing": False})
+    woke = [k for k in lanes if held.get(k)]
+    for k in lanes:
+        held[k] = False
+    _AI["paused"] = all(held.get(x) for x in
+                        ("listening", "hearing", "thinking", "auditing"))
+    if woke:
+        log("Asked for by name, so " + ", ".join(sorted(woke))
+            + " woke up for it.")
+    return woke
 
 
 def _ai_unhold_for(want):
@@ -15364,6 +15526,7 @@ def _aud_garble(stt, freq):
     if not freq:
         return []
     out = []
+    foreign = []
     for sg in (stt or []):
         if not isinstance(sg, dict):
             continue
@@ -15379,6 +15542,38 @@ def _aud_garble(stt, freq):
         # along so the model may better it.
         txt = str((sg.get("was") if sg.get("fx") else sg.get("t"))
                   or "").strip()
+        # AN ALPHABET NOBODY HERE SPEAKS IS STRUCK OUTRIGHT. This
+        # detector tokenises LATIN words, so a line written entirely in
+        # Chinese had no tokens and sailed past the net built to catch
+        # exactly it - his own screenshot found one the v7 audit had
+        # read and left standing. There is nothing to deliberate: the
+        # two alphabets of this house are the two alphabets of this
+        # house, so no model is asked and no cap may drop it.
+        _letters = [c for c in txt if c.isalpha()]
+        if _letters and not sg.get("g"):
+            # ...but NOT on lines the ears flagged as the GAME's own
+            # audio: a Japanese game speaking Japanese is the game
+            # being itself. The strike is for the reader hallucinating
+            # alphabets into HIS voice (review 318).
+            _ok = sum(1 for c in _letters
+                      if ("a" <= c.lower() <= "z")
+                      or ("\u0600" <= c <= "\u06ff")
+                      or ("\u0750" <= c <= "\u077f"))
+            if _ok / float(len(_letters)) < 0.5:
+                try:
+                    _t = float(sg.get("a") or 0) / 1000.0
+                    _b = float(sg.get("b") or 0) / 1000.0
+                except (TypeError, ValueError):
+                    _t, _b = 0.0, 0.0
+                foreign.append({
+                    "t": round(_t, 1),
+                    "b": round(max(_b, _t + 0.5), 1),
+                    "text": txt[:200], "odd": [],
+                    "verdict": "noise", "carried": True,
+                    "vwhy": ("written in an alphabet nobody in this "
+                             "house speaks - only English and Arabic "
+                             "are real here")})
+                continue
         ws = re.findall(r"[A-Za-z']{2,}", txt)
         if not ws or len(txt) > 240:
             continue
@@ -15399,7 +15594,9 @@ def _aud_garble(stt, freq):
             row["standing"] = str(sg.get("t") or "")[:200]
         out.append(row)
     out.sort(key=lambda r: -len(r["odd"]))
-    return out[:10]
+    # foreign-script strikes ride OUTSIDE the cap - they cost no model
+    # time and dropping one would leave Chinese standing in a transcript
+    return foreign + out[:10]
 
 
 def _aud_places(vis):
@@ -19118,6 +19315,17 @@ def _ai_tick(ctl):
                     # changes this job's verdict: a review that landed is
                     # a review that landed, even on a night the story
                     # half could not be told.
+                    if ((_AI.get("held") or {}).get("auditing")
+                            and not _AI["abort"] and not _AI.get("wind")
+                            and (_aud_owing(path)
+                                 or (fredo and fw == "all"))):
+                        # IT OWED AN AUDIT AND THE LANE WAS HELD.
+                        # Falling through here without a word is why a
+                        # night came back described-but-still-silver,
+                        # over and over, for weeks.
+                        log("The review of " + os.path.basename(path)
+                            + " is done, but its audit is held - it "
+                            "stays silver until the audit lane runs.")
                     if not _AI["abort"] and not _AI.get("wind") \
                             and not (_AI.get("held") or {}).get("auditing") \
                             and (_aud_owing(path)
@@ -21840,6 +22048,10 @@ class _JsApi:
         # next beat, silently (review 308)
         if str(want or "").lower() == "audit":
             return self.ai_force_many([path], "audit", True)
+        _ai_ask_unhold(want)     # a by-name ask is never held - the
+        #                          one door 3.18 forgot (review 318)
+        _ai_ask_unhold(want)     # a by-name ask is never held - the
+        #                          one door 3.18 forgot (review 318)
         """Put this recording at the FRONT of the reader's queue - the one you
         are looking at now, rather than whatever the sweep happens to reach.
         `want` picks WHAT to run: all, sound (the curve + gold moments) or
@@ -21938,8 +22150,33 @@ class _JsApi:
         # opening a JSON per row (13.0s cold on his disk) on the watcher
         # thread, every five seconds, for nothing.
         todo = [p for p in out if _force_owes(p, want, redo)]
-        already = len(out) - len(todo)
-        if not todo:
+        # A SILVER ROW IS NOT "NOTHING TO DO". Its description is
+        # complete - that is why the describe-filter drops it - but its
+        # AUDIT is owed, and that is the work he selected it for. He
+        # picked every silver video tonight and this filter queued NONE
+        # of them. They are re-routed to the audit instead of silently
+        # discarded; a re-describe of a finished description is hours
+        # of model time to rebuild the same words.
+        reroute = []
+        if want in ("think", "all") and not redo:
+            for p in out:
+                if p in todo:
+                    continue
+                try:
+                    # THE MARKS' OWN TRUTH, not the sweep's tries-
+                    # gate: described, and the audit has not read THIS
+                    # version. redo=True on the queued audit, so three
+                    # spent tries cannot silently drop it either.
+                    if _ins_done_honest(p) and not _aud_covers_now(p):
+                        reroute.append(p)
+                except Exception:
+                    pass
+        already = len(out) - len(todo) - len(reroute)
+        if reroute and not todo:
+            log("Queued " + str(len(reroute)) + " video(s) for their "
+                "AUDIT - their descriptions are already complete; the "
+                "audit is what they are owed.")
+        if not todo and not reroute:
             said = _WANT_SAID.get(want, want)
             if already == 1:
                 why = "it already has " + said + " - nothing to do"
@@ -21949,19 +22186,27 @@ class _JsApi:
             return {"ok": False, "n": 0, "already": already,
                     "want": want, "why": why}
         _ai_unhold_for(want)           # "these, now" outranks "wait"
+        _ai_ask_unhold(want)           # ...including the audit lane
         with _AI_FORCE_LOCK:
-            # THE LINE IS HIS. A press used to REPLACE everything still
-            # waiting - which, now that the line is a named, persisted
-            # thing he curates, threw away work he believed he owned
-            # (review 308). It appends; a path already waiting for this
-            # same job is not doubled.
+            # WHAT HE JUST ASKED FOR GOES FIRST. Appending sent his
+            # Redo to the back of a line he could not see moving - he
+            # pressed it again and again while the tome described a
+            # different night, which is exactly "it's jumping to
+            # something else". A press is the most recent thing he
+            # wants; it takes the front, as a block, in the order he
+            # picked. Nothing is thrown away: whatever was waiting
+            # simply waits behind it.
             q0 = list(_AI.get("force_queue") or [])
-            have = {(it[0], str(it[1] if len(it) > 1 else "all"))
-                    for it in q0}
-            added = [(p, want, bool(redo), []) for p in todo
-                     if (p, want) not in have]
+            # BY PATH, not by (path, want): a night queued as "think"
+            # and again as "all" rode the line twice and was described
+            # twice. The newest ask for a path IS his intent for it.
+            fresh_paths = set(todo) | set(reroute)
+            kept = [it for it in q0 if it[0] not in fresh_paths]
+            added = ([(p, want, bool(redo), []) for p in todo]
+                     + [(p, "audit", True, []) for p in reroute])
             replaced = 0
-            _AI["force_queue"] = q0 + added
+            behind = len(kept)
+            _AI["force_queue"] = added + kept
             _AI["_qdirty"] = True
             _AI["force"] = None        # let the queue hand over the first
             _AI["force_want"] = None
@@ -22023,6 +22268,27 @@ class _JsApi:
                 # fell over left the panel showing nothing at all.
                 "last_err": str(_DL.get("last_err") or ""),
                 "free": _free_bytes(where)}
+
+    def ai_resume_all(self):
+        """Every lane wakes. The one-press answer to the state that ate
+        his week: four lanes silently standing down and four separate
+        Resume buttons to find."""
+        held = _AI.setdefault("held", {"listening": False,
+                                       "hearing": False})
+        woke = [k for k in ("listening", "hearing", "thinking",
+                            "auditing") if held.get(k)]
+        for k in ("listening", "hearing", "thinking", "auditing"):
+            held[k] = False
+        _AI["paused"] = False
+        _AI["t_last"] = 0
+        try:
+            _ai_state_save()
+        except Exception:
+            pass
+        if woke:
+            log("Everything resumed - " + ", ".join(sorted(woke))
+                + " woke up.")
+        return {"ok": True, "woke": woke}
 
     def models_forget_error(self):
         """He has seen it; stop showing it."""

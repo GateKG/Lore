@@ -460,8 +460,14 @@ def main(src, dst, game="", mic=None):
             order = {}
             for L in labels:
                 order[L] = order.get(L, 0) + 1
+            # THE FLOOR THAT ATE HIS FRIENDS. 2.5% of a seven-hour
+            # night is ~50 utterances - a quiet seventh player with
+            # thirty lines was culled outright, every one of their
+            # lines then reading "a voice". The floor is capped at 15
+            # utterances: enough to drop strays, never enough to erase
+            # a real person who mostly listens.
             keep = [L for L, n in order.items()
-                    if n >= max(2, len(segs) // 40)]
+                    if n >= max(2, min(15, len(segs) // 80))]
             name = {L: i + 1 for i, L in enumerate(
                 sorted(keep, key=lambda L: -order[L]))}
             # EVERY utterance is scored against the kept voices, not
