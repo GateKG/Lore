@@ -741,6 +741,9 @@ body.resizing .dustmote{display:none!important}
   width:15px;height:15px;border-radius:4px;font-style:normal;font-size:9px;
   background:rgba(12,8,3,.78);color:rgba(226,200,150,.45);
   box-shadow:0 0 0 1px rgba(150,120,75,.35)}
+.proj-have i.part{color:#2b2b30;
+  background:linear-gradient(160deg,#d8d8dc,#a9adb4);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.35)}
 .proj-have i.on{color:#1d1305;background:var(--gold);
   box-shadow:0 0 0 1px rgba(255,225,170,.5)}   /* cached thumb: appear at once, no fade-from-black on re-render */
 /* 2.76: watched - one quiet tick in the corner, the tome's own memory */
@@ -2769,7 +2772,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.13'};},
+      webhook:true,version:'3.15'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2858,7 +2861,9 @@ function makeMock(){
     have_flags:async ps=>{const o={};(ps||[]).forEach((p,i)=>{
       o[p]={hl:true,stt:true,lvl:true,
         ins:i%3!==1, ins_lvl:i%3===1?1:2,
-        aud:i%3===2, aud_lvl:i%3===2?2:(i%3===0?1:0), aud_v:i%3===0?6:7};});
+        ins_why:'no audit has read this description yet',
+        aud:i%3===2, aud_lvl:i%3===2?2:(i%3===0?1:0), aud_v:i%3===0?6:7,
+        aud_why:'it read an older description'};});
       return o;},
     models_status:async()=>({ok:true,where:'C:/mock/models',
       free:900e9,busy:false,dl:null,sets:[
@@ -2912,7 +2917,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.13'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.15'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3293,11 +3298,12 @@ let _haveWait=null, _haveQ=new Set();
 function markHave(path,box){
   const paint=()=>{
     const f=_have.get(path)||{};
-    box.querySelectorAll('i').forEach(b=>{
-      const on=!!f[b.dataset.k];
-      b.classList.toggle('on',on);
-      b.title=(on?'has ':'no ')+b.title.replace(/^(has |no )/,'');
-    });
+    /* THE SAME THREE STATES AS THE SHELF. These cards were left on the
+       old boolean while the list moved to gold/silver/nothing - and
+       since "audited" got stricter, a real audit that had re-told a
+       line went DARK here with no silver to replace it. One painter,
+       one truth, both places. */
+    box.querySelectorAll('i').forEach(b=>markPaint(b,f,b.dataset.k));
   };
   box._paint=paint;   /* registered FIRST - the cached early-return used to
                          skip it, so most cards never live-updated when a
@@ -3360,8 +3366,13 @@ function avMatch(v){
     if(!f){ if(w>0)return false; continue; }  /* unknown counts as missing,
                                                  but every filter still gets
                                                  its say */
-    if(w>0 && !f[k])return false;
-    if(w<0 && f[k])return false;
+    /* the chips filter on the MARK, so "described" cannot hide a
+       row whose pen is lit, and "not audited" cannot hide a silver
+       scale that is asking for exactly that */
+    const lv=(k==='ins')?(f.ins_lvl|0):(k==='aud')?(f.aud_lvl|0)
+            :(f[k]?2:0);
+    if(w>0 && !lv)return false;
+    if(w<0 && lv)return false;
   }
   return true;
 }
@@ -3546,13 +3557,21 @@ function markPaint(b,f,k){
   b.classList.toggle('on',lvl===2);
   b.classList.toggle('part',lvl===1);
   if(lvl===1){
+    /* SILVER SAYS WHY, in the backend's own words: the audit either
+       never read this description or read an older one. Either way
+       the answer is the same - run the audit again (\u26a1 Audit only). */
+    const why=(k==='aud'?f.aud_why:f.ins_why)||'a fresh pass is owed';
+    b.title=(k==='aud'
+      ? 'audited at v'+(f.aud_v||'?')+', but '+why
+      : 'described \u2014 but '+why)
+      +' \u2014 run the audit again (\u26a1 \u2192 Audit only)';
+  }else if(lvl===2){
     b.title=(k==='aud')
-      ? 'audited, but by auditor v'+(f.aud_v||'?')+' \u2014 a fresh '
-        +'pass is owed, and the sweep brings it (or use \u26a1)'
-      : 'described, but an audit re-told part of it and those minutes '
-        +'are being written again';
+      ? 'audited by v'+(f.aud_v||'?')+' against this description'
+      : (k==='ins' ? 'described, and the audit has read this version'
+                   : AV_HAS[k]);
   }else{
-    b.title=(lvl===2?AV_HAS[k]:AV_NOT[k]);
+    b.title=AV_NOT[k];
   }
 }
 const AV_HAS={hl:'has sound & gold moments',stt:'has a transcript',
@@ -3565,7 +3584,12 @@ function avStatLine(list){
   list.forEach(v=>{bytes+=(v.size||0);
     const f=_have.get(v.path);
     if(!f){unknown++;return;}       /* [44] not looked at is not "missing" */
-    if(!f.stt)noStt++; if(!f.hl)noHl++; if(!f.ins)noIns++;});
+    if(!f.stt)noStt++; if(!f.hl)noHl++;
+    /* COUNT WHAT THE MARK SHOWS. This read the old complete-only
+       boolean, so a night with ninety-four chapters and a lit pen was
+       still counted "not described" in the same header - which is the
+       mismatch he opened this whole thread with. */
+    if(!(f.ins_lvl|0))noIns++;});
   const bits=[list.length.toLocaleString()+' recording'+(list.length===1?'':'s'),
               fmtSize(bytes)];
   if(noHl)bits.push(noHl.toLocaleString()+' with no sound pass');
@@ -3774,7 +3798,14 @@ function qlookShow(v){
     +fmtSize(v.size)+'  \u00b7  '+fmtWhen(v.mtime))));
   const f=_have.get(v.path)||{};
   card.append(el('div','qlmarks',esc(['hl','stt','ins','aud']
-    .map(k=>f[k]?AV_HAS[k]:AV_NOT[k]).join('  \u00b7  '))));
+    .map(k=>{
+      const lvl=(k==='aud')?(f.aud_lvl|0):(k==='ins')?(f.ins_lvl|0)
+               :(f[k]?2:0);
+      if(lvl===2)return AV_HAS[k];
+      if(lvl===1)return (k==='aud'?'audited, older':'described, '
+        +'audit owed');
+      return AV_NOT[k];
+    }).join('  \u00b7  '))));
   q.append(card); q.classList.add('on');
   loadThumb(v.path,im,v.mtime);
 }

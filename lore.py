@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.13"
+APP_VERSION = "3.15"
 
 try:
     import psutil
@@ -16688,6 +16688,37 @@ def _aud_read(video_path, kind):
     return d, False
 
 
+def _aud_covers_now(video_path, aud=None):
+    """Did this night's audit read the DESCRIPTION that is on disk now?
+
+    Every audit writes down the clock of each layer it read. If the
+    description has moved since - a re-describe, or the audit's own
+    retell rewriting the minutes it corrected - then the audit was
+    built against words that no longer exist, and it is owed again.
+    This is the difference between GOLD and SILVER on the shelf."""
+    try:
+        if aud is None:
+            with open(_ai_sidecar(video_path, "aud"),
+                      encoding="utf-8") as fh:
+                aud = json.load(fh) or {}
+        if not aud.get("complete"):
+            return False
+        was = float((aud.get("src") or {}).get("ins") or 0.0)
+        if was <= 0:
+            return False
+        now = round(os.path.getmtime(_ai_sidecar(video_path, "ins")), 1)
+        if abs(now - was) >= 0.6:        # _aud_src rounds to a tenth
+            return False
+        # AND THE REVIEW MUST BE WHOLE. An audit stamps this clock
+        # AFTER its own retell has cut the corrected minutes out, so a
+        # torn review carries a matching clock and would otherwise show
+        # GOLD - over a description the same audit had just taken
+        # apart (review 314).
+        return _ins_done_honest(video_path)
+    except Exception:
+        return False
+
+
 def _aud_src(video_path):
     """When each layer this audit was built from last moved. The audit is
     owed again the moment any of them does - a redone review is a
@@ -17094,27 +17125,27 @@ def _aud_apply_strikes(video_path, garble, skip_ts=None, freq=None):
 
 
 def _ai_ask_first(path, want="think", why=""):
-    """Put a recording at the FRONT of the work line, once.
+    """Put a recording at the head of the SWEEP'S WALK - not on the
+    forced line.
 
     The audit uses this to repair what it opened: a night whose
-    windows it cut out must be re-described NOW, not eventually - the
-    sweep is hundreds of recordings deep and 'eventually' is what left
-    forty-one nights carrying an audit and no description."""
+    windows it cut out must be re-described soon, not eventually,
+    because the sweep is hundreds of recordings deep.
+
+    IT MUST NOT LOOK LIKE A BY-NAME ASK. The forced line is the one
+    thing allowed to load a fifteen-gigabyte model while he is
+    PLAYING - that is what "he asked for this one" means. Putting an
+    automatic repair there started the describer on his game's card
+    five seconds after a game interrupted an audit (review 314,
+    critical). The focus only REORDERS the walk: every gate - playing,
+    held, paused, shut down - still decides whether anything runs."""
     try:
-        with _AI_FORCE_LOCK:
-            q = [it for it in (_AI.get("force_queue") or [])
-                 if not (it[0] == path
-                         and str(it[1] if len(it) > 1 else "") == want)]
-            _AI["force_queue"] = [(path, want, False, [])] + q
-        _AI["failed"].pop(path, None)   # asking again clears a memo
-        _AI["t_last"] = 0               # look at the line now
-        try:
-            _ai_state_save()
-        except Exception:
-            pass
+        _AI["focus"] = path       # first in line, next time the sweep looks
+        _AI["failed"].pop(path, None)   # and it may try again
+        _AI["t_last"] = 0
         if why:
-            log("Asked for " + os.path.basename(path) + " first - "
-                + why)
+            log(os.path.basename(path) + " goes to the head of the "
+                "queue - " + why)
         return True
     except Exception:
         return False
@@ -19223,7 +19254,14 @@ def _ai_tick(ctl):
         vids = [_focus] + [x for x in vids if x != _focus]
 
     for p in vids:
-        if _AI.get("force") or _AI.get("force_queue"):
+        if _AI.get("force") or any(
+                _takeable(it) for it in (_AI.get("force_queue") or [])):
+            # THE SAME QUESTION THE BEAT ASKS. Bailing on the line's
+            # mere existence undid 308 one screen below it: a single
+            # row that can never start - an audit on a night with no
+            # description - stopped every lane on the whole shelf, for
+            # ever, and across restarts. A line nobody can pull from
+            # is not a reason to stand still.
             return             # an ask landed mid-walk - it owns the next beat
         if _queued_finish_badge(p):
             continue                       # HDR master still awaiting SDR
@@ -19284,10 +19322,26 @@ def _ai_tick(ctl):
             _AI["focus"] = p
             _audit_ask(p)
             return
-        # NOTHING LEFT THIS WALK CAN START on this night - let it go,
-        # or the newest recording would hold the sweep for ever
+        # LET IT GO ONLY WHEN IT OWES NOTHING AT ALL. Releasing on
+        # "nothing this walk can START" fired on exactly the beat the
+        # focus was invented for: a night whose only remaining job is
+        # the describer, gated because a game is in front, reaches
+        # here every time - and lost its place to the next night's
+        # cheap job, which is the three-of-four he complained about.
+        # Holding focus only reorders the walk; the loop still serves
+        # every other night below it.
         if _AI.get("focus") == p:
-            _AI["focus"] = None
+            try:
+                _owes_more = (
+                    not _ai_sidecar_fresh(p, "hl")
+                    or not _ai_sidecar_fresh(p, "lvl")
+                    or not _ai_sidecar_fresh(p, "stt")
+                    or _ins_owing(p) or _sns_owing(p)
+                    or _aud_owing_swept(p))
+            except Exception:
+                _owes_more = False
+            if not _owes_more:
+                _AI["focus"] = None
 
 
 def _queued_finish_badge(path):
@@ -19339,7 +19393,12 @@ def _aud_done_current(video_path):
     try:
         with open(ap, encoding="utf-8") as fh:
             d = json.load(fh) or {}
-        ok = bool(d.get("complete")) and int(d.get("v") or 0) >= _AUD_V
+        ok = (bool(d.get("complete")) and int(d.get("v") or 0) >= _AUD_V
+              and _aud_covers_now(video_path, d))
+        # ONE MEANING OF AUDITED. The tally used to answer a looser
+        # question than the shelf's marks, so the Working page could
+        # say "nothing left" while every scale on the shelf was silver
+        # asking for a re-run (review 314).
     except Exception:
         ok = False
     _AUD_VCACHE[ap] = (key, ok)
@@ -21042,19 +21101,18 @@ class _JsApi:
             # complete", in his words.
             row["ins"] = False
             row["ins_lvl"] = 0
+            row["ins_why"] = ""
+            _has_desc = False
             try:
                 with open(_ai_sidecar(p, "ins"), encoding="utf-8") as fh:
                     d = json.load(fh) or {}
+                # THERE IS A DESCRIPTION OR THERE IS NOT. Ninety-four
+                # chapters is a description whatever the complete flag
+                # says - lighting only on "complete" is what made Big
+                # Walk look like a night nobody had ever told.
+                _has_desc = bool(d.get("chapters")) and not d.get("failed")
                 row["ins"] = (bool(d.get("complete")) and not d.get("failed")
                               and bool(d.get("chapters")))
-                if row["ins"]:
-                    row["ins_lvl"] = 2
-                elif d.get("chapters") and not d.get("failed"):
-                    # SILVER: a real review whose windows an audit cut
-                    # out and has not put back yet. Big Walk sat like
-                    # this - ninety-four chapters, every window gone -
-                    # and looked identical to never-described.
-                    row["ins_lvl"] = 1
             except Exception:
                 pass
             # AUDITED means audited BY THIS AUDITOR. An audit from an
@@ -21065,19 +21123,47 @@ class _JsApi:
             row["aud"] = False
             row["aud_lvl"] = 0
             row["aud_v"] = 0
+            row["aud_why"] = ""
+            _covers = False
             try:
                 with open(_ai_sidecar(p, "aud"), encoding="utf-8") as fh:
                     d2 = json.load(fh) or {}
                 _v = int(d2.get("v") or 0)
                 row["aud_v"] = _v
                 if d2.get("complete"):
-                    # SILVER vs GOLD: an audit by an older hand is real
-                    # work and must not read as "never audited" - he
-                    # cannot ask for a re-run he cannot see is owed.
-                    row["aud_lvl"] = 2 if _v >= _AUD_V else 1
+                    _covers = _aud_covers_now(p, d2)
+                    if _covers and _v >= _AUD_V:
+                        row["aud_lvl"] = 2
+                    else:
+                        # SILVER: real work, owed again - either it read
+                        # a description that has since changed, or a
+                        # newer auditor is installed
+                        row["aud_lvl"] = 1
+                        row["aud_why"] = (
+                            "it read an older description"
+                            if not _covers else
+                            "auditor v%d is installed" % _AUD_V)
                 row["aud"] = row["aud_lvl"] == 2
             except Exception:
                 pass
+            # AND THE DESCRIPTION IS GOLD ONLY WHEN AN AUDIT HAS READ
+            # IT. "silver would mean i need to rerun audit, because the
+            # audit didnt hit this version of the description."
+            if not _has_desc:
+                # NOTHING TO SHOW, SO SHOW NOTHING. A night the tome
+                # listened to and honestly found nothing in was wearing
+                # a gold scale beside a dark pen - two marks on one row
+                # flatly contradicting each other.
+                row["aud_lvl"] = 0
+                row["aud"] = False
+                row["aud_why"] = ""
+            if _has_desc:
+                row["ins_lvl"] = 2 if row["aud_lvl"] == 2 else 1
+                if row["ins_lvl"] == 1:
+                    row["ins_why"] = (
+                        "no audit has read this description yet"
+                        if row["aud_lvl"] == 0 else
+                        (row["aud_why"] or "the audit is owed again"))
             out[raw] = row
         return out
 
@@ -21644,6 +21730,17 @@ class _JsApi:
                 out.append(sp)
         if not out:
             return {"ok": False, "why": "nothing to do"}
+        if want == "audit":
+            # AN AUDIT NEEDS A DESCRIPTION TO READ. A row asking for an
+            # audit on a night that has none can never start - and a
+            # line nobody can pull from used to stop every lane on the
+            # shelf (review 314, critical). What those nights owe is a
+            # describe, and its chain ends in the audit he asked for.
+            _undesc = [p for p in out if not _ins_done_honest(p)]
+            if len(_undesc) == len(out):
+                want, redo = "think", False
+            elif _undesc:
+                out = [p for p in out if p not in _undesc]
         blocked = _force_blocked(want)
         if blocked:
             return {"ok": False, "why": blocked}
@@ -22372,6 +22469,14 @@ class _JsApi:
                 # from "refused because you are playing".
                 try:
                     why = _audit_why(p, redo=bool(redo))
+                    if why and "description must exist first" in why:
+                        # THE REFUSAL PROMISES "the audit follows on
+                        # its own" - so keep it. The night goes to the
+                        # head of the sweep's walk as a describe, and
+                        # the audit follows that chain.
+                        _ai_ask_first(p, "think",
+                                      "an audit was asked for and it "
+                                      "needs a description first")
                     started = (not why) and bool(_audit_ask(
                         p, redo=bool(redo)))
                     if started:

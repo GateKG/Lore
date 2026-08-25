@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.13` (backend) / `3.13` (UI) |
-| **Stamped** | 2026-08-25 19:38 |
-| **Last commit** | eb74a5a LORE v3.12 - no audit without a description, from both ends |
-| **lore.py** | 1.1 MB, 25,600 lines, saved 2026-08-25 19:33 |
-| **ui.html** | 0.9 MB, 13,238 lines, saved 2026-08-25 19:34 |
-| **Built exe** | 13.2 MB, 2026-08-25 19:37 |
+| **Version** | `3.15` (backend) / `3.15` (UI) |
+| **Stamped** | 2026-08-25 20:19 |
+| **Last commit** | 1e75bee LORE v3.13 - silver: it is there, and a pass is owed |
+| **lore.py** | 1.1 MB, 25,705 lines, saved 2026-08-25 20:12 |
+| **ui.html** | 0.9 MB, 13,269 lines, saved 2026-08-25 20:14 |
+| **Built exe** | 13.2 MB, 2026-08-25 20:17 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
