@@ -2765,7 +2765,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.10'};},
+      webhook:true,version:'3.11'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2903,7 +2903,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.10'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.11'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -6575,6 +6575,15 @@ function renderSet(cL,cR,app,spreadIdx){
       s.value=hit||'';if(!hit&&cur){const o=document.createElement('option');
         o.value=cur;o.textContent=cur+' (not connected)';s.append(o);s.value=cur;}
       return s;})());
+    hint(L,'A virtual microphone from mixing software \u2014 Sonar, '
+      +'Voicemeeter and the like \u2014 is a fine thing to record: it '
+      +'is where your noise cancelling and EQ live. LORE watches it '
+      +'while you play, and if the device stops sending sound it '
+      +'reopens the stream in place and fills the gap with silence so '
+      +'nothing drifts. A mic that was not ready when recording began '
+      +'is retried for the whole session. Naming yours here rather '
+      +'than leaving it on Default just means Windows cannot switch '
+      +'it under you.');
     const rb=el('button','wbtn','Listen again');
     rb.addEventListener('click',async()=>{const d=await api.audio_devices();
       st.devices=d;if(!S.turning)renderSpread(S.idx);whisper('the tome listened for new voices');});
@@ -7580,7 +7589,7 @@ function applyState(st){
      is identical - a needless style/layout tick at 1.6Hz, all night - so
      leave early when none of the painted fields moved. */
   const fp=JSON.stringify([st.status,st.elapsed,st.game,st.size_mb,st.binding,
-    st.converting,st.queued,st.hdr,st.webhook]);
+    st.converting,st.queued,st.hdr,st.webhook,st.mic_trouble]);
   if(fp===S.stateFp)return;
   S.stateFp=fp;
   applyBindCard(st.binding||null);
@@ -7598,12 +7607,20 @@ function applyState(st){
   seal.title=(s==='recording'||s==='paused')?'Stop & save':(s==='starting'?'Cancel':'Begin recording');
   const [word,subDefault,col]=STATE_TXT[s];
   const sw=$('#stateword');sw.textContent=word;sw.style.color=col;
+  const _sl=$('#statesub');
+  if(_sl)_sl.style.color=((s==='recording'||s==='paused')&&st.mic_trouble)
+    ?'#e8a33d':'';
   const t=$('#timer');
   if(s==='recording'||s==='paused'){t.textContent=fmtClock(st.elapsed);
     t.style.color=s==='recording'?'#ffb59a':'#f0d9a0';}
   else{t.textContent='';}   /* idle: no stray dot hovering over the sub-line */
   let sub=subDefault;
   if(s==='recording')sub=(st.game||'the screen')+(st.size_mb?` — ${st.size_mb>1000?(st.size_mb/1000).toFixed(1)+' GB':Math.round(st.size_mb)+' MB'} so far`:'');
+  /* A SILENT MICROPHONE SAYS SO, HERE, WHILE IT MATTERS. He lost a
+     night's voice to a virtual input that quietly died and told no
+     one; this line is where he is already looking. */
+  if((s==='recording'||s==='paused')&&st.mic_trouble)
+    sub='\u26a0 '+st.mic_trouble;
   if(s==='watching'){
     const bits=[];
     if(st.converting)bits.push(`restoring ${st.converting.name.replace(/\.mp4$/,'')}${st.converting.pct?` — ${Math.round(st.converting.pct)}%`:''}`);

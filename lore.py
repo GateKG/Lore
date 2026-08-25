@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.10"
+APP_VERSION = "3.11"
 
 try:
     import psutil
@@ -1971,7 +1971,17 @@ class AudioRecorder:
         ring = {"kind": kind, "rate": rate, "channels": channels,
                 "chunks": deque(), "bytes": 0,
                 "max": rate * channels * 2 * self._replay_seconds,
-                "t_first": None, "frames": 0, "push": None, "frame_bytes": channels * 2}
+                "t_first": None, "frames": 0, "push": None,
+                "frame_bytes": channels * 2,
+                # THE MIC WATCH (3.11): a virtual input can die mid-
+                # session and hand back perfect silence forever, and
+                # nothing used to notice.
+                "dev": str(dev.get("name") or ""), "heard": None,
+                "last_sound": None}
+        if kind == "mic":
+            _MICWATCH.update({"dev": ring["dev"], "heard": None,
+                              "last_sound": None, "quiet": False,
+                              "since": time.time(), "said": False})
         with self._ring_lock:
             self.rings.append(ring)
 
@@ -2014,6 +2024,9 @@ class AudioRecorder:
         # HOW the device starves.
         def callback(in_data, frame_count, time_info, status):
             now = time.time()
+            ring["cb_at"] = now       # ALIVE - whatever it is delivering
+            if kind == "mic":
+                _MICWATCH["cb_at"] = now
             if ring.get("closed"):
                 return (None, pyaudio.paComplete)       # tail already sealed by stop
             if status:
@@ -2037,6 +2050,20 @@ class AudioRecorder:
                     ring["frames"] += n
                     miss -= n
             if nfr:
+                # IS THERE ANYTHING THERE AT ALL? Exact digital silence
+                # strips to nothing; a live microphone never does, not
+                # even in a quiet room.
+                if kind == "mic" and in_data.strip(b"\x00"):
+                    ring["last_sound"] = now
+                    if ring["heard"] is None:
+                        ring["heard"] = now
+                        _MICWATCH["heard"] = now
+                    _MICWATCH["last_sound"] = now
+                    if _MICWATCH.get("quiet"):
+                        _MICWATCH["quiet"] = False
+                        _MICWATCH["said"] = False
+                        log("Your microphone is back ("
+                            + ring["dev"] + ").")
                 _push(in_data)
                 ring["frames"] += nfr
             return (None, pyaudio.paContinue)
@@ -2045,12 +2072,22 @@ class AudioRecorder:
         # more headroom against scheduling jitter while the GPU is busy encoding.
         # That headroom is what keeps the high-rate Sonar stream (8ch @ 96kHz)
         # from dropping samples and sounding robotic.
-        stream = self._pa.open(
-            format=pyaudio.paInt16, channels=channels, rate=rate,
-            input=True, input_device_index=dev["index"],
-            frames_per_buffer=4096, stream_callback=callback,
-        )
+        def _open_stream():
+            return self._pa.open(
+                format=pyaudio.paInt16, channels=channels, rate=rate,
+                input=True, input_device_index=dev["index"],
+                frames_per_buffer=4096, stream_callback=callback,
+            )
+
+        stream = _open_stream()
         self._streams.append(stream)
+        # HOW TO COME BACK. The same callback, the same ring, the same
+        # queue and the same WAV - only the endpoint is replaced. The
+        # callback's wall-clock gap-fill then writes real silence for
+        # the dead stretch, so the timeline never shifts.
+        ring["cb_at"] = time.time()
+        ring["reopen"] = _open_stream
+        ring["stream"] = stream
 
         def writer():
             try:
@@ -2301,7 +2338,13 @@ class AudioRecorder:
                     self.tmp_dir, f"mic{('_' + self.tag) if self.tag else ''}.wav")
                 self._open_capture(mic, self.mic_wav, f"mic ({mic['name']})", "mic")
             else:
-                log("Audio: no microphone found; mic skipped.")
+                log("Audio: no microphone found yet; LORE will keep "
+                    "looking while this records.")
+        if SETTINGS.get("capture_mic", True):
+            # the watch runs for the life of the session
+            _t = threading.Thread(target=self._mic_watch, daemon=True)
+            _t.start()
+            self._threads.append(_t)
 
     def _resolve_mic(self, wasapi):
         want = SETTINGS["mic_name_contains"].strip().lower()
@@ -2382,6 +2425,101 @@ class AudioRecorder:
         # cannot be inside PyAudio() while this one is inside terminate()
         _pa_close(self._pa)
         self._pa = None
+
+    def _mic_ring(self):
+        with self._ring_lock:
+            for r in self.rings:
+                if r.get("kind") == "mic":
+                    return r
+        return None
+
+    def _mic_reopen(self, ring, why):
+        """Put a dead microphone back on its feet, in place."""
+        try:
+            old = ring.get("stream")
+            if old is not None:
+                try:
+                    old.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    old.close()
+                except Exception:
+                    pass
+                try:
+                    self._streams.remove(old)
+                except ValueError:
+                    pass
+            ring["stream"] = None
+            fresh = ring["reopen"]()
+            ring["stream"] = fresh
+            self._streams.append(fresh)
+            ring["cb_at"] = time.time()
+            _MICWATCH["cb_at"] = ring["cb_at"]
+            _MICWATCH["fixes"] = int(_MICWATCH.get("fixes") or 0) + 1
+            _MICWATCH["state"] = "reconnected"
+            log("Microphone reconnected (" + str(ring.get("dev") or "")
+                + ") - " + why + ". The gap is filled with silence so "
+                "the sound stays in step with the picture.")
+            return True
+        except Exception as e:
+            _MICWATCH["state"] = "reconnecting"
+            log("Microphone could not be reopened yet ("
+                + str(e)[:100] + ") - trying again shortly.")
+            return False
+
+    def _mic_watch(self):
+        """A virtual microphone can stop delivering while its handle
+        stays open, and it can be missing at the moment a recording
+        starts. Neither is a reason to lose his voice for a whole
+        night, so both are repaired here while the film rolls."""
+        import pyaudiowpatch as pyaudio
+        last_try = 0.0
+        while not self._stop.wait(4.0):
+            if not SETTINGS.get("capture_mic", True):
+                continue
+            now = time.time()
+            ring = self._mic_ring()
+            if ring is None:
+                # B: it was never opened. Keep asking - Sonar may still
+                # be starting up, or a game had the device first.
+                if now - last_try < 20:
+                    continue
+                last_try = now
+                try:
+                    wasapi = self._pa.get_host_api_info_by_type(
+                        pyaudio.paWASAPI)
+                    mic = self._resolve_mic(wasapi)
+                    if mic is not None:
+                        self.mic_wav = os.path.join(
+                            self.tmp_dir,
+                            "mic%s.wav" % (("_" + self.tag)
+                                           if self.tag else ""))
+                        self._open_capture(mic, self.mic_wav,
+                                           "mic (%s)" % mic["name"],
+                                           "mic")
+                        log("Microphone found on a second look ("
+                            + str(mic["name"]) + ") - it is being "
+                            "recorded from here on.")
+                except Exception:
+                    pass
+                continue
+            cb = ring.get("cb_at") or 0
+            if cb and now - cb > 8:
+                # A: the endpoint stopped delivering. This is the one
+                # that cost him a night.
+                _MICWATCH["state"] = "reconnecting"
+                self._mic_reopen(ring, "it stopped sending sound")
+                continue
+            # CONTENT silence is treated gently: his noise gate is
+            # MEANT to emit digital silence when he is not talking.
+            snd = ring.get("last_sound")
+            base = snd or ring.get("t_first") or 0
+            if base and now - base > 480 and now - ring.get(
+                    "last_fix", 0) > 600:
+                ring["last_fix"] = now
+                self._mic_reopen(
+                    ring, "it had been silent for eight minutes")
 
     def stop(self):
         self.signal_stop()
@@ -5685,6 +5823,10 @@ def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset
 # ---------------------------------------------------------------------------
 # 'path'/'t0'/'pct' are read by the dashboard to show a live "Converting..."
 # badge (with real percent progress) on the file's card while ffmpeg works.
+_MICWATCH = {"dev": "", "heard": None, "last_sound": None,
+             "quiet": False, "since": 0.0, "said": False,
+             "cb_at": None, "fixes": 0, "state": ""}
+
 _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
               "busy": False, "aborted": False}
 
@@ -20159,6 +20301,41 @@ def _stop_media_server():
 #  they only do what the old tray/menu handlers did: poke ctl events, read
 #  SETTINGS, spawn worker threads. Nothing here touches Tk directly.
 # ---------------------------------------------------------------------------
+def _mic_trouble():
+    """One sentence about the microphone, or nothing at all.
+
+    Said BY NAME, because the fault he actually hit was a virtual
+    device going quiet while a real microphone sat unused on the desk,
+    and no amount of "mic: on" in Settings can tell you that."""
+    if not SETTINGS.get("capture_mic", True):
+        return ""
+    w = _MICWATCH
+    dev = w.get("dev") or "your microphone"
+    now = time.time()
+    fixes = int(w.get("fixes") or 0)
+    cb = w.get("cb_at")
+    if cb and now - cb > 12:
+        return (dev + " stopped sending sound - reconnecting")
+    if w.get("heard") is None:
+        since = now - (w.get("since") or now)
+        if since > 90:
+            w["quiet"] = True
+            return (dev + " has not made a sound yet"
+                    + (" (reconnected %d time%s)"
+                       % (fixes, "" if fixes == 1 else "s")
+                       if fixes else ""))
+        return ""
+    quiet_for = now - (w.get("last_sound") or now)
+    if quiet_for > 300:
+        w["quiet"] = True
+        return (dev + " has been quiet for about "
+                + str(int(quiet_for / 60)) + " min"
+                + (" - reconnected %d time%s so far"
+                   % (fixes, "" if fixes == 1 else "s")
+                   if fixes else ""))
+    return ""
+
+
 class _JsApi:
     def __init__(self, ctl):
         self._ctl = ctl
@@ -20212,7 +20389,17 @@ class _JsApi:
             except Exception:
                 pass
         ai_busy = _AI.get("busy")
+        mic_bad = ""
+        if s in ("recording", "paused"):
+            try:
+                mic_bad = _mic_trouble()
+                if mic_bad and not _MICWATCH.get("said"):
+                    _MICWATCH["said"] = True
+                    log("MICROPHONE: " + mic_bad)
+            except Exception:
+                mic_bad = ""
         return {"status": s, "game": game, "elapsed": elapsed,
+                "mic_trouble": mic_bad,
                 "saving": getattr(ctl, "saving", 0) > 0,
                 "binding": binding,
                 "ai": ({"kind": ai_busy[0], "name": ai_busy[1]}

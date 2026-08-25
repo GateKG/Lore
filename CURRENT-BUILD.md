@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.10` (backend) / `3.10` (UI) |
-| **Stamped** | 2026-08-25 00:50 |
-| **Last commit** | 3463a1f the build report, regenerated after the push |
-| **lore.py** | 1.1 MB, 25,320 lines, saved 2026-08-25 00:36 |
-| **ui.html** | 0.9 MB, 13,193 lines, saved 2026-08-25 00:45 |
-| **Built exe** | 13.2 MB, 2026-08-25 00:49 |
+| **Version** | `3.11` (backend) / `3.11` (UI) |
+| **Stamped** | 2026-08-25 19:00 |
+| **Last commit** | b143c52 LORE v3.10 - your voice, back in the film |
+| **lore.py** | 1.1 MB, 25,507 lines, saved 2026-08-25 18:55 |
+| **ui.html** | 0.9 MB, 13,210 lines, saved 2026-08-25 18:57 |
+| **Built exe** | 13.2 MB, 2026-08-25 18:59 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
@@ -42,8 +42,6 @@ Nothing is deleted — `_archive\` keeps it with the reason. See `_archive\MANIF
 | Folder | Size | |
 |---|---|---|
 | `_archive\build-logs` | 0.00 GB | one line each of a build that already shipped |
-| `_archive\experiments` | 50.86 GB | shootout scaffolding and one-off comparison reports |
-| `_archive\models-retired` | 68.53 GB | models tried and set aside - see WHY.txt for each |
 | `_archive\notes` | 0.00 GB | private handover notes from older versions (1.2.7, 1.16.3, 2.46) - they |
 | `_archive\old-source` | 0.00 GB | superseded source and stale backups |
 | `_archive\retired-runtimes` | 0.65 GB | no code path reaches these any more |
