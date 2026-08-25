@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.11"
+APP_VERSION = "3.12"
 
 try:
     import psutil
@@ -17093,6 +17093,33 @@ def _aud_apply_strikes(video_path, garble, skip_ts=None, freq=None):
     return n
 
 
+def _ai_ask_first(path, want="think", why=""):
+    """Put a recording at the FRONT of the work line, once.
+
+    The audit uses this to repair what it opened: a night whose
+    windows it cut out must be re-described NOW, not eventually - the
+    sweep is hundreds of recordings deep and 'eventually' is what left
+    forty-one nights carrying an audit and no description."""
+    try:
+        with _AI_FORCE_LOCK:
+            q = [it for it in (_AI.get("force_queue") or [])
+                 if not (it[0] == path
+                         and str(it[1] if len(it) > 1 else "") == want)]
+            _AI["force_queue"] = [(path, want, False, [])] + q
+        _AI["failed"].pop(path, None)   # asking again clears a memo
+        _AI["t_last"] = 0               # look at the line now
+        try:
+            _ai_state_save()
+        except Exception:
+            pass
+        if why:
+            log("Asked for " + os.path.basename(path) + " first - "
+                + why)
+        return True
+    except Exception:
+        return False
+
+
 def _aud_retell(video_path, changed_ts, refill=True):
     """The corrected minutes get their description back - JUST those.
 
@@ -17147,15 +17174,29 @@ def _aud_retell(video_path, changed_ts, refill=True):
         + " - re-describing just those minutes, then the title.")
     if not (refill and was_complete):
         # the card is leaving, or the review was already mid-build: the
-        # MARK is on disk (instant, no model), and the sweep's own
-        # thinking lane refills the missing windows - the night
-        # self-heals instead of describing the old words forever
+        # MARK is on disk (instant, no model). It must not be left to
+        # the sweep alone - that queue is hundreds of nights deep, and
+        # waiting there is exactly how a night ends up wearing a
+        # finished audit over a review with its windows torn out.
+        _ai_ask_first(video_path, "think",
+                      "the audit re-told part of it and the "
+                      "description must catch up")
         return len(dirty)
     _aud_keep_drop()               # one model on the card, ever
     try:
         _insights_one(video_path, forced=True)
     except Exception as e:
         log("The re-describe after the audit stumbled: " + str(e)[:120])
+    # AND IT MUST ACTUALLY BE WHOLE AGAIN. A stumble, a Stop, or a
+    # wind-down part-way through leaves the review still cut open;
+    # the night goes to the front of the line rather than waiting.
+    try:
+        if not _ins_done_honest(video_path):
+            _ai_ask_first(video_path, "think",
+                          "its description is still missing the "
+                          "minutes the audit re-told")
+    except Exception:
+        pass
     return len(dirty)
 
 
@@ -17811,6 +17852,22 @@ def _audit_ask(video_path, redo=False, named=None):
     if not _bg_work_allowed():
         return False                   # the master switch is off - the
         #                                Working page wakes it
+    # NO REVIEW, NO AUDIT - AT THE DOOR. The audit reads the
+    # description back against the transcript and the screen, so a
+    # night without a finished one has nothing to check; and a night
+    # whose review THIS auditor tore open must be made whole before it
+    # is judged again. The rule was written in the sweep's owing-judge
+    # and in the page's refusal message, but never here, where every
+    # audit in the app actually passes - so asking by name walked
+    # straight through it.
+    try:
+        if not _ins_done_honest(video_path):
+            _ai_ask_first(video_path, "think",
+                          "an audit was asked for and it has no "
+                          "finished description to check")
+            return False
+    except Exception:
+        return False
     held0 = _AI.get("held") or {}
     lift_hold = False
     if held0.get("auditing"):
