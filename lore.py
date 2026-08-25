@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.12"
+APP_VERSION = "3.13"
 
 try:
     import psutil
@@ -19211,6 +19211,17 @@ def _ai_tick(ctl):
     if entered_forced:
         return
 
+    # ONE NIGHT AT A TIME, TO THE END. The sweep used to re-walk the
+    # whole shelf every beat and take the first owed job it found, so
+    # a night whose next job was gated - the describer waits while a
+    # game has focus - quietly lost its turn to another night's cheap
+    # job, and he watched recordings sit at three jobs out of four.
+    # The night it last worked on keeps its place at the head of the
+    # walk until it owes nothing that can run.
+    _focus = _AI.get("focus")
+    if _focus and _focus in vids:
+        vids = [_focus] + [x for x in vids if x != _focus]
+
     for p in vids:
         if _AI.get("force") or _AI.get("force_queue"):
             return             # an ask landed mid-walk - it owns the next beat
@@ -19236,9 +19247,11 @@ def _ai_tick(ctl):
         # not looking at - which is the wait that made the editor unusable.
         if do_hl and (not _ai_sidecar_fresh(p, "hl")
                       or not _ai_sidecar_fresh(p, "lvl")):
+            _AI["focus"] = p         # keep this night until it is done
             _spawn("listening", p, mt)
             return                          # one job per tick
         if do_stt and not _ai_sidecar_fresh(p, "stt"):
+            _AI["focus"] = p
             _spawn("hearing", p, mt)
             return
         # LOOKING IS ASKED FOR, NEVER SWEPT UP. A look costs ~21 seconds
@@ -19249,6 +19262,7 @@ def _ai_tick(ctl):
         # does NOT appear here: the eye runs when he presses for it.
         if (do_ins and (_ins_owing(p) or _sns_owing(p))
                 and _ai_sidecar_fresh(p, "hl") and _ai_sidecar_fresh(p, "stt")):
+            _AI["focus"] = p
             _spawn("thinking", p, mt)
             return
         # AN AUDIT-ONLY NIGHT IS STILL OWED. The line above dispatches
@@ -19267,8 +19281,13 @@ def _ai_tick(ctl):
             # its OWN gate, not do_ins: holding the review lane used to
             # silently stop every audit too - the lanes are siblings,
             # not parent and child
+            _AI["focus"] = p
             _audit_ask(p)
             return
+        # NOTHING LEFT THIS WALK CAN START on this night - let it go,
+        # or the newest recording would hold the sweep for ever
+        if _AI.get("focus") == p:
+            _AI["focus"] = None
 
 
 def _queued_finish_badge(path):
@@ -21022,11 +21041,20 @@ class _JsApi:
             # still being rebuilt) - "cancelled 50% in and it thinks it's
             # complete", in his words.
             row["ins"] = False
+            row["ins_lvl"] = 0
             try:
                 with open(_ai_sidecar(p, "ins"), encoding="utf-8") as fh:
                     d = json.load(fh) or {}
                 row["ins"] = (bool(d.get("complete")) and not d.get("failed")
                               and bool(d.get("chapters")))
+                if row["ins"]:
+                    row["ins_lvl"] = 2
+                elif d.get("chapters") and not d.get("failed"):
+                    # SILVER: a real review whose windows an audit cut
+                    # out and has not put back yet. Big Walk sat like
+                    # this - ninety-four chapters, every window gone -
+                    # and looked identical to never-described.
+                    row["ins_lvl"] = 1
             except Exception:
                 pass
             # AUDITED means audited BY THIS AUDITOR. An audit from an
@@ -21035,11 +21063,19 @@ class _JsApi:
             # truth, and what makes the filter chip useful for finding
             # the backlog.
             row["aud"] = False
+            row["aud_lvl"] = 0
+            row["aud_v"] = 0
             try:
                 with open(_ai_sidecar(p, "aud"), encoding="utf-8") as fh:
                     d2 = json.load(fh) or {}
-                row["aud"] = (bool(d2.get("complete"))
-                              and int(d2.get("v") or 0) >= _AUD_V)
+                _v = int(d2.get("v") or 0)
+                row["aud_v"] = _v
+                if d2.get("complete"):
+                    # SILVER vs GOLD: an audit by an older hand is real
+                    # work and must not read as "never audited" - he
+                    # cannot ask for a re-run he cannot see is owed.
+                    row["aud_lvl"] = 2 if _v >= _AUD_V else 1
+                row["aud"] = row["aud_lvl"] == 2
             except Exception:
                 pass
             out[raw] = row

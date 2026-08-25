@@ -13,8 +13,8 @@
 [Setup]
 AppId={{7C1A44D9-63BF-4A0E-9E7D-2F4B8C5A930E}
 AppName=Lore
-AppVersion=3.12
-VersionInfoVersion=3.12.0
+AppVersion=3.13
+VersionInfoVersion=3.13.0
 ; A 64-bit app should live in the real Program Files (v1 landed in x86;
 ; upgrades reuse whichever folder is already installed, so nothing breaks).
 ArchitecturesAllowed=x64compatible

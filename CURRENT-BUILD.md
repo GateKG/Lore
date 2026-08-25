@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.12` (backend) / `3.12` (UI) |
-| **Stamped** | 2026-08-25 19:25 |
-| **Last commit** | 402cedc LORE v3.11 - the microphone heals itself |
-| **lore.py** | 1.1 MB, 25,564 lines, saved 2026-08-25 19:18 |
-| **ui.html** | 0.9 MB, 13,210 lines, saved 2026-08-25 19:23 |
-| **Built exe** | 13.2 MB, 2026-08-25 19:24 |
+| **Version** | `3.13` (backend) / `3.13` (UI) |
+| **Stamped** | 2026-08-25 19:38 |
+| **Last commit** | eb74a5a LORE v3.12 - no audit without a description, from both ends |
+| **lore.py** | 1.1 MB, 25,600 lines, saved 2026-08-25 19:33 |
+| **ui.html** | 0.9 MB, 13,238 lines, saved 2026-08-25 19:34 |
+| **Built exe** | 13.2 MB, 2026-08-25 19:37 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
