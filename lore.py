@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.18"
+APP_VERSION = "3.19"
 
 try:
     import psutil
@@ -10520,6 +10520,13 @@ def _ai_next_sweep():
             for p, mt in vids:
                 if _queued_finish_badge(p):
                     continue
+                # THE SAME ANSWER THE REAL WALK GIVES. The sweep skips
+                # a recording he has just skipped; this preview did
+                # not, so the plate went on announcing it as "next
+                # from the shelf" for the full fifteen minutes - which
+                # reads exactly like the skip having failed.
+                if _ai_skipped_recently(p):
+                    continue
                 if (_AI.get("failed") or {}).get(p) == mt:
                     continue
                 if do_hl and (not _ai_sidecar_fresh(p, "hl")
@@ -10666,6 +10673,17 @@ def _ai_state_load():
         pass
 
 
+def _ai_skipped_recently(path, within=900):
+    """Was this recording skipped by hand in the last quarter hour?
+    A skip is 'not this one, now' - it expires, it is never a refusal,
+    and it never reaches the shelf of things the tome gave up on."""
+    try:
+        t = (_AI.get("skipped") or {}).get(path)
+        return bool(t) and (time.time() - t) < within
+    except Exception:
+        return False
+
+
 def _ai_lanes_free(want):
     """May a forced ask with this want start right now, or is a lane it
     needs held? Held lanes make queued work WAIT - never disappear."""
@@ -10787,6 +10805,76 @@ def _ai_sidecar(video_path, kind):
     name = os.path.splitext(os.path.basename(video_path))[0]
     return os.path.join(_thumb_dir(SETTINGS.get("output_dir", "")),
                         f"{name}.{kind}.json")
+
+
+# WHICH SIDECARS EACH LANE OWNS. A fresh pass rebuilds these, so a
+# fresh pass is what archives them.
+_ATTIC_OF = {"listening": ("hl", "lvl"),
+             "hearing": ("stt",),
+             "thinking": ("ins", "sns", "vis"),
+             "auditing": ("aud",)}
+
+
+def _attic_dir():
+    return os.path.join(_thumb_dir(SETTINGS.get("output_dir", "")),
+                        ".attic")
+
+
+def _ai_attic(video_path, lanes, older_than=None):
+    """Move aside the sidecars a fresh pass is about to rewrite.
+
+    "if i press do all.. it should delete all previous version of
+    everything.. or not delete.. just archive older version and start
+    from scratch". Deleting is easy and wrong: a description is hours
+    of model time and the only copy of what the tome once thought. The
+    old reading moves to the .attic folder beside the thumbnails,
+    stamped with the hour it was replaced,
+    and the new pass starts on genuinely empty ground - which is also
+    the only way a redo can rebuild a layer that already looked
+    fresh."""
+    moved = []
+    try:
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        att = _attic_dir()
+        os.makedirs(att, exist_ok=True)
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        for lane in lanes:
+            for kind in _ATTIC_OF.get(lane, ()):
+                src = _ai_sidecar(video_path, kind)
+                if not os.path.isfile(src):
+                    continue
+                # NEVER THIS ASK'S OWN WORK. A lane that finished while
+                # a game was starting is never recorded as run (abort
+                # clears the bookkeeping), so the drain comes back for
+                # it - and without this test it would file away the
+                # very curve it had just written and do it all again.
+                if older_than is not None:
+                    try:
+                        if os.path.getmtime(src) >= older_than:
+                            continue
+                    except OSError:
+                        pass
+                dst = os.path.join(att, "%s.%s.%s.json"
+                                        % (base, kind, stamp))
+                try:
+                    # A COPY. NEVER A MOVE. Taking the file away broke
+                    # every guard that reads the previous reading at
+                    # write time - the .v1/.v2/.v3 bank, his typed
+                    # voice names, the eye's better-pass test, the
+                    # review's carry-forward, the .ins staging - and
+                    # it was never what made a redo fresh anyway:
+                    # redo=True is, and the passes already honour it.
+                    # The writers do their own banking, so this does
+                    # not bank as well; doing both would rotate a real
+                    # generation off the end of the chain for nothing.
+                    import shutil as _sh
+                    _sh.copy2(src, dst)
+                    moved.append(kind)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return moved
 
 
 def _read_sidecar(video_path, kind):
@@ -18333,6 +18421,14 @@ def _audit_ask(video_path, redo=False, named=None):
                 + ": " + str(e)[:120])
         finally:
             live = _AI.pop("aud_live", None)
+            # A DELIBERATE SKIP IS NOT AN INTERRUPTION. Skip filters
+            # the row out of the line and then aborts - and this
+            # block, which runs afterwards, put it straight back. The
+            # audit restarted on the next beat and Skip looked broken
+            # for every audit he ever pressed it on (review 319,
+            # critical, found twice).
+            if live and _ai_skipped_recently(live[0]):
+                live = None
             if live and live[0] == video_path and not done_ok \
                     and _AI.get("abort"):
                 # INTERRUPTED, NOT FINISHED - back to the line, in its
@@ -19131,6 +19227,12 @@ def _ai_tick(ctl):
         a forced beat never sweeps, so an undrainable line would have
         starved every other lane forever (review 308, critical)."""
         w = it[1] if len(it) > 1 else "all"
+        # JUST SKIPPED CANNOT START. Skip holds no lanes on purpose,
+        # so nothing else stops a row that races back into the line
+        # from re-taking the card on the very next beat. It waits
+        # where it stands instead - visible, never deleted.
+        if _ai_skipped_recently(it[0]):
+            return False
         if not _ai_lanes_free(w):
             return False
         if str(w or "").lower() == "audit":
@@ -19415,6 +19517,8 @@ def _ai_tick(ctl):
                 q = list(_AI.get("force_queue") or [])
                 take = None
                 for i0, it0 in enumerate(q):
+                    if _ai_skipped_recently(it0[0]):
+                        continue       # he just let this one go
                     p0, w0 = it0[0], it0[1]
                     if not os.path.isfile(p0):
                         take = i0          # gone from disk - drop it below
@@ -19454,6 +19558,15 @@ def _ai_tick(ctl):
                                            take)
                     elif os.path.isfile(p0):
                         _AI["force"] = p0
+                        # WHEN THIS ASK BEGAN. The attic files away what
+                        # was there before he pressed the button and
+                        # never what this ask has since written. In
+                        # memory only, deliberately: a queue row is a
+                        # 4-tuple that round-trips through JSON, and
+                        # widening it would break every reader of the
+                        # saved line. A restart mid-ask simply loses the
+                        # refinement and archives as it used to.
+                        _AI["force_t0"] = time.time()
                         _AI["force_want"] = w0
                         _AI["force_redo"] = (bool(it0[2])
                                              if len(it0) > 2 else False)
@@ -19567,9 +19680,17 @@ def _ai_tick(ctl):
             # logs nothing until its first window lands, ~12 minutes in.
             nice0 = {"listening": "the sound", "hearing": "the words",
                      "thinking": "the senses & the review"}[kind0]
+            # FROM SCRATCH MEANS FROM SCRATCH. Archiving the lane's own
+            # sidecars here - not at the ask - means a redo he stops
+            # half way only ever moved aside what actually re-ran, and
+            # a lane whose turn never comes keeps its old reading.
+            filed = (_ai_attic(fp, [kind0], _AI.get("force_t0"))
+                     if redo else [])
             log(f"Starting {nice0} on {os.path.basename(fp)}"
-                + (" - done fresh, the old banks as a version" if redo
-                   else "") + ".")
+                + (" - from scratch; the old "
+                   + ", ".join(filed) + " copied to the attic first"
+                   if filed else
+                   (" - from scratch" if redo else "")) + ".")
             _spawn(kind0, fp, mt)
             return
 
@@ -19593,6 +19714,13 @@ def _ai_tick(ctl):
         vids = [_focus] + [x for x in vids if x != _focus]
 
     for p in vids:
+        # JUST SKIPPED IS NOT "NEXT". Without this the sweep hands the
+        # very recording he skipped straight back on the next beat, and
+        # Skip becomes indistinguishable from a button that does
+        # nothing - which is how Stop ended up standing down the whole
+        # tome instead.
+        if _ai_skipped_recently(p):
+            continue
         if _AI.get("force") or any(
                 _takeable(it) for it in (_AI.get("force_queue") or [])):
             # THE SAME QUESTION THE BEAT ASKS. Bailing on the line's
@@ -22015,23 +22143,139 @@ class _JsApi:
             q2 = [it for it in q if it[0] != p]
             _AI["force_queue"] = q2
             n = len(q) - len(q2)
+            # WHAT LEAVES THE LINE IS KEPT. 185 waiting rows left his
+            # line in seven seconds tonight with nothing on earth to
+            # undo it - "i had like 200 other things queued,
+            # everything dissapeared????". They are recoverable now.
+            if n:
+                att = list(_AI.get("dropped") or [])
+                att.extend(it for it in q if it[0] == p)
+                _AI["dropped"] = att[-500:]
         if n:
             log("Let " + os.path.basename(p) + " out of the line.")
             _ai_state_save()
-        return {"ok": bool(n), "n": len(q2),
+        return {"ok": bool(n), "n": len(q2), "restorable": len(
+            _AI.get("dropped") or []),
                 "why": "" if n else "not in the line"}
+
+    def ai_skip_current(self):
+        """Let go of the job in hand and MOVE ON - the tome keeps
+        working.
+
+        Stop did two jobs at once: it aborted the piece in hand and it
+        held every lane until Resume. He pressed it on one recording
+        three times tonight and each press silenced the whole reader -
+        "i dont know why everything was paused??". Skipping one job
+        and standing the tome down are different intentions, so they
+        are different buttons; this is the one the card offers, and
+        Pause everything keeps the other meaning under its own name.
+
+        Whatever the job had already written stays written."""
+        busy = _AI.get("busy")
+        if not busy:
+            return {"ok": False, "why": "nothing running"}
+        kind, name = busy
+        path = _AI.get("busy_path")
+        dropped = 0
+        with _AI_FORCE_LOCK:
+            if path and _AI.get("force") == path:
+                _AI["force"] = None
+                _AI["force_want"] = None
+                _AI["force_redo"] = False
+                _AI["force_ran"] = set()
+            # ...and out of the line, or the very next beat hands the
+            # same recording straight back and the button looks dead
+            q = list(_AI.get("force_queue") or [])
+            q2 = [it for it in q if it[0] != path]
+            dropped = len(q) - len(q2)
+            # AND IT IS RECOVERABLE, like every other door. This was
+            # the last one that deleted waiting rows outright.
+            if dropped:
+                _AI["dropped"] = (list(_AI.get("dropped") or [])
+                                  + [it for it in q
+                                     if it[0] == path])[-500:]
+            _AI["force_queue"] = q2
+            _AI["_qdirty"] = True
+        if path:
+            _AI.setdefault("skipped", {})[path] = time.time()
+            # A QUEUE-DRIVEN AUDIT IS NOT IN THE LINE WHILE IT RUNS -
+            # its row lives in aud_live, and the worker's finally
+            # re-files it the moment it dies. The purge above cannot
+            # see it. He asked for this one to stop; that is not an
+            # interruption, so the memo goes.
+            if (_AI.get("aud_live") or ("",))[0] == path:
+                _AI.pop("aud_live", None)
+        if _AI.get("focus") == path:
+            _AI["focus"] = None        # stop steering the sweep at it
+        # the plate's "next from the shelf" line is an 8-second cache;
+        # without this it went on naming the recording he had just
+        # skipped, which reads exactly like the skip having failed
+        _AI.pop("next_pick", None)
+        _ai_abort()
+        _AI["t_last"] = 0
+        log("Skipped " + AI_LABEL.get(kind, kind) + " on " + str(name)
+            + " - what it had already written stays written. Nothing "
+            "else was paused, and the tome will not offer this one "
+            "again for a quarter of an hour.")
+        _ai_state_save()
+        return {"ok": True, "skipped": str(name), "dropped": dropped}
 
     def ai_queue_clear(self):
         """Empty the waiting line WITHOUT touching the job in hand -
         the middle between moving one row and Stop."""
         with _AI_FORCE_LOCK:
-            n = len(_AI.get("force_queue") or [])
+            q = list(_AI.get("force_queue") or [])
+            n = len(q)
             _AI["force_queue"] = []
+            if n:
+                _AI["dropped"] = (list(_AI.get("dropped") or [])
+                                  + q)[-500:]
         if n:
             log("Let the whole line go - " + str(n) + " waiting "
-                "item(s).")
+                "item(s). They can be put back.")
             _ai_state_save()
-        return {"ok": True, "dropped": n}
+        return {"ok": True, "dropped": n,
+                "restorable": len(_AI.get("dropped") or [])}
+
+    def ai_queue_restore(self):
+        """Put back everything that was let out of the line.
+
+        The line is the only place his intent lives between pressing a
+        button and the tome reaching it, and until tonight the only
+        thing that could happen to it was loss."""
+        with _AI_FORCE_LOCK:
+            att = list(_AI.get("dropped") or [])
+            have = {it[0] for it in (_AI.get("force_queue") or [])}
+        if not att:
+            return {"ok": False, "why": "nothing was let go"}
+        # THE DISK WALK HAPPENS OUTSIDE THE LOCK. Up to 500 stats on a
+        # spinning library, holding the lock the recorder's own watcher
+        # thread needs every five seconds, is a stall mid-recording.
+        back, keep = [], []
+        for it in att:
+            try:
+                if it[0] in have:
+                    continue          # already waiting: nothing to do
+                if not os.path.isfile(it[0]):
+                    keep.append(it)   # gone for now - not ours to forget
+                    continue
+            except Exception:
+                keep.append(it)
+                continue
+            have.add(it[0])
+            back.append(tuple(it))
+        with _AI_FORCE_LOCK:
+            _AI["force_queue"] = list(_AI.get("force_queue") or []) + back
+            # WHAT IT DID NOT PUT BACK, IT KEEPS. Emptying the attic
+            # wholesale threw away rows it had deliberately declined to
+            # restore - a second silent loss inside the undo for the
+            # first one.
+            _AI["dropped"] = keep
+            _AI["_qdirty"] = True
+        _AI["t_last"] = 0
+        log("Put " + str(len(back)) + " row(s) back in the line.")
+        _ai_state_save()
+        return {"ok": True, "restored": len(back)}
 
     def search_words(self, query):
         """Search every transcript for the words - the tome's AI search.
@@ -22042,66 +22286,43 @@ class _JsApi:
         except Exception:
             return []
 
-    def prioritise(self, path, want="all"):
-        # an audit is a LINE job, never a force - setting force for it
-        # aborted whatever was running and then dropped the ask on the
-        # next beat, silently (review 308)
+    def prioritise(self, path, want="all", redo=False):
+        """Ask for this one BY NAME: it goes to the FRONT of the line.
+
+        This used to seize the card directly - force = this path, abort
+        whatever was running - and the evicted job was simply dropped
+        on the floor. His log tonight, four presses in two seconds:
+
+          Starting now on Drova - ELDENRING_20260418 was let go of
+          Starting now on hearthstone
+          Starting now on rocketleague
+          Starting now on Trackmania2020
+
+        Four asks, one survivor, no warning: "i pressed x on rocket
+        league and hearthstone, its not even picking them from the
+        queue, its not starting". Every by-name ask is the same door
+        now - the front of the line, in the order pressed, nothing
+        thrown away - and it is FRESH, because a row he is asking for
+        again is a row whose old answer he has already rejected.
+
+        It does NOT ask for a fresh one by default, though, and that
+        distinction cost a review round to see. A forced ask already
+        zeroes the three-try wall and already restarts a review that
+        had completed, so redo buys nothing here - while the archiving
+        it switches on moves the senses sidecar aside, and the senses
+        pass carries his TYPED VOICE NAMES forward by reading exactly
+        that file. Asking again for a description would have quietly
+        blanked every name he had given a voice.
+
+        An AUDIT is the exception, and deliberately so (review 308): it
+        is the one lane the attic never touches - the drain only ever
+        archives listening, hearing and thinking - so there is nothing
+        for a fresh audit to lose, and "read it again" is the only
+        thing that press can sensibly mean."""
         if str(want or "").lower() == "audit":
-            return self.ai_force_many([path], "audit", True)
-        _ai_ask_unhold(want)     # a by-name ask is never held - the
-        #                          one door 3.18 forgot (review 318)
-        _ai_ask_unhold(want)     # a by-name ask is never held - the
-        #                          one door 3.18 forgot (review 318)
-        """Put this recording at the FRONT of the reader's queue - the one you
-        are looking at now, rather than whatever the sweep happens to reach.
-        `want` picks WHAT to run: all, sound (the curve + gold moments) or
-        words (the transcript). Asking for just the sound is the common case:
-        it is seconds of work and it is what the editor needs."""
-        p = self._safe_path(path)
-        if not p:
-            return {"ok": False, "why": "unknown file"}
-        want = str(want or "all").lower()
-        if want not in ("all", "sound", "words", "think", "audit"):
-            want = "all"
-        # SAY WHICH IT IS. "already done" was also the answer when the job
-        # was switched off in Settings or its worker was not installed -
-        # two opposite situations wearing one sentence, and the refusals
-        # shelf's "Ask again" row just sat there looking ignored.
-        blocked = _force_blocked(want)
-        if blocked:
-            return {"ok": False, "why": blocked}
-        # THE SAME TEST THE BEAT USES. This one asked only about the review
-        # under "All of it", so a recording owing just its senses, the eye
-        # or the auditor was told it was finished while the sweep would
-        # happily have run it.
-        owe = _force_owes(p, want, False)
-        stt_left = "hearing" in owe
-        hl_left = "listening" in owe
-        think_left = "thinking" in owe
-        if not owe:
-            return {"ok": False,
-                    "why": _force_off_reason(p, want) or "already done",
-                    "already": 1}
-        _ai_unhold_for(want)           # "this one, now" outranks "wait"
-        with _AI_FORCE_LOCK:
-            _AI["force"] = p
-            _AI["force_want"] = want
-            _AI["force_redo"] = False
-            _AI["force_ran"] = set()   # this ask has run nothing yet
-            _AI["_qdirty"] = True
-            _AI["failed"].pop(p, None)  # asking again clears an old refusal
-        if _AI.get("busy"):
-            _ai_abort()                # let go of the current one, take this
-        _AI["t_last"] = 0              # and start on the very next beat
-        # SAY WHAT IT DOES. "Moved to the front of the queue" is what
-        # queuing sounds like, and it is the one thing this does not do: it
-        # stops whatever is running and starts yours instead.
-        was = (_AI.get("busy") or (None, None))[1]
-        log(f"Starting now on {os.path.basename(p)}"
-            + (f" - {was} was let go of" if was else "")
-            + f" ({want}).")
-        return {"ok": True, "stt": stt_left, "hl": hl_left,
-                "think": think_left}
+            redo = True
+        return self.ai_force_many([path], want, bool(redo))
+
 
     def ai_force_many(self, paths, want="all", redo=False):
         """Do ONE kind of work to a whole selection, in order.

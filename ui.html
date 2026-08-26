@@ -644,6 +644,10 @@ body.resizing .dustmote{display:none!important}
 #zapmenu.on{display:block}
 #zapmenu h5{margin:3px 8px 5px;font:700 9.5px var(--ui);letter-spacing:.16em;
   text-transform:uppercase;color:#a98d5c}
+#zapmenu button.zfresh{font-weight:700;letter-spacing:.01em}
+#zapmenu button.zfresh::after{content:'every layer, from nothing';
+  display:block;font:italic 9.5px var(--serif);opacity:.72;
+  letter-spacing:0;margin-top:1px}
 #zapmenu button{display:block;width:100%;text-align:left;border:0;
   background:transparent;color:#e6d4ab;font:600 12px var(--ui);
   padding:7px 10px;border-radius:8px;cursor:pointer}
@@ -2791,7 +2795,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.18'};},
+      webhook:true,version:'3.19'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2898,10 +2902,25 @@ function makeMock(){
       next:{name:'mock night.mp4',kind:'listening'},
       shutdown:!!window.__mockSd}),
     ai_queue_move:async()=>({ok:true}),
-    ai_queue_drop:async p=>{window.__mockQ=(window.__mockQ||[])
-      .filter(x=>x.path!==p);return {ok:true};},
+    ai_queue_drop:async p=>{
+      const gone=(window.__mockQ||[]).filter(x=>x.path===p);
+      window.__mockDropped=(window.__mockDropped||[]).concat(gone);
+      window.__mockQ=(window.__mockQ||[]).filter(x=>x.path!==p);
+      return {ok:true,
+              restorable:(window.__mockDropped||[]).length};},
     ai_queue_clear:async()=>{const n=(window.__mockQ||[]).length;
-      window.__mockQ=[];return {ok:true,dropped:n};},
+      window.__mockDropped=(window.__mockDropped||[])
+        .concat(window.__mockQ||[]);
+      window.__mockQ=[];
+      return {ok:true,dropped:n,
+              restorable:(window.__mockDropped||[]).length};},
+    ai_queue_restore:async()=>{const b=(window.__mockDropped||[]);
+      window.__mockQ=(window.__mockQ||[]).concat(b);
+      window.__mockDropped=[];
+      return b.length?{ok:true,restored:b.length}
+                     :{ok:false,why:'nothing was let go'};},
+    ai_skip_current:async()=>({ok:true,skipped:'a recording',
+                               dropped:0}),
     ai_shutdown:async on=>{window.__mockSd=(on==null)?!window.__mockSd
       :!!on;return {ok:true,shutdown:!!window.__mockSd};},
     ai_refusals:async()=>[
@@ -2937,7 +2956,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.18'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.19'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -4103,14 +4122,22 @@ function zapAsk(ev,onePath,pathsOverride){
      It starts off EVERY time the menu opens: a sticky redo over the whole
      shelf is days of reading. */
   let again=false;
-  const runIt=async(want)=>{
+  const runIt=async(want,freshOverride)=>{
+    /* A ROW MAY CARRY ITS OWN MEANING. "All of it" queued redo=FALSE,
+       so a night whose sound and words were already fresh skipped
+       both and began at the review - "its starting at ai review". The
+       tick that meant "again" sat unticked in a corner; the row that
+       says from scratch now carries it. */
+    const fresh=(freshOverride==null)?again:!!freshOverride;
     let r=null;
-    try{ r=await api.ai_force_many(paths,want,again); }catch(_){}
+    try{ r=await api.ai_force_many(paths,want,fresh); }catch(_){}
     if(r&&r.ok){
       const said={all:'everything',sound:'sound & gold moments',
                   words:'transcripts',think:'descriptions',
                   audit:'audits'}[want]||want;
       whisper(said+' for '+r.n+' recording'+(r.n===1?'':'s')
+              +(fresh?' \u2014 FROM SCRATCH; the old readings move to '
+                      +'the attic, nothing is deleted':'')
               +(r.already?' ('+r.already+' already had it)':'')
               +(r.n>1?' \u2014 working through them in order':''));
       if(many){ AV.sel.clear(); AV.anchor=null; avPaint();
@@ -4126,18 +4153,24 @@ function zapAsk(ev,onePath,pathsOverride){
       if(hadIt)m.classList.add('on');
     }
   };
-  [['sound','Sound & gold moments'],['words','Transcripts'],
-   ['think','Describe '+(many?'them':'it')],['audit','Audit (only)'],
-   ['all','All of it']]
-  .forEach(([want,label])=>{
+  [['sound','Sound & gold moments',null],['words','Transcripts',null],
+   ['think','Describe '+(many?'them':'it'),null],
+   ['audit','Audit (only)',null],
+   ['all','Fill in what is missing',null],
+   ['all','Everything, from scratch',true]]
+  .forEach(([want,label,fresh])=>{
     const b=el('button','',esc(label));
+    if(fresh){b.classList.add('zfresh');
+      b.title='Every layer again from nothing - the sound, the words, '
+             +'the senses, the review and the audit. The readings it '
+             +'already has are moved to the attic, never deleted.';}
     b.addEventListener('click',e=>{
       e.stopPropagation(); m.classList.remove('on');
       /* audits queue like everything else now - one at a time on
          the card, but the LINE holds any number, visibly, and a night
          that is not ready waits in place saying why (his 7-8-video
          select used to be refused by a whisper nobody saw) */
-      runIt(want);
+      runIt(want,fresh);
     });
     m.append(b);
   });
@@ -5059,7 +5092,10 @@ function evSeqArm(vids){
 function renderChapter(cL,cR,sp,spreadIdx){
   const g=sp.game,hue=sp.hue;
   glyphmark(cL,g.key,hue,1+sp.k*2);glyphmark(cR,g.key,hue,2+sp.k*2);
-  const suffix=sp.pagesN>1?` · ${roman(sp.k+1)}`:'';
+  /* "page 2 of 2", not a bare roman II. A page number you cannot
+     read as a page number is how a shelf of eighteen recordings can
+     look like a shelf of three. */
+  const suffix=sp.pagesN>1?` \u00b7 page ${sp.k+1} of ${sp.pagesN}`:'';
   const lbl=items=>{const c=items.filter(v=>v.kind==='clip').length,s=items.length-c;
     return c&&s?'clips & sessions':c?'clips':'sessions';};
   /* ---- LEFT page (chapter head on k===0) ---- */
@@ -5072,7 +5108,17 @@ function renderChapter(cL,cR,sp,spreadIdx){
     addRenameBtn(ptitle(cL,`chapter ${roman(sp.gi+1)} — ${lbl(sp.lItems)}`,g.display,hue,
            stats.join(' &nbsp;·&nbsp; '),g.key),g.display);
   }else{
-    ptitle(cL,`chapter ${roman(sp.gi+1)} — ${lbl(sp.lItems)}${suffix}`,g.display,hue,null,null);
+    /* AND THE TRUE TOTAL RIDES EVERY PAGE. It used to appear only on
+       page one, so turning to page two of a game showed six
+       recordings and no hint that there were eighteen. */
+    /* WHAT THE PAGES SHOW, not what the game owns. The pages obey
+       the media filter; a total that ignored it would say 34 over a
+       page of 18 - a new way of misreporting a shelf inside the fix
+       for misreporting shelves. */
+    const tot=mediaItems(g).length;
+    ptitle(cL,`chapter ${roman(sp.gi+1)} — ${lbl(sp.lItems)}${suffix}`,
+           g.display,hue,
+           `<b>${tot}</b> in this chapter altogether`,null);
   }
   const bl=pbody(cL);
   if(sp.k===0){
@@ -5679,6 +5725,10 @@ function shutdownBar(){
 }
 
 function queuePlate(){
+  /* how many rows the last drop took out of the line, so the plate can
+     offer them back. Session-lived on purpose: the door back is for the
+     press he just regretted, not a permanent graveyard. */
+  let _letGo=0;
   /* THE WAITING LINE, visible and yours - every item by name, with a
      way out for one row or the whole line, and the sweep's own next
      pick named so nothing ever "just starts" again. */
@@ -5692,15 +5742,36 @@ function queuePlate(){
       !!x.redo,x.wait||'']),nx&&nx.name,nx&&nx.kind,sd]);
     if(s2===sig)return; sig=s2;
     box.innerHTML='';
+    const rf=()=>{sig=null;paint();};
     if(sd)box.append(el('div','qnote','everything is paused for your '
       +'game \u2014 the line waits exactly as it is'));
     if(nx&&!sd)box.append(el('div','qnote','next from the shelf: '
       +esc(String(nx.name||'').replace(/\.mp4$/i,''))
       +'  ('+esc(nx.kind||'')+')'));
+    /* THE DOOR BACK IS DRAWN ON BOTH PATHS. It used to live at the
+       bottom of the row list, and paint() returns early when the line
+       is empty - so letting the WHOLE line go, which is the press it
+       exists to undo, hid it. */
+    const putBack=()=>{
+      if(!(_letGo>0))return;
+      const pb=el('button','wbtn primary','Put back '+_letGo
+                                          +' that were let go');
+      pb.style.cssText='align-self:flex-start;margin-top:4px';
+      pb.addEventListener('click',async()=>{
+        pb.disabled=true;
+        let r3=null;
+        try{r3=api.ai_queue_restore&&await api.ai_queue_restore();}
+        catch(e){}
+        whisper(r3&&r3.ok?((r3.restored||0)+' put back in the line')
+                         :((r3&&r3.why)||'there was nothing to put back'));
+        _letGo=0; rf();});
+      box.append(pb);
+    };
     if(!items.length){
       if(!sd&&!nx)box.append(el('div','vempty','nothing is waiting '
         +'\u2014 the \u26a1 bolt puts recordings here, and the '
         +'shelf sweep names its next pick here'));
+      putBack();
       return;
     }
     box.append(el('div','aiqhead','waiting in line \u00b7 '
@@ -5718,7 +5789,6 @@ function queuePlate(){
       const rm=el('button','wbtn mini danger','\u00d7');
       rm.title='Let this one out of the line';
       up.disabled=(i===0);dn.disabled=(i===items.length-1);
-      const rf=()=>{sig=null;paint();};
       up.addEventListener('click',async()=>{
         try{await api.ai_queue_move(it.path,-1);}catch(e){}
         whisper('moved sooner in the line');rf();});
@@ -5729,7 +5799,9 @@ function queuePlate(){
         let r2=null;
         try{r2=api.ai_queue_drop&&await api.ai_queue_drop(it.path);}
         catch(e){}
-        whisper(r2&&r2.ok?'let out of the line'
+        if(r2&&r2.ok)_letGo=(r2.restorable||0);
+        whisper(r2&&r2.ok?'let out of the line \u2014 "Put back" '
+                          +'below undoes it'
           :'it was not in the line');rf();});
       r.append(up,dn,rm);box.append(r);
     });
@@ -5744,11 +5816,16 @@ function queuePlate(){
         clearTimeout(b._arm);b._arm=null;
         let r2=null;
         try{r2=api.ai_queue_clear&&await api.ai_queue_clear();}catch(e){}
+        _letGo=(r2&&r2.restorable)||0;
         whisper('the line is empty \u2014 '
-          +((r2&&r2.dropped)||0)+' let go');
+          +((r2&&r2.dropped)||0)+' let go. "Put back" undoes this.');
         rf();});
       box.append(lg);
     }
+    /* 185 waiting rows left his line in seven seconds tonight and
+       there was nothing anywhere that could return them: "i had like
+       200 other things queued, everything dissapeared". */
+    putBack();
   };
   const tick=async()=>{
     if(!document.body.contains(box))return;
@@ -5780,6 +5857,7 @@ function refusalsPlate(){
       'nothing here \u2014 the tome has not given up on anything.'));return;}
     rows.forEach(rw=>{
       const r=el('div','srow');
+      r.dataset.refusal=String(rw.path||'');
       r.style.cssText='flex:0 0 auto;display:flex;align-items:center;gap:8px;'
         +'padding:3px 8px;min-height:0';
       const base=String(rw.path).split(/[\\/]/).pop().replace(/\.mp4$/i,'');
@@ -5799,14 +5877,61 @@ function refusalsPlate(){
       b.addEventListener('click',async()=>{
         b.disabled=true; b.textContent='asked';
         let ok=null;
+        /* NOT a from-scratch ask. Being forced already zeroes the
+           three-try wall and already restarts a review that had
+           completed, so "fresh" would buy nothing here - and it would
+           archive the senses sidecar, which is where his typed voice
+           names live. */
         try{ ok=await api.prioritise(rw.path,WANT[rw.kind]||'all'); }catch(e){}
-        whisper(ok&&ok.ok?'asked again \u2014 it starts now'
+        /* it QUEUES now - it used to seize the card, so pressing
+           four of these ran one recording and binned the other
+           three without a word */
+        whisper(ok&&ok.ok?'asked again \u2014 at the front of the line'
                          :(ok&&ok.why)||'that would not start');
         if(ok&&ok.ok)r.remove();
         else{b.disabled=false;b.textContent='Ask again';}
       });
       b.style.flex='0 0 auto'; r.append(b); box.append(r);
     });
+    if(rows.length>1){
+      /* ONE PRESS FOR ALL OF THEM. Pressing them one by one is what
+         he did tonight, four times in two seconds, and only the last
+         survived. */
+      const all=el('button','wbtn','Ask again for all '+rows.length);
+      all.style.cssText='align-self:flex-start;margin:6px 8px 2px';
+      all.addEventListener('click',async()=>{
+        all.disabled=true; all.textContent='asking\u2026';
+        let n=0;
+        const left=[];
+        /* BACKWARDS ON PURPOSE. Every ask takes the front of the
+           line, so walking the shelf top-down landed them in the
+           line bottom-up - the order on screen reversed itself. */
+        for(const rw of [...rows].reverse()){
+          let ok=null;
+          try{ ok=await api.prioritise(rw.path,WANT[rw.kind]||'all'); }
+          catch(e){}
+          if(ok&&ok.ok){
+            n++;
+            /* a row that IS in the line no longer belongs on the
+               shelf of things the tome gave up on. Matched by walking
+               the children rather than a selector: a Windows path is
+               full of backslashes and makes a hostile one. */
+            const m0=[...box.children].find(
+              x=>x.dataset&&x.dataset.refusal===String(rw.path||''));
+            if(m0)m0.remove();
+          }else left.push(rw);
+        }
+        whisper(n?(n+' put back at the front of the line'
+                     +(left.length
+                        ?' \u2014 '+left.length+' still would not start'
+                        :'')):'none of them would start');
+        if(left.length){ all.disabled=false;
+          all.textContent='Ask again for all '+left.length;
+          rows=left; }
+        else all.remove();
+      });
+      box.append(all);
+    }
   })();
   return box;
 }
@@ -5858,7 +5983,7 @@ function workPlate(){
     .forEach(k=>box.append(rows[k].r));
   /* the waiting line lives on the RIGHT LEAF now (queuePlate) - a
      real list with remove and let-go, not a footnote under the rows */
-  const set=(o,live,what,name,pct,onStop,queued)=>{
+  const set=(o,live,what,name,pct,onStop,queued,stopLabel)=>{
     /* MONOTONE WITHIN ONE JOB. Real anchors arrive at their own pace;
        a bar that leaps between them - or backwards - reads as broken.
        The name is the job's identity: a new name resets the clamp. */
@@ -5882,6 +6007,11 @@ function workPlate(){
     o.pct.textContent=has?Math.round(pct)+'%':'';
     o.stop.style.display=onStop?'':'none';
     o.stop.onclick=onStop||null;
+    /* THIS BUTTON IS SHARED BY EVERY LABOUR ON THE PLATE - the reader,
+       an export, a save, colour being restored. Naming it at creation
+       renamed it for all of them; only the job that IS a skip says
+       so, and everything else keeps the honest default. */
+    o.stop.textContent=stopLabel||'Stop';
     o.alt.style.display='none'; o.alt.onclick=null;
     o.go.style.display='none'; o.go.onclick=null;
     o.redo.style.display='none'; o.redo.onclick=null;
@@ -6060,17 +6190,21 @@ function workPlate(){
               +'\n'+tally,
             job?job.pct:null,
             ()=>{ (async()=>{let r=null;
-                    try{r=await api.ai_stop_current();}catch(e){}
+                    /* SKIP, NOT SILENCE. This called ai_stop_current,
+                       which stood EVERY lane down until Resume - he
+                       pressed it on one recording three times in one
+                       evening and the whole reader went quiet: "i
+                       dont know why everything was paused??". To
+                       silence the tome there is a button that says
+                       so, on this very page. */
+                    try{r=await api.ai_skip_current();}catch(e){}
                     if(!(r&&r.ok)){
                       whisper((r&&r.why)||'nothing was running');
                       return;}
-                    whisper('stopped \u2014 everything is holding '
-                      +'now, nothing else starts'
-                      +((r&&r.requeued)
-                        ?'; this one waits at the FRONT of the line'
-                        :'')
-                      +'. Press Resume on a row to start that one '
-                      +'again.'); })(); });
+                    whisper('skipped \u2014 what it had already '
+                      +'written stays written, and the next job '
+                      +'starts now. Nothing else was paused.'); })(); },
+            null,'Skip this one');
         holdBtn(o,kind); catchBtn(o,k); redoBtn(o,kind); return;
       }
       if(ai&&ai.forced&&ai.forced_want&&
@@ -6832,8 +6966,16 @@ function renderSet(cL,cR,app,spreadIdx){
       +'tome: open LORE tomorrow and the same line continues.');
     divider(R,'Given up on');
     R.append(refusalsPlate());
-    hint(R,'Recordings the tome tried and let go of, and why. Ask again '
-      +'sends one straight back to the front of the queue.');
+    hint(R,'Nothing here is lost or broken \u2014 this is the tome '
+      +'being honest. It tries a recording three times; if all three '
+      +'end without a result (the model would not load, it ran out of '
+      +'memory, the file would not open, you closed LORE mid-way) it '
+      +'stops retrying by itself rather than grinding the same '
+      +'failure for ever. The line to the left is what WILL run; this '
+      +'is what it stopped offering. "Ask again" puts one back at the '
+      +'front of that line and starts it fresh \u2014 worth pressing '
+      +'after an update, or once a game has closed and the graphics '
+      +'card is free again.');
     divider(R,'Where the work happens');
     R.append(el('div','shint','Recordings are staged on a scratch drive while '
       +'they are made, then welded into the finished film. When the library '
@@ -7336,7 +7478,11 @@ function simplifyFlightFace(n){
 function lightFace(idx,side){
   const n=el('div'),sp=S.spreads[idx],baseHue={c:'#8a6f42',g:'rgba(138,111,66,.35)'};
   if(sp&&sp.type==='chapter'){
-    const g=sp.game,hue=sp.hue||baseHue,suffix=sp.pagesN>1?` · ${roman(sp.k+1)}`:'';
+    /* THE SAME WORDS AS THE LANDED PAGE. This drew a bare roman
+       numeral, so every turn flashed "· II" before settling on
+       "· page 2 of 2". */
+    const g=sp.game,hue=sp.hue||baseHue,
+          suffix=sp.pagesN>1?` \u00b7 page ${sp.k+1} of ${sp.pagesN}`:'';
     glyphmark(n,g.key,hue,(side==='R'?2:1)+sp.k*2);
     if(side==='L'){
       if(sp.k===0){const stats=[];
@@ -7344,7 +7490,10 @@ function lightFace(idx,side){
         if(g.clips.length)stats.push(`<b>${g.clips.length}</b> clip${g.clips.length>1?'s':''}`);
         const total=(g.sessions.concat(g.clips)).reduce((a,v)=>a+(v.size||0),0);stats.push(`<b>${esc(fmtSize(total))}</b>`);
         ptitle(n,`chapter ${roman(sp.gi+1)} — ${_flightLabel(sp.lItems)}`,g.display,hue,stats.join(' &nbsp;·&nbsp; '),g.key);
-      }else ptitle(n,`chapter ${roman(sp.gi+1)} — ${_flightLabel(sp.lItems)}${suffix}`,g.display,hue,null,null);
+      }else ptitle(n,`chapter ${roman(sp.gi+1)} — ${_flightLabel(sp.lItems)}${suffix}`,
+                   g.display,hue,
+                   `<b>${mediaItems(g).length}</b> in this chapter altogether`,
+                   null);
       renderFlightItems(n,sp.lItems,hue);folio(n,idx,'l',g.display);
     }else{
       if(sp.rItems&&sp.rItems.length){ptitle(n,`${_flightLabel(sp.rItems)}${suffix}`,g.display,hue);renderFlightItems(n,sp.rItems,hue);}
