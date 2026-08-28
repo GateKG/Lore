@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.19"
+APP_VERSION = "3.20"
 
 try:
     import psutil
@@ -181,6 +181,12 @@ DEFAULTS = {
     "scratch_dir":       "auto",
     "afk_pause":         True,
     "afk_minutes":       4,
+    # AFK CATCH-UP. When he has been away this long, the tome is allowed
+    # to work through EVERYTHING it owes - sound, transcripts, the
+    # review, the audit - even if he left it paused or standing down.
+    # The moment he touches anything it goes back exactly as it was.
+    "afk_ai":            False,
+    "afk_ai_minutes":    15,
     # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
     # loopback) instead of everything the speakers play - Discord and
     # Spotify stay out of the video. Falls back to normal system audio
@@ -652,6 +658,7 @@ def _sanitize_settings(d):
         "clip_hotkey_seconds": (1, 3600), "discord_max_mb": (1, 1000),
         "discord_clip_seconds": (1, 3600), "discord_quality_mbps": (1, 1000),
         "sdr_finish_max_min": (1, 600), "afk_minutes": (1, 120),
+        "afk_ai_minutes": (1, 240),
     }
     for k, (lo, hi) in INT_BOUNDS.items():
         try:
@@ -1349,6 +1356,9 @@ def _cursor_pos():
 
 # breadcrumb state: the last idle reading, where the cursor was, and when
 # the log last spoke (>=10 min between lines - never a log storm)
+# THE LAST READING OF THE IDLE CLOCK, shared by everything that wants
+# to know without paying for another controller poll.
+_AFK_SEEN = {"t": 0.0, "v": 0.0}
 _AFK_CLK = {"prev": 0.0, "pos": None, "said": 0.0}
 
 
@@ -1375,7 +1385,32 @@ def _afk_idle_seconds():
         log(f"AFK countdown reset at {int(prev // 60)} min by {src}.")
     _AFK_CLK["prev"] = got
     _AFK_CLK["pos"] = _cursor_pos()
+    # every reader shares this one poll - see _afk_idle_recent
+    _AFK_SEEN["t"] = now
+    _AFK_SEEN["v"] = got
     return got
+
+
+def _afk_idle_recent(max_age=2.0):
+    """The idle clock WITHOUT adding another poll of the controller.
+
+    _afk_idle_seconds calls _pad_check, which reads "the stick moved"
+    as a DELTA against the previous poll. Polling four times as often
+    makes every delta a quarter of the size, so a slow stick sweep
+    that used to clear the movement floor can stop clearing it - and
+    that would quietly blunt the recorder's own AFK pause. The
+    recorder's beat stays the one authoritative caller; everything
+    added since reads its result while it is fresh.
+
+    Ageing the cached value forward can only ever over-state how long
+    he has been away, by at most max_age. On a fifteen-minute
+    threshold that is nothing, and on the five-second "he is back"
+    test it costs at worst one more beat before the card goes back."""
+    now = time.time()
+    t = _AFK_SEEN.get("t") or 0
+    if t and 0 <= now - t < max_age:
+        return float(_AFK_SEEN.get("v") or 0) + (now - t)
+    return _afk_idle_seconds()
 
 
 def _inp_beat(session):
@@ -8661,7 +8696,16 @@ def _watch_core(ctl):
             # "anytime, even mid-game" and could not possibly deliver it -
             # the call site was unreachable during a recording, which is most
             # of the time on this machine.
+            # ...and AFK CATCH-UP has to be reached here too, or the
+            # one situation it exists for - a game left running while
+            # he walks away - is the one situation it never sees. The
+            # tick's own gates still decide whether anything RUNS; this
+            # only lets the question be asked. It must also be reached
+            # to RELEASE: an override that engaged on the desktop and
+            # then had a recording start would otherwise latch on with
+            # no beat left to turn it off.
             if session is not None and (SETTINGS.get("always_read")
+                                        or SETTINGS.get("afk_ai")
                                         or _AI.get("force")
                                         or _AI.get("force_queue")):
                 _ai_tick(ctl)
@@ -8709,11 +8753,19 @@ def _watch_core(ctl):
                     if _bg_work_allowed():
                         _sdr_finish_tick(ctl)  # truly idle: HDR->SDR
                     _ai_tick(ctl)              # ...and let the tome read its books
-                elif SETTINGS.get("always_read") or _AI.get("force") \
-                        or _AI.get("force_queue"):
+                elif (SETTINGS.get("always_read")
+                      or SETTINGS.get("afk_ai")
+                      or _AI.get("force")
+                      or _AI.get("force_queue")):
                     # a game is in front, or one is being recorded, and you have
                     # said to read anyway. It runs BELOW NORMAL and the game
                     # keeps the GPU - only the disk is shared.
+                    # afk_ai is here for the same reason it is on the gate
+                    # above: opening a game, tabbing out and walking away
+                    # must still let the catch-up be ASKED. Whether
+                    # anything runs is still decided by the tick's own
+                    # gates, and the describer still refuses to load onto
+                    # a card a game has focus of.
                     _ai_tick(ctl)
                 if auto:
                     _sdr_finish_abort()        # game first - the GPU is theirs now
@@ -10484,11 +10536,183 @@ def _ai_effective_lane(kind, name):
     return kind or "thinking"
 
 
+# AFK CATCH-UP, live. "on" only while he is away AND the setting is
+# on; "held"/"shut" are exactly how he left things, kept so they can be
+# put back untouched.
+_AFKAI = {"on": False, "since": 0.0, "idle": 0.0,
+          "held": None, "shut": None, "woke": 0}
+# _afk_ai_tick runs on the watcher thread while afk_ai_set and
+# _afk_ai_forget run on the pywebview thread: arming and releasing are
+# both check-then-act on the dict above. Held ONLY across the swap.
+_AFKAI_LOCK = threading.Lock()
+
+
 def _bg_work_allowed():
     """One question, one answer: may ANY background work run? The
     master switch is the whole answer - the finer switches and holds
-    speak below it."""
+    speak below it.
+
+    ...unless he is genuinely away and asked for the catch-up, in which
+    case the machine is the tome's until he comes back. Note this reads
+    the OVERRIDE and never his saved preference: bg_shutdown is written
+    to settings.json, so flipping it here would quietly rewrite what he
+    chose and survive the restart."""
+    if _AFKAI.get("on"):
+        return True
     return not SETTINGS.get("bg_shutdown")
+
+
+def _afk_ai_off_kinds():
+    """Which parts of the suite are switched OFF in Settings, in his
+    words. The catch-up lifts pauses, never these - so it says which
+    ones it is going to skip rather than appearing to do less than it
+    promised."""
+    off = []
+    if not SETTINGS.get("ai_highlights", True):
+        off.append("sound & gold moments")
+    if not SETTINGS.get("ai_transcribe", True):
+        off.append("transcripts")
+    if not SETTINGS.get("insights_auto", True):
+        off.append("the review")
+    try:
+        if _describer_paths() is None:
+            off.append("the describer is not installed")
+    except Exception:
+        pass
+    try:
+        if _reader_paths() is None and SETTINGS.get("ai_transcribe", True):
+            off.append("the reader is not installed")
+    except Exception:
+        pass
+    return off
+
+
+def _afk_ai_forget(lanes=None):
+    """He has just spoken about these lanes, so the catch-up's memory
+    of them is void.
+
+    The release used to compare each lane against the all-false state
+    the override wrote, which notices a Stop (it ADDS a hold) but is
+    blind to a Resume (it leaves the lane exactly as the override left
+    it). Rather than guess, every button that sets a hold says so."""
+    with _AFKAI_LOCK:
+        if not _AFKAI.get("on"):
+            return
+        was = _AFKAI.get("held")
+        mine = _AFKAI.get("set")
+        for k in (lanes or ("listening", "hearing", "thinking",
+                            "auditing")):
+            if isinstance(was, dict):
+                was.pop(k, None)
+            if isinstance(mine, dict):
+                mine.pop(k, None)
+
+
+def _afk_ai_release(why=""):
+    """Put back exactly what he had, and hand the card back."""
+    with _AFKAI_LOCK:
+        if not _AFKAI.get("on"):
+            return False            # the other thread already has it
+        was = dict(_AFKAI.get("held") or {})
+        mine = dict(_AFKAI.get("set") or {})
+        shut = bool(_AFKAI.get("shut"))
+        _AFKAI["on"] = False
+        _AFKAI["held"] = None
+        _AFKAI["shut"] = None
+        _AFKAI["set"] = None
+    held = _AI.setdefault("held", {})
+    for k in ("listening", "hearing", "thinking", "auditing"):
+        # HIS PRESS OUTRANKS MY SNAPSHOT, in both directions. A Stop
+        # ADDS a hold and is caught by the comparison below; a Resume
+        # leaves the lane exactly as the override left it and cannot
+        # be, so the buttons call _afk_ai_forget and the lane simply
+        # is not in `was` any more.
+        if k not in was:
+            continue
+        if k in mine and bool(held.get(k)) != bool(mine.get(k)):
+            continue
+        held[k] = bool(was.get(k))
+    _AI["paused"] = all(held.get(k) for k in
+                        ("listening", "hearing", "thinking", "auditing"))
+    # THE CARD IS HIS AGAIN. Re-holding a lane while the describer is
+    # still running on it is not handing anything back, so whatever is
+    # in hand stops if its own lane is held again - or if the master
+    # switch he had set is back. What it wrote is already on disk.
+    busy = _AI.get("busy")
+    lane = None
+    if busy:
+        try:
+            lane = _ai_effective_lane(busy[0], busy[1])
+        except Exception:
+            lane = busy[0]
+    quiet = bool(shut or (lane and held.get(lane)) or _AI["paused"])
+    if quiet and busy:
+        _ai_abort()
+    log("AFK catch-up ended - " + (why or "you are back")
+        + ". Everything is back exactly as you left it"
+        + ("; the job in hand let go of the card." if quiet
+           and _AI.get("busy") else "."))
+    _ai_state_save()
+    return True
+
+
+def _afk_ai_tick():
+    """One beat of the catch-up: are you away, and for how long?
+
+    Runs BEFORE every other gate on purpose - the whole point is to
+    speak over a master switch that would otherwise return first."""
+    try:
+        if not SETTINGS.get("afk_ai"):
+            _AFKAI["idle"] = 0.0
+            return _afk_ai_release("the setting was switched off")
+        try:
+            mins = max(1, int(SETTINGS.get("afk_ai_minutes") or 15))
+        except Exception:
+            mins = 15
+        idle = _afk_idle_recent()
+        _AFKAI["idle"] = idle
+        if _AFKAI.get("on"):
+            # BACK AT THE DESK. Five seconds, not zero: the clock is
+            # polled every few seconds, so "0" would almost never be
+            # the value we happen to see.
+            if idle < 5:
+                return _afk_ai_release("you are back")
+            return False
+        if idle < mins * 60:
+            return False
+        with _AFKAI_LOCK:
+            if _AFKAI.get("on"):
+                return False        # someone armed it between the two
+            #                         checks: never snapshot twice, or
+            #                         the second one records the state
+            #                         the first already cleared
+            _AFKAI["held"] = dict(_AI.get("held") or {})
+            _AFKAI["shut"] = bool(SETTINGS.get("bg_shutdown"))
+            # what the catch-up itself is about to write, so release can
+            # tell "still as I left it" from "he has since changed this"
+            _AFKAI["set"] = {k: False for k in
+                             ("listening", "hearing", "thinking",
+                              "auditing")}
+            _AFKAI["on"] = True
+            _AFKAI["since"] = time.time()
+            _AFKAI["woke"] = int(_AFKAI.get("woke") or 0) + 1
+            held = _AI.setdefault("held", {})
+            for k in ("listening", "hearing", "thinking", "auditing"):
+                held[k] = False
+        _AI["paused"] = False
+        _AI["t_last"] = 0                # start on this very beat
+        skip = _afk_ai_off_kinds()
+        log("AFK catch-up: no keyboard, mouse or controller for %d "
+            "minutes, so the tome is taking the whole suite - sound, "
+            "transcripts, the review and the audit. Anything you had "
+            "paused is remembered and comes straight back the moment "
+            "you touch something." % mins
+            + ("" if not skip else
+               "  NOT included, because it is switched off in Settings "
+               "rather than paused: " + ", ".join(skip) + "."))
+        return True
+    except Exception:
+        return False
 
 
 def _ai_next_sweep():
@@ -10562,6 +10786,19 @@ def _ai_state_path():
     return os.path.join(_data_dir(), "ai_state.json")
 
 
+def _afk_ai_true_held():
+    """His holds, not the catch-up's. While the override is running the
+    live dict is all-false by design; writing that to ai_state.json
+    would suppress the "lanes that were standing down are awake again"
+    notice at the next boot - and silent holds already cost him a week
+    of asks once."""
+    if _AFKAI.get("on") and isinstance(_AFKAI.get("held"), dict):
+        out = dict(_AI.get("held") or {})
+        out.update(_AFKAI["held"])
+        return out
+    return dict(_AI.get("held") or {})
+
+
 def _ai_state_save():
     """The line, the holds and the master switch, written down - so
     closing LORE and opening it continues the SAME work. The job in
@@ -10579,7 +10816,9 @@ def _ai_state_save():
                           bool(it[2]) if len(it) > 2 else False,
                           list(it[3]) if len(it) > 3 else []]
                          for it in q],
-               "held": dict(_AI.get("held") or {})}
+               # HIS holds, not the catch-up's - see
+               # _afk_ai_true_held
+               "held": _afk_ai_true_held()}
         tmp = _ai_state_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh)
@@ -10705,6 +10944,10 @@ def _ai_ask_unhold(want):
     woke = [k for k in lanes if held.get(k)]
     for k in lanes:
         held[k] = False
+    # HE HAS SPOKEN ABOUT THESE LANES. Without this the AFK catch-up
+    # would put back, on his return, the very holds this ask lifted -
+    # the ask silently re-paused behind him.
+    _afk_ai_forget(lanes)
     _AI["paused"] = all(held.get(x) for x in
                         ("listening", "hearing", "thinking", "auditing"))
     if woke:
@@ -19178,6 +19421,10 @@ def _ai_tick(ctl):
     never while recording, saving, or while the user is watching. One video
     per tick keeps every pause instant."""
     _AI["ctl"] = ctl        # the reader's budget asks it whether he is playing
+    # BEFORE EVERY GATE. The catch-up exists to speak over a master
+    # switch that returns two lines below this one, so it cannot live
+    # any further down.
+    _afk_ai_tick()
     # A FORCED ASK IS NOT SUBJECT TO THE TWO SWITCHES. With Transcribe and
     # Mark-loud-moments both off in Settings this returned at the first
     # line, before the forced loop below could run - so pressing
@@ -19271,7 +19518,17 @@ def _ai_tick(ctl):
         # switch, and it is now what it does. Recording, saving and
         # finishing an edit all keep their veto: the first is his whole
         # point, and the other two have his video file open.
-        if ctl.session is not None or ctl.saving > 0 or _FINISHING["busy"]:
+        # A SUSPENDED SESSION IS NOT A RECORDING. While he is away
+        # the recorder's own AFK pause has already stopped writing, so
+        # reading the library costs it nothing - and that is precisely
+        # when the catch-up is meant to work. A session that is really
+        # recording still vetoes, and saving or finishing an edit veto
+        # always: those two have his video file open.
+        _sess = ctl.session
+        _live = _sess is not None and not getattr(_sess, "suspended", False)
+        _afk_ok = bool(_AFKAI.get("on")) and not _live
+        if ((_sess is not None and not _afk_ok)
+                or ctl.saving > 0 or _FINISHING["busy"]):
             return
         # WHAT USED TO BE HERE: a fourth gate that also refused to work
         # for twenty seconds after he opened ANY recording. The tome is
@@ -21950,12 +22207,17 @@ class _JsApi:
             held.setdefault(_k, False)     # four lanes, always
         if kind in ("listening", "hearing", "thinking", "auditing"):
             held[kind] = (not held.get(kind)) if on is None else bool(on)
+            # HE HAS SPOKEN ABOUT THIS LANE. The AFK catch-up must not
+            # put its own snapshot back over a press he made while the
+            # override was running - in either direction.
+            _afk_ai_forget([kind])
             log(f"{AI_LABEL.get(kind, kind)}: "
                 + ("held." if held[kind] else "carrying on."))
         else:
             want = (not all(held.values())) if on is None else bool(on)
             for k in held:
                 held[k] = want
+            _afk_ai_forget()
             log("Reader " + ("held." if want else "carrying on."))
         _AI["paused"] = all(held.values())        # the old flat flag, kept true
         busy = _AI.get("busy")
@@ -22034,6 +22296,7 @@ class _JsApi:
         # bolt lifts whatever it needs.
         for _k in ("listening", "hearing", "thinking", "auditing"):
             held2[_k] = True
+        _afk_ai_forget()        # his Stop outranks the catch-up's memory
         if chain_tail:
             # the audit TAIL of a describe chain: the ask lives on the
             # thinking lane. Holding only auditing let the very next
@@ -22073,6 +22336,97 @@ class _JsApi:
         _ai_state_save()
         return {"ok": True, "stopped": name, "kind": kind, "lane": lane,
                 "requeued": requeued, "queued_dropped": 0}
+
+    def afk_ai_status(self):
+        """Everything the page needs to SHOW the detection working.
+
+        He has been told twice that AFK detection was fixed and twice
+        found it was not, so this returns the live clock rather than a
+        boolean: seconds since the last input, which device the clock
+        is reading, and how long until it fires. A countdown that
+        visibly resets when he touches the mouse is the only proof
+        worth anything."""
+        try:
+            mins = max(1, int(SETTINGS.get("afk_ai_minutes") or 15))
+        except Exception:
+            mins = 15
+        on = bool(SETTINGS.get("afk_ai"))
+        # the SAME clock the recorder's auto-pause reads - and it
+        # reads the recorder's own poll rather than taking another,
+        # because this runs every two seconds from the page. With the
+        # switch OFF it does not even do that: the pill polls this
+        # forever, and a poll it does not need is paid for out of the
+        # recorder's own measurement.
+        try:
+            # ALWAYS the watcher's own reading, aged forward. This
+            # runs every 2-3 seconds from two places on the page, and
+            # the watcher's beat is slower than that - so a short cache
+            # would let the PAGE poll the controller, shrinking the
+            # deltas the recorder measures stick movement with.
+            idle = float(_afk_idle_recent(1e9))
+        except Exception:
+            idle = 0.0
+        try:
+            kbms = _kbms_idle_ms() / 1000.0
+            pad = (time.time() - _PAD["active_t"]) if _PAD.get("active_t") \
+                else None
+        except Exception:
+            kbms, pad = idle, None
+        # whichever device spoke MOST RECENTLY is the one holding the
+        # clock down - naming it is how a defeated countdown stops
+        # being a mystery
+        src = "keyboard or mouse"
+        if pad is not None and pad < kbms:
+            src = "the controller"
+        # A STICK HELD PAST THE FLOOR COUNTS AS INPUT FOR AS LONG AS
+        # IT IS HELD - deliberately, because a long cruise is a person.
+        # A controller left leaning on something is therefore able to
+        # hold this off for ever, and no automatic rule can safely tell
+        # the two apart. So it is made visible: if the keyboard and
+        # mouse have been quiet for minutes and only the pad is
+        # talking, the page says exactly that.
+        stuck = bool(on and kbms > 300 and pad is not None and pad < 10)
+        return {"enabled": on,
+                "minutes": mins,
+                "pad_stuck": stuck,
+                "running": bool(_AFKAI.get("on")),
+                "idle_s": round(idle, 1),
+                "kbms_s": round(kbms, 1),
+                "pad_s": (round(pad, 1) if pad is not None else None),
+                "pad_seen": bool(_PAD.get("active_t")),
+                "source": src,
+                "left_s": max(0, int(mins * 60 - idle)),
+                "since_s": (round(time.time() - (_AFKAI.get("since") or 0), 0)
+                            if _AFKAI.get("on") else 0),
+                "times": int(_AFKAI.get("woke") or 0),
+                # anything the catch-up will NOT do, and why - a switch
+                # that is OFF is a choice, not a pause, so it is left
+                # alone and named instead of silently skipped
+                "skipping": _afk_ai_off_kinds(),
+                "shutdown": bool(SETTINGS.get("bg_shutdown"))}
+
+    def afk_ai_set(self, on=None, minutes=None):
+        """Turn the catch-up on or off, and/or set how long away counts.
+
+        Switching it OFF while it is running hands the card straight
+        back - it must never leave his lanes woken behind it."""
+        if on is not None:
+            SETTINGS["afk_ai"] = bool(on)
+        if minutes is not None:
+            try:
+                SETTINGS["afk_ai_minutes"] = max(1, min(240, int(minutes)))
+            except Exception:
+                pass
+        try:
+            save_settings(SETTINGS)      # it takes the dict
+        except Exception:
+            pass                         # a disk hiccup may not eat the press
+        if not SETTINGS.get("afk_ai"):
+            _afk_ai_release("the switch was turned off")
+        log("AFK catch-up is %s, after %d minutes away."
+            % ("ON" if SETTINGS.get("afk_ai") else "off",
+               int(SETTINGS.get("afk_ai_minutes") or 15)))
+        return self.afk_ai_status()
 
     def ai_shutdown(self, on=None):
         """THE MASTER SWITCH. Everything background stands down - the
@@ -22500,6 +22854,10 @@ class _JsApi:
                             "auditing") if held.get(k)]
         for k in ("listening", "hearing", "thinking", "auditing"):
             held[k] = False
+        # HE HAS SPOKEN. If the AFK catch-up is running, its snapshot of
+        # these lanes is now void - otherwise coming back would put the
+        # very holds he just cleared straight back on.
+        _afk_ai_forget()
         _AI["paused"] = False
         _AI["t_last"] = 0
         try:

@@ -358,6 +358,42 @@ body.reduced #seal .s-runes,body.reduced #seal .s-ticks{animation:none}
 /* The seal's mirror. OFF is grey and flat, ON is gold and lit - the first
    attempt was two shades of the same beige and you could not tell which state
    you were in, and it was pinned to the window edge, on top of the tabs. */
+/* THE CATCH-UP'S PILL. Every rule its twin has, with the mirror
+   margin dropped - only the rightmost pill is measured against the
+   seal on the far left. */
+#afkread{display:flex;align-items:center;gap:9px;flex:0 0 auto;cursor:pointer;
+  /* --armr is measured from the toggle on the left, so the orb ends up the
+     same distance in from the right edge as the seal is from the left */
+  margin-left:10px;margin-right:var(--armr,0px);
+  padding:4px 10px 4px 12px;border-radius:26px;
+  background:transparent;border:1px solid transparent;
+  /* NOT all: the margin is the mirror offset, measured and set - animating it
+     makes it slide on every relayout, and makes it unreadable to measure */
+  transition:background .2s,border-color .2s,color .2s}
+#afkread:hover{background:rgba(255,246,225,.05);
+  border-color:rgba(232,181,99,.35)}
+#afkread .ar-h{font:600 10px var(--ui);letter-spacing:.3em;color:#7d6a48;
+  text-transform:uppercase;transition:color .2s;line-height:1.35}
+#afkread .ar-sub{font:italic 12px var(--serif);color:#8a7a58;
+  transform:translateY(-1px);transition:color .2s}
+#afkread .ar-s{font:600 17px var(--serif);letter-spacing:.05em;color:#7a6a4e;
+  line-height:1.1;flex:0 0 auto;min-width:30px;transition:color .2s}
+#afkread .ar-orb{width:28px;height:28px;border-radius:50%;flex:0 0 auto;
+  display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(circle at 40% 35%,#3a2f1e,#171009 70%);
+  box-shadow:inset 0 0 0 1px rgba(140,112,68,.5);transition:all .25s}
+#afkread .ar-orb span{width:10px;height:10px;border-radius:50%;
+  background:#4a3f2c;transition:all .25s}
+#afkread.on .ar-h{color:var(--gold);text-shadow:0 0 12px rgba(232,181,99,.35)}
+#afkread.on .ar-s{color:#efe2c2}
+#afkread.on .ar-sub{color:#b7a476}
+#afkread.on .ar-orb{background:radial-gradient(circle at 40% 35%,#6b5220,#2a1d08 70%);
+  box-shadow:inset 0 0 0 1px rgba(232,181,99,.85),0 0 16px rgba(232,181,99,.45)}
+#afkread.on .ar-orb span{background:var(--gold-hi);
+  box-shadow:0 0 10px var(--gold);animation:arpulse 2.6s ease-in-out infinite}
+body.reduced #afkread.on .ar-orb span{animation:none}
+#afkread{margin-right:0}
+#afkread .ar-sub{max-width:170px}
 #anyread{display:flex;align-items:center;gap:9px;flex:0 0 auto;cursor:pointer;
   /* --armr is measured from the toggle on the left, so the orb ends up the
      same distance in from the right edge as the seal is from the left */
@@ -996,6 +1032,13 @@ select.tin option{background:#efe3c4;color:#3a2c1a}
 .wbtn:hover{background:var(--ink);color:var(--page-hi)}
 .wbtn:disabled{opacity:.35;cursor:default}
 .wbtn:disabled:hover{background:rgba(255,250,235,.4);color:inherit}
+/* a dropdown on the PARCHMENT page - the only other select in the app
+   lives in the dark player menu and would paint a black slab here */
+.wsel{border:1px solid rgba(110,88,50,.6);border-radius:8px;
+  background:rgba(255,250,235,.55);color:var(--ink);
+  font:600 11px var(--ui);letter-spacing:.05em;padding:5px 9px;
+  cursor:pointer;flex:0 0 auto}
+.wsel:disabled{opacity:.4;cursor:default}
 .wbtn.danger:hover{background:#7c2d16;border-color:#7c2d16;color:#ffe2d0}
 .wbtn.primary{background:linear-gradient(180deg,var(--gold-hi),var(--gold));
   border-color:rgba(60,40,10,.55);color:#2b1c08;font-weight:700}
@@ -1141,6 +1184,18 @@ body.vfull.vsaid #vbar{left:calc(50% - 186px)}
 #vsaid .sline.now{background:rgba(232,181,99,.18);color:#fff3dc}
 #vsaid .sline b{flex:0 0 auto;color:var(--gold);opacity:.72;font-weight:600;
   font-size:11px;padding-top:2px;font-variant-numeric:tabular-nums}
+/* EVERY empty state, not just the ones inside a viewer panel. This
+   class was styled only under #vsaid/#vchaps/#vseen/#vthread, so the
+   waiting-line plate - which uses the very same class - inherited the
+   page's full-size serif and painted a headline-sized sentence into a
+   scroll box built for small print. That is the clipped "nothing is
+   waiting" he photographed; it looked monitor-specific only because
+   the book scales differently on the second screen. The four rules
+   below are ID-scoped and still win wherever they apply. */
+.vempty{padding:14px 12px;font:italic 12px var(--serif);
+  color:var(--ink-faint);line-height:1.6}
+/* and the plate must not vertically centre a child it then clips */
+.qplate{margin:0}
 #vsaid .vempty{padding:18px 13px;font-family:var(--serif);font-style:italic;
   font-size:12px;color:rgba(214,199,172,.62);line-height:1.65}
 /* THE SHAPE OF THE SESSION, as a list. It used to be labels scattered along
@@ -2275,6 +2330,17 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
   <!-- THE SEAL'S TWIN, at the other end of the apron. The seal says what the
        RECORDER is doing; this says whether the tome is allowed to read while
        you are busy. Same row, same height, text on the inside, orb outermost. -->
+  <!-- AFK CATCH-UP: while he is genuinely away, the tome may work
+       through everything it owes - even what he left paused. It gives
+       every switch back untouched the moment he returns. -->
+  <div id="afkread" role="button" tabindex="0">
+    <div id="arinfo">
+      <div class="ar-h">AFK CATCH-UP</div>
+      <div class="ar-sub">off</div>
+    </div>
+    <div class="ar-orb"><span></span></div>
+    <div class="ar-s">Off</div>
+  </div>
   <div id="anyread" role="button" tabindex="0">
     <div id="arinfo">
       <div class="ar-h">BACKGROUND WORK</div>
@@ -2795,7 +2861,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.19'};},
+      webhook:true,version:'3.20'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2901,6 +2967,14 @@ function makeMock(){
     ai_queue_list:async()=>({ok:true,queue:window.__mockQ||[],
       next:{name:'mock night.mp4',kind:'listening'},
       shutdown:!!window.__mockSd}),
+    afk_ai_status:async()=>({enabled:!!window.__mockAfk,minutes:15,
+      running:false,idle_s:12,kbms_s:12,pad_s:null,pad_seen:false,
+      source:'keyboard or mouse',left_s:888,since_s:0,times:0,
+      shutdown:false}),
+    afk_ai_set:async(on,mins)=>{if(on!=null)window.__mockAfk=!!on;
+      return {enabled:!!window.__mockAfk,minutes:mins||15,running:false,
+              idle_s:12,source:'keyboard or mouse',left_s:888,
+              pad_seen:false,since_s:0,times:0,shutdown:false};},
     ai_queue_move:async()=>({ok:true}),
     ai_queue_drop:async p=>{
       const gone=(window.__mockQ||[]).filter(x=>x.path===p);
@@ -2956,7 +3030,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.19'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.20'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -6952,6 +7026,107 @@ function renderSet(cL,cR,app,spreadIdx){
   }
 
   if(app.key==='work'){
+    divider(L,'While you are away');
+    /* AFK CATCH-UP lives on WORKING because that is the page that
+       says what is running, and this is the switch that can
+       overrule all of it. The readout is the point: he has been
+       told twice that AFK detection was fixed and twice found it
+       was not, so the row shows the live clock rather than
+       asserting anything. */
+    {
+      const wrap=el('div');
+      wrap.style.cssText='display:flex;align-items:center;gap:8px';
+      const sw=el('button','wbtn','\u2610 off');
+      const sel=document.createElement('select');
+      sel.className='wsel';
+      [5,10,15,20,30,45,60,90,120].forEach(n=>{
+        const o=document.createElement('option');
+        o.value=String(n); o.textContent=n+' min';
+        sel.append(o);});
+      wrap.append(sw,sel);
+      const live=el('div','shint');
+      live.style.cssText='margin:2px 0 0 2px;font:italic 11px '
+        +'var(--serif);color:#8a7a58';
+      let st=null,dead=false;
+      const mmss=n=>{n=Math.max(0,Math.round(n));
+        return n<60?(n+' s'):(Math.floor(n/60)+' min '+(n%60)+' s');};
+      const paint=()=>{
+        if(!st)return;
+        sw.textContent=(st.enabled?'\u2611 on':'\u2610 off');
+        sw.classList.toggle('primary',!!st.enabled);
+        sel.value=String(st.minutes||15);
+        sel.disabled=!st.enabled;
+        if(!st.enabled){
+          live.textContent='switched off \u2014 nothing starts on its '
+            +'own while you are away.';
+          return;}
+        if(st.running){
+          live.textContent='RUNNING NOW \u2014 you have been away '
+            +mmss(st.idle_s)+', so the tome is working through '
+            +'everything it owes. It stops and puts every switch back '
+            +'the instant you touch anything.';
+          return;}
+        live.textContent='watching \u2014 last input '+mmss(st.idle_s)
+          +' ago ('+(st.source||'')+')'
+          +(st.pad_seen?', a controller has been seen this run':'')
+          +'. '+mmss(st.left_s)+' more and it starts. '
+          +'Move the mouse and this resets \u2014 that is the check.'
+          /* A STICK HELD PAST THE FLOOR COUNTS AS INPUT for as
+             long as it is held - on purpose, because a long
+             cruise is a person. So a pad left leaning on
+             something can hold this off for ever, and nothing
+             can safely guess which it is. Naming it is the only
+             honest answer. */
+          +(st.pad_stuck
+             ? '  \u26a0 a controller is reporting input every few '
+               +'seconds while the keyboard and mouse have been '
+               +'quiet \u2014 if you are not holding it, a leaning '
+               +'stick is keeping the tome awake.' : '')
+          /* and it may never appear to do less than the whole
+             suite without saying which part is switched off */
+          +((st.skipping&&st.skipping.length)
+             ? '  Not included, because it is switched off in '
+               +'Settings rather than paused: '
+               +st.skipping.join(', ')+'.' : '');
+      };
+      const tick=async()=>{
+        if(dead||!document.body.contains(live)){dead=true;return;}
+        if(typeof _parked==='function'&&_parked(tick))return;
+        try{ if(api.afk_ai_status)st=await api.afk_ai_status(); }catch(e){}
+        paint();
+        setTimeout(tick,2000);
+      };
+      /* and the pill on the apron throws the same switch */
+      window._afkRowRefresh=async()=>{
+        if(dead||!document.body.contains(live))return;
+        try{ if(api.afk_ai_status)st=await api.afk_ai_status(); }catch(e){}
+        paint();
+      };
+      sw.addEventListener('click',async()=>{
+        const want=!(st&&st.enabled);
+        try{ if(api.afk_ai_set)st=await api.afk_ai_set(want); }catch(e){}
+        paint();
+        whisper(want?'AFK catch-up on':'AFK catch-up off');
+        try{if(window._afkPillRefresh)window._afkPillRefresh();}catch(e){}
+      });
+      sel.addEventListener('change',async()=>{
+        try{ if(api.afk_ai_set)
+               st=await api.afk_ai_set(null,parseInt(sel.value,10)); }
+        catch(e){}
+        paint();
+        whisper('the tome waits '+sel.value+' minutes before it starts');
+      });
+      row(L,'Work while I am away',wrap,
+          'When the keyboard, mouse AND controller have all been quiet '
+          +'this long, the tome works through everything it owes \u2014 '
+          +'sound, transcripts, the review and the audit \u2014 even '
+          +'lanes you paused and even if you shut background work down. '
+          +'It puts every one of those switches back exactly as you '
+          +'left it the moment you touch something. This is the same '
+          +'detection the recorder uses to auto-pause.');
+      L.append(live);
+      if(!PREBUILD)tick();
+    }
     divider(L,'At this moment');
     L.append(shutdownBar());
     L.append(workPlate());
@@ -12788,6 +12963,72 @@ function wireInput(){
   /* Every place that REPORTS work is now a door to the page that lists it:
      the saving card top-left, the status line under the seal (the one that
      says "reading big walk..."), and the wordmark goes home. */
+  /* THE CATCH-UP PILL. Polls only while the apron is on screen, and
+     the subtitle carries the live clock so the switch is never a
+     mystery: "after 15 min away" while it waits, "running - away
+     22 min" once it has taken over. */
+  (()=>{
+    const af=$('#afkread');
+    if(!af)return;
+    const sub=af.querySelector('.ar-sub'), sw=af.querySelector('.ar-s');
+    let st=null;
+    const mmss=n=>{n=Math.max(0,Math.round(n));
+      return n<60?(n+'s'):(Math.floor(n/60)+' min');};
+    const paint=()=>{
+      const on=!!(st&&st.enabled), run=!!(st&&st.running);
+      af.classList.toggle('on',on);
+      sw.textContent=on?'On':'Off';
+      if(!on){ sub.textContent='off';
+        af.title='When you are away from the PC, let the tome work '
+          +'through everything it owes \u2014 sound, transcripts, the '
+          +'review and the audit \u2014 even things you have paused. '
+          +'It puts every switch back exactly as you left it the '
+          +'moment you touch the keyboard, mouse or controller.';
+        return; }
+      if(run){ sub.textContent='running \u2014 away '
+                 +mmss(st.idle_s||0);
+        af.title='You have been away '+mmss(st.idle_s||0)+', so the '
+          +'tome is working through everything it owes. Whatever you '
+          +'had paused is remembered and comes back the instant you '
+          +'touch anything.'; }
+      else { sub.textContent='after '+(st.minutes||15)+' min away';
+        af.title='Waiting: '+mmss(st.left_s||0)+' more without the '
+          +'keyboard, mouse or controller and the tome starts working. '
+          +'Last input: '+mmss(st.idle_s||0)+' ago ('+(st.source||'')
+          +'). Change the wait under Settings \u2192 Working.'; }
+    };
+    const tick=async()=>{
+      if(!document.body.contains(af))return;
+      if(typeof _parked==='function'&&_parked(tick))return;
+      try{ if(api.afk_ai_status)st=await api.afk_ai_status(); }catch(e){}
+      paint();
+      setTimeout(tick,3000);
+    };
+    /* THE SETTINGS ROW THROWS THE SAME SWITCH. Without this the pill
+       sat stale for up to three seconds after a press on the other
+       page, which reads exactly like the press not taking. */
+    window._afkPillRefresh=async()=>{
+      try{ if(api.afk_ai_status)st=await api.afk_ai_status(); }catch(e){}
+      paint();
+    };
+    af.addEventListener('keydown',e=>{
+      if(e.key==='Enter'||e.key===' '){e.preventDefault();af.click();}});
+    af.addEventListener('click',async()=>{
+      const want=!af.classList.contains('on');
+      af.classList.toggle('on',want);          /* answer the click now */
+      sw.textContent=want?'On':'Off';
+      try{ if(api.afk_ai_set)st=await api.afk_ai_set(want); }catch(e){}
+      paint();
+      try{if(window._afkRowRefresh)window._afkRowRefresh();}catch(e){}
+      whisper(want
+        ? 'AFK catch-up on \u2014 after '+((st&&st.minutes)||15)
+          +' minutes away the tome works through everything it owes, '
+          +'and puts your switches back the moment you return'
+        : 'AFK catch-up off \u2014 nothing starts on its own while '
+          +'you are away');
+    });
+    if(!PREBUILD)tick();
+  })();
   const ar=$('#anyread');
   if(ar){
     /* MIRROR THE SEAL, not the window edge. The seal is inset by whatever the
