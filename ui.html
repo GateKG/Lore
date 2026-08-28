@@ -951,6 +951,11 @@ body.reduced .proj-glare::after{animation:none}
   margin:3px 0;flex:0 0 auto;background:rgba(255,248,230,.34);
   border:1px solid rgba(110,88,50,.3)}
 .lab.idle{background:rgba(255,248,230,.16);border-color:rgba(110,88,50,.18)}
+/* THE AFK CARD. .lab is already a full-width wrapping flex row, so the
+   text block takes the free space and the two controls sit inside the
+   square at its right - which is what he drew. */
+.afkcard .lmid{flex:1 1 260px;min-width:0}
+.afkcard .wsel{margin-left:2px}
 .lab .ldot{width:6px;height:6px;border-radius:50%;flex:0 0 auto;background:rgba(110,88,50,.4)}
 /* NEXT: not working yet, but nothing is wrong - it is simply behind the one
    that is. A hollow gold ring says "queued", where a grey dot said "dead". */
@@ -2861,7 +2866,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.20'};},
+      webhook:true,version:'3.21'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3030,7 +3035,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.20'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.21'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -7026,16 +7031,24 @@ function renderSet(cL,cR,app,spreadIdx){
   }
 
   if(app.key==='work'){
+    divider(L,'At this moment');
+    L.append(shutdownBar());
+    L.append(workPlate());
+    hint(L,'The tome only works while you are away from a game: reading and '
+      +'listening pause the instant one starts, and a save always finishes. '
+      +'Anything with a Stop can be called off safely - what is already '
+      +'written stays written, and the original is never touched.');
     divider(L,'While you are away');
-    /* AFK CATCH-UP lives on WORKING because that is the page that
-       says what is running, and this is the switch that can
-       overrule all of it. The readout is the point: he has been
-       told twice that AFK detection was fixed and twice found it
-       was not, so the row shows the live clock rather than
-       asserting anything. */
+    /* AFK CATCH-UP: the LAST thing on the page, because it is the
+       thing that overrules everything above it - and built on .lab,
+       the same wide card the plates above use, with its controls
+       inside the card rather than in a 35% settings box beside it. */
     {
-      const wrap=el('div');
-      wrap.style.cssText='display:flex;align-items:center;gap:8px';
+      const card=el('div','lab afkcard');
+      const mid=el('div','lmid');
+      const what=el('div','lwhat','Work while I am away');
+      const name=el('div','lname','');
+      mid.append(what,name);
       const sw=el('button','wbtn','\u2610 off');
       const sel=document.createElement('select');
       sel.className='wsel';
@@ -7043,10 +7056,15 @@ function renderSet(cL,cR,app,spreadIdx){
         const o=document.createElement('option');
         o.value=String(n); o.textContent=n+' min';
         sel.append(o);});
-      wrap.append(sw,sel);
-      const live=el('div','shint');
-      live.style.cssText='margin:2px 0 0 2px;font:italic 11px '
-        +'var(--serif);color:#8a7a58';
+      card.append(mid,sw,sel);
+      const why=el('div','shint','When the keyboard, mouse AND '
+        +'controller have all been quiet this long, the tome works '
+        +'through everything it owes \u2014 sound, transcripts, the '
+        +'review and the audit \u2014 even lanes you paused and even '
+        +'if you shut background work down. It puts every one of those '
+        +'switches back exactly as you left it the moment you touch '
+        +'something. This is the same detection the recorder uses to '
+        +'auto-pause.');
       let st=null,dead=false;
       const mmss=n=>{n=Math.max(0,Math.round(n));
         return n<60?(n+' s'):(Math.floor(n/60)+' min '+(n%60)+' s');};
@@ -7056,41 +7074,43 @@ function renderSet(cL,cR,app,spreadIdx){
         sw.classList.toggle('primary',!!st.enabled);
         sel.value=String(st.minutes||15);
         sel.disabled=!st.enabled;
+        card.classList.toggle('idle',!st.enabled);
         if(!st.enabled){
-          live.textContent='switched off \u2014 nothing starts on its '
-            +'own while you are away.';
+          name.textContent='off \u2014 nothing starts on its own while '
+            +'you are away.';
           return;}
         if(st.running){
-          live.textContent='RUNNING NOW \u2014 you have been away '
+          name.textContent='RUNNING NOW \u2014 you have been away '
             +mmss(st.idle_s)+', so the tome is working through '
             +'everything it owes. It stops and puts every switch back '
-            +'the instant you touch anything.';
+            +'the instant you touch anything.'
+            +((st.skipping&&st.skipping.length)
+               ? '  Not included, because it is switched off in '
+                 +'Settings rather than paused: '
+                 +st.skipping.join(', ')+'.' : '');
           return;}
-        live.textContent='watching \u2014 last input '+mmss(st.idle_s)
+        name.textContent='watching \u2014 last input '+mmss(st.idle_s)
           +' ago ('+(st.source||'')+')'
           +(st.pad_seen?', a controller has been seen this run':'')
           +'. '+mmss(st.left_s)+' more and it starts. '
           +'Move the mouse and this resets \u2014 that is the check.'
-          /* A STICK HELD PAST THE FLOOR COUNTS AS INPUT for as
-             long as it is held - on purpose, because a long
-             cruise is a person. So a pad left leaning on
-             something can hold this off for ever, and nothing
-             can safely guess which it is. Naming it is the only
-             honest answer. */
+          /* A STICK HELD PAST THE FLOOR COUNTS AS INPUT for as long
+             as it is held - on purpose, because a long cruise is a
+             person. So a pad left leaning on something can hold this
+             off for ever, and nothing can safely guess which it is.
+             Naming it is the only honest answer. */
           +(st.pad_stuck
              ? '  \u26a0 a controller is reporting input every few '
-               +'seconds while the keyboard and mouse have been '
-               +'quiet \u2014 if you are not holding it, a leaning '
-               +'stick is keeping the tome awake.' : '')
-          /* and it may never appear to do less than the whole
-             suite without saying which part is switched off */
+               +'seconds while the keyboard and mouse have been quiet '
+               +'\u2014 if you are not holding it, a leaning stick is '
+               +'keeping the tome awake.' : '')
           +((st.skipping&&st.skipping.length)
              ? '  Not included, because it is switched off in '
                +'Settings rather than paused: '
                +st.skipping.join(', ')+'.' : '');
       };
       const tick=async()=>{
-        if(dead||!document.body.contains(live)){dead=true;return;}
+        if(dead||!document.body.contains(card)){dead=true;return;}
         if(typeof _parked==='function'&&_parked(tick))return;
         try{ if(api.afk_ai_status)st=await api.afk_ai_status(); }catch(e){}
         paint();
@@ -7098,7 +7118,7 @@ function renderSet(cL,cR,app,spreadIdx){
       };
       /* and the pill on the apron throws the same switch */
       window._afkRowRefresh=async()=>{
-        if(dead||!document.body.contains(live))return;
+        if(dead||!document.body.contains(card))return;
         try{ if(api.afk_ai_status)st=await api.afk_ai_status(); }catch(e){}
         paint();
       };
@@ -7115,25 +7135,12 @@ function renderSet(cL,cR,app,spreadIdx){
         catch(e){}
         paint();
         whisper('the tome waits '+sel.value+' minutes before it starts');
+        try{if(window._afkPillRefresh)window._afkPillRefresh();}catch(e){}
       });
-      row(L,'Work while I am away',wrap,
-          'When the keyboard, mouse AND controller have all been quiet '
-          +'this long, the tome works through everything it owes \u2014 '
-          +'sound, transcripts, the review and the audit \u2014 even '
-          +'lanes you paused and even if you shut background work down. '
-          +'It puts every one of those switches back exactly as you '
-          +'left it the moment you touch something. This is the same '
-          +'detection the recorder uses to auto-pause.');
-      L.append(live);
+      L.append(card,why);
       if(!PREBUILD)tick();
     }
-    divider(L,'At this moment');
-    L.append(shutdownBar());
-    L.append(workPlate());
-    hint(L,'The tome only works while you are away from a game: reading and '
-      +'listening pause the instant one starts, and a save always finishes. '
-      +'Anything with a Stop can be called off safely - what is already '
-      +'written stays written, and the original is never touched.');
+
     divider(R,'Waiting in line');
     R.append(queuePlate());
     hint(R,'Everything that will run, in order, by name \u2014 move it, '
