@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.21"
+APP_VERSION = "3.22"
 
 try:
     import psutil
@@ -5075,7 +5075,7 @@ _LVL_V = 2          # the loudness curve behind the sound graph
 # WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
 # learns to hear something it could not hear before; 2 is the reader
 # whose transliteration wall faces both ways.
-_STT_READER = 2
+_STT_READER = 3
 
 
 def _stt_reader_note():
@@ -12339,6 +12339,7 @@ def _transcribe_one(video_path):
                 f"{cnt.get('arabizi', 0)} Arabizi re-ask(s), "
                 f"{cnt.get('leash', 0)} language re-ask(s), "
                 f"{cnt.get('echo', 0)} prompt echo(es) re-asked, "
+                f"{cnt.get('physics', 0)} impossible-speed re-ask(s), "
                 f"{cnt.get('translit', 0)} Arabic-in-Latin re-ask(s) "
                 f"({cnt.get('translit_won', 0)} kept), "
                 f"{cnt.get('enwall', 0)} English-in-Arabic re-ask(s) "
@@ -16806,7 +16807,21 @@ def _aud_dossier(g, src, ins):
         if not txt:
             continue
         mark = ">>> " if abs(a - t) < 1.0 else "    "
-        lang = "[ar]" if str(sg.get("lang") or "") == "arabic" else "[en]"
+        # THE TAG IS THE MODEL'S GUESS; THE SCRIPT IS WHAT IT WROTE.
+        # 4,178 Arabic-script lines in this library are tagged
+        # "english", and this label fed that lie to every dossier the
+        # auditor ever built. Judged from the characters at read time,
+        # every existing sidecar heals with zero writes to the library.
+        _dl = [c2 for c2 in txt if c2.isalpha()]
+        _da = sum(1 for c2 in _dl if "\u0600" <= c2 <= "\u06ff")
+        if _dl and _da / float(len(_dl)) > 0.5:
+            lang = "[ar]"
+        elif _dl and sum(1 for c2 in _dl
+                         if c2.isascii()) / float(len(_dl)) > 0.5:
+            lang = "[en]"
+        else:
+            lang = ("[ar]" if str(sg.get("lang") or "") == "arabic"
+                    else "[en]")
         outl.append(mark + lang + " " + txt[:110])
         if len(outl) >= 14:
             break

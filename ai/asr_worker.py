@@ -344,7 +344,7 @@ def _arabizi(t):
 # read yesterday - and nothing on disk said which reader had written a
 # transcript, so there was no way even to ask. Every transcript carries
 # this number now; the app counts them and says the number out loud.
-READER = 2
+READER = 3
 
 # HOW MANY EXTRA REQUESTS THE TWO NEW WALLS MAY SPEND, the same
 # reasoning as TRANSLIT_MAX: not a budget, a stop, so a night that goes
@@ -735,7 +735,8 @@ def main(src, dst, mic=None):
     # how often the guards fired - the app logs one summary line per job
     stats = {"arabizi": 0, "leash": 0, "echo": 0, "translit": 0,
              "translit_won": 0, "mic_lines": 0, "enwall": 0,
-             "enwall_won": 0, "laugh": 0, "laugh_won": 0}
+             "enwall_won": 0, "laugh": 0, "laugh_won": 0,
+             "physics": 0}
     # AND WHAT ELSE HAPPENED, in words. These used to go to stderr, which
     # the app only reads when the job FAILS - so a mic layer that quietly
     # skipped itself left no trace anywhere on a successful run.
@@ -968,12 +969,75 @@ def main(src, dst, mic=None):
         def toks(s):
             return [w for w in re.findall(r"[a-z']+", s.lower())
                     if len(w) > 3 and w not in _CTX_STOP]
+        # THE SHORT ARM. The seven-word floor below exempts exactly the
+        # shape the library is full of: "Bloodthief." as a whole line,
+        # nine times in one night nobody said it. A short line that
+        # collapses to the game's own title (give or take one word) IS
+        # the prompt speaking. Only the title clause is consulted -
+        # never the boilerplate, whose words ("friends", "chat",
+        # "discord") are ordinary speech in this house - and the remedy
+        # is the same no-context retry as the long form, so a genuine
+        # shout of the game's name survives by answering the same
+        # words without the prompt.
+        # the clause ends at the first period FOLLOWED BY WHITESPACE -
+        # exactly how the builder terminates it - so a title with its
+        # own periods ("R.E.P.O") survives the parse
+        mg = re.match(r"\s*gaming session of (.+?)\.(?:\s|$)", c.lower())
+        if mg:
+            gt = re.findall(r"[a-z0-9']+", mg.group(1))
+            lt = re.findall(r"[a-z0-9']+", t.lower())
+            gj, lj = "".join(gt), "".join(lt)
+            # the >=4 floor guards against one-letter accidents, but an
+            # EXACT collapse match is the bare-title shape itself - a
+            # shelf named "Ds" deserves the same guard as Bloodthief
+            if (gj and (len(gj) >= 4 or gj == lj)
+                    and lt and len(lt) <= len(gt) + 1
+                    and len(lj) <= len(gj) + 8):
+                # BOUNDARY-ALIGNED ONLY. The join exists so a split or
+                # fused title still matches ("Blood thief." ~
+                # "Bloodthief") - but without boundaries 'peak' hides
+                # inside "don't speak" and a real line on a PEAK night
+                # reads as the prompt leaking. A match must start and
+                # end where a word starts or ends.
+                bounds = {0}
+                acc = 0
+                for w in lt:
+                    acc += len(w)
+                    bounds.add(acc)
+                k = lj.find(gj)
+                while k != -1:
+                    if k in bounds and (k + len(gj)) in bounds:
+                        return True
+                    k = lj.find(gj, k + 1)
         tw = toks(t)
         if len(tw) < 7:
             return False
         cp = {w[:4] for w in toks(c)}
         hit = sum(1 for w in tw if w[:4] in cp)
         return hit / float(len(tw)) >= 0.4
+
+    def _impossible(t, secs):
+        """More characters than a human mouth can make in the time.
+
+        Real speech in this library: median 11.4 chars/sec, p99 26.8.
+        Genuine in-game voice lines max at 16.0. The fabrications - the
+        prompt paraphrased onto music, the "Oh yeah!" x27 attractor -
+        run 78 to 263. Counted on speech characters only: whitespace,
+        punctuation and Arabic tashkeel stripped (full diacritics
+        inflate Arabic counts 40-90% and were the one measured
+        collision risk), and judged by the SCRIPT actually written,
+        never the language tag, because the tag lies."""
+        if not t or secs <= 0:
+            return False
+        body = re.sub("[\u064B-\u0652\u0670]", "", t)
+        body = "".join(ch for ch in body if ch.isalnum())
+        if not body:
+            return False
+        letters = [ch for ch in body if ch.isalpha()]
+        arab = sum(1 for ch in letters if "\u0600" <= ch <= "\u06ff")
+        limit = 30.0 if letters and arab / float(len(letters)) > 0.5 \
+            else 40.0
+        return len(body) / float(secs) > limit
 
     def _foreign(t):
         """Written in an alphabet nobody in this house uses? Only Latin
@@ -1102,13 +1166,48 @@ def main(src, dst, mic=None):
                            + txt[hd[1]:])
                     if _arabic_frac(txt) < 0.5:
                         lang = "english"
+        if txt and _impossible(txt, len(audio) / float(sr)):
+            # A MOUTH CANNOT SAY THIS. The paraphrase leak lands here:
+            # prompt-flavoured sentences stamped on sub-second spans of
+            # music, byte-identical across nights because temperature
+            # is 0. One retry with the context stripped - words
+            # genuinely spoken survive on their own; a fabrication has
+            # nothing to come back as. The retry faces this same test,
+            # so it cannot smuggle the line back in.
+            stats["physics"] += 1
+            pin = lang if lang in KEEP else last
+            t2, l2 = ask(audio, pin, use_ctx=False)
+            if t2 and (_foreign(t2)
+                       or _impossible(t2, len(audio) / float(sr))):
+                t2, l2 = "", None
+            txt, lang = (t2 or ""), (l2 or lang)
+        # THE TAG IS THE MODEL'S GUESS; THE SCRIPT IS WHAT IT WROTE.
+        # 4,178 Arabic-script lines in this library are tagged
+        # "english" - 44% of all Arabic lines - and `last` then learns
+        # the lie, so the leash pins English onto an Arabic night and
+        # forces Latin output on the re-ask. The characters decide now,
+        # BEFORE `last` learns anything.
+        if txt:
+            _sf_letters = [ch for ch in txt if ch.isalpha()]
+            if _sf_letters:
+                _sf_ar = sum(1 for ch in _sf_letters
+                             if "\u0600" <= ch <= "\u06ff")
+                if _sf_ar / float(len(_sf_letters)) > 0.5:
+                    lang = "arabic"
+                elif sum(1 for ch in _sf_letters
+                         if ch.isascii()) / float(len(_sf_letters)) > 0.5:
+                    lang = "english"
         slow_n = slow_n + 1 if time.time() - t_ask > 150 else 0
         if slow_n >= 3:
             raise SystemExit(
                 "three utterances in a row took over 150s each - the server "
                 "is crawling; giving up rather than pinning the job for "
                 "hours")
-        if lang in KEEP:
+        # A BLANKED LINE TEACHES NOTHING. The walls above blank a
+        # condemned line but leave its tag - and the tags of exactly
+        # those lines are the least trustworthy in the file. `last`
+        # learns only from lines that ship.
+        if txt and lang in KEEP:
             last = lang
         if txt:
             sg_new = {"a": int(g["start"] / sr * 1000),
