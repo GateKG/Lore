@@ -279,6 +279,9 @@ class NoSrv:
 
 lore._INS_OWE_CACHE.clear()
 check("a legacy review owes its coverage count", lore._ins_owing_raw(VID))
+_warm = lore._ins_owing(VID)      # warm the cached judge, as a real
+#                                   sweep beat would, and never touch
+#                                   it again for the rest of this test
 lore._DESC_KEEP["srv"] = NoSrv()
 lore._insights_one(VID, forced=False)
 d = json.load(io.open(INS, encoding="utf-8"))
@@ -294,6 +297,13 @@ check("nothing was banked and nothing was staged",
       not os.path.isfile(INS + ".v1") and not os.path.isfile(INS + ".new"))
 lore._INS_OWE_CACHE.clear()
 check("...and the debt is settled", not lore._ins_owing_raw(VID))
+# AND THE CACHED JUDGE MUST AGREE - without clearing it by hand.
+# The stamp restores the mtime on purpose, so the signature cannot
+# see the change: the writer has to tell the caches itself, or the
+# very next sweep beat sends the night down the staged lane and
+# re-describes the whole thing (measured: 200 of 346 nights).
+check("THE CACHED JUDGE AGREES TOO - no hand-clearing",
+      lore._ins_owing(VID) is False)
 
 # a review with NO gen key must NOT be promoted to the current one -
 # that would settle an engine upgrade it never had
@@ -382,6 +392,111 @@ for _ in range(6):
         break
 check("a night the model cannot finish STOPS being re-swept forever",
       budget_hit)
+
+print("\n--- a hole inside an answer is owed like a tail ---")
+
+
+class HoleSrv:
+    """Answers about the head and the far end of every slice, and
+    silently skips its own middle - the shape that used to bank
+    'nothing left' over a 29-row hole."""
+
+    def __init__(self):
+        self.pr = FakePr()
+        self.n = 0
+
+    def ask(self, sysp, user, max_tokens=0, schema=None, images=None):
+        if schema is lore._TITLE_SCHEMA:
+            return json.dumps({"title": "A Night", "summary": "s"})
+        self.n += 1
+        return json.dumps({"segments": [
+            {"name": "head %d" % self.n, "what": "x", "from_line": 0,
+             "to_line": 10, "topics": [], "quote": ""},
+            {"name": "tail %d" % self.n, "what": "x", "from_line": 40,
+             "to_line": 47, "topics": [], "quote": ""}], "moments": []})
+
+    def stop(self):
+        pass
+
+
+for p in (INS, INS + ".new", INS + ".v1", INS + ".v2", INS + ".v3"):
+    if os.path.isfile(p):
+        os.remove(p)
+wr(STT, {"v": lore._STT_V, "engine": "qwen3-asr",
+         "reader": lore._STT_READER, "segments": BIG}, 500)
+lore._video_duration = lambda p: 1600.0
+lore._av_durations = lambda p: (1600.0, 1600.0)
+lore._INS_OWE_CACHE.clear()
+lore._DESC_KEEP["srv"] = HoleSrv()
+lore._insights_one(VID, forced=True)
+d = json.load(io.open(INS, encoding="utf-8"))
+w0 = (d.get("windows") or {}).get("0") or {}
+told = set()
+for sg in (w0.get("segments") or []):
+    if isinstance(sg.get("src"), list) and len(sg["src"]) == 2:
+        told.update(range(sg["src"][0], sg["src"][1] + 1))
+check("the HOLE is tracked, not just the tail - the ranges owed are "
+      "banked with their positions",
+      isinstance(w0.get("pend"), list) and w0.get("pend")
+      and any(a > 0 for a, _b in w0["pend"]))
+check("a model that will not cover its middle still terminates",
+      int(w0.get("asks") or 0) <= 5)
+check("...and the review SAYS it is short rather than reading whole",
+      (d.get("cov") or {}).get("short") is True
+      and (d.get("cov") or {}).get("owed") is False)
+
+
+class FillSrv(HoleSrv):
+    """A realistic model: it skips its middle once, then answers the
+    range it is actually handed."""
+
+    def ask(self, sysp, user, max_tokens=0, schema=None, images=None):
+        if schema is lore._TITLE_SCHEMA:
+            return json.dumps({"title": "A Night", "summary": "s"})
+        self.n += 1
+        if self.n == 1:
+            return HoleSrv.ask(self, sysp, user, max_tokens, schema,
+                               images)
+        body = user.split("\n\n", 1)[-1]
+        n = len([x for x in body.splitlines() if x.strip()])
+        return json.dumps({"segments": [
+            {"name": "filled %d" % self.n, "what": "x", "from_line": 0,
+             "to_line": max(0, n - 1), "topics": [], "quote": ""}],
+            "moments": []})
+
+
+for p in (INS, INS + ".new", INS + ".v1", INS + ".v2", INS + ".v3"):
+    if os.path.isfile(p):
+        os.remove(p)
+lore._INS_OWE_CACHE.clear()
+lore._DESC_KEEP["srv"] = FillSrv()
+lore._insights_one(VID, forced=True)
+d2 = json.load(io.open(INS, encoding="utf-8"))
+w2 = (d2.get("windows") or {}).get("0") or {}
+told2 = set()
+for sg in (w2.get("segments") or []):
+    if isinstance(sg.get("src"), list) and len(sg["src"]) == 2:
+        told2.update(range(sg["src"][0], sg["src"][1] + 1))
+check("a model that answers what it is asked fills the hole "
+      "(%d of 155 rows told)" % len(told2), len(told2) >= 150)
+check("...and the review reads whole, not short",
+      not (d2.get("cov") or {}).get("short")
+      and (d2.get("cov") or {}).get("frac", 0) >= 0.95)
+
+print("\n--- gold is not gold over a retelling nobody read ---")
+for p in (INS, INS + ".new"):
+    if os.path.isfile(p):
+        os.remove(p)
+wr(INS, ins_doc(3), 100)
+wr(AUD, {"v": 7, "complete": True, "when": int(NOW - 50),
+         "src": {"ins": os.path.getmtime(INS),
+                 "stt": os.path.getmtime(STT)}}, 50)
+check("with nothing staged, the audit reads as covering the review",
+      lore._aud_covers_now(VID) is True)
+wr(INS + ".new", ins_doc(3, complete=False, wins={"0": WINS["0"]}), 40)
+check("with a retell staged, it does NOT - the words it read are "
+      "queued for replacement", lore._aud_covers_now(VID) is False)
+os.remove(INS + ".new")
 
 print("\n--- a sighting earns the gold timeline ---")
 

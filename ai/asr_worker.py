@@ -737,19 +737,27 @@ def main(src, dst, mic=None):
     stats = {"arabizi": 0, "leash": 0, "echo": 0, "translit": 0,
              "translit_won": 0, "mic_lines": 0, "enwall": 0,
              "enwall_won": 0, "laugh": 0, "laugh_won": 0,
-             "physics": 0, "leash_kept": 0, "mic_only": 0}
+             "physics": 0, "leash_kept": 0, "mic_only": 0,
+             "mic_dropped": 0}
     # AND WHAT ELSE HAPPENED, in words. These used to go to stderr, which
     # the app only reads when the job FAILS - so a mic layer that quietly
     # skipped itself left no trace anywhere on a successful run.
     notes = []
 
     say_progress(0, 0, 0.0, len(a) / float(sr))    # "started, finding speech"
+    _mix_spans_first = True
     spans = get_speech_timestamps(torch.from_numpy(a), load_silero_vad(),
                                   sampling_rate=sr,
                                   min_silence_duration_ms=300,
                                   max_speech_duration_s=CHUNK_S,
                                   speech_pad_ms=200)
-    if not spans:
+    # A SILENT MIX IS NOT A SILENT NIGHT. This used to end the job
+    # here - before the microphone was ever opened, four lines below -
+    # so a night where the game was quiet and he was the only one
+    # talking transcribed to nothing at all. 225 recordings on the
+    # shelf logged "0 lines". The mic gets its say before anything is
+    # given up on; if it has nothing either, the answer is the same.
+    if not spans and not (mic and os.path.isfile(mic)):
         json.dump({"segments": [], "model": MODEL, "engine": engine,
                    "reader": READER, "counters": stats},
                   open(dst, "w", encoding="utf-8"))
@@ -843,17 +851,24 @@ def main(src, dst, mic=None):
         # rather than cheap re-asks. The longest spans are kept: those
         # are the ones most likely to be speech rather than a noisy
         # floor.
-        if len(_extra) > MIC_EXTRA_MAX:
+        _found = len(_extra)
+        if _found > MIC_EXTRA_MAX:
             _extra.sort(key=lambda s3: s3["end"] - s3["start"],
                         reverse=True)
             _extra = sorted(_extra[:MIC_EXTRA_MAX],
                             key=lambda s3: s3["start"])
-            notes.append("the mic found more spans than the wall allows "
-                         "(%d) - the longest were kept" % MIC_EXTRA_MAX)
+            stats["mic_dropped"] = _found - MIC_EXTRA_MAX
         if _extra:
             stats["mic_only"] = len(_extra)
-            notes.append("the mic found %d span(s) the mix had missed"
-                         % len(_extra))
+            # THE NUMBER IT FOUND, NOT THE NUMBER IT KEPT. This said
+            # "found 60" on a night where it had found far more, and
+            # what was lost was recorded nowhere at all.
+            notes.append(
+                "the mic found %d span(s) the mix had missed"
+                % _found
+                + ("" if _found <= MIC_EXTRA_MAX else
+                   " - the wall keeps the %d longest, %d went unread"
+                   % (MIC_EXTRA_MAX, _found - MIC_EXTRA_MAX)))
             spans = sorted(list(spans) + _extra,
                            key=lambda s3: s3["start"])
 

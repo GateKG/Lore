@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.27"
+APP_VERSION = "3.28"
 
 try:
     import psutil
@@ -14323,9 +14323,18 @@ def _insights_one(video_path, forced=False, fresh=False):
                          and any(g.get("kind") == "untold"
                                  and int(g.get("rows") or 0) >= 6
                                  for g in _gaps)))
+            # SHORT IS NOT THE SAME AS OWED. A window that spent
+            # its five asks is finished - nothing more will be asked
+            # for it, or the card grinds on a night that will never
+            # improve - but if rows are still untold the review must
+            # SAY so rather than read as a whole telling.
+            _short = any(int((w or {}).get("left") or 0) >= 6
+                         for w in done_map.values()
+                         if isinstance(w, dict))
             _cov = {"rows": len(_rows), "told": _in,
                     "frac": round(_in / float(len(_rows) or 1), 3),
-                    "gaps": _gaps[:24], "owed": bool(_owed)}
+                    "gaps": _gaps[:24], "owed": bool(_owed),
+                    "short": bool(_short and not _owed)}
         except Exception:
             _cov = {}
         out = {"v": 3, "engine": "local",
@@ -14498,6 +14507,17 @@ def _insights_one(video_path, forced=False, fresh=False):
                 os.utime(side_p, (_keep_mt, _keep_mt))
             except OSError:
                 pass
+            # AND THE CACHES MUST BE TOLD THE CLOCK LIED. Both owing
+            # judges are keyed on these mtimes, and this is the one
+            # write in the app that changes the ANSWER without moving
+            # one. Left standing, the stale "owed" sends the night
+            # down the staged lane on the very next beat - which is
+            # the whole re-describe this stamp exists to prevent,
+            # plus a banked review and a gold audit gone silver.
+            # Measured on the shelf: 200 of 346 nights, 617 asks.
+            _k = os.path.normcase(os.path.abspath(video_path))
+            _INS_OWE_CACHE.pop(_k, None)
+            _AUD_OWE_CACHE.pop(_k, None)
         if staged:
             # THE SHORTCUT MUST STILL SWAP. A staged .new that arrives
             # here complete-in-all-but-name used to finish IN PLACE -
@@ -14568,9 +14588,21 @@ def _insights_one(video_path, forced=False, fresh=False):
             wmoments = list(_pw.get("moments") or [])
             asked = int(_pw.get("asks") or 0)
             _lf = int(_pw.get("left") or 0)
-            pending = ([(max(0, len(part) - _lf), len(part))]
-                       if mapped and 0 < _lf <= len(part)
-                       else [(0, len(part))])
+            # THE RANGES THEMSELVES, not just how much was left. A
+            # hole in the middle of a window is owed exactly like a
+            # tail is, and only the ranges can say where it is.
+            pending = []
+            for _r in (_pw.get("pend") or []):
+                try:
+                    _a3, _b3 = int(_r[0]), int(_r[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if 0 <= _a3 < _b3 <= len(part):
+                    pending.append((_a3, _b3))
+            if not pending:
+                pending = ([(max(0, len(part) - _lf), len(part))]
+                           if mapped and 0 < _lf <= len(part)
+                           else [(0, len(part))])
             got = None
             imgs = []
             if _desc_mmproj() is not None and not _AI["abort"]:
@@ -14738,6 +14770,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                         return fallback
 
                 last = -1
+                _told = []          # what THIS ask actually spoke for
                 for sgm in stretches:
                     _q_check(sgm, use)
                     a_sg = _lt(sgm.get("from_line"), None)
@@ -14759,6 +14792,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                         _t = max(0, min(len(use) - 1,
                                         int(sgm.get("to_line"))))
                         sgm["src"] = [r0 + min(_f, _t), r0 + max(_f, _t)]
+                        _told.append((r0 + min(_f, _t),
+                                      r0 + max(_f, _t)))
                         last = max(last, r0 + max(_f, _t))
                     except (TypeError, ValueError):
                         pass
@@ -14778,16 +14813,21 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # covers; the remainder is the next range, until the
                 # window is told or the budget is spent.
                 # WHAT IT DID NOT TELL GOES BACK ON THE PILE, on
-                # EVERY exit. Popping the range at the top and
-                # re-queueing only at the bottom meant a parse failure
-                # - the likeliest failure there is - banked the window
-                # claiming it had left nothing, and a night with a
-                # fifth of its rows told was stamped finished for
-                # good.
-                if last < r0:
-                    last = r0 - 1
-                if r1 - 1 - last >= 6:
-                    pending.insert(0, (last + 1, r1))
+                # EVERY exit - and a hole in the middle counts. The
+                # old rule resumed after the HIGHEST row cited, so an
+                # answer about rows 0-10 and 40-47 abandoned 11-39 and
+                # then banked "nothing left". Measured on the real
+                # function: 68 of 155 rows told, stamped complete.
+                _gaps2 = []
+                _cur = r0
+                for _a4, _b4 in sorted(_told):
+                    if _a4 - _cur >= 6:
+                        _gaps2.append((_cur, _a4))
+                    _cur = max(_cur, _b4 + 1)
+                if r1 - _cur >= 6:
+                    _gaps2.append((_cur, r1))
+                for _g4 in reversed(_gaps2):
+                    pending.insert(0, _g4)
                 if got is None:
                     break
             log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} min -> "
@@ -14797,9 +14837,10 @@ def _insights_one(video_path, forced=False, fresh=False):
                                          "moments": wmoments,
                                          "asks": asked,
                                          "rows": len(part),
-                                         "left": (pending[0][1]
-                                                  - pending[0][0])
-                                         if pending else 0}
+                                         "pend": [[a4, b4]
+                                                  for a4, b4 in pending],
+                                         "left": sum(b4 - a4 for a4, b4
+                                                     in pending)}
                 progress = True
                 tries = 0
                 # ON DISK NOW - an interruption after this line loses
@@ -15764,6 +15805,7 @@ def _hl_refold_migration():
                 with open(hp, encoding="utf-8") as fh:
                     hd = json.load(fh) or {}
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
             if int(hd.get("fg") or 0) >= 1:
                 continue
@@ -15783,6 +15825,7 @@ def _hl_refold_migration():
                 with open(hp, encoding="utf-8") as fh:
                     hd2 = json.load(fh) or {}
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
             _af = sum(len(g.get("also") or [])
                       for g in (hd2.get("events") or [])
@@ -15808,6 +15851,7 @@ def _hl_refold_migration():
                     pass          # the pre-fold timeline is banked
                 _atomic_write_json(hp, hd2)
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
     if files:
         log("The fold went back for " + str(total) + " signal(s) it "
@@ -15841,6 +15885,7 @@ def _vis_promote_migration():
                 with open(hp, encoding="utf-8") as fh:
                     hd = json.load(fh) or {}
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
             if int(hd.get("eg") or 0) >= 1:
                 continue
@@ -15860,6 +15905,7 @@ def _vis_promote_migration():
                 with open(vp, encoding="utf-8") as fh:
                     vd = json.load(fh) or {}
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
             looks = [lk for lk in (vd.get("looks") or [])
                      if isinstance(lk, dict)
@@ -15907,6 +15953,7 @@ def _vis_promote_migration():
                 files += 1
                 _atomic_write_json(hp, hd)
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
     if total:
         log("The eye's gate took " + str(total) + " sighting(s) off the "
@@ -18630,6 +18677,17 @@ def _aud_covers_now(video_path, aud=None):
         # torn review carries a matching clock and would otherwise show
         # GOLD - over a description the same audit had just taken
         # apart (review 314).
+        # A STAGED RETELL IS A DESCRIPTION ALREADY CONDEMNED. The
+        # served review's clock never moves while one is pending - it
+        # lives in .new by design - so every lineage test agrees while
+        # the words this audit read are queued for replacement. 55 of
+        # 281 gold nights were in exactly that state; the audit's own
+        # owing test already knew, and only the shelf still said gold.
+        try:
+            if os.path.isfile(_ai_sidecar(video_path, "ins") + ".new"):
+                return False
+        except Exception:
+            pass
         return _ins_done_honest(video_path)
     except Exception:
         return False
@@ -18906,6 +18964,7 @@ def _aud_restrike(video_path, freq):
 _MIG_WALKS = ("refold", "eye", "strike")
 _MIG_BUSY = [False]
 _MIG_BANKED = set()
+_MIG_SKIPPED = [0]      # files a walk could not read this pass
 
 
 def _shelf_migrations():
@@ -18919,11 +18978,16 @@ def _shelf_migrations():
     small read at every later boot instead of eighteen hundred cold
     opens of files that need nothing."""
     mark = os.path.join(_data_dir(), "shelf.mig")
+    # KEYED TO THE LIBRARY IT WALKED. One global stamp meant pointing
+    # the tome at a second shelf would retire walks that had never
+    # seen it.
+    lib = os.path.normcase(os.path.abspath(
+        SETTINGS.get("output_dir", "") or "?"))
     done = set()
     try:
         with open(mark, encoding="utf-8") as fh:
             got = json.load(fh)
-        if isinstance(got, dict):
+        if isinstance(got, dict) and got.get("lib") == lib:
             done = set(str(x) for x in (got.get("done") or []))
     except Exception:
         done = set()          # an older or unreadable marker means
@@ -18970,11 +19034,20 @@ def _shelf_migrations():
                     continue      # NOT recorded: a walk that fell over
                     #               runs again next boot rather than
                     #               being retired half-done
+                if _MIG_SKIPPED[0]:
+                    # A WALK THAT COULD NOT READ SOME OF THE SHELF is
+                    # not finished either - per-file trouble used to
+                    # be swallowed and the walk recorded as done.
+                    log("The " + nm + " walk could not read "
+                        + str(_MIG_SKIPPED[0]) + " file(s) - it will "
+                        "run again rather than be written off.")
+                    _MIG_SKIPPED[0] = 0
+                    continue
                 done.add(key)
             _MIG_BANKED.clear()
             try:
                 with open(mark, "w", encoding="utf-8") as fh:
-                    json.dump({"done": sorted(done)}, fh)
+                    json.dump({"lib": lib, "done": sorted(done)}, fh)
             except Exception:
                 pass
         finally:
@@ -19017,6 +19090,7 @@ def _aud_strike_migration():
                 with open(ap, encoding="utf-8") as fh:
                     ad = json.load(fh) or {}
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
             if int(ad.get("sg") or 0) >= 2:
                 continue
@@ -19119,6 +19193,7 @@ def _aud_strike_migration():
                 files += 1
                 touched.append(p)
             except Exception:
+                _MIG_SKIPPED[0] += 1
                 continue
     _AI["_mig_quiet"] = False
     if touched:

@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.27` (backend) / `3.27` (UI) |
-| **Stamped** | 2026-09-01 20:23 |
-| **Last commit** (source state at report time; the release commit lands after) | f1c334b LORE v3.26 - the evidence keeps its receipts |
-| **lore.py** | 1.2 MB, 28,461 lines, saved 2026-09-01 20:20 |
-| **ui.html** | 0.9 MB, 13,803 lines, saved 2026-09-01 20:20 |
-| **Built exe** | 13.4 MB, 2026-09-01 20:22 |
+| **Version** | `3.28` (backend) / `3.28` (UI) |
+| **Stamped** | 2026-09-01 22:12 |
+| **Last commit** (source state at report time; the release commit lands after) | 355444a LORE v3.27 - it tells the whole night |
+| **lore.py** | 1.3 MB, 28,536 lines, saved 2026-09-01 22:10 |
+| **ui.html** | 0.9 MB, 13,803 lines, saved 2026-09-01 22:10 |
+| **Built exe** | 13.4 MB, 2026-09-01 22:12 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
