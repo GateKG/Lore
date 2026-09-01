@@ -167,13 +167,21 @@ try:
     rt = lore._aud_retell(VID, [10.0, 20.0, 3999.0])
 finally:
     lore._insights_one = _real_ins_one
+# 3.26: A COMPLETE SERVED REVIEW IS NEVER TOUCHED. The cut goes to
+# .new; the upgrade lane refills it and only a complete result swaps.
+# The old in-place cut destroyed three real chapters on the shelf -
+# this suite used to ASSERT that behavior (Codex round four caught it).
 d4 = json.load(io.open(INS, encoding="utf-8"))
-check("two dirty windows cut, the untouched one kept",
-      rt == 2 and set(d4["windows"]) == {"1800"})
-check("the review is honestly incomplete until refilled",
-      d4["complete"] is False and d4["tries"] == 0)
+check("the SERVED review is byte-identical - complete, all windows",
+      d4["complete"] is True and set(d4["windows"]) == {"0", "1800",
+                                                        "3600"})
+d4n = json.load(io.open(INS + ".new", encoding="utf-8"))
+check("the staged .new carries the cut: two dirty windows gone",
+      rt == 2 and set(d4n["windows"]) == {"1800"}
+      and d4n["complete"] is False and d4n["tries"] == 0)
 check("the describer was sent, forced",
       calls == [("night.mp4", True)])
+os.remove(INS + ".new")
 json.dump({"complete": False, "windows": {"0": {}}},
           io.open(INS, "w", encoding="utf-8"))
 lore._insights_one = lambda *a, **k: calls.append("NO") or True
@@ -194,9 +202,15 @@ try:
 finally:
     lore._insights_one = _real_ins_one
 d6 = json.load(io.open(INS, encoding="utf-8"))
-check("refill=False (abort/wind) marks without loading any model",
+d6n = json.load(io.open(INS + ".new", encoding="utf-8"))
+check("refill=False (abort/wind) marks without loading any model - "
+      "and stages, never cuts, the served review",
       rt3 == 1 and "NO2" not in calls
-      and set(d6["windows"]) == {"1800"} and d6["complete"] is False)
+      and d6["complete"] is True
+      and set(d6["windows"]) == {"0", "1800"}
+      and set(d6n["windows"]) == {"1800"}
+      and d6n["complete"] is False)
+os.remove(INS + ".new")
 seg_tw = [{"a": 50000, "b": 51000, "t": "same twin words"},
           {"a": 51500, "b": 52400, "t": "same twin words"}]
 d_tw = json.load(io.open(STT, encoding="utf-8"))

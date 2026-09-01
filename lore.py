@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.25"
+APP_VERSION = "3.26"
 
 try:
     import psutil
@@ -5078,6 +5078,73 @@ _LVL_V = 2          # the loudness curve behind the sound graph
 # learns to hear something it could not hear before; 2 is the reader
 # whose transliteration wall faces both ways.
 _STT_READER = 3
+
+_STT_RD_CACHE = {}
+
+
+def _stt_current_doc(d):
+    """Is this transcript the CURRENT reader's work? v/engine said yes
+    for all 522 pre-gen-3 files on the shelf - the reader generation
+    is the part of freshness v/engine cannot see."""
+    try:
+        eng = str(d.get("engine") or "")
+        return (int(d.get("v") or 0) >= _STT_V
+                and (not eng or eng.startswith(_STT_ENGINE))
+                and int(d.get("reader") or 0) >= _STT_READER)
+    except Exception:
+        return False
+
+
+def _stt_reader_of(video_path):
+    """The reader generation stamped on a transcript, via an 8KB
+    head-read (the key is written before the segments on purpose) and
+    an mtime cache - the sweep and the tally ask per file per beat."""
+    sp = _ai_sidecar(video_path, "stt")
+    try:
+        mt = os.path.getmtime(sp)
+    except OSError:
+        return -1
+    key = os.path.normcase(sp)
+    hit = _STT_RD_CACHE.get(key)
+    if hit and hit[0] == mt:
+        return hit[1]
+    rd = 0
+    try:
+        with open(sp, encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(8192)
+        m = re.search(r'"reader"\s*:\s*(\d+)', head)
+        rd = int(m.group(1)) if m else 0
+    except Exception:
+        rd = 0
+    _STT_RD_CACHE[key] = (mt, rd)
+    return rd
+
+
+def _stt_stale_reader(video_path):
+    """A transcript exists but an older reader wrote it."""
+    rd = _stt_reader_of(video_path)
+    return rd >= 0 and rd < _STT_READER
+
+
+def _worker_reader_gen():
+    """The READER constant of the INSTALLED worker file - the cheap
+    parity check that would have caught the 3.24 drop shipping without
+    the gen-3 reader (a whole redo ran on the old ear, undetected)."""
+    got = _AI.get("_worker_gen")
+    if got is not None:
+        return got
+    gen = 0
+    try:
+        rp = _reader_paths()
+        if rp:
+            with open(rp[1], encoding="utf-8", errors="ignore") as fh:
+                m = re.search(r"^READER\s*=\s*(\d+)",
+                              fh.read(65536), re.M)
+            gen = int(m.group(1)) if m else 0
+    except Exception:
+        gen = 0
+    _AI["_worker_gen"] = gen
+    return gen
 
 
 def _stt_reader_note():
@@ -10760,7 +10827,9 @@ def _ai_next_sweep():
                     val = {"name": os.path.basename(p),
                            "kind": "listening"}
                     break
-                if do_stt and not _ai_sidecar_fresh(p, "stt"):
+                if do_stt and (not _ai_sidecar_fresh(p, "stt")
+                               or (SETTINGS.get("reread_old")
+                                   and _stt_stale_reader(p))):
                     val = {"name": os.path.basename(p),
                            "kind": "hearing"}
                     break
@@ -11160,7 +11229,7 @@ def _read_sidecar(video_path, kind):
                 m["kind"] = ""
     return d
 
-def _ins_retone(moments, sns):
+def _ins_retone(moments, sns, hl=None):
     """The senses cross-examine the review's feelings. A moment filed
     funny or scary is re-read against the arousal curve at that second
     (scored against the night's own spread) and against whether anyone
@@ -11175,8 +11244,13 @@ def _ins_retone(moments, sns):
             return 0
         sv = sorted(v)
         p85 = sv[int(len(sv) * 0.85)]
+        # LAUGHTER LIVES IN THE .hl, NOT THE .sns - the old lookup
+        # searched a sidecar that has never carried a laugh, so the
+        # stand-test could not pass and only the p85 bypass saved any
+        # label. Measured: 1287 of 1444 funny moments had no laugh
+        # within ten seconds of them.
         evs = [(float(e.get("t") or 0), str(e.get("kind") or ""))
-               for e in ((sns or {}).get("events") or [])]
+               for e in ((hl or {}).get("events") or [])]
         n = 0
         for m in moments:
             k = str(m.get("kind") or "")
@@ -11186,16 +11260,16 @@ def _ins_retone(moments, sns):
                 t = float(m.get("t") or 0)
             except (TypeError, ValueError):
                 continue
-            x = v[max(0, min(len(v) - 1, int(t / hop)))]
-            if x < p85:
-                continue              # not even hot - leave the label be
             near = [kk for tt, kk in evs if abs(tt - t) <= 10]
             if k == "funny" and "laugh" in near:
                 continue              # someone really laughed - it stands
             if k == "scary" and "scream" in near:
                 continue              # someone really screamed - it stands
+            x = v[max(0, min(len(v) - 1, int(t / hop)))]
             m["kind0"] = k
-            m["kind"] = "excited"
+            # hot with no laugh is EXCITEMENT; cold with no laugh is
+            # just a moment - a tone word needs its evidence
+            m["kind"] = "excited" if x >= p85 else ""
             n += 1
         return n
     except Exception:
@@ -11334,7 +11408,9 @@ def _ai_pending_counts():
     try:
         for d, kind in _library_dirs(out):
             for v in _scan_dir_mp4s(d, kind):
-                if not _ai_sidecar_fresh(v["path"], "stt"):
+                if not _ai_sidecar_fresh(v["path"], "stt") \
+                        or (SETTINGS.get("reread_old")
+                            and _stt_stale_reader(v["path"])):
                     stt += 1
                 if not _ai_sidecar_fresh(v["path"], "hl"):
                     hl += 1
@@ -12159,6 +12235,23 @@ def _transcribe_one(video_path):
         log("The tome's reader is not installed (looked for ai\\venv and "
             "ai\\asr_worker.py next to the app). Nothing was transcribed.")
         return False
+    _wg = _worker_reader_gen()
+    if 0 < _wg < _STT_READER:
+        # a stale worker would spend minutes writing words the shelf
+        # immediately calls old - refuse up front, once per file, and
+        # say exactly how to fix it. (This is the check that would
+        # have caught the update that shipped without the reader.)
+        if not _AI.get("_worker_gen_said"):
+            _AI["_worker_gen_said"] = True
+            log("The installed reader is generation %d but LORE "
+                "expects %d - transcription is on hold so stale words "
+                "are never written. Re-run the update to refresh "
+                "ai\\asr_worker.py." % (_wg, _STT_READER))
+        try:
+            _AI["failed"][video_path] = os.path.getmtime(video_path)
+        except OSError:
+            pass
+        return False
     py, work = rp
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     if os.name == "nt":
@@ -12167,6 +12260,8 @@ def _transcribe_one(video_path):
                        f"stt_{os.getpid()}_{threading.get_ident()}.wav")
     outj = wav + ".json"
     asrv = None                       # the GPU server, if one comes up
+    _t_run0 = time.time()
+    _vd = _ad = 0.0
     _source_busy_add(video_path)
     try:
         # ALL of the audio, not whichever track ffmpeg felt like: under
@@ -12188,6 +12283,22 @@ def _transcribe_one(video_path):
                     f"{os.path.basename(video_path)} (ffmpeg rc={rc}) - "
                     f"the transcript was not attempted.")
                 _AI["soft_fail"] = True    # a busy disk is not a bad file
+            return False
+        # THE WHOLE NIGHT OR NOTHING. rc=0 with a short file is how a
+        # truncated decode quietly becomes a fresh partial transcript;
+        # the sound pass has refused under-90% coverage forever and
+        # the reader now refuses the same way. The prior transcript,
+        # if any, keeps serving.
+        try:
+            _vd = float(_probe_duration(video_path) or 0.0)
+            _ad = float(_probe_duration(wav) or 0.0)
+        except Exception:
+            _vd = _ad = 0.0
+        if _vd > 60 and _ad and _ad < _vd * 0.9:
+            log(f"Audio for {os.path.basename(video_path)} decoded "
+                f"only {int(_ad)}s of {int(_vd)}s - the transcript "
+                "was not attempted; the previous one stands.")
+            _AI["soft_fail"] = True
             return False
         # THE MIC LAYER (2.81+): extracted beside the mix so the worker
         # can say which lines are HIS voice - not the game's, not a tab's
@@ -12320,8 +12431,21 @@ def _transcribe_one(video_path):
         _atomic_write_json(_ai_sidecar(video_path, "stt"),
                            {"v": _STT_V,
                             "model": data.get("model") or _STT_ENGINE,
-                            "engine": "qwen3-asr", "counters": cnt,
+                            "engine": str(data.get("engine")
+                                          or _STT_ENGINE),
+                            "counters": cnt,
                             "reader": int(data.get("reader") or 1),
+                            # WHAT PRODUCED THIS, PROVABLY. Runtime,
+                            # coverage and route used to vanish with
+                            # the scratch files - "2.5 minutes" was a
+                            # user-observed number nobody could check.
+                            "run": {"elapsed_s": round(
+                                        time.time() - _t_run0, 1),
+                                    "video_s": round(_vd, 1),
+                                    "audio_s": round(_ad, 1),
+                                    "reader": int(data.get("reader")
+                                                  or 0),
+                                    "when": int(time.time())},
                             "segments": segs})
         _AI["index"] = None
         # THE GOLD MOMENTS WERE PICKED WITHOUT THESE WORDS. Sound runs first on
@@ -13622,6 +13746,43 @@ def _ins_owing_raw(video_path):
         return tries < 3
     if isinstance(d.get("windows"), dict) and not d.get("complete"):
         return tries < 3
+    # A NEWER EAR RE-OWES THE REVIEW. When a transcript is replaced
+    # by a newer READER GENERATION (the re-read lane), a complete
+    # review built on the old ear follows it automatically - and the
+    # audit follows the review via _aud_covers_now. Generation-gated,
+    # never mtime-gated: the audit's own fixes move the stt clock and
+    # must not churn a full re-describe.
+    if d.get("complete"):
+        try:
+            # a review with no src_stt stamp was built on a legacy
+            # ear (reader zero) - it follows a re-read exactly like a
+            # stamped one. Zero effect until a gen-3 ear exists for
+            # the night, so the wave is throttled by the re-reads
+            # themselves.
+            if (int((d.get("src_stt") or {}).get("reader") or 0)
+                    < _stt_reader_of(video_path)):
+                return True
+        except Exception:
+            pass
+    # A STAGED RETELL IS OWED TOO. The audit stages its re-describe
+    # in .new at the CURRENT generation; without this clause an
+    # interrupted staged retell slept forever (the served file is
+    # complete, so nothing below fires).
+    if d.get("complete") and d.get("chapters"):
+        try:
+            with open(sp + ".new", encoding="utf-8") as fh:
+                nd = json.load(fh) or {}
+            if (isinstance(nd.get("windows"), dict)
+                    and not nd.get("complete")
+                    and int(nd.get("tries") or 0) < 3
+                    and int(nd.get("gen") or _INS_GENERATION)
+                    >= int(d.get("gen") or 0)):
+                # at least the SERVED doc's generation: a staged
+                # retell copies that gen, so the next engine bump
+                # cannot orphan every interrupted retell on the shelf
+                return True
+        except Exception:
+            pass
     # AN UPGRADE IS OWED, NEVER A WIPE. A finished review from an older
     # engine keeps serving exactly as it is; the sweep rebuilds it into a
     # .new side file and the swap happens only when the new one is
@@ -13651,10 +13812,16 @@ def _ins_owing(video_path):
     moved, neither has the answer."""
     sp = _ai_sidecar(video_path, "ins")
     try:
+        _stp = _ai_sidecar(video_path, "stt")
         sig = (os.path.getmtime(video_path),
                os.path.getmtime(sp) if os.path.isfile(sp) else -1.0,
                os.path.getmtime(sp + ".new")
                if os.path.isfile(sp + ".new") else -1.0,
+               # the reader cascade reads the stt's generation, so a
+               # re-read must bust this cache in-session, not at the
+               # next restart
+               os.path.getmtime(_stp) if os.path.isfile(_stp)
+               else -1.0,
                _desc_mmproj() is not None)
     except OSError:
         return _ins_owing_raw(video_path)
@@ -14007,8 +14174,18 @@ def _insights_one(video_path, forced=False, fresh=False):
                 continue
             kept_m.append(m)
         moms = kept_m
+        _sst = {}
+        try:
+            _sst = {"mt": os.path.getmtime(_ai_sidecar(video_path,
+                                                       "stt")),
+                    "reader": _stt_reader_of(video_path)}
+        except OSError:
+            pass
         out = {"v": 3, "engine": "local", "gen": _INS_GENERATION,
-               "title": str(prior.get("title") or "")[:120],
+               "src_stt": _sst,
+               "title": (lambda _t: _t if len(_t) <= 120 else
+                         (_t[:120].rsplit(" ", 1)[0] or _t[:120]))(
+                   str(prior.get("title") or "")),
                "summary": str(prior.get("summary") or "")[:600],
                "chapters": [], "segments": [],
                # the old cloud pass wrote moments (gold-mark reasons) and
@@ -14071,7 +14248,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                                     "what": what[:220]})
         try:
             sns0 = _read_sidecar(video_path, "sns") or {}
-            rt = _ins_retone(out.get("moments") or [], sns0)
+            hl0 = _read_sidecar(video_path, "hl") or {}
+            rt = _ins_retone(out.get("moments") or [], sns0, hl0)
             if rt:
                 log("The tone curve retoned " + str(rt) + " moment(s) to "
                     "excited - nobody laughed and nobody screamed, the "
@@ -14140,6 +14318,13 @@ def _insights_one(video_path, forced=False, fresh=False):
                        "at": time.time()}
     if not missing and windows:
         _assemble(windows, True, 0)
+        if upgrade:
+            # THE SHORTCUT MUST STILL SWAP. A staged .new that arrives
+            # here complete-in-all-but-name used to finish IN PLACE -
+            # no bank, no swap - and a hard kill during the title ask
+            # lost the audit's retell forever, undetectably.
+            _bank_sidecar(video_path, "ins")
+            os.replace(work_p, side_p)
         log(f"Described {name}: nothing missing - review rebuilt from "
             f"{len(windows)} window(s).")
         return True
@@ -14553,6 +14738,35 @@ def _insights_one(video_path, forced=False, fresh=False):
                             + ", ".join(bad) + " - nobody by that "
                             "name was heard, so it says 'a friend' "
                             "instead.")
+            # THE NAME OF A NIGHT IS A NAME, NOT A LIST. 59.7% of
+            # the shelf's titles were "X, Y, and Z" collections -
+            # three unweighted chapter names validating each other -
+            # and a one-mention subject rode one to the top. List-
+            # shaped or longer than nine words falls back to the name
+            # of the chapter that lived longest: deterministic, and
+            # honest about what most of the night actually was.
+            _t2 = re.sub(r"\s{2,}", " ", str(title or "")).strip()
+            if _t2 and (len(re.findall("[,\u060c]", _t2)) >= 2
+                        or len(_t2.split()) > 9):
+                _bn, _bd = "", -1.0
+                for _k2 in windows:
+                    _w2 = windows[_k2]
+                    for sgm in (_w2.get("segments")
+                                if isinstance(_w2, dict)
+                                else _w2) or []:
+                        _nm = str(sgm.get("name") or "").strip()
+                        try:
+                            _d2 = (float(sgm.get("to") or 0)
+                                   - float(sgm.get("from") or 0))
+                        except (TypeError, ValueError):
+                            _d2 = 0.0
+                        if _nm and _d2 > _bd:
+                            _bn, _bd = _nm, _d2
+                if _bn:
+                    log("The title came back a list (\"" + _t2[:60]
+                        + "\") - the longest-lived chapter names the "
+                        "night instead.")
+                    title = _bn
             prior["title"] = title or prior.get("title") or \
                 (names[0] if names else "")
             prior["summary"] = summary or prior.get("summary") or ""
@@ -15779,6 +15993,48 @@ def _aud_filler():
     _AUD_VOCAB["filler"] = f
     _AUD_VOCAB["filler_at"] = _AUD_VOCAB.get("at")
     return f
+
+
+def _aud_prompt_ear(er):
+    """An 'ear' that is the relisten's own prompt echoed back is fake
+    testimony, not a hearing - the model repeating "Friends gaming on
+    Discord..." passed the vocabulary arm because every word is real
+    (8 of 74 measured restore candidates were this)."""
+    low = str(er or "").lower()
+    return ("friends gaming on discord" in low
+            or "gaming session of" in low
+            or "emirati gulf arabic" in low)
+
+
+def _aud_ear_veto(txt, ear):
+    """Would the current gates preserve this line against a noise
+    strike, given what the re-listen heard? ONE source of truth for
+    the live audit and the strike migration - a hand copy of a gate
+    drifts (this very round's recorder-oracle lesson).
+
+    Arms, in order: whole token-list equality (two listeners repeated
+    the same words), the skeleton comparator (cross-script), whole-
+    string skeleton equality at >=2 consonants (two-consonant names),
+    then the fully-readable-multi-word vocabulary arm. A prompt-echo
+    ear vetoes nothing."""
+    _er = str(ear or "").strip()
+    _txt = str(txt or "").strip()
+    if not _er or _aud_prompt_ear(_er):
+        return False
+    _elt = re.findall(r"[a-z0-9]+", _aud_lat(_er))
+    _sk1 = _aud_skel(_er)
+    if _txt and (
+            (_elt and _elt == re.findall(r"[a-z0-9]+",
+                                         _aud_lat(_txt)))
+            or _aud_ear_agrees(_er, _txt)
+            or (len(_sk1) >= 2 and _sk1 == _aud_skel(_txt))):
+        return True
+    _etk = re.findall("[\u0600-\u06ff]{2,}|[A-Za-z']{3,}", _er)
+    _eok, _ebad = _aud_sense(_er, (_AUD_VOCAB.get("freq") or {}))
+    return bool(_eok and len(_etk) >= 2 and not _ebad
+                and not re.search(
+                    "[\u3040-\u30ff\u31f0-\u4dbf"
+                    "\u4e00-\u9fff\uac00-\ud7af]", _er))
 
 
 def _aud_ear_agrees(ear, heard):
@@ -17022,7 +17278,11 @@ def _aud_relisten(video_path, garble):
                 if txt and len(txt) >= 2:
                     okE, _bw = _aud_sense(txt,
                                           (_AUD_VOCAB.get("freq") or {}))
-                    if okE:
+                    if _aud_prompt_ear(txt):
+                        # the relisten echoed its own prompt - that is
+                        # fake testimony, not a hearing
+                        g["ear_junk"] = True
+                    elif okE:
                         g["ear"] = txt[:160]
                     else:
                         # the second ear produced non-words too - that
@@ -17339,46 +17599,14 @@ def _aud_parse(got, garble):
                 # nothing the library has never heard, and no CJK
                 # static (which slid through on a lone Arabic token).
                 _er = str(row.get("ear") or "").strip()
-                if _er and not row.get("ear_junk"):
-                    # TWO INDEPENDENT LISTENERS CONVERGED. When the
-                    # relisten repeats the line itself - whole tokens,
-                    # or the skeleton comparator across scripts - the
-                    # agreement IS the evidence, and the vocabulary
-                    # test is deliberately skipped: a name the library
-                    # never heard is exactly this case: 8 such
-                    # one-word names were measured banked away as
-                    # [unintelligible], each one re-heard verbatim.
-                    _txt = str(row.get("text") or "").strip()
-                    # the equality arm demands substance: [] == []
-                    # (pure static on both sides) is agreement about
-                    # nothing and must not veto a correct strike
-                    _elt = re.findall(r"[a-z0-9]+", _aud_lat(_er))
-                    _sk1 = _aud_skel(_er)
-                    if _txt and (
-                            (_elt and _elt == re.findall(
-                                r"[a-z0-9]+", _aud_lat(_txt)))
-                            or _aud_ear_agrees(_er, _txt)
-                            # short names skeletonize under the >=3
-                            # containment floor (Ateka -> tk): whole-
-                            # string equality at two consonants is
-                            # still two listeners converging
-                            or (len(_sk1) >= 2
-                                and _sk1 == _aud_skel(_txt))):
-                        v = "unclear"
-                        row["ear_kept"] = True
-                    else:
-                        _etk = re.findall(
-                            "[\u0600-\u06ff]{2,}|[A-Za-z']{3,}",
-                            _er)
-                        _eok, _ebad = _aud_sense(
-                            _er, (_AUD_VOCAB.get("freq") or {}))
-                        if (_eok and len(_etk) >= 2 and not _ebad
-                                and not re.search(
-                                    "[\u3040-\u30ff\u31f0-\u4dbf"
-                                    "\u4e00-\u9fff\uac00-\ud7af]",
-                                    _er)):
-                            v = "unclear"
-                            row["ear_kept"] = True
+                if _er and not row.get("ear_junk") \
+                        and _aud_ear_veto(row.get("text"), _er):
+                    # TWO INDEPENDENT LISTENERS CONVERGED (or the ear
+                    # is fully readable) - the whole decision lives in
+                    # _aud_ear_veto, shared with the strike migration
+                    # so the two can never drift apart.
+                    v = "unclear"
+                    row["ear_kept"] = True
             row["verdict"] = v
             row["vwhy"] = _aud_clip(str(c.get("why") or "").strip())
     fx_raw = got.get("fixes")
@@ -17896,6 +18124,12 @@ def _aud_owing_swept(video_path):
                # audit stays un-owed forever
                os.path.getmtime(_ai_sidecar(video_path, "ins"))
                if os.path.isfile(_ai_sidecar(video_path, "ins")) else -1.0,
+               # a re-read moves the stt clock and re-owes the audit -
+               # paced one per beat through the sweep, never a wall of
+               # them at the next boot because the cache stayed warm
+               os.path.getmtime(_ai_sidecar(video_path, "stt"))
+               if os.path.isfile(_ai_sidecar(video_path, "stt"))
+               else -1.0,
                _describer_paths() is not None,
                _aud_llm_paths() is not None)
     except OSError:
@@ -18109,6 +18343,104 @@ def _aud_restrike(video_path, freq):
         except Exception:
             return []
     return healed_ts
+
+
+def _aud_strike_migration():
+    """3.26, once per audit sidecar: the current ear-veto replayed
+    over every machine strike on the shelf. A strike made before the
+    ear gates existed stays wrong forever on its own (nn is settled);
+    when today's gate says the re-listen READ the line, the words come
+    back - banked first, aud row flipped to unclear (re-litigated at
+    the next audit, never carried), windows staged for re-describe,
+    pins untouched. Dry-run on the real shelf before ship: 66
+    honest candidates (74 veto-shaped minus 8 prompt-echo ears), 65
+    restored across 47 recordings, idempotent on the second pass."""
+    out = SETTINGS.get("output_dir", "")
+    total = files = 0
+    try:
+        _aud_vocab()               # the veto's vocabulary arm, once
+    except Exception:
+        pass
+    for d0, kind in _library_dirs(out):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            ap = _ai_sidecar(p, "aud")
+            if not os.path.isfile(ap):
+                continue
+            try:
+                with open(ap, encoding="utf-8") as fh:
+                    ad = json.load(fh) or {}
+            except Exception:
+                continue
+            if int(ad.get("sg") or 0) >= 2:
+                continue
+            rows = [g for g in (ad.get("garble") or [])
+                    if isinstance(g, dict)
+                    and g.get("verdict") == "noise"
+                    and str(g.get("ear") or "").strip()
+                    and not g.get("ear_junk")]
+            restored = []
+            sd = None
+            for g in rows:
+                if not _aud_ear_veto(g.get("text"), g.get("ear")):
+                    continue
+                if sd is None:
+                    try:
+                        with open(_ai_sidecar(p, "stt"),
+                                  encoding="utf-8") as fh:
+                            sd = json.load(fh) or {}
+                    except Exception:
+                        sd = {}
+                try:
+                    t0 = float(g.get("t") or 0)
+                except (TypeError, ValueError):
+                    continue
+                for sg in (sd.get("segments") or []):
+                    if not isinstance(sg, dict) or sg.get("pin") \
+                            or not sg.get("nn") \
+                            or sg.get("was") is None:
+                        continue
+                    try:
+                        if abs(float(sg.get("a") or 0) / 1000.0
+                               - t0) > 0.15:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    sg["t"] = sg["was"]
+                    sg.pop("nn", None)
+                    _ow = str(sg.get("fxw") or "").rstrip().rstrip(".")
+                    sg["fxw"] = _aud_clip(
+                        (_ow + ". " if _ow else "")
+                        + "Given back: the re-listen read this line, "
+                        "and the current gates keep what two ears "
+                        "agree on.")
+                    g["verdict"] = "unclear"
+                    g["ear_kept"] = True
+                    g.pop("struck", None)
+                    g["vwhy"] = _aud_clip(
+                        "restored - the re-listen read it; the next "
+                        "audit re-judges it fresh")
+                    restored.append(t0)
+                    break
+            ad["sg"] = 2
+            try:
+                if restored and sd is not None:
+                    _aud_bank_orig(p, "aud")
+                    _bank_sidecar(p, "stt")
+                    _atomic_write_json(_ai_sidecar(p, "stt"), sd)
+                    _atomic_write_json(ap, ad)
+                    _aud_retell(p, restored, refill=False)
+                    total += len(restored)
+                    files += 1
+                else:
+                    _atomic_write_json(ap, ad)
+            except Exception:
+                continue
+    if total:
+        log("The ear-veto migration gave back " + str(total)
+            + " struck line(s) across " + str(files)
+            + " recording(s) - words the re-listen had read all "
+            "along. Each is re-judged fresh at its next audit.")
 
 
 def _aud_refresh_whys(video_path, garble):
@@ -18331,8 +18663,34 @@ def _aud_retell(video_path, changed_ts, refill=True):
         wins.pop(k, None)
     d["complete"] = False
     d["tries"] = 0
+    # A COMPLETE SERVED REVIEW IS NOT TOUCHED. The cut document is
+    # staged to .new - the side file the upgrade lane already resumes -
+    # and only a COMPLETE refill banks the old review and swaps. The
+    # old in-place cut destroyed three real chapters on the shelf (the
+    # banked audit still quotes them; the served review has an
+    # 18-minute hole), and its complete=False actively defeated the
+    # staging lane built to prevent exactly that. A mid-build review
+    # keeps the in-place cut: nothing complete stands to lose, and the
+    # upgrade lane would ignore a .new beside an incomplete prior.
+    # AND THE CUT LANDS ON THE FRESHEST TELLING: when a .new is
+    # already mid-flight (an earlier retell, or an upgrade), its
+    # windows are the newest words - rebuilding from the served copy
+    # resurrected windows an earlier audit had cut (proven on the
+    # shelf) and threw away in-flight describes.
+    if was_complete:
+        try:
+            with open(sp + ".new", encoding="utf-8") as fh:
+                nd0 = json.load(fh) or {}
+            if isinstance(nd0.get("windows"), dict)                     and not nd0.get("complete"):
+                for k in dirty:
+                    nd0["windows"].pop(k, None)
+                nd0["complete"] = False
+                nd0["tries"] = 0
+                d = nd0
+        except Exception:
+            pass
     try:
-        _atomic_write_json(sp, d)
+        _atomic_write_json(sp + ".new" if was_complete else sp, d)
     except Exception:
         return 0
     log("The audit corrected lines inside " + str(len(dirty))
@@ -18354,10 +18712,11 @@ def _aud_retell(video_path, changed_ts, refill=True):
     except Exception as e:
         log("The re-describe after the audit stumbled: " + str(e)[:120])
     # AND IT MUST ACTUALLY BE WHOLE AGAIN. A stumble, a Stop, or a
-    # wind-down part-way through leaves the review still cut open;
-    # the night goes to the front of the line rather than waiting.
+    # wind-down part-way through leaves the STAGED file unfinished
+    # (the served review stays whole by design now) - the night goes
+    # to the front of the line rather than waiting on the sweep.
     try:
-        if not _ins_done_honest(video_path):
+        if _ins_owing_raw(video_path):
             _ai_ask_first(video_path, "think",
                           "its description is still missing the "
                           "minutes the audit re-told")
@@ -19876,7 +20235,11 @@ def _force_owes(path, want="all", redo=False):
     if (want in ("all", "words") and SETTINGS.get("ai_transcribe", True)
             and _reader_paths() is not None):
         try:
-            if redo or not _ai_sidecar_fresh(path, "stt"):
+            # BY NAME beats the bulk switch: he pointed at this one
+            # and said words - a stale-reader transcript is owed on
+            # that press whether or not reread_old is on.
+            if redo or not _ai_sidecar_fresh(path, "stt") \
+                    or _stt_stale_reader(path):
                 owe.add("hearing")
         except Exception:
             owe.add("hearing")
@@ -19939,6 +20302,15 @@ def _ai_tick(ctl):
         return          # an audit owns the card
     if _SLATE_BUSY[0] > 0:
         return                 # a slate is clearing sidecars - let it finish
+    if not _AI.get("_sg2"):
+        # 3.26, once per boot: the strike migration walks the shelf on
+        # THIS thread while nothing owns the card - the cheapest
+        # mutual exclusion there is. Pure file work, no models.
+        _AI["_sg2"] = True
+        try:
+            _aud_strike_migration()
+        except Exception as e:
+            log("The strike migration stumbled: " + str(e)[:120])
     # ASKED FOR means asked for. The idle rules below exist so the reader
     # never steals a frame from a game you did not ask it to interrupt - but
     # when you point at one recording and say do this now, waiting for a quiet
@@ -20494,7 +20866,9 @@ def _ai_tick(ctl):
             _AI["focus"] = p         # keep this night until it is done
             _spawn("listening", p, mt)
             return                          # one job per tick
-        if do_stt and not _ai_sidecar_fresh(p, "stt"):
+        if do_stt and (not _ai_sidecar_fresh(p, "stt")
+                       or (SETTINGS.get("reread_old")
+                           and _stt_stale_reader(p))):
             _AI["focus"] = p
             _spawn("hearing", p, mt)
             return
@@ -20674,6 +21048,19 @@ def _ai_tally():
         out[job] = {"left": left[job], "done": done[job], "secs": secs[job]}
     _AI["_tally"] = out
     return out
+
+
+def _ask_negish(ans):
+    """Is this answer already an honest negative? Only a NEGATIVE may
+    survive with zero verified hits - anything else is an affirmative
+    claim wearing no evidence."""
+    low = str(ans or "").lower()
+    return bool(re.search(
+        r"\b(no|not|nothing|never|nobody|none|didn't|doesn't|wasn't|"
+        r"isn't|did not|does not|was not|is not|could not|couldn't|"
+        r"cannot|can't|unable)\b", low)
+        or "\u0644\u0627 " in low or "\u0644\u0645 " in low
+        or "\u0644\u064a\u0633" in low)
 
 
 def _moment_of(path, why, question):
@@ -22241,6 +22628,14 @@ class _JsApi:
             except Exception:
                 continue
         ans = str(data.get("answer") or "")[:600]
+        if not hits and not _misses and not _ask_negish(ans):
+            # THE MODEL OFFERED NO EVIDENCE AT ALL - hits=[] used to
+            # sail past the verifier entirely (nothing to check meant
+            # nothing failed), letting confident prose stand on
+            # nothing. A no-evidence answer may only be a negative.
+            ans = ("LORE could not verify that in this recording's "
+                   "transcript - the answer offered no lines to "
+                   "check.")
         if _misses and not hits:
             # EVERY quote failed - an assertion whose entire evidence
             # was rejected may not stand as the primary answer with a
@@ -22344,6 +22739,7 @@ class _JsApi:
         # the local window holds ~120 entries, not 1,900: rank every row
         # by how much of the question it carries and renumber the keepers
         terms = _ask_terms(q)
+        _lib_grounded = 0
         scored = sorted(range(len(rows)),
                         key=lambda i: (-_ask_score(rows[i], terms), i))
         keep = [i for i in scored if _ask_score(rows[i], terms)][:100]
@@ -22392,6 +22788,8 @@ class _JsApi:
                 # when the words genuinely appear nowhere.
                 why = str(h.get("why") or "")[:160]
                 ms = _moment_of(path, why, q)
+                if ms >= 0:
+                    _lib_grounded += 1
                 if ms < 0:
                     # THE ROWS THE MODEL READ CARRY NO TIMESTAMPS, so
                     # its number is invented by construction - and it
@@ -22407,7 +22805,14 @@ class _JsApi:
                             "text": why})
             except Exception:
                 continue
-        return {"ok": True, "answer": str(data.get("answer") or "")[:600],
+        _lans = str(data.get("answer") or "")[:600]
+        if not _lib_grounded and not _ask_negish(_lans):
+            # not one hit grounded in any transcript: the prose is
+            # standing on generated metadata alone
+            _lans = ("LORE could not ground that answer in any "
+                     "recording's transcript - treat it as not "
+                     "found.")
+        return {"ok": True, "answer": _lans,
                 "hits": out}
 
     def have_flags(self, paths):
@@ -22434,9 +22839,16 @@ class _JsApi:
                         d3 = json.load(fh) or {}
                     _sv = int(d3.get("v") or 0)
                     _eng = str(d3.get("engine") or "")
-                    if _sv >= _STT_V and (not _eng
-                                          or _eng == _STT_ENGINE):
+                    _rd = int(d3.get("reader") or 0)
+                    if _stt_current_doc(d3):
                         row["stt_lvl"] = 2
+                    elif _sv >= _STT_V and (not _eng
+                                            or _eng.startswith(
+                                                _STT_ENGINE)):
+                        row["stt_lvl"] = 1
+                        row["stt_why"] = ("read by an older reader "
+                                          "(gen %d of %d)"
+                                          % (_rd, _STT_READER))
                     else:
                         row["stt_lvl"] = 1
                         row["stt_why"] = (
@@ -24282,14 +24694,24 @@ class _JsApi:
         vd = [round(max(v[i:i + step]), 3) for i in range(0, len(v), step)]
         sv = sorted(v)
         p90 = sv[int(len(sv) * 0.9)]
-        peaks = []
-        for i in range(2, len(v) - 2):
-            if v[i] >= p90 and v[i] == max(v[i - 2:i + 3]):
-                t = round(i * hop, 1)
-                if not peaks or t - peaks[-1] > 45:
-                    peaks.append(t)
+        # THE STRONGEST PEAKS SURVIVE. First-40-chronological kept
+        # weak early peaks and dropped stronger late ones (75 of 296
+        # histories; the worst night lost 179 stronger peaks). The
+        # strongest wins its 45-second neighbourhood, the strongest
+        # forty win the night, and the ribbon still reads in order.
+        cand = sorted(((v[i], round(i * hop, 1))
+                       for i in range(2, len(v) - 2)
+                       if v[i] >= p90 and v[i] == max(v[i - 2:i + 3])),
+                      reverse=True)
+        keep = []
+        for sc, t in cand:
+            if all(abs(t - t2) > 45 for _, t2 in keep):
+                keep.append((sc, t))
+                if len(keep) >= 40:
+                    break
+        peaks = sorted(t for _, t in keep)
         return {"ok": True, "hop": hop * step, "v": vd,
-                "peaks": peaks[:40],
+                "peaks": peaks,
                 "median": round(sv[len(sv) // 2], 3), "p90": round(p90, 3)}
 
     def sns_rename(self, path, who, name):

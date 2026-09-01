@@ -83,8 +83,17 @@ check("it starts out honestly described",
 # the auditor corrected a line at 5s and cannot re-describe right now
 n = lore._aud_retell(VID, [5.0], refill=False)
 check("the retell cut the stale window out", n >= 1)
-check("...which leaves the review unfinished, as it must",
-      lore._ins_done_honest(VID) is False)
+# 3.26: the cut is STAGED - the served review keeps serving whole
+# (the in-place cut once destroyed three real chapters), and the
+# refill debt lives in .new where the sweep's owing clause finds it.
+check("...while the SERVED review stays honestly finished",
+      lore._ins_done_honest(VID) is True)
+check("...and the staged .new owes the refill to the sweep",
+      lore._ins_owing_raw(VID) is True)
+try:
+    os.remove(lore._ai_sidecar(VID, "ins") + ".new")
+except OSError:
+    pass
 # 3.15: the repair steers the SWEEP (focus) instead of forging a
 # by-name ask - a forced row is the one thing allowed to load the
 # describer while he is playing, and an automatic repair must not be

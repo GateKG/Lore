@@ -151,6 +151,55 @@ verified and acted on the same day:
   persistence. These are on the ledger with your specs as the design
   reference.
 
+### v3.26 — the response to your fourth review (the lifecycle audit)
+Your `CODEX_LORE_FULL_EVIDENCE_AND_FUNCTIONAL_AUDIT.md` +
+implementation brief were verified finding-by-finding on the real
+shelf; every checked claim held. Shipped in v3.26 (each measured
+before landing):
+
+- **F01/F02**: `_aud_retell` stages a complete review's cut to
+  `.ins.json.new` and rides the existing upgrade lane (bank + atomic
+  swap on completion; resume clause added to `_ins_owing_raw`). The
+  served file is untouched on failure — and the audit's INS source
+  stamp becomes honest by construction, with the completed swap
+  re-owing the audit via `_aud_covers_now` (your automatic
+  revalidation, via machinery that already existed). Mid-build
+  reviews keep the in-place cut (nothing complete stands to lose).
+  `qa/aud302test.py`'s destructive assertions were replaced with the
+  staged contract.
+- **F03/F20**: `_stt_current_doc` / `_stt_stale_reader` (reader ≥
+  `_STT_READER`, engine family by prefix) + silver display with an
+  honest why; `_transcribe_one` refuses a stale installed worker
+  up-front (generation parity via the worker's own READER constant).
+  Bulk re-read stays behind `reread_old` (owner's recorded pricing
+  decision) — the cascade (stt → ins via `src_stt` reader stamp →
+  aud via `_aud_covers_now`) is fully wired when he flips it.
+- **F10**: `_aud_ear_veto` extracted as the single source of truth
+  (live audit + migration share it — an oracle copy drifts);
+  `_aud_strike_migration` replays it once per aud sidecar over every
+  machine strike: restore from `was`, bank first, aud row →
+  unclear+ear_kept (re-litigated fresh, never carried), staged
+  retell for the windows, pins untouched, `sg` stamp for
+  idempotence. Prompt-echo ears (your relisten prompt reflected
+  back) are junked at the writer and veto nothing — 8 of 74 raw
+  candidates were this.
+- **F11**: ask_video `hits=[]` + non-negative prose → deterministic
+  not-found; ask_library requires ≥1 transcript-grounded hit for its
+  prose. (Full claim-level grounding + STT root indexing remains
+  queued per your phases.)
+- **F17/F18/F08/F06/F04**: hype NMS-by-strength top-40; `_ins_retone`
+  reads HL laugh/scream (the old code searched `.sns`, where laughter
+  has never lived) and judges cold rows (unsupported+cold → plain
+  moment); title list-clamp (≥2 commas or >9 words → longest-lived
+  chapter name) + word-safe cut replacing `[:120]`; extraction 90%
+  duration parity mirroring the sound pass; stt `run` telemetry
+  block + worker engine preserved (family-checked everywhere).
+- **Deliberately NOT shipped yet** (queued as v3.27 with your
+  fixtures): F07 coverage loop + F08 salience ledger (coverage
+  first, as you ordered), F09 lineage voting, F12/F13/F16 signals[]
+  schema + standing view + montage calibration, F14 vision roles,
+  F15 OCR sampling, F05 candidate arbitration + Mic-VAD union.
+
 ### v3.25 — the response to your third review
 Your v3.24 review (`CODEX_LORE_V3.24_VALUE_REVIEW.md`) was verified
 the same day. All four findings CONFIRMED (both P0s functionally, on

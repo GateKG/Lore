@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.25` (backend) / `3.25` (UI) |
-| **Stamped** | 2026-09-01 15:01 |
-| **Last commit** (source state at report time; the release commit lands after) | d54cbc4 LORE v3.24 - the auditor's ear earns its vote |
-| **lore.py** | 1.2 MB, 27,337 lines, saved 2026-09-01 15:00 |
-| **ui.html** | 0.9 MB, 13,793 lines, saved 2026-09-01 14:58 |
-| **Built exe** | 13.4 MB, 2026-09-01 15:00 |
+| **Version** | `3.26` (backend) / `3.26` (UI) |
+| **Stamped** | 2026-09-01 16:52 |
+| **Last commit** (source state at report time; the release commit lands after) | 454e588 LORE v3.25 - a stopword is not evidence |
+| **lore.py** | 1.2 MB, 27,759 lines, saved 2026-09-01 16:47 |
+| **ui.html** | 0.9 MB, 13,793 lines, saved 2026-09-01 16:47 |
+| **Built exe** | 13.4 MB, 2026-09-01 16:52 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
@@ -27,6 +27,7 @@
 
 | Model | Size | For |
 |---|---|---|
+| `.agent_harnesses.json` | 0.00 GB | — |
 | `Cnn14_DecisionLevelMax_mAP=0.385.pth` | 0.30 GB | laughter |
 | `clap` | 0.73 GB | sound tags |
 | `ecapa` | 0.08 GB | voice clusters |
