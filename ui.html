@@ -1634,6 +1634,14 @@ body.vfull.vthread #vstage video{max-width:calc(100vw - 392px)}
   border-left:2px solid var(--gold);border-right:2px solid var(--gold);
   border-radius:3px;display:none;z-index:6}
 #vclipband.on{display:block}
+/* THE ENDS ARE HANDLES. They are drawn on the band (which never takes
+   the pointer itself - the grab is hit-tested in script), so what you
+   see is exactly the twelve pixels that answer. */
+#vclipband::before,#vclipband::after{content:'';position:absolute;
+  top:50%;width:5px;height:15px;margin-top:-7.5px;border-radius:3px;
+  background:var(--gold);box-shadow:0 0 6px rgba(0,0,0,.55)}
+#vclipband::before{left:-4px}
+#vclipband::after{right:-4px}
 #vclipband i{position:absolute;top:-17px;left:50%;transform:translateX(-50%);
   font:700 10px var(--ui);color:#241806;background:var(--gold);
   padding:1px 6px;border-radius:7px;white-space:nowrap;font-style:normal}
@@ -2870,7 +2878,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.28'};},
+      webhook:true,version:'3.29'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3039,7 +3047,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.28'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.29'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -5281,10 +5289,35 @@ function renderFront(cL,cR,spreadIdx){
    span, posts it and deletes it - the same pipeline the clip hotkey uses,
    which is why the size limit and quality come from Sharing settings. */
 const CLIP_MAX_S = 15;
-const CLIP = {on:false, a:null, b:null, drag:false};
+const CLIP = {on:false, a:null, b:null, drag:false,
+              mode:'new', grab:0};
+const CLIP_GRAB_PX = 12;   /* how near an edge counts as taking it */
 
 function clipFmt(t){const m=Math.floor(t/60),s=Math.floor(t%60);
   return m+':'+String(s).padStart(2,'0');}
+
+function clipEdges(){
+  /* the two ends of the span in SCREEN pixels - the same mapping the
+     band is painted with, so what you grab is what you see */
+  if(CLIP.a==null||CLIP.b==null)return null;
+  const wrapEl=$('#vseekwrap'); if(!wrapEl)return null;
+  const win=tlWin(), w=wrapEl.getBoundingClientRect();
+  const px=t=>w.left+7+clamp((t-win.a)/Math.max(0.001,win.len),0,1)
+             *Math.max(1,w.width-14);
+  const lo=Math.min(CLIP.a,CLIP.b), hi=Math.max(CLIP.a,CLIP.b);
+  return {lo:lo, hi:hi, x1:px(lo), x2:px(hi)};
+}
+
+function clipHit(clientX){
+  /* 'a' or 'b' to take that edge, 'in' to slide the whole span,
+     null to start a new one */
+  const e=clipEdges();
+  if(!e||Math.abs(CLIP.b-CLIP.a)<=0.01)return null;
+  if(Math.abs(clientX-e.x1)<=CLIP_GRAB_PX)return 'a';
+  if(Math.abs(clientX-e.x2)<=CLIP_GRAB_PX)return 'b';
+  if(clientX>e.x1&&clientX<e.x2)return 'in';
+  return null;
+}
 
 function clipPaint(){
   const band=$('#vclipband'), msg=$('#vclipmsg');
@@ -5396,25 +5429,67 @@ function wireClipper(){
     if(!CLIP.on)return;
     e.preventDefault(); e.stopPropagation();
     try{wrap.setPointerCapture(e.pointerId);}catch(_){}
-    CLIP.drag=true; CLIP.a=tlTimeAt(e.clientX); CLIP.b=CLIP.a; clipPaint();
+    const hit=clipHit(e.clientX);
+    CLIP.drag=true;
+    CLIP.mode=hit||'new';
+    if(hit==='in'){
+      /* slide it: remember where inside the span you took hold */
+      CLIP.grab=tlTimeAt(e.clientX);
+      CLIP._a0=Math.min(CLIP.a,CLIP.b); CLIP._b0=Math.max(CLIP.a,CLIP.b);
+    }else if(hit){
+      /* take one end; the other is the anchor and does not move */
+      const lo=Math.min(CLIP.a,CLIP.b), hi=Math.max(CLIP.a,CLIP.b);
+      CLIP.a=(hit==='a')?hi:lo;      /* anchor */
+      CLIP.b=(hit==='a')?lo:hi;      /* the end in your hand */
+      CLIP.mode='end';
+    }else{
+      /* OUTSIDE the span - and only outside - starts a new one. A
+         press on your own clip used to throw it away. */
+      CLIP.a=tlTimeAt(e.clientX); CLIP.b=CLIP.a;
+    }
+    clipPaint();
   },true);
   wrap.addEventListener('pointermove',e=>{
     if(!CLIP.on||!CLIP.drag)return;
     e.preventDefault(); e.stopPropagation();
     const t=tlTimeAt(e.clientX);
-    /* THE CEILING IS ENFORCED WHILE YOU DRAG, not complained about after:
-       you cannot pull out more than Discord will take. */
-    CLIP.b=(t>=CLIP.a) ? Math.min(t,CLIP.a+CLIP_MAX_S)
-                       : Math.max(t,CLIP.a-CLIP_MAX_S);
+    if(CLIP.mode==='in'){
+      /* the whole span slides, its length untouched, and it stops at
+         the ends of the recording rather than being squashed */
+      const len=CLIP._b0-CLIP._a0, d=tlDur()||0;
+      let a=CLIP._a0+(t-CLIP.grab);
+      a=Math.max(0,Math.min(a,Math.max(0,(d||len)-len)));
+      CLIP.a=a; CLIP.b=a+len;
+    }else{
+      /* THE CEILING IS ENFORCED WHILE YOU DRAG, not complained about
+         after: you cannot pull out more than Discord will take. */
+      CLIP.b=(t>=CLIP.a) ? Math.min(t,CLIP.a+CLIP_MAX_S)
+                         : Math.max(t,CLIP.a-CLIP_MAX_S);
+    }
     clipPaint();
   },true);
   const up=e=>{
     if(!CLIP.on||!CLIP.drag)return;
     CLIP.drag=false;
     if(CLIP.b<CLIP.a){const t=CLIP.a;CLIP.a=CLIP.b;CLIP.b=t;}   /* dragged left */
-    if(CLIP.b-CLIP.a<0.4){CLIP.b=Math.min(CLIP.a+3,tlDur()||CLIP.a+3);}
+    /* a span you MEANT to make gets a floor; nudging an edge to nearly
+       nothing is your business, and sliding one never resizes it */
+    if(CLIP.mode==='new'&&CLIP.b-CLIP.a<0.4)
+      CLIP.b=Math.min(CLIP.a+3,tlDur()||CLIP.a+3);
+    if(CLIP.mode==='end'&&CLIP.b-CLIP.a<0.15)
+      CLIP.b=CLIP.a+0.15;
+    CLIP.mode='new';
     clipPaint();
   };
+  /* and the cursor says which of the three it will be */
+  wrap.addEventListener('pointermove',e=>{
+    if(!CLIP.on||CLIP.drag)return;
+    const hit=clipHit(e.clientX);
+    wrap.style.cursor=(hit==='a'||hit==='b')?'ew-resize'
+                     :(hit==='in'?'grab':'');
+  });
+  wrap.addEventListener('pointerleave',()=>{wrap.style.cursor='';});
+
   wrap.addEventListener('pointerup',up,true);
   wrap.addEventListener('pointercancel',up,true);
 

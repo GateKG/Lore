@@ -41,6 +41,9 @@ for %%t in (codex327test codex326test codex325test codex324test codex323test asr
 echo ===== rectests =====
 python "rectests\recorder_scenarios.py"
 if errorlevel 1 set FAILED=!FAILED! recorder_scenarios
+echo ===== cliptest =====
+node "cliptest.js"
+if errorlevel 1 set FAILED=!FAILED! cliptest
 echo ===== paneltest =====
 node "paneltest.js"
 if errorlevel 1 set FAILED=!FAILED! paneltest

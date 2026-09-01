@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.28` (backend) / `3.28` (UI) |
-| **Stamped** | 2026-09-01 22:12 |
-| **Last commit** (source state at report time; the release commit lands after) | 355444a LORE v3.27 - it tells the whole night |
-| **lore.py** | 1.3 MB, 28,536 lines, saved 2026-09-01 22:10 |
-| **ui.html** | 0.9 MB, 13,803 lines, saved 2026-09-01 22:10 |
-| **Built exe** | 13.4 MB, 2026-09-01 22:12 |
+| **Version** | `3.29` (backend) / `3.29` (UI) |
+| **Stamped** | 2026-09-01 22:47 |
+| **Last commit** (source state at report time; the release commit lands after) | 084fdc6 LORE v3.28 - the count stops undoing itself |
+| **lore.py** | 1.3 MB, 28,536 lines, saved 2026-09-01 22:45 |
+| **ui.html** | 0.9 MB, 13,878 lines, saved 2026-09-01 22:45 |
+| **Built exe** | 13.4 MB, 2026-09-01 22:46 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
