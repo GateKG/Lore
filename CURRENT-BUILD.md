@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.26` (backend) / `3.26` (UI) |
-| **Stamped** | 2026-09-01 16:52 |
-| **Last commit** (source state at report time; the release commit lands after) | 454e588 LORE v3.25 - a stopword is not evidence |
-| **lore.py** | 1.2 MB, 27,759 lines, saved 2026-09-01 16:47 |
-| **ui.html** | 0.9 MB, 13,793 lines, saved 2026-09-01 16:47 |
-| **Built exe** | 13.4 MB, 2026-09-01 16:52 |
+| **Version** | `3.27` (backend) / `3.27` (UI) |
+| **Stamped** | 2026-09-01 20:23 |
+| **Last commit** (source state at report time; the release commit lands after) | f1c334b LORE v3.26 - the evidence keeps its receipts |
+| **lore.py** | 1.2 MB, 28,461 lines, saved 2026-09-01 20:20 |
+| **ui.html** | 0.9 MB, 13,803 lines, saved 2026-09-01 20:20 |
+| **Built exe** | 13.4 MB, 2026-09-01 20:22 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships

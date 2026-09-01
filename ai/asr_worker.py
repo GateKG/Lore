@@ -52,6 +52,7 @@ import time
 import urllib.request
 
 MODEL = os.environ.get("LORE_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B-hf")
+MIC_EXTRA_MAX = 60    # a stop on mic-only spans, not a budget
 CHUNK_S = 28          # at most this much SPEECH per request
 GROUP_GAP_S = 0.8     # speech separated by less than this is one utterance
 
@@ -344,7 +345,7 @@ def _arabizi(t):
 # read yesterday - and nothing on disk said which reader had written a
 # transcript, so there was no way even to ask. Every transcript carries
 # this number now; the app counts them and says the number out loud.
-READER = 3
+READER = 4
 
 # HOW MANY EXTRA REQUESTS THE TWO NEW WALLS MAY SPEND, the same
 # reasoning as TRANSLIT_MAX: not a budget, a stop, so a night that goes
@@ -736,7 +737,7 @@ def main(src, dst, mic=None):
     stats = {"arabizi": 0, "leash": 0, "echo": 0, "translit": 0,
              "translit_won": 0, "mic_lines": 0, "enwall": 0,
              "enwall_won": 0, "laugh": 0, "laugh_won": 0,
-             "physics": 0}
+             "physics": 0, "leash_kept": 0, "mic_only": 0}
     # AND WHAT ELSE HAPPENED, in words. These used to go to stderr, which
     # the app only reads when the job FAILS - so a mic layer that quietly
     # skipped itself left no trace anywhere on a successful run.
@@ -799,6 +800,62 @@ def main(src, dst, mic=None):
             if ov >= 0.9 * max(1, e0 - s0):
                 return ma[s0:e0], e0 - s0
         return a[s0:e0], 0
+
+    # HIS VOICE CAN START A LINE. The mic detector used to be allowed
+    # only to ROUTE inside spans the mix had already found, so a
+    # sentence the mix missed under a loud game - or under three
+    # friends at once - was never a candidate at all, however clean
+    # the mic had it. Its spans join the mix's here: subtracted first
+    # so nothing is decoded twice, fragments too short to be speech
+    # dropped, anything longer than one request split.
+    if ma is not None and mm:
+        _mix = sorted((s3["start"], s3["end"]) for s3 in spans)
+        _extra = []
+        for _x, _y in sorted(mm):
+            # never past the end of EITHER track: a mic recording that
+            # outruns the mix would otherwise put a line past the end
+            # of the video
+            _y = min(_y, len(ma), len(a))
+            if _x >= _y:
+                continue
+            _cuts = [(_x, _y)]
+            for _mx, _my in _mix:
+                if _my <= _x or _mx >= _y:
+                    continue
+                _nxt = []
+                for _a2, _b2 in _cuts:
+                    if _mx > _a2:
+                        _nxt.append((_a2, min(_b2, _mx)))
+                    if _my < _b2:
+                        _nxt.append((max(_a2, _my), _b2))
+                _cuts = [(p2, q2) for p2, q2 in _nxt if q2 - p2 > 0]
+            for _a2, _b2 in _cuts:
+                if _b2 - _a2 < 0.4 * sr:
+                    continue                  # too short to be speech
+                while _b2 - _a2 > CHUNK_S * sr:
+                    _extra.append({"start": _a2,
+                                   "end": _a2 + int(CHUNK_S * sr)})
+                    _a2 += int(CHUNK_S * sr)
+                if _b2 - _a2 >= 0.4 * sr:
+                    _extra.append({"start": _a2, "end": _b2})
+        # A STOP, NOT A BUDGET - the same rule the other three walls
+        # in this file carry, and this one adds whole model requests
+        # rather than cheap re-asks. The longest spans are kept: those
+        # are the ones most likely to be speech rather than a noisy
+        # floor.
+        if len(_extra) > MIC_EXTRA_MAX:
+            _extra.sort(key=lambda s3: s3["end"] - s3["start"],
+                        reverse=True)
+            _extra = sorted(_extra[:MIC_EXTRA_MAX],
+                            key=lambda s3: s3["start"])
+            notes.append("the mic found more spans than the wall allows "
+                         "(%d) - the longest were kept" % MIC_EXTRA_MAX)
+        if _extra:
+            stats["mic_only"] = len(_extra)
+            notes.append("the mic found %d span(s) the mix had missed"
+                         % len(_extra))
+            spans = sorted(list(spans) + _extra,
+                           key=lambda s3: s3["start"])
 
     # group neighbouring speech into requests, remembering the REAL times so
     # the transcript still lines up with the video
@@ -1072,6 +1129,7 @@ def main(src, dst, mic=None):
             say_progress(i + 1, len(groups), speech_done, speech_total)
             continue    # skipped, but the bar must not stall on it
         t_ask = time.time()
+        lost = None
         txt, lang = ask(audio, None)
         if lang and lang not in KEEP:
             stats["leash"] += 1
@@ -1083,7 +1141,39 @@ def main(src, dst, mic=None):
                 arab = sum(1 for c in txt if "\u0600" <= c <= "\u06ff")
                 last = ("arabic" if letters and arab / float(letters) > 0.3
                         else "english")
-            txt, lang = ask(audio, last)
+            # THE RETRY HAS TO EARN IT. This used to be an
+            # unconditional overwrite on the strength of a tag - the
+            # one guard here that never looked at what it was
+            # keeping. Every test below is already written in this
+            # file; they are simply pointed at the retry, at no extra
+            # cost, because this is the call that already happened.
+            t2, l2 = ask(audio, last)
+            secs0 = len(audio) / float(sr)
+            worse = (not (t2 or "").strip()          # nothing came back
+                     or _foreign(t2)                 # an unread alphabet
+                     or _impossible(t2, secs0)       # no mouth is that fast
+                     or (ctx and _ctx_echo(t2, ctx)))  # the prompt talking
+            # PINNING FORCES THE SCRIPT - the arabizi guard leans on
+            # that deliberately - so an answer written in the script
+            # the pin was pushing is not evidence about what was
+            # said. It is only the PIN that has to be doubted, and
+            # only when it pointed away from the first answer:
+            # guarding one direction unconditionally made Arabic win
+            # every argument and latch there.
+            _af1, _af2 = _arabic_frac(txt), _arabic_frac(t2)
+            if not worse and ((last == "english"
+                               and _af1 >= 0.5 and _af2 < 0.5)
+                              or (last == "arabic"
+                                  and _af1 < 0.5 and _af2 >= 0.5)):
+                worse = True
+            if worse and txt and not _foreign(txt) \
+                    and not _impossible(txt, secs0):
+                stats["leash_kept"] += 1
+                lang = None          # the script fix below decides it
+                if t2 and t2.strip() != txt.strip():
+                    lost = t2.strip()[:300]
+            else:
+                txt, lang = t2, l2
         if txt and _foreign(txt):
             # a foreign ALPHABET slipped past the language leash: one
             # pinned retry, then the utterance is dropped - silence beats
@@ -1210,6 +1300,13 @@ def main(src, dst, mic=None):
         if txt and lang in KEEP:
             last = lang
         if txt:
+            if lost:
+                # the answer that did not win is kept beside the one
+                # that did - a leash swap used to leave no trace at
+                # all, so nothing could ever be measured after
+                sg_new_alt = lost
+            else:
+                sg_new_alt = None
             sg_new = {"a": int(g["start"] / sr * 1000),
                       "b": int(g["end"] / sr * 1000), "t": txt,
                       "lang": lang or last}
@@ -1221,6 +1318,8 @@ def main(src, dst, mic=None):
                 # partially mic-sourced: say HOW much, never a binary
                 # that would be wrong in both directions
                 sg_new["micp"] = round(mfrac, 2)
+            if sg_new_alt:
+                sg_new["alt"] = sg_new_alt
             out.append(sg_new)
             gidx.append(i)   # out[k] came from groups[gidx[k]]
         speech_done += g["len"] / float(sr)

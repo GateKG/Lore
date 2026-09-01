@@ -2870,7 +2870,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.26'};},
+      webhook:true,version:'3.27'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3039,7 +3039,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.26'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.27'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -8889,7 +8889,12 @@ async function renderHlMarks(vid,req){
               :ev.kind==='scream'?'scream'
               :SNSK[ev.kind]?'sense':'loud');
       m.dataset.fk=fk;
-      m.classList.toggle('hid',MARKS[fk]===false);
+      /* a mark can answer to more than one chip now - a laugh with a
+         WINNER under it belongs to Laughs AND to Senses, and hiding
+         either chip must not hide the other's evidence */
+      m._fks=[fk].concat((ev.also||[]).map(k=>k==='laugh'?'laugh'
+              :k==='scream'?'scream':(SNSK[k]?'sense':'loud')));
+      m.classList.toggle('hid',!m._fks.some(k=>MARKS[k]!==false));
       m.removeAttribute('title');
     };
     /* ONE cluster pass for BOTH paths, run after every full placement.
@@ -10659,7 +10664,8 @@ function insMarksPlace(){
   if(wrap._goldShown!==gsig){
     wrap._goldShown=gsig;
     wrap.querySelectorAll('.hlmark').forEach(m=>
-      m.classList.toggle('hid',MARKS[m.dataset.fk||'loud']===false));
+      m.classList.toggle('hid',
+        !(m._fks||[m.dataset.fk||'loud']).some(k=>MARKS[k]!==false)));
   }
 }
 
@@ -10907,6 +10913,10 @@ function markTipShow(m){
     why=m._said?('\u2726 '+m._said.why)
         :ev.kind==='creature'?visLabel(ev.t)
         :(SN[ev.kind]||m._heard||'a loud moment');
+    /* and whatever else happened in the same second - a WINNER under
+       a groan used to be dropped entirely; it rides the mark now */
+    if(ev.also&&ev.also.length)
+      why+=' + '+ev.also.map(k=>SN[k]||k).join(', ');
   }else if(m.classList.contains('insmark')){
     const c=m._c||{}; t=c.t; why='chapter \u2014 '+(c.label||'');
     /* every chapter draws now, so a long night stacks several on one

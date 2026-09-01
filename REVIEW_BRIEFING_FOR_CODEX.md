@@ -151,6 +151,91 @@ verified and acted on the same day:
   persistence. These are on the ledger with your specs as the design
   reference.
 
+### v3.27 — the rest of your fourth review, judged item by item
+Everything below was measured on the real shelf before it was written,
+and five of your remedies were rejected with numbers rather than
+implemented. Read this section before re-reporting any of it.
+
+- **F07 SHIPPED, but your mechanism was wrong.** Even-row context
+  thinning never fired on the flagship file (windows rendered
+  2504/2274/2881 tokens against room for 4132). The real cause is the
+  head: `"Three to five stretches."` — 69% of 971 historical asks
+  returned 3–5 stretches at ~12 lines each, so ONE ask covers a median
+  of 48 lines regardless of window size. Shipped: a pending-range loop
+  (contiguous runs, ASK_MAX 5, MIN_RUN 6), `want` stretches asked for
+  by run length, schema maxItems 8→12, per-ask token cap, `src` row
+  ranges per stretch, a `cov` block (rows/told/frac/gaps with
+  silence-vs-untold), and `missing` extended by `_win_owes`. A window
+  RESUMES from disk (stretches, spent asks, and the range it left), so
+  the budget is spent across runs and a night the model cannot finish
+  becomes terminal.
+  **REJECTED — coverage-gated `complete`** (your F07 exact-change): it
+  makes such a night un-finishable and loops the GPU forever, because
+  `tries` resets whenever any window lands. `_ins_done_honest` consults
+  the cov block instead, which is terminal by construction.
+  **REJECTED — fixed-size chunking** (5× the asks, measured) and
+  **bumping `_INS_GENERATION`** (58 GPU-hours, automatic, unasked).
+  Also fixed in passing: the cross-window "story so far" block read
+  `sgm["label"]`, but stored stretches only ever carry `name` — every
+  cross-window ask ever made was handed an empty string.
+- **F08 SHIPPED NARROWED.** Your salience remedy was measured to
+  *promote* the offending subject: "Toilets and Team Play" is the
+  SECOND-LONGEST chapter of that night (339.6s of 19), and shelf-wide
+  the longest chapter of a night holds 22.9% of its clock but only
+  10.7% of its moments — duration is an anti-signal. Shipped: a
+  blended ledger (0.45 duration + 0.30 cited rows + 0.25 moments and
+  gold) that re-orders the SAME single ask heaviest-first with weights
+  inline; no extra model call. The list-clamp fallback prefers the
+  clock and uses the ledger only to break ties (left to itself it
+  overruled the longest chapter by 0.003 and named noise over
+  content). The real fix for that title is F07, not F08 — the boss
+  outcome was never in the candidate set.
+- **F09 SHIPPED (proximity half).** `_aud_says` now picks the row that
+  COVERS the second, not the first within ±4s (45.7% of "agreements"
+  had no overlap; 813 skipped a covering row), and says how far away a
+  near-miss was. A chapter label no longer votes (86% span 60s+); a
+  moment votes only when it names the second; `agrees == ["review"]`
+  is dropped. Structured reason codes and carry generations remain
+  queued.
+- **F12/F13/F16 — SCHEMA MIGRATION REJECTED.** Your mechanism is also
+  wrong here: nothing overwrites. `_merge_sns_into_hl` is FIRST WRITER
+  WINS (`if "kind" not in near[0]`), `_merge_vis_into_hl`'s collision
+  arm is a deliberate `pass`, and laughter only appears to dominate
+  because it lands in the gold pass before the folds run. Measured
+  18.8% loss (516/2,746). The full `signals[]` array cannot be cashed
+  out on the read side — the tome draws one node per event with one
+  colour, the picker keys on the second, and the cluster pass folds
+  same-second ticks into one — so three ticks for three signals would
+  violate your own acceptance criterion. Shipped instead: an additive
+  `also` list on the same event (every existing reader, including an
+  un-updated exe and the banked attic, ignores an unknown key), UI
+  chip/tooltip opt-ins, and a re-fold walk that recovers the lost
+  signals from the sidecars with zero model calls.
+- **F14 SHIPPED.** Worse than you reported: 1,749 gold marks carry
+  `kind == "creature"` — 8.9% of the entire 19,545-mark timeline —
+  and at most ~155 are plausibly an enemy. `_eye_worth` gates on
+  not-a-creature words, menu/board context (in `place` AND `doing`),
+  and then either a hostile-creature word or an actor verb. Measured
+  9.4% keep, per-game: Rocket League 1.2%, Hearthstone 1.9%, Lies of P
+  50.3%, Supraland 69.1%. `_vis_promote_migration` re-judges the
+  existing marks once, banked, and only where a mark can be matched to
+  a look today's gate rejects.
+- **F15 NOT SHIPPED.** Confirmed and queued; the eye outranked it per
+  GPU-second and the sampler needs its own cost budget.
+- **F05 SHIPPED NARROWED.** The leash fires on 25.9% of ALL utterances
+  (8,291) and 56.1% of the flagship night, and it replaced the first
+  decode on a language TAG with no accept test — the only guard in
+  that worker without one. It now keeps the first answer when the
+  retry is empty, foreign-alphabet, physically impossible, a prompt
+  echo, or written in the script the pin was pushing (both directions
+  — guarding one direction made Arabic win every argument and latch).
+  The loser is persisted as `alt`. Mic-only VAD spans are unioned in
+  (subtracted first, fragments dropped, capped by a stop the way
+  TRANSLIT_MAX and ENWALL_MAX are). READER 3→4.
+  **REJECTED — your content-agreement arbiter**: 893 library lines
+  score below the only available dictionary floor and every one read
+  is his own Gulf Arabic or an Arabic name.
+
 ### v3.26 — the response to your fourth review (the lifecycle audit)
 Your `CODEX_LORE_FULL_EVIDENCE_AND_FUNCTIONAL_AUDIT.md` +
 implementation brief were verified finding-by-finding on the real

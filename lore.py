@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.26"
+APP_VERSION = "3.27"
 
 try:
     import psutil
@@ -5077,7 +5077,7 @@ _LVL_V = 2          # the loudness curve behind the sound graph
 # WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
 # learns to hear something it could not hear before; 2 is the reader
 # whose transliteration wall faces both ways.
-_STT_READER = 3
+_STT_READER = 4
 
 _STT_RD_CACHE = {}
 
@@ -11352,6 +11352,17 @@ def _merge_sns_into_hl(video_path, sns=None):
                 if "kind" not in near[0]:
                     near[0]["kind"] = e2["kind"]
                     changed = True
+                elif near[0]["kind"] != e2["kind"]:
+                    # TWO THINGS HAPPENED IN THAT SECOND. The seat was
+                    # taken - by laughter, usually, because it rides
+                    # the gold pass and lands first - and the second
+                    # signal used to be dropped on the floor. It rides
+                    # along now: same mark, same tick, both named.
+                    _al = list(near[0].get("also") or [])
+                    if e2["kind"] not in _al:
+                        _al.append(e2["kind"])
+                        near[0]["also"] = _al
+                        changed = True
             else:
                 gold.append({"t": round(float(e2["t"]), 1),
                              "z": z2, "kind": e2["kind"]})
@@ -11829,6 +11840,44 @@ def _senses_paths():
     return py, work
 
 
+def _mig_bank_bytes(cur, raw):
+    """Bank BYTES that were read before a mutation - the rotation
+    _bank_sidecar does, but for a file already rewritten in place."""
+    key = os.path.normcase(os.path.abspath(cur))
+    if key in _MIG_BANKED:
+        return False
+    _MIG_BANKED.add(key)
+    try:
+        if os.path.isfile(cur + ".v2"):
+            os.replace(cur + ".v2", cur + ".v3")
+        if os.path.isfile(cur + ".v1"):
+            os.replace(cur + ".v1", cur + ".v2")
+        with open(cur + ".v1", "wb") as fh:
+            fh.write(raw)
+        return True
+    except Exception:
+        return False
+
+
+def _mig_bank(video_path, kind):
+    """Bank once per sidecar per shelf walk. Two walks touching the
+    same gold file banked it twice in one boot - two of the three
+    generations holding identical bytes, and a genuine older one
+    pushed off the end."""
+    # THE SAME KEY THE OTHER DOOR USES - the sidecar itself. Keying
+    # one helper on the video and the other on the sidecar meant they
+    # could never see each other: 137 gold files banked twice in one
+    # walk, two generations of identical bytes, and one genuine older
+    # generation pushed off the end for good.
+    key = os.path.normcase(os.path.abspath(_ai_sidecar(video_path,
+                                                       kind)))
+    if key in _MIG_BANKED:
+        return False
+    _MIG_BANKED.add(key)
+    _bank_sidecar(video_path, kind)
+    return True
+
+
 def _bank_sidecar(video_path, kind):
     """A redo is about to REPLACE this sidecar: keep what is there. Three
     generations ride beside the current one (.v1 newest banked, .v3 oldest,
@@ -12212,6 +12261,10 @@ def _repick_moments(video_path):
         near = [g for g in events if abs(g["t"] - kv["t"]) <= 8.0]
         if near:
             near[0]["kind"] = kv["kind"]
+            if kv.get("also"):
+                near[0]["also"] = kv["also"]     # or the re-pick
+            #                                      erases every second
+            #                                      signal recovered
             near[0]["z"] = max(near[0].get("z") or 0, kv.get("z") or 0)
         else:
             events.append(kv)
@@ -12978,7 +13031,7 @@ RULES:
 _DESC_SCHEMA = {
     "type": "object",
     "properties": {
-        "segments": {"type": "array", "maxItems": 8, "items": {
+        "segments": {"type": "array", "maxItems": 12, "items": {
             "type": "object",
             "properties": {
                 "from_line": {"type": "integer"},
@@ -13746,6 +13799,16 @@ def _ins_owing_raw(video_path):
         return tries < 3
     if isinstance(d.get("windows"), dict) and not d.get("complete"):
         return tries < 3
+    # A REVIEW THAT NEVER COUNTED ITS COVERAGE OWES ONE PASS. For
+    # most nights that pass makes no model call at all - nothing is
+    # missing, so the run rebuilds from the windows already on disk
+    # and stamps the count. Only the genuinely half-told ones spend
+    # an ask, and their budget is finite.
+    if d.get("complete") and d.get("chapters") \
+            and not isinstance(d.get("cov"), dict):
+        return True
+    if (d.get("cov") or {}).get("owed"):
+        return True
     # A NEWER EAR RE-OWES THE REVIEW. When a transcript is replaced
     # by a newer READER GENERATION (the re-read lane), a complete
     # review built on the old ear follows it automatically - and the
@@ -14065,8 +14128,29 @@ def _insights_one(video_path, forced=False, fresh=False):
     # resumable like any window job - and only a COMPLETE result replaces
     # what the reader is looking at.
     upgrade = bool(prior.get("complete") and prior.get("chapters"))
-    work_p = side_p + ".new" if upgrade else side_p
-    if upgrade:
+    # A COUNT IS NOT A RE-TELLING. A finished review that predates the
+    # coverage count owes the count and nothing else - but "finished"
+    # is exactly what sends a night down the staged-upgrade lane,
+    # which reads its windows out of a .new that does not exist yet,
+    # finds every window missing, and describes the whole night again.
+    # Measured on the shelf: 347 finished reviews, about 3,500 asks,
+    # 39 to 88 hours of the card his games want. The stamp rebuilds
+    # from the windows already on disk, in place, for nothing.
+    cov_only = bool(upgrade and not forced and not fresh
+                    and isinstance(prior.get("windows"), dict)
+                    and prior.get("windows")
+                    and not isinstance(prior.get("cov"), dict))
+    staged = upgrade and not cov_only
+    work_p = side_p + ".new" if staged else side_p
+    if cov_only:
+        windows = prior["windows"]
+        # THE FIELD, READ THE WAY THE OWING TEST READS IT. Defaulting
+        # a gen-less review to the CURRENT generation quietly settled
+        # the eye-era upgrade for 56 pre-vision nights that had never
+        # been re-described at all.
+        carry_gen = int(prior.get("gen") or 2)
+        tries = 0
+    elif upgrade:
         wdoc = {}
         try:
             with open(work_p, encoding="utf-8") as fh:
@@ -14081,12 +14165,20 @@ def _insights_one(video_path, forced=False, fresh=False):
         if forced and windows and (fresh or wdoc.get("complete")):
             windows = {}
         tries = 0 if forced else int(wdoc.get("tries") or 0)
+        # THE GENERATION BELONGS TO THE WORDS, NOT THE RUN. Windows
+        # kept from an older telling keep their generation, so the
+        # night stays honestly owed its upgrade instead of being
+        # relabelled current by the run that merely resumed it.
+        carry_gen = int(wdoc.get("gen") or _INS_GENERATION) \
+            if windows else _INS_GENERATION
     else:
         windows = prior.get("windows") \
             if isinstance(prior.get("windows"), dict) else {}
         if forced and windows and (fresh or prior.get("complete")):
             windows = {}
         tries = 0 if forced else int(prior.get("tries") or 0)
+        carry_gen = int(prior.get("gen") or _INS_GENERATION) \
+            if windows else _INS_GENERATION
 
     _LANG_RE = r"\b(arabic|english|bilingual|language)\b"
 
@@ -14181,8 +14273,64 @@ def _insights_one(video_path, forced=False, fresh=False):
                     "reader": _stt_reader_of(video_path)}
         except OSError:
             pass
-        out = {"v": 3, "engine": "local", "gen": _INS_GENERATION,
-               "src_stt": _sst,
+        # HOW MUCH OF THE NIGHT THIS REVIEW ACTUALLY TELLS. Rows,
+        # not clock: most of a long hole is usually silence, and
+        # silence is not a gap in the telling - it is the night
+        # being quiet. A row counts as told when its middle falls
+        # inside a stretch.
+        _cov = {}
+        try:
+            _spans = sorted((float(x.get("from")), float(x.get("to")))
+                            for w in done_map.values()
+                            for x in ((w.get("segments")
+                                       if isinstance(w, dict) else w)
+                                      or [])
+                            if x.get("from") is not None
+                            and x.get("to") is not None)
+            _rows = [((sg.get("a") or 0) + (sg.get("b") or 0)) / 2000.0
+                     for sg in segs]
+            _in = 0
+            for _t in _rows:
+                for _a, _b in _spans:
+                    if _a - 0.5 <= _t <= _b + 0.5:
+                        _in += 1
+                        break
+            _gaps = []
+            _prev = 0.0
+            for _a, _b in _spans + [(vdur, vdur)]:
+                if _a - _prev >= 20.0:
+                    _n = sum(1 for _t in _rows if _prev < _t < _a)
+                    _gaps.append({"a": round(_prev, 1),
+                                  "b": round(_a, 1), "rows": _n,
+                                  "kind": "silence" if not _n
+                                  else "untold"})
+                _prev = max(_prev, _b)
+            # AND THE COUNT BELIEVES ITS OWN GAPS. A legacy window
+            # carries no ask budget to answer for itself, so a
+            # genuinely half-told night would otherwise stamp itself
+            # told: an untold run of six rows or more is owed however
+            # the window came to be.
+            # A LEGACY WINDOW HAS NO BUDGET TO ANSWER WITH, so its
+            # untold rows speak for it - but a window that SPENT its
+            # asks is finished, however little it managed. Letting the
+            # gaps override a spent budget made a night the model
+            # cannot tell owed forever, which is the card grinding on
+            # a night that will never improve.
+            _legacyw = any(not isinstance(w, dict) or "asks" not in w
+                           for w in done_map.values())
+            _owed = (any(_win_owes(w) for w in done_map.values())
+                     or (_legacyw
+                         and any(g.get("kind") == "untold"
+                                 and int(g.get("rows") or 0) >= 6
+                                 for g in _gaps)))
+            _cov = {"rows": len(_rows), "told": _in,
+                    "frac": round(_in / float(len(_rows) or 1), 3),
+                    "gaps": _gaps[:24], "owed": bool(_owed)}
+        except Exception:
+            _cov = {}
+        out = {"v": 3, "engine": "local",
+               "gen": min(int(carry_gen), _INS_GENERATION),
+               "src_stt": _sst, "cov": _cov,
                "title": (lambda _t: _t if len(_t) <= 120 else
                          (_t[:120].rsplit(" ", 1)[0] or _t[:120]))(
                    str(prior.get("title") or "")),
@@ -14194,8 +14342,13 @@ def _insights_one(video_path, forced=False, fresh=False):
                # that were working
                # our own found moments first; a legacy cloud list only
                # when this review produced none
-               "moments": (moms[:40] if moms
-                           else list(prior.get("moments") or [])),
+               # a rebuild is not a re-telling: if the cross-window
+               # twin rule would shave moments a finished review
+               # already kept, the review keeps them
+               "moments": (moms[:40] if moms and not (
+                   cov_only and len(moms)
+                   < len(prior.get("moments") or []))
+                   else list(prior.get("moments") or [])),
                "clips": list(prior.get("clips") or []),
                # the respelling undo ledger survives every reassembly -
                # the audit's retell used to erase it in the same breath
@@ -14307,7 +14460,19 @@ def _insights_one(video_path, forced=False, fresh=False):
         pass
     _seen.sort()
 
-    missing = [(lo, hi) for lo, hi in edges if str(int(lo)) not in windows]
+    def _win_owes(w):
+        """A window that stopped early with budget left is not done."""
+        if not isinstance(w, dict):
+            return False
+        try:
+            return (int(w.get("asks") or 0) < 5
+                    and int(w.get("left") or 0) >= 6)
+        except (TypeError, ValueError):
+            return False
+
+    missing = [(lo, hi) for lo, hi in edges
+               if str(int(lo)) not in windows
+               or _win_owes(windows.get(str(int(lo))))]
     # honest progress + guard telemetry for THIS job
     guard_cov = guard_retry = 0
     # "at" is WHEN this count became true - the row's estimate divides by
@@ -14317,8 +14482,23 @@ def _insights_one(video_path, forced=False, fresh=False):
                        "total": len(edges), "tail": False,
                        "at": time.time()}
     if not missing and windows:
+        # THE CLOCK BELONGS TO THE TELLING. A coverage stamp adds a
+        # count and changes not one word - so the review keeps the
+        # mtime the audit recorded, or 212 finished audits go silver
+        # over a file that did not change.
+        _keep_mt = None
+        if cov_only:
+            try:
+                _keep_mt = os.path.getmtime(side_p)
+            except OSError:
+                _keep_mt = None
         _assemble(windows, True, 0)
-        if upgrade:
+        if _keep_mt is not None:
+            try:
+                os.utime(side_p, (_keep_mt, _keep_mt))
+            except OSError:
+                pass
+        if staged:
             # THE SHORTCUT MUST STILL SWAP. A staged .new that arrives
             # here complete-in-all-but-name used to finish IN PLACE -
             # no bank, no swap - and a hard kill during the title ask
@@ -14373,15 +14553,25 @@ def _insights_one(video_path, forced=False, fresh=False):
                 windows[str(int(lo))] = []      # a silent half hour is done,
                 progress = True                  # not owing
                 continue
-            # fit THIS window to the context, evenly, before asking
-            n = len(part)
-            while True:
-                step = len(part) / float(n)
-                use = [part[int(i * step)] for i in range(n)]
-                body = "\n".join(_line(sg, i) for i, sg in enumerate(use))
-                if _tokens(body) <= room or n <= 24:
-                    break
-                n = max(24, int(n * room / float(max(1, _tokens(body)))) - 2)
+            # NOTHING IS SAMPLED AWAY. The window is walked in
+            # contiguous runs that fit the context; whatever an ask
+            # leaves uncovered becomes the next run. The old even-row
+            # fit dropped every k-th line to make the window fit, and
+            # the model never read those words at all.
+            # A WINDOW RESUMES, IT DOES NOT RESTART. Its stretches,
+            # its spent asks and the range it left are all on disk;
+            # beginning again with an empty list and a fresh budget
+            # meant a night the model cannot finish was re-swept at
+            # full price forever, its coverage frozen, never done.
+            _pw = windows.get(str(int(lo))) or {}
+            mapped = list(_pw.get("segments") or [])
+            wmoments = list(_pw.get("moments") or [])
+            asked = int(_pw.get("asks") or 0)
+            _lf = int(_pw.get("left") or 0)
+            pending = ([(max(0, len(part) - _lf), len(part))]
+                       if mapped and 0 < _lf <= len(part)
+                       else [(0, len(part))])
+            got = None
             imgs = []
             if _desc_mmproj() is not None and not _AI["abort"]:
                 imgs = [(f"[frame at {int(t) // 60}:{int(t) % 60:02d}]", b)
@@ -14439,7 +14629,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                             a2 = float(sgm2.get("from"))
                         except (TypeError, ValueError):
                             continue
-                        nm2 = str(sgm2.get("label") or "").strip()
+                        # "label" is the ASSEMBLED shape; a stored
+                        # stretch only ever carries "name", so every
+                        # cross-window ask ever made was handed an
+                        # empty story-so-far. Measured: 0 of 4,418
+                        # stored stretches have a label key.
+                        nm2 = str(sgm2.get("name") or "").strip()
                         if nm2:
                             earlier.append((a2, nm2))
                 earlier.sort()
@@ -14455,138 +14650,156 @@ def _insights_one(video_path, forced=False, fresh=False):
                           "come back to it, say so plainly by its name.\n")
             except Exception:
                 so_far = ""
-            head = (f"The game being played is {game}. This window of "
-                    f"the recording runs from minute {int(lo // 60)} to "
-                    f"minute {int(hi // 60)}. {see}{ears}{eyes}{so_far}"
-                    f"Cite lines ONLY "
-                    f"by their #numbers ({0} to {len(use) - 1}). "
-                    f"Three to five stretches.\n\n")
-            got = None
-            for _attempt in range(2):
-                txt = srv.ask(_DESC_SYSTEM, head + body, max_tokens=MAX_OUT,
-                              schema=_DESC_SCHEMA, images=imgs)
-                if txt:
-                    try:
-                        got = json.loads(
-                            _re.search(r"\{.*\}", txt, _re.S).group(0))
+            while pending and asked < 5 and not _AI["abort"] \
+                    and not _AI.get("wind"):
+                r0, r1 = pending.pop(0)
+                # the longest contiguous run of this range that fits
+                # BUDGETED AGAINST WHAT WILL ACTUALLY BE SENT. room
+                # reserves a fixed 900 for the answer, but a long run
+                # asks for up to 1,500 and the head is not in the
+                # reserve at all - together that could overcommit the
+                # context by fourteen hundred tokens, and a truncated
+                # answer does not parse.
+                _hd = (_tokens(see + ears + eyes + so_far) + 260
+                       if asked == 0 else 60)
+                _avail = max(600, room + 900 - _hd - 130)
+                j = r1
+                while True:
+                    use = part[r0:j]
+                    body = "\n".join(_line(sg, i)
+                                     for i, sg in enumerate(use))
+                    _w0 = max(3, min(12, -(-len(use) // 12)))
+                    _c0 = min(1500, 900 + 100 * max(0, _w0 - 5))
+                    if _tokens(body) + _c0 <= _avail or len(use) <= 24:
                         break
-                    except Exception:
-                        got = None
-                if _attempt == 0:
-                    guard_retry += 1        # the parse retry fired
-                n = max(24, n // 2)             # send less, ask once more
-                step = len(part) / float(n)
-                use = [part[int(i * step)] for i in range(n)]
-                body = "\n".join(_line(sg, i) for i, sg in enumerate(use))
-                # fewer lines = new numbering; the head must cite the NEW
-                # top line or the model's references map to the wrong rows
-                head = (f"The game being played is {game}. This window of "
-                        f"the recording runs from minute {int(lo // 60)} to "
-                        f"minute {int(hi // 60)}. {so_far}Cite lines ONLY "
-                        f"by their #numbers ({0} to {len(use) - 1}). "
-                        f"Three to five stretches.\n\n")
-            stretches = (got or {}).get("segments") or []
-            # THE CLOCK COMES FROM THE TRANSCRIPT, NOT THE MODEL. It cited
-            # line numbers; the lines know exactly when they were spoken.
-            # Inventing from/to seconds is how "Scouting and Egg Collection"
-            # landed eight minutes before the round it describes existed.
-            def _lt(v, fallback):
-                try:
-                    return use[max(0, min(len(use) - 1, int(v)))]
-                except (TypeError, ValueError):
-                    return fallback
-            mapped = []
-            for sgm in stretches:
-                _q_check(sgm, use)
-                a_sg = _lt(sgm.get("from_line"), None)
-                b_sg = _lt(sgm.get("to_line"), None)
-                if a_sg is not None:
-                    sgm["from"] = round((a_sg.get("a") or 0) / 1000.0, 1)
-                if b_sg is not None:
-                    sgm["to"] = round((b_sg.get("b") or 0) / 1000.0, 1)
-                if sgm.get("from") is not None and sgm.get("to") is not None:
-                    mapped.append(sgm)
-            wmoments = []
-            for mm in ((got or {}).get("moments") or [])[:4]:
-                m_sg = _lt(mm.get("line"), None)
-                why = str(mm.get("why") or "").strip()
-                if m_sg is None or not why:
-                    continue
-                why = _m_qcheck(mm, why, use)
-                wmoments.append(
-                    {"t": round(((m_sg.get("a") or 0)
-                                 + (m_sg.get("b") or 0)) / 2000.0, 1),
-                     "why": _devoice(_descrub(why))[:140],
-                     "kind": str(mm.get("kind") or "")[:12]})
-            # THE TAIL GETS ASKED FOR. Told twice to cover every line, the
-            # model still sometimes stops a third of the way through a
-            # window (measured on his own Devour: last citation line 47 of
-            # 161). When the last cited line falls short of ~85% of the
-            # window, the uncovered remainder is asked for ONCE, renumbered,
-            # and the answers are appended - so a window's back half can no
-            # longer silently have no chapters.
-            last_line = -1
-            for sgm in stretches:
-                try:
-                    last_line = max(last_line, int(sgm.get("to_line")))
-                except (TypeError, ValueError):
-                    pass
-            if got is not None and mapped and not _AI["abort"] \
-                    and 0 <= last_line < 0.85 * (len(use) - 1) \
-                    and len(use) - 1 - last_line >= 6:
-                rest = use[last_line + 1:]
-                body2 = "\n".join(_line(sg, i) for i, sg in enumerate(rest))
-                head2 = (f"The game being played is {game}. This is the "
-                         f"REST of a window whose start you already "
-                         f"described: minute "
-                         f"{int((rest[0].get('a') or 0) // 60000)} to minute "
-                         f"{int(hi // 60)}. Cite lines ONLY by their "
-                         f"#numbers ({0} to {len(rest) - 1}). One to three "
-                         f"stretches.\n\n")
-                guard_cov += 1              # the coverage guard fired
-                ip = _AI.get("ins_prog")
-                if isinstance(ip, dict):
-                    ip["tail"] = True       # the Working row says so
-                txt2 = srv.ask(_DESC_SYSTEM, head2 + body2,
-                               max_tokens=MAX_OUT, schema=_DESC_SCHEMA)
-                got2 = None
-                if txt2:
-                    try:
-                        got2 = json.loads(
-                            _re.search(r"\{.*\}", txt2, _re.S).group(0))
-                    except Exception:
-                        got2 = None
+                    j = r0 + max(24, int((j - r0)
+                                         * max(1, _avail - _c0)
+                                         / float(max(1, _tokens(body))))
+                                 - 2)
+                if len(use) < 3:
+                    continue           # a handful of lines is not a
+                    #                    chapter - but the ranges
+                    #                    behind it might be
+                # AND IT IS ASKED FOR THE RIGHT NUMBER OF PARTS. "Three
+                # to five stretches" is why one ask covered a median of
+                # 48 lines whatever it was given: the model obeyed, at
+                # about twelve lines a stretch. Measured reach by
+                # stretch count: 3 -> 27 lines, 5 -> 48, 8 -> 100.
+                want = max(3, min(12, -(-len(use) // 12)))
+                out_cap = min(1500, 900 + 100 * max(0, want - 5))
+                _first = (asked == 0)
+                head = (f"The game being played is {game}. This window "
+                        f"of the recording runs from minute "
+                        f"{int(lo // 60)} to minute {int(hi // 60)}. "
+                        + (f"{see}{ears}{eyes}{so_far}" if _first
+                           else "This is the REST of a window whose "
+                                "start you already described - do not "
+                                "describe those minutes again. ")
+                        + f"Cite lines ONLY by their #numbers "
+                          f"({0} to {len(use) - 1}). "
+                          f"{want} stretches.\n\n")
+                got = None
+                for _attempt in range(2):
+                    txt = srv.ask(_DESC_SYSTEM, head + body,
+                                  max_tokens=out_cap,
+                                  schema=_DESC_SCHEMA,
+                                  images=imgs if _first else None)
+                    if txt:
+                        try:
+                            got = json.loads(
+                                _re.search(r"\{.*\}", txt, _re.S)
+                                .group(0))
+                            break
+                        except Exception:
+                            got = None
+                    if _attempt == 0:
+                        guard_retry += 1    # the parse retry fired
+                    # THE SAME LINES, ASKED AGAIN. Halving the body on
+                    # the retry was the even-row loss wearing a second
+                    # hat: a parse failure says nothing about how many
+                    # rows the model can read.
+                asked += 1
+                if not _first:
+                    guard_cov += 1          # a continuation ask
+                    ip = _AI.get("ins_prog")
+                    if isinstance(ip, dict):
+                        ip["tail"] = True   # the Working row says so
+                stretches = (got or {}).get("segments") or []
 
-                def _lt2(v):
+                # THE CLOCK COMES FROM THE TRANSCRIPT, NOT THE MODEL.
+                # It cited line numbers; the lines know exactly when
+                # they were spoken. Inventing from/to seconds is how
+                # "Scouting and Egg Collection" landed eight minutes
+                # before the round it describes existed.
+                def _lt(v, fallback):
                     try:
-                        return rest[max(0, min(len(rest) - 1, int(v)))]
+                        return use[max(0, min(len(use) - 1, int(v)))]
                     except (TypeError, ValueError):
-                        return None
-                for sgm in ((got2 or {}).get("segments") or []):
-                    _q_check(sgm, rest)
-                    a_sg = _lt2(sgm.get("from_line"))
-                    b_sg = _lt2(sgm.get("to_line"))
-                    if a_sg is None or b_sg is None:
+                        return fallback
+
+                last = -1
+                for sgm in stretches:
+                    _q_check(sgm, use)
+                    a_sg = _lt(sgm.get("from_line"), None)
+                    b_sg = _lt(sgm.get("to_line"), None)
+                    if a_sg is not None:
+                        sgm["from"] = round((a_sg.get("a") or 0)
+                                            / 1000.0, 1)
+                    if b_sg is not None:
+                        sgm["to"] = round((b_sg.get("b") or 0)
+                                          / 1000.0, 1)
+                    if sgm.get("from") is None or sgm.get("to") is None:
                         continue
-                    sgm["from"] = round((a_sg.get("a") or 0) / 1000.0, 1)
-                    sgm["to"] = round((b_sg.get("b") or 0) / 1000.0, 1)
+                    # WHICH ROWS THIS CHAPTER ACTUALLY SPEAKS FOR,
+                    # in the transcript's own numbering - the line
+                    # numbers above are indices into one ask's slice
+                    try:
+                        _f = max(0, min(len(use) - 1,
+                                        int(sgm.get("from_line"))))
+                        _t = max(0, min(len(use) - 1,
+                                        int(sgm.get("to_line"))))
+                        sgm["src"] = [r0 + min(_f, _t), r0 + max(_f, _t)]
+                        last = max(last, r0 + max(_f, _t))
+                    except (TypeError, ValueError):
+                        pass
                     mapped.append(sgm)
-                for mm in ((got2 or {}).get("moments") or [])[:4]:
-                    m_sg = _lt2(mm.get("line"))
+                for mm in ((got or {}).get("moments") or [])[:4]:
+                    m_sg = _lt(mm.get("line"), None)
                     why = str(mm.get("why") or "").strip()
                     if m_sg is None or not why:
                         continue
-                    why = _m_qcheck(mm, why, rest)
+                    why = _m_qcheck(mm, why, use)
                     wmoments.append(
                         {"t": round(((m_sg.get("a") or 0)
                                      + (m_sg.get("b") or 0)) / 2000.0, 1),
                          "why": _devoice(_descrub(why))[:140],
                          "kind": str(mm.get("kind") or "")[:12]})
+                # WHAT IT LEFT COMES BACK. One ask covers what it
+                # covers; the remainder is the next range, until the
+                # window is told or the budget is spent.
+                # WHAT IT DID NOT TELL GOES BACK ON THE PILE, on
+                # EVERY exit. Popping the range at the top and
+                # re-queueing only at the bottom meant a parse failure
+                # - the likeliest failure there is - banked the window
+                # claiming it had left nothing, and a night with a
+                # fifth of its rows told was stamped finished for
+                # good.
+                if last < r0:
+                    last = r0 - 1
+                if r1 - 1 - last >= 6:
+                    pending.insert(0, (last + 1, r1))
+                if got is None:
+                    break
             log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} min -> "
                 f"{len(mapped)} stretch(es), {len(wmoments)} moment(s).")
-            if got is not None:
+            if mapped or got is not None:
                 windows[str(int(lo))] = {"segments": mapped,
-                                         "moments": wmoments}
+                                         "moments": wmoments,
+                                         "asks": asked,
+                                         "rows": len(part),
+                                         "left": (pending[0][1]
+                                                  - pending[0][0])
+                                         if pending else 0}
                 progress = True
                 tries = 0
                 # ON DISK NOW - an interruption after this line loses
@@ -14599,29 +14812,101 @@ def _insights_one(video_path, forced=False, fresh=False):
                 f"{guard_cov} coverage re-ask(s), "
                 f"{_qf[0]} quote(s) not found in their cited lines "
                 f"(blanked or trimmed, the stretch kept).")
-        complete = all(str(int(lo)) in windows for lo, hi in edges)
-        if complete:
+        # AN UNDER-TOLD WINDOW IS NOT A FINISHED REVIEW. Without
+        # this an interrupted run stamped complete, asked for a
+        # title, and SWAPPED the staged file in - throwing away the
+        # resume point, so the next run started the night over from
+        # its first row. Measured: the same interruption five
+        # evenings running cost 65 asks and never converged.
+        complete = all(str(int(lo)) in windows
+                       and not _win_owes(windows[str(int(lo))])
+                       for lo, hi in edges)
+        if complete and not _AI["abort"] and not _AI.get("wind"):
             # A TITLE FOR THE WHOLE THING, from every window's chapter
             # names - window 1's own title kept naming a two-hour night
             # after its first half hour.
             names = []
+            cinfo = []
             for k in sorted(windows, key=lambda x: float(x)):
                 w = windows[k]
+                _wm = (w.get("moments") if isinstance(w, dict)
+                       else None) or []
                 for sgm in (w.get("segments") if isinstance(w, dict)
                             else w) or []:
                     nm = str(sgm.get("name") or "").strip()
-                    if nm:
-                        names.append(nm)
+                    if not nm:
+                        continue
+                    names.append(nm)
+                    try:
+                        _a2 = float(sgm.get("from") or 0.0)
+                        _b2 = float(sgm.get("to") or 0.0)
+                    except (TypeError, ValueError):
+                        _a2 = _b2 = 0.0
+                    try:
+                        _sr = sgm.get("src") or []
+                        _rw = max(1, int(_sr[1]) - int(_sr[0]) + 1)
+                    except (TypeError, ValueError, IndexError):
+                        _rw = 1
+                    cinfo.append({"n": nm, "d": max(0.0, _b2 - _a2),
+                                  "r": _rw, "a": _a2, "b": _b2,
+                                  "m": sum(1 for _mm in _wm
+                                           if _a2 <= float(_mm.get("t")
+                                                           or -1) <= _b2),
+                                  "g": 0})
+            # the gold marks are model-independent evidence that
+            # something happened in a stretch - the one signal in the
+            # ledger no describer wrote
+            try:
+                with open(_ai_sidecar(video_path, "hl"),
+                          encoding="utf-8") as fh:
+                    for _e in (json.load(fh) or {}).get("events") or []:
+                        _tt = _e.get("t")
+                        if not isinstance(_tt, (int, float)):
+                            continue
+                        for _c in cinfo:
+                            if _c["a"] <= float(_tt) <= _c["b"]:
+                                _c["g"] += 1
+                                break
+            except Exception:
+                pass
+
+            def _sal(cs):
+                """How much of the night a chapter actually was.
+                Duration alone points at the dull end: the longest
+                chapter holds 22.9% of the clock but only 10.7% of
+                the moments. Lines spoken and marks landed carry the
+                rest."""
+                _ch = sum(c["d"] for c in cs) or 1.0
+                _rt = sum(c["r"] for c in cs) or 1
+                _mg = sum(c["m"] + c["g"] for c in cs) or 1
+                for c in cs:
+                    c["s"] = (0.45 * c["d"] / _ch
+                              + 0.30 * c["r"] / _rt
+                              + 0.25 * (c["m"] + c["g"]) / _mg)
+                return sorted(cs, key=lambda c: -c["s"])
             title = summary = ""
             if names:
+                _ranked = _sal(list(cinfo))[:40]
+                _lines = "\n".join(
+                    "- %s [%d min, %d lines%s]"
+                    % (c["n"], int(round(c["d"] / 60.0)), c["r"],
+                       (", %d marked moments" % (c["m"] + c["g"]))
+                       if (c["m"] + c["g"]) else "")
+                    for c in _ranked)
                 t_ask = (f"These are the chapters of one session of "
-                         f"{game}, in order:\n- " + "\n- ".join(names[:40])
+                         f"{game}, heaviest first - the bracket says how "
+                         f"much of the night each one actually was:\n"
+                         + _lines
                          + "\n\nReply with STRICT JSON and nothing else: "
                            '{"title": "...", "summary": "one or two '
                            'sentences"}. The title names what actually '
                            "happened, in the session's own words and names - "
                            "if it would fit a thousand other recordings it "
-                           "is wrong. Write Arabic words in Arabic letters. "
+                           "is wrong. Prefer a chapter near the top of the "
+                           "list, but a short chapter that is the point of "
+                           "the night beats a long one that is not. At most "
+                           "nine words, and it is a name, not a list. "
+                           "Write Arabic words in Arabic letters. "
                            "Never name a person unless that name is in the "
                            "chapter list above - unheard names are the one "
                            "unforgivable error.")
@@ -14748,20 +15033,19 @@ def _insights_one(video_path, forced=False, fresh=False):
             _t2 = re.sub(r"\s{2,}", " ", str(title or "")).strip()
             if _t2 and (len(re.findall("[,\u060c]", _t2)) >= 2
                         or len(_t2.split()) > 9):
-                _bn, _bd = "", -1.0
-                for _k2 in windows:
-                    _w2 = windows[_k2]
-                    for sgm in (_w2.get("segments")
-                                if isinstance(_w2, dict)
-                                else _w2) or []:
-                        _nm = str(sgm.get("name") or "").strip()
-                        try:
-                            _d2 = (float(sgm.get("to") or 0)
-                                   - float(sgm.get("from") or 0))
-                        except (TypeError, ValueError):
-                            _d2 = 0.0
-                        if _nm and _d2 > _bd:
-                            _bn, _bd = _nm, _d2
+                # not simply the longest - the best-scoring chapter
+                # among those with real time behind them
+                _bn = ""
+                if cinfo:
+                    _sal(cinfo)
+                    _mx = max(c["d"] for c in cinfo) or 0.0
+                    _pool = [c for c in cinfo
+                             if c["d"] >= 0.5 * _mx] or cinfo
+                    # the clock leads and the ledger breaks ties: left
+                    # to itself the ledger overruled the longest
+                    # chapter by three thousandths, and its losses ran
+                    # one way - it named the noise over the content
+                    _bn = max(_pool, key=lambda c: (c["d"], c["s"]))["n"]
                 if _bn:
                     log("The title came back a list (\"" + _t2[:60]
                         + "\") - the longest-lived chapter names the "
@@ -14771,7 +15055,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                 (names[0] if names else "")
             prior["summary"] = summary or prior.get("summary") or ""
             out = _assemble(windows, True, 0)
-            if upgrade:
+            if staged:
                 # the moment of the swap - and the ONLY moment the old
                 # review is touched. It is BANKED first, never destroyed.
                 _bank_sidecar(video_path, "ins")
@@ -15308,6 +15592,80 @@ def _eye_places(looks):
     return spans
 
 
+_EYE_NOTCREATURE = re.compile(
+    r"\b(cars?|vehicles?|karts?|racers?|drivers?"
+    r"|minions?|portraits?|cards?|boards?|decks?|tavern|heroe?s?"
+    r"|players?|avatars?|teammates?|allies|ally|squad|party"
+    r"|operatives?|tarnished|bots?|helldivers?)\b", re.I)
+_EYE_BOARD = re.compile(
+    r"\b(board|tavern|deck|lobby|garage|scoreboard"
+    r"|card table)\b", re.I)
+_EYE_MENU = re.compile(
+    r"\b(menu|screen|lobby|selection|selecting|loading|title|inventory"
+    r"|shop|skill tree|map|pause|settings|options|results|scoreboard"
+    r"|character creation|customisation|customization|warbond|hub"
+    r"|queue|searching|waiting|start line|replay|cutscene|browsing"
+    r"|choosing|displaying|showing)\b", re.I)
+_EYE_MONSTER = re.compile(
+    r"\b(monsters?|beasts?|creatures?|demons?|dragons?|undead"
+    r"|skeletons?|skeletal|zombies?|ghouls?|wraiths?|spectres?"
+    r"|specters?|spectral|trolls?|ogres?|giants?|abominations?"
+    r"|horrors?|boss(?:es)?|warlord|overlord|behemoth|serpents?"
+    r"|golems?|mutants?|infected|swarm|aliens?|brutes?|butcher"
+    r"|reaper|enemies|enemy|hulking|monstrosity|nurgle|poxwalker"
+    r"|scab|ogryn|plague|insectoid|shambl\w+|walkers?|corpses?"
+    r"|puppets?|automat\w+|robots?|mechs?|droids?|drones?"
+    r"|turrets?|constructs?|machines?|terminids?|devastators?"
+    r"|chargers?|stalkers?|bile|hive|vermin|rats?|roach\w*"
+    r"|crawlers?|parasites?|spiders?|scorpions?|wasps?|hounds?"
+    r"|worms?|slimes?|wretch\w*|fiends?|revenants?)\b", re.I)
+_EYE_ACTOR = re.compile(
+    r"\b(attack\w*|lunging|pouncing|leaping|chasing|advancing"
+    r"|approaching|looming|emerging|bursting|rearing|roaring|biting"
+    r"|clawing|stomping|slamming|grabbing|hurling|summoning|casting"
+    r"|fighting|battling|duelling|dueling|engag\w+|felled|defeated"
+    r"|explod\w+|circling|stalking|shooting at|firing at"
+    r"|dying|dies|killed|staggered|collaps\w+|crumbl\w+)\b"
+    r"|charging (?:at|toward)|closing in|swinging (?:a|its|the)"
+    r"|taking damage|health depleting|falling apart", re.I)
+
+
+def _eye_worth(lk):
+    """Does this sighting belong on the gold timeline?
+
+    A gold mark says "something happened here". His own car, his own
+    cards, his own squad and his own character do not clear that bar
+    just by being on screen - and measured over the shelf they were
+    91% of everything the eye ever promoted. A sighting earns a mark
+    when it is a THING, in the WORLD, DOING something: the creature
+    is not one of his own, the frame is not a menu, and the eye says
+    it acted. Everything else stays in the Eye panel and in the
+    describer's lines, which is where it was always useful."""
+    if not isinstance(lk, dict):
+        return False
+    cre = str(lk.get("creature") or "").strip()
+    if not cre:
+        return False
+    if _EYE_NOTCREATURE.search(cre):
+        return False
+    _doing = str(lk.get("doing") or "")
+    # a menu is a menu whichever field says so - "selecting a card",
+    # "browsing the shop" describe a screen, not a fight
+    if _EYE_MENU.search(str(lk.get("place") or "")) \
+            or _EYE_MENU.search(_doing) \
+            or _EYE_BOARD.search(str(lk.get("place") or "")):
+        return False
+    # A MONSTER STANDING STILL IS STILL A MONSTER. The verb test
+    # alone dropped "a skeletal warrior, standing" and kept nothing
+    # of the quiet bosses, so an unambiguously hostile creature word
+    # clears the bar on its own. Ambiguous ones - knight, warrior,
+    # soldier, guard, figure - still have to be seen DOING something,
+    # because those are just as often his own squad.
+    if _EYE_MONSTER.search(cre):
+        return True
+    return bool(_EYE_ACTOR.search(_doing))
+
+
 def _merge_vis_into_hl(video_path, vis=None):
     """Put the creatures the eye saw onto the gold timeline, kind
     'creature'.
@@ -15335,8 +15693,7 @@ def _merge_vis_into_hl(video_path, vis=None):
         if not vis or vis.get("failed"):
             return 0, None
         sights = [lk for lk in (vis.get("looks") or [])
-                  if isinstance(lk, dict)
-                  and str(lk.get("creature") or "").strip()][:12]
+                  if _eye_worth(lk)][:12]
         if not sights:
             return 0, None
         with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
@@ -15387,6 +15744,175 @@ def _merge_vis_into_hl(video_path, vis=None):
         return added, None
     except Exception as e:
         return 0, str(e)[:120]
+
+
+def _hl_refold_migration():
+    """3.27, once per gold sidecar: the sense fold re-run so the
+    signals it dropped on the floor come back. 516 of 2,746 sense and
+    OCR events never reached the timeline because another signal held
+    the second - the answers were on disk the whole time, so this
+    costs nothing but a walk."""
+    out = SETTINGS.get("output_dir", "")
+    files = total = 0
+    for d0, kind in _library_dirs(out):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            hp = _ai_sidecar(p, "hl")
+            if not os.path.isfile(hp):
+                continue
+            try:
+                with open(hp, encoding="utf-8") as fh:
+                    hd = json.load(fh) or {}
+            except Exception:
+                continue
+            if int(hd.get("fg") or 0) >= 1:
+                continue
+            _b4 = sum(len(g.get("also") or [])
+                      for g in (hd.get("events") or [])
+                      if isinstance(g, dict))
+            _mt0 = _raw0 = None
+            try:
+                _mt0 = os.path.getmtime(hp)
+                # THE BANK IS WHAT WE READ, taken BEFORE the fold
+                # rewrites the file. Banking afterwards copied the
+                # already-changed bytes, so the timeline as it stood
+                # was in no generation at all.
+                with open(hp, "rb") as fh:
+                    _raw0 = fh.read()
+                _merge_sns_into_hl(p)
+                with open(hp, encoding="utf-8") as fh:
+                    hd2 = json.load(fh) or {}
+            except Exception:
+                continue
+            _af = sum(len(g.get("also") or [])
+                      for g in (hd2.get("events") or [])
+                      if isinstance(g, dict))
+            # NOTHING IS WRITTEN THAT DID NOT CHANGE. Stamping every
+            # gold file moved every gold mtime, and the audit records
+            # that clock: 281 finished audits would have gone silver
+            # in one boot over 1,012 files that came back identical.
+            # The walk is idempotent on its own; the shelf marker is
+            # what stops it running twice.
+            if _af <= _b4:
+                if _mt0 is not None:
+                    try:
+                        os.utime(hp, (_mt0, _mt0))
+                    except OSError:
+                        pass
+                continue
+            files += 1
+            total += _af - _b4
+            hd2["fg"] = 1
+            try:
+                if _raw0 is not None and _mig_bank_bytes(hp, _raw0):
+                    pass          # the pre-fold timeline is banked
+                _atomic_write_json(hp, hd2)
+            except Exception:
+                continue
+    if files:
+        log("The fold went back for " + str(total) + " signal(s) it "
+            "had dropped across " + str(files) + " recording(s) - a "
+            "cheer under a laugh, a WINNER under a groan. Nothing was "
+            "re-listened to; the answers were already on disk.")
+
+
+def _vis_promote_migration():
+    """3.27, once per gold sidecar: today's sighting gate replayed
+    over every creature mark on the shelf. A mark minted before the
+    gate existed stays wrong forever on its own, and re-looking would
+    be forty-nine hours of the card that belongs to his games - the
+    eye's answers are already on disk.
+
+    Only a mark that can be matched to a look TODAY'S gate rejects is
+    removed; one whose look cannot be found is left alone, because a
+    mark of unknown parentage is not evidence of a bad one. The gold
+    sidecar is banked before it changes, and every sighting keeps its
+    place in the Eye panel either way."""
+    out = SETTINGS.get("output_dir", "")
+    total = files = 0
+    for d0, kind in _library_dirs(out):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            hp = _ai_sidecar(p, "hl")
+            vp = _ai_sidecar(p, "vis")
+            if not (os.path.isfile(hp) and os.path.isfile(vp)):
+                continue
+            try:
+                with open(hp, encoding="utf-8") as fh:
+                    hd = json.load(fh) or {}
+            except Exception:
+                continue
+            if int(hd.get("eg") or 0) >= 1:
+                continue
+            marks = [g for g in (hd.get("events") or [])
+                     if isinstance(g, dict) and g.get("kind") == "creature"]
+            if not marks:
+                continue        # nothing to judge - and a file is
+                #                 never rewritten just to be stamped:
+                #                 moving 1,292 mtimes would re-owe
+                #                 every finished audit on the shelf
+            try:
+                # FRESH OR NOTHING, the same rule the fold itself
+                # states twelve lines above: a sidecar older than its
+                # recording describes footage a trim may have cut
+                if os.path.getmtime(vp) < os.path.getmtime(p):
+                    continue
+                with open(vp, encoding="utf-8") as fh:
+                    vd = json.load(fh) or {}
+            except Exception:
+                continue
+            looks = [lk for lk in (vd.get("looks") or [])
+                     if isinstance(lk, dict)
+                     and str(lk.get("creature") or "").strip()]
+            drop = set()
+            moved = 0
+            for g in marks:
+                try:
+                    gt = float(g.get("t") or 0)
+                except (TypeError, ValueError):
+                    continue
+                near = None
+                for lk in looks:
+                    try:
+                        lt = float(lk.get("t") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(lt - gt) <= 1.5:
+                        near = lk
+                        break
+                if near is not None and not _eye_worth(near):
+                    _al = [k for k in (g.get("also") or []) if k]
+                    if _al:
+                        # THE RE-FOLD RUNS FIRST and may have hung a
+                        # real signal here - a cheer, a groan, a
+                        # WINNER. Taking the whole mark would destroy
+                        # what was just recovered; only the sighting
+                        # is taken off it.
+                        g["kind"] = _al[0]
+                        if _al[1:]:
+                            g["also"] = _al[1:]
+                        else:
+                            g.pop("also", None)
+                        moved += 1
+                    else:
+                        drop.add(id(g))
+            if not (drop or moved):
+                continue
+            try:
+                _mig_bank(p, "hl")
+                hd["eg"] = 1
+                hd["events"] = [g for g in (hd.get("events") or [])
+                                if id(g) not in drop]
+                total += len(drop)
+                files += 1
+                _atomic_write_json(hp, hd)
+            except Exception:
+                continue
+    if total:
+        log("The eye's gate took " + str(total) + " sighting(s) off the "
+            "gold timeline across " + str(files) + " recording(s) - his "
+            "own car, his own cards, his own squad. Every one is still "
+            "in the Eye panel, and the sound marks are untouched.")
 
 
 def _vis_owing(video_path):
@@ -16594,6 +17120,7 @@ def _aud_says(t, src):
     the same list - the panel's "agrees" must not shuffle between two
     runs over the same night."""
     lay, det = [], {}
+    _wbest = None
     for sg in (src.get("stt") or []):
         try:
             a = float(sg.get("a") or 0) / 1000.0
@@ -16607,11 +17134,25 @@ def _aud_says(t, src):
         txt = str(sg.get("t") or "").strip()
         if len(txt.split()) < 2 or sg.get("g"):
             continue                  # the game's own audio is not a voice
-        who = _aud_voice(src.get("sns"), a, b)
+        # THE LINE THAT COVERS THE SECOND WINS. Taking the first row
+        # in the window and stopping handed the thinker a sentence
+        # from a different moment 45.7% of the time, and in 813 of
+        # those a line that genuinely covered the second was sitting
+        # right there behind it.
+        _gp = 0.0 if a <= t <= b else min(abs(a - t), abs(b - t))
+        if _wbest is None or _gp < _wbest[0]:
+            _wbest = (_gp, a, b, txt)
+        if _gp == 0.0:
+            break                     # nothing beats covering it
+    if _wbest is not None:
+        _gp, _wa, _wb, _wt = _wbest
+        who = _aud_voice(src.get("sns"), _wa, _wb)
         lay.append("words")
-        det["words"] = ((who + ': "' + txt[:100] + '"') if who
-                        else '"' + txt[:100] + '"')
-        break
+        # AND IT SAYS HOW FAR AWAY IT WAS. A line two seconds off is
+        # context; the thinker was being handed it as the line.
+        det["words"] = (("%.1fs away: " % _gp) if _gp > 0.4 else "")
+        det["words"] += ((who + ': "' + _wt[:100] + '"') if who
+                         else '"' + _wt[:100] + '"')
     sns = src.get("sns") or {}
     for e2 in (sns.get("events") or []):
         try:
@@ -16655,19 +17196,27 @@ def _aud_says(t, src):
         lay.append("eye")
         det["eye"] = best[:90]
     ins = src.get("ins") or {}
+    # THE REVIEW IS A RETELLING, NOT A WITNESS. A moment may stand
+    # as a layer when it genuinely cites this second; a chapter label
+    # spanning a minute never can (1,036 of 1,208 chapter agreements
+    # covered 60 seconds or more). Both still SHOW on the page - only
+    # the vote is withdrawn.
+    _mb = None
     for m in (ins.get("moments") or []):
         try:
-            if abs(float(m.get("t") or 0) - t) <= _AUD_REVIEW:
-                lay.append("review")
-                det["review"] = str(m.get("why") or "")[:140]
-                break
+            _d3 = abs(float(m.get("t") or 0) - t)
         except (TypeError, ValueError):
             continue
+        if _d3 <= _AUD_REVIEW and (_mb is None or _d3 < _mb[0]):
+            _mb = (_d3, str(m.get("why") or "")[:140])
+    if _mb is not None:
+        det["review"] = _mb[1]
+        if _mb[0] <= 0.5:
+            lay.append("review")      # it names this very second
     if "review" not in det:
         for c in (ins.get("chapters") or []):
             try:
                 if abs(float(c.get("t") or 0) - t) <= _AUD_CHAPTER:
-                    lay.append("review")
                     det["review"] = str(c.get("label") or "")[:80]
                     break
             except (TypeError, ValueError):
@@ -16729,6 +17278,10 @@ def _aud_condemn(t, src, live, origin):
     audit."""
     lay, det = _aud_says(t, src)
     agrees = [k for k in lay if k != origin]
+    if agrees == ["review"]:
+        # a mark whose only support is the review is supported by a
+        # retelling of a transcript that said nothing there
+        agrees = []
     others = live - {origin}
     return (bool(others) and not agrees), agrees, det
 
@@ -18345,6 +18898,97 @@ def _aud_restrike(video_path, freq):
     return healed_ts
 
 
+# THE MARKER NAMES THE WALKS THAT FINISHED. A single number
+# standing for three separately-added walks let one stamp retire work
+# that had never run - measured on his own machine, where the file
+# said "3" and not one sidecar carried a stamp. A name can only
+# retire itself.
+_MIG_WALKS = ("refold", "eye", "strike")
+_MIG_BUSY = [False]
+_MIG_BANKED = set()
+
+
+def _shelf_migrations():
+    """The once-per-shelf walks, off the recorder's thread.
+
+    _ai_tick is called from the loop that notices a game starting and
+    rolls the recording, and these walks touch every sidecar on the
+    shelf - four minutes of not watching for a game, at the first
+    boot. They run on their own thread instead, behind one busy flag,
+    and the done-marker lives on disk: a migrated shelf costs one
+    small read at every later boot instead of eighteen hundred cold
+    opens of files that need nothing."""
+    mark = os.path.join(_data_dir(), "shelf.mig")
+    done = set()
+    try:
+        with open(mark, encoding="utf-8") as fh:
+            got = json.load(fh)
+        if isinstance(got, dict):
+            done = set(str(x) for x in (got.get("done") or []))
+    except Exception:
+        done = set()          # an older or unreadable marker means
+        #                       "nothing is proven" - the walks run
+    todo = [w for w in _MIG_WALKS if w not in done]
+    if not todo:
+        return
+    if _MIG_BUSY[0]:
+        return
+
+    _MIG_BUSY[0] = True         # set BEFORE the thread, or a second
+    #                             caller slips past the check below
+
+    def work():
+        try:
+            seen = 0
+            try:
+                for _d, _k in _library_dirs(SETTINGS.get("output_dir",
+                                                         "")):
+                    seen += len(_scan_dir_mp4s(_d, _k))
+            except Exception:
+                seen = 0
+            if not seen:
+                # AN EMPTY WALK EARNS NOTHING. The drive may be asleep
+                # or the folder not set yet; stamping the shelf as
+                # migrated here would retire every walk forever on a
+                # shelf nobody has read.
+                return
+            _MIG_BANKED.clear()
+            for key, fn, nm in (("refold", _hl_refold_migration,
+                                 "re-fold"),
+                                ("eye", _vis_promote_migration,
+                                 "eye-gate"),
+                                ("strike", _aud_strike_migration,
+                                 "strike")):
+                # the fold and the eye first: both edit gold marks,
+                # and the strike walk reads them
+                if key not in todo:
+                    continue
+                try:
+                    fn()
+                except Exception as e:
+                    log("The " + nm + " walk stumbled: " + str(e)[:120])
+                    continue      # NOT recorded: a walk that fell over
+                    #               runs again next boot rather than
+                    #               being retired half-done
+                done.add(key)
+            _MIG_BANKED.clear()
+            try:
+                with open(mark, "w", encoding="utf-8") as fh:
+                    json.dump({"done": sorted(done)}, fh)
+            except Exception:
+                pass
+        finally:
+            _MIG_BUSY[0] = False
+
+    threading.Thread(target=work, daemon=True,
+                     name="shelf-migrations").start()
+
+
+def _mig_busy():
+    """The lanes stand back while the shelf is being walked."""
+    return bool(_MIG_BUSY[0])
+
+
 def _aud_strike_migration():
     """3.26, once per audit sidecar: the current ear-veto replayed
     over every machine strike on the shelf. A strike made before the
@@ -18357,6 +19001,8 @@ def _aud_strike_migration():
     restored across 47 recordings, idempotent on the second pass."""
     out = SETTINGS.get("output_dir", "")
     total = files = 0
+    _AI["_mig_quiet"] = True       # one ask at the end, not 54
+    touched = []
     try:
         _aud_vocab()               # the veto's vocabulary arm, once
     except Exception:
@@ -18374,11 +19020,42 @@ def _aud_strike_migration():
                 continue
             if int(ad.get("sg") or 0) >= 2:
                 continue
-            rows = [g for g in (ad.get("garble") or [])
-                    if isinstance(g, dict)
-                    and g.get("verdict") == "noise"
-                    and str(g.get("ear") or "").strip()
-                    and not g.get("ear_junk")]
+            def _eared(doc):
+                return [g for g in ((doc or {}).get("garble") or [])
+                        if isinstance(g, dict)
+                        and g.get("verdict") == "noise"
+                        and str(g.get("ear") or "").strip()
+                        and not g.get("ear_junk")]
+
+            rows = _eared(ad)
+            # AND THE EARS THE LAST AUDIT FORGOT. Each pass rewrites
+            # its own garble list, so a line struck two audits ago
+            # has no row here at all - but the audit that struck it
+            # is banked right beside this one, ear and all. Read-only
+            # on the attic: it is evidence, never a target.
+            _seen_t = set()
+            for _g in rows:
+                try:
+                    _seen_t.add(round(float(_g.get("t") or 0), 2))
+                except (TypeError, ValueError):
+                    pass
+            for _vn in (".v1", ".v2", ".v3"):
+                try:
+                    with open(ap + _vn, encoding="utf-8") as fh:
+                        _old = json.load(fh) or {}
+                except Exception:
+                    continue
+                for _g in _eared(_old):
+                    try:
+                        _tk = round(float(_g.get("t") or 0), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    if _tk in _seen_t:
+                        continue
+                    _seen_t.add(_tk)
+                    _cp = dict(_g)
+                    _cp["_attic"] = True
+                    rows.append(_cp)
             restored = []
             sd = None
             for g in rows:
@@ -18420,22 +19097,41 @@ def _aud_strike_migration():
                     g["vwhy"] = _aud_clip(
                         "restored - the re-listen read it; the next "
                         "audit re-judges it fresh")
+                    if g.pop("_attic", None):
+                        # it came from a banked audit: give it a row
+                        # in today's, or the page keeps showing a
+                        # line that is no longer struck as struck
+                        ad.setdefault("garble", []).append(g)
                     restored.append(t0)
                     break
-            ad["sg"] = 2
+            if not (restored and sd is not None):
+                continue      # nothing restored: the audit is not
+                #               rewritten just to be stamped - its
+                #               mtime is the clock the shelf reads
             try:
-                if restored and sd is not None:
-                    _aud_bank_orig(p, "aud")
-                    _bank_sidecar(p, "stt")
-                    _atomic_write_json(_ai_sidecar(p, "stt"), sd)
-                    _atomic_write_json(ap, ad)
-                    _aud_retell(p, restored, refill=False)
-                    total += len(restored)
-                    files += 1
-                else:
-                    _atomic_write_json(ap, ad)
+                ad["sg"] = 2
+                _aud_bank_orig(p, "aud")
+                _mig_bank(p, "stt")
+                _atomic_write_json(_ai_sidecar(p, "stt"), sd)
+                _atomic_write_json(ap, ad)
+                _aud_retell(p, restored, refill=False)
+                total += len(restored)
+                files += 1
+                touched.append(p)
             except Exception:
                 continue
+    _AI["_mig_quiet"] = False
+    if touched:
+        # the head-of-queue slot holds ONE night, so the newest goes
+        # there and the rest ride the sweep - which owes every one of
+        # them, because each carries a staged re-describe
+        try:
+            _ai_ask_first(max(touched, key=lambda x: os.path.getmtime(x)),
+                          "think",
+                          "the audit gave back struck lines and the "
+                          "description must catch up")
+        except Exception:
+            pass
     if total:
         log("The ear-veto migration gave back " + str(total)
             + " struck line(s) across " + str(files)
@@ -18696,6 +19392,11 @@ def _aud_retell(video_path, changed_ts, refill=True):
     log("The audit corrected lines inside " + str(len(dirty))
         + " described window(s) of " + os.path.basename(video_path)
         + " - re-describing just those minutes, then the title.")
+    if _AI.get("_mig_quiet"):
+        # a shelf walk is retelling dozens of nights: the single
+        # head-of-queue slot holds ONE, so the walk hands the sweep
+        # the whole list itself when it is done
+        return len(dirty)
     if not (refill and was_complete):
         # the card is leaving, or the review was already mid-build: the
         # MARK is on disk (instant, no model). It must not be left to
@@ -20302,15 +21003,12 @@ def _ai_tick(ctl):
         return          # an audit owns the card
     if _SLATE_BUSY[0] > 0:
         return                 # a slate is clearing sidecars - let it finish
+    if _MIG_BUSY[0]:
+        return            # the shelf walk is rewriting sidecars this
+        #                   lane is about to read - one at a time
     if not _AI.get("_sg2"):
-        # 3.26, once per boot: the strike migration walks the shelf on
-        # THIS thread while nothing owns the card - the cheapest
-        # mutual exclusion there is. Pure file work, no models.
         _AI["_sg2"] = True
-        try:
-            _aud_strike_migration()
-        except Exception as e:
-            log("The strike migration stumbled: " + str(e)[:120])
+        _shelf_migrations()
     # ASKED FOR means asked for. The idle rules below exist so the reader
     # never steals a frame from a game you did not ask it to interrupt - but
     # when you point at one recording and say do this now, waiting for a quiet
@@ -20946,6 +21644,10 @@ def _ins_done_honest(video_path):
         with open(_ai_sidecar(video_path, "ins"), encoding="utf-8") as fh:
             d = json.load(fh) or {}
         if d.get("failed"):
+            return False
+        # a review that stopped early with asks to spare is not
+        # finished, whatever its complete flag says
+        if (d.get("cov") or {}).get("owed"):
             return False
         return bool(d.get("complete")) and (bool(d.get("chapters"))
                                             or bool(d.get("empty")))

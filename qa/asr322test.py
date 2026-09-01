@@ -141,8 +141,12 @@ check("the dossier derives [ar]/[en] from the characters",
           < LSRC.index('outl.append(mark + lang + " " + txt[:110])'))
 
 print("\n--- T4: the reader generation ---")
-check("worker stamps READER = 3", "READER = 3" in SRC)
-check("the app expects the same", "_STT_READER = 3" in LSRC)
+import re as _re2
+_wr = _re2.search(r"^READER = (\d+)", SRC, _re2.M)
+_ar = _re2.search(r"^_STT_READER = (\d+)", LSRC, _re2.M)
+check("the worker stamps a reader generation", bool(_wr))
+check("the app expects exactly what the worker writes - a mismatch is how a stale worker ran a whole redo undetected",
+      bool(_ar) and _wr.group(1) == _ar.group(1))
 check("the physics counter ships in stats", '"physics": 0' in SRC)
 check("the boot note still never re-reads behind his back",
       "never read again on its own" in LSRC)

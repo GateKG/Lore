@@ -29,7 +29,7 @@ if not exist "C:\Program Files\Lore\ffmpeg\bin\ffmpeg.exe" (
 )
 
 set FAILED=
-for %%t in (codex326test codex325test codex324test codex323test asr322test
+for %%t in (codex327test codex326test codex325test codex324test codex323test asr322test
             afkai320test afkrace320test fresh319test fleet319test
             afk2test afktest pairtest freezetest schedtest sched4test
             aud302test aud303test silvertest gatetest295 micheal

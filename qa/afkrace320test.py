@@ -15,6 +15,15 @@ import time
 sys.path.insert(0, r"D:\Gate LLC")
 import lore  # noqa: E402
 
+# A SUITE THAT TICKS MUST PEN THE LIBRARY WALK. _ai_tick carries the
+# once-per-boot migrations (strikes, the eye's gate, the re-fold) and
+# every one of them WRITES. Without this the walk would be pointed at
+# the real D:\Records the moment a guard above the hook stops
+# returning early.
+import lore as _pen_lore
+_pen_lore._library_dirs = lambda out: []
+_pen_lore._scan_dir_mp4s = lambda d, k: []
+
 lore.log = lambda m: None
 lore.load_settings()
 lore._ai_state_save = lambda: None

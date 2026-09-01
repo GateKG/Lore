@@ -15,6 +15,15 @@ import time
 sys.path.insert(0, r"D:\Gate LLC")
 import lore  # noqa: E402
 
+# A SUITE THAT TICKS MUST PEN THE LIBRARY WALK. _ai_tick carries the
+# once-per-boot migrations (strikes, the eye's gate, the re-fold) and
+# every one of them WRITES. Without this the walk would be pointed at
+# the real D:\Records the moment a guard above the hook stops
+# returning early.
+import lore as _pen_lore
+_pen_lore._library_dirs = lambda out: []
+_pen_lore._scan_dir_mp4s = lambda d, k: []
+
 SAID = []
 lore.log = lambda m: SAID.append(m)
 lore.load_settings()
@@ -391,10 +400,17 @@ try:
     st3 = api.afk_ai_status()
     check("a controller talking while the keyboard is silent is flagged",
           st3.get("pad_stuck") is True)
+    # A LIVE CONTROLLER ON HIS DESK MUST NOT DECIDE THIS. _pad_check
+    # reads real XInput, so a pad that is merely awake re-stamps
+    # active_t between the set and the assertion and the check fails
+    # for a reason that has nothing to do with the code. The poll is
+    # silenced for this one question.
+    lore._pad_check = lambda: None
     lore._PAD["active_t"] = time.time() - 900
     lore._AFK_SEEN["t"] = 0.0
     check("and a quiet pad is not",
           api.afk_ai_status().get("pad_stuck") is False)
+    lore._pad_check = _cnt2
 finally:
     lore._pad_check = _rp2
     lore._kbms_idle_ms = _kb

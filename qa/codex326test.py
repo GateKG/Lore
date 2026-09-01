@@ -95,19 +95,20 @@ check("the dirty window was STAGED for re-describe, served intact",
 os.remove(INS + ".new")
 
 print("\n--- a stale ear cannot look current ---")
-check("gen-2 under a gen-3 app is not current",
+check("an older reader is not current, whatever the app expects now",
       lore._stt_current_doc({"v": 3, "engine": "qwen3-asr",
-                             "reader": 2}) is False)
+                             "reader": lore._STT_READER - 1}) is False)
 check("a gguf-routed engine is still the qwen family",
       lore._stt_current_doc({"v": 3, "engine": "qwen3-asr-gguf",
-                             "reader": 3}) is True)
+                             "reader": lore._STT_READER}) is True)
 check("the head-read sees the stale reader",
       lore._stt_stale_reader(VID) is True)
 
 print("\n--- no-evidence prose cannot stand (Ask) ---")
 api = lore._JsApi.__new__(lore._JsApi)
 api._safe_path = lambda p: p
-json.dump({"v": 3, "engine": "qwen3-asr", "reader": 3, "segments": [
+json.dump({"v": 3, "engine": "qwen3-asr",
+           "reader": lore._STT_READER, "segments": [
     {"a": 5000, "b": 8000, "t": "I know the way"}]},
     io.open(STT, "w", encoding="utf-8"))
 _real = lore._ask_llm
