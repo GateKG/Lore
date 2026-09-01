@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.23"
+APP_VERSION = "3.24"
 
 try:
     import psutil
@@ -13805,7 +13805,13 @@ def _insights_one(video_path, forced=False, fresh=False):
         # and the CLEANED text is kept, because the dressing is not
         # speech either.
         q2 = re.sub(r"^\s*\[#?\d+\s+\d+:\d{2}\]\s*", "", q)
-        q2 = re.sub(r"^[A-Za-z][\w' .-]{0,24}:\s+", "", q2).strip()
+        # SCRIPT-BLIND: 3.23 itself puts Arabic voice names on the
+        # lines ("مريم: ..."), so a Latin-only strip blanked honest
+        # Arabic-prefixed quotes. Safety is unchanged - the stripped
+        # text still has to match the transcript verbatim.
+        q2 = re.sub("^[\\w\u0600-\u06FF]"
+                    "[\\w\u0600-\u06FF' .-]{0,24}:\\s+",
+                    "", q2).strip()
         q2n = _qnorm(q2)
         if q2n and q2n in hayq:
             sgm["quote"] = q2[:200]
@@ -15728,6 +15734,29 @@ def _aud_phon(k, h):
     return len(d) == 1 and d[0] in _AUD_PAIRS
 
 
+def _aud_ear_agrees(ear, heard):
+    """Exact tokens failed - judge agreement the way names are judged:
+    consonant skeletons with containment, because the ear glues words
+    it heard and Arabic transliterates without vowels. 'Bastin.' and
+    باستن share no _aud_lat token yet are the same word."""
+    ek = [k for k in (_aud_skel(w) for w in
+                      re.findall(r"[a-z0-9]+", _aud_lat(ear)))
+          if len(k) >= 3]
+    hk = [k for k in (_aud_skel(w) for w in
+                      re.findall(r"[a-z0-9]+", _aud_lat(heard)))
+          if len(k) >= 3]
+    es = _aud_skel(ear)
+    hs = _aud_skel(heard)
+    for k in hk:
+        if k in es or any(k in e or e in k or _aud_phon(k, e)
+                          for e in ek):
+            return True
+    for e in ek:
+        if e in hs:
+            return True
+    return False
+
+
 def _aud_grounded(name, words, skels, spoken):
     """Was this person mentioned in THIS night? Returns (verdict, how,
     the spelling the night actually used).
@@ -15779,7 +15808,7 @@ def _aud_vocab():
     Two questions need it and neither can be answered from one recording.
     Is "Confusion" a person's name or an ordinary word? - the library
     writes "confusion" in lower case hundreds of times, so it is a word.
-    Is "Kedarrant" a word at all? - thirty thousand distinct words across
+    Is "Vontrelle" a word at all? - thirty thousand distinct words across
     four hundred transcripts have never once contained it, so it is not.
 
     Built once and kept for an hour; it costs a few seconds over the whole
@@ -16101,8 +16130,8 @@ def _aud_garble(stt, freq):
     thirty thousand distinct words; a line where a third of the words are
     not among them is not a sentence, it is one language being written
     down by an ear listening for another. On the Backrooms night it finds
-    four lines out of two hundred and eighteen - Kedarrant, Almond water,
-    Jali hehe, Odey shukran - which are the four he pointed at.
+    four lines out of two hundred and eighteen - Vontrelle, Almond water,
+    Zami hehe, Ruda shukran - which are the four he pointed at.
 
     It only ever SHORTLISTS. What was really said needs the model."""
     if not freq:
@@ -16801,13 +16830,13 @@ FOUR WORKED EXAMPLES:
 line: "Sakar late?"    (hint: Sakar could be \u0633\u0643\u0631; late could be \u0644\u064a\u062a)
   fix: {"n": 0, "heard": "\u0633\u0643\u0631 \u0644\u064a\u062a\u061f",
         "why": "same sounds spell the Gulf phrase close-the-light; they were fixing the lamp"}
-line: "Uh, I asked this Mikello cheesecake."   (said calmly, once)
+line: "Uh, I asked this Torvello cheesecake."   (said calmly, once)
   right: {"n": 1, "verdict": "right",
-          "why": "he is ordering the Mikello cheesecake, a real shop order they discussed - rare because it came up once, not because it is wrong"}
-line: "Iba hna tuiyala su meel."   (an earlier pass guessed: "\u0625\u0628\u0627 \u0647\u0646\u0627 \u062a\u0648\u0644\u064a\u0644\u0627 \u0633\u0648 \u0645\u064a\u0644")
+          "why": "he is ordering the Torvello cheesecake, a real shop order they discussed - rare because it came up once, not because it is wrong"}
+line: "Oba hna karilada su neel."   (an earlier pass guessed: "\u0625\u0628\u0627 \u0647\u0646\u0627 \u062a\u0648\u0644\u064a\u0644\u0627 \u0633\u0648 \u0645\u064a\u0644")
   noise: {"n": 2, "verdict": "noise",
           "why": "neither the sounds nor the earlier guess spell words anyone says in either language - the guess just redrew the same static in Arabic letters"}
-line: "Kedarrant."   (one clean word, and the room reacted to it)
+line: "Vontrelle."   (one clean word, and the room reacted to it)
   unclear: {"n": 3, "verdict": "unclear",
             "why": "probably a real name or word the story never anchors - he should hear the second himself"}
 
@@ -17224,7 +17253,7 @@ def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
 def _aud_parse(got, garble):
     """One parser for whichever thinker answered - the fixes with the
     sense gate, and the INVESTIGATION VERDICTS: a line the model checked
-    and found already right (Mikello cheesecake - a real shop, said
+    and found already right (Torvello cheesecake - a real shop, said
     once, seriously) or still unreadable is an answer too, and it is
     what the panel prints instead of the rarity sentence."""
     beats, gist, fixes = [], "", []
@@ -17247,6 +17276,34 @@ def _aud_parse(got, garble):
                                       (_AUD_VOCAB.get("freq") or {}))
                 if not okC:
                     v = "noise"
+            # A STRIKE NEEDS THE RECORDING'S OWN TESTIMONY. The ear
+            # re-listened to this very span; if it made out READABLE
+            # words, "noise" is the thinker's opinion against the
+            # audio's evidence - the line is PRESERVED automatically
+            # (unclear strikes nothing). Hands-off means the machine
+            # decides; here it decides to keep what was heard.
+            if v == "noise":
+                # THE VETO MUST DEMAND MORE THAN THE EAR'S OWN
+                # WRITE-GATE. An ear only exists because it already
+                # passed the sense test at relisten time - rechecking
+                # the same test made every eared span unstrikeable
+                # (147 of 316 historical strikes vetoed, measured).
+                # A FULLY readable ear: two or more real word-tokens,
+                # nothing the library has never heard, and no CJK
+                # static (which slid through on a lone Arabic token).
+                _er = str(row.get("ear") or "").strip()
+                if _er and not row.get("ear_junk"):
+                    _etk = re.findall(
+                        "[\u0600-\u06ff]{2,}|[A-Za-z']{3,}", _er)
+                    _eok, _ebad = _aud_sense(
+                        _er, (_AUD_VOCAB.get("freq") or {}))
+                    if (_eok and len(_etk) >= 2 and not _ebad
+                            and not re.search(
+                                "[\u3040-\u30ff\u31f0-\u4dbf"
+                                "\u4e00-\u9fff\uac00-\ud7af]",
+                                _er)):
+                        v = "unclear"
+                        row["ear_kept"] = True
             row["verdict"] = v
             row["vwhy"] = _aud_clip(str(c.get("why") or "").strip())
     fx_raw = got.get("fixes")
@@ -17280,11 +17337,54 @@ def _aud_parse(got, garble):
         okS, badW = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}))
         if not okS:
             gated.append(str((garble or [])[i].get("t")))
+            (garble or [])[i].setdefault("verdict", "unclear")
+            (garble or [])[i].setdefault(
+                "vwhy", _aud_clip(
+                    "a correction was refused - its words appear in "
+                    "no transcript"))
             log("The auditor refused its own correction at "
                 + _eye_stamp((garble or [])[i].get("t") or 0)
                 + " - \"" + heard[:60] + "\" failed the sense test ("
                 + ", ".join(badW[:3]) + " appear in no transcript).")
             continue
+        # THE RECORDING MUST SUPPORT THE FIX. The ear re-listened to
+        # this span with the right prior; a correction that shares not
+        # one distinctive token with what the audio said is plausible
+        # library language, not this recording's speech. Both sides
+        # through _aud_lat so Arabic and Latin compare; spans the ear
+        # never reached keep the old behaviour - a gate that cannot
+        # see must not guess.
+        _er2 = str((garble or [])[i].get("ear") or "").strip()
+        if _er2 and not (garble or [])[i].get("ear_junk"):
+            _et = set(w for w in re.findall(r"[a-z0-9]+",
+                                            _aud_lat(_er2))
+                      if len(w) >= 3)
+            _ht = set(w for w in re.findall(r"[a-z0-9]+",
+                                            _aud_lat(heard))
+                      if len(w) >= 3)
+            # EXACT TOKENS FIRST, SKELETONS BEFORE REFUSING. Raw
+            # _aud_lat equality is vowel- and spacing-blind across
+            # scripts - it refused 27 of 308 known-good repairs
+            # ("Bastin." vs باستن), the exact bug the skeleton
+            # comparator was built to kill.
+            if (_et and _ht and not (_et & _ht)
+                    and not _aud_ear_agrees(_er2, heard)):
+                gated.append(str((garble or [])[i].get("t")))
+                # A REFUSAL MUST LEAVE A TRACE: verdict-less rows were
+                # re-litigated forever with nothing on the page.
+                # setdefault - a genuine model verdict is never
+                # clobbered. unclear strikes nothing and carries.
+                (garble or [])[i].setdefault("verdict", "unclear")
+                (garble or [])[i].setdefault(
+                    "vwhy", _aud_clip(
+                        "a correction was refused - the re-listened "
+                        "audio heard none of its words"))
+                log("The auditor refused a correction at "
+                    + _eye_stamp((garble or [])[i].get("t") or 0)
+                    + " - the re-listened audio heard none of its "
+                    "words (\"" + heard[:50] + "\" vs ear \""
+                    + _er2[:50] + "\").")
+                continue
         fixes.append({"t": (garble or [])[i].get("t"), "was": was,
                       "heard": heard[:200],
                       "why": _aud_clip(str(f.get("why") or "").strip()),
@@ -17294,9 +17394,13 @@ def _aud_parse(got, garble):
     # fix. The fix passed the sense gate, so the fix is the answer.
     fixed_ts = {f.get("t") for f in fixes}
     for g in (garble or []):
-        if g.get("verdict") == "noise" and g.get("t") in fixed_ts:
+        if g.get("t") in fixed_ts and (
+                g.get("verdict") == "noise"
+                or (g.get("verdict") == "unclear"
+                    and g.get("ear_kept"))):
             g.pop("verdict", None)
             g.pop("vwhy", None)
+            g.pop("ear_kept", None)
     return beats, gist, "", False, False, fixes
 
 
@@ -18253,7 +18357,7 @@ def _aud_apply_names(video_path, names):
     respelt the way the NIGHT says it - that is the spelling his search
     can actually find. Every swap is remembered in the sidecar's
     "names_fixed" so it can be reversed exactly, and the possessive
-    keeps its 's only when the new spelling is Latin - فيصل's is not a
+    keeps its 's only when the new spelling is Latin - مارد's is not a
     word in either language."""
     todo = [r for r in (names or [])
             if r.get("verdict") == "spelt" and r.get("said")]
@@ -18348,7 +18452,13 @@ def _aud_carry(garble, prior_garble):
                 # fix replaced it) - the old verdict judged a different
                 # question; the model gets asked fresh (review 306)
                 break
-            if p0.get("verdict") in ("right", "unclear")                     and str(p0.get("vwhy") or "").strip():
+            if (p0.get("verdict") in ("right", "unclear")
+                    and not p0.get("ear_kept")
+                    and str(p0.get("vwhy") or "").strip()):
+                # ear_kept rows are NOT carried: a vetoed strike is a
+                # conflict between the thinker and the audio, and it
+                # is re-litigated fresh at the next audit rather than
+                # frozen as "unclear" over a reason arguing noise
                 g["verdict"] = p0.get("verdict")
                 g["vwhy"] = p0.get("vwhy")
                 g["carried"] = True
@@ -21976,12 +22086,29 @@ class _JsApi:
                                         and qn in sn + " "
                                         + segn[j + 1]):
                             cands.append(j)
-                    elif q0r and q0r in (segs[j].get("t") or "") \
-                            .lower().replace("\u2019", "'") \
-                            .replace("\u2018", "'"):
-                        # one word: raw letters only - the normaliser
-                        # is many-to-one and would false-verify it
-                        cands.append(j)
+                    elif q0r:
+                        # one word: WHOLE tokens only - a raw substring
+                        # verified "no" inside "know". Contiguous token
+                        # equality, both scripts, apostrophes folded;
+                        # still raw letters, because the many-to-one
+                        # normaliser would false-verify short words.
+                        _st = ((segs[j].get("t") or "").lower()
+                               .replace("\u2019", "'")
+                               .replace("\u2018", "'"))
+                        # Arabic punctuation is word-glue to \w -
+                        # shed it on both sides or ؟ hides a token
+                        _arp = "[\u061f\u060c\u061b\u06d4\u0640]"
+                        _stk = re.findall(
+                            "[\\w\u0600-\u06FF']+",
+                            re.sub(_arp, " ", _st))
+                        _qtk = re.findall(
+                            "[\\w\u0600-\u06FF']+",
+                            re.sub(_arp, " ", q0r))
+                        if _qtk and any(
+                                _stk[k:k + len(_qtk)] == _qtk
+                                for k in range(
+                                    len(_stk) - len(_qtk) + 1)):
+                            cands.append(j)
                 if cands:
                     j0 = min(cands, key=lambda j: abs(
                         (segs[j].get("a") or 0) / 1000.0 - tm))
@@ -22007,7 +22134,14 @@ class _JsApi:
             except Exception:
                 continue
         ans = str(data.get("answer") or "")[:600]
-        if _misses:
+        if _misses and not hits:
+            # EVERY quote failed - an assertion whose entire evidence
+            # was rejected may not stand as the primary answer with a
+            # footnote. The explicit automatic verdict replaces it.
+            ans = ("LORE could not verify that in this recording's "
+                   "transcript - none of the answer's quoted lines "
+                   "were found in it.")
+        elif _misses:
             ans += (" (" + str(_misses) + " quoted line(s) were not "
                     "in the transcript and were left out.)")
         return {"ok": True, "answer": ans, "hits": hits}
@@ -22152,10 +22286,13 @@ class _JsApi:
                 why = str(h.get("why") or "")[:160]
                 ms = _moment_of(path, why, q)
                 if ms < 0:
-                    # -1 = the words appear nowhere; 0 is a REAL hit
-                    # on the opening line and must not be mistaken
-                    # for it
-                    ms = int(float(h.get("t") or 0) * 1000)
+                    # THE ROWS THE MODEL READ CARRY NO TIMESTAMPS, so
+                    # its number is invented by construction - and it
+                    # was being kept precisely when grounding FAILED,
+                    # the moment its support was weakest. Ungrounded
+                    # means open WITHOUT seeking (t=0 is this file's
+                    # own "do not seek" convention).
+                    ms = 0
                 out.append({"path": path,
                             "file": os.path.splitext(
                                 os.path.basename(path))[0],

@@ -76,7 +76,7 @@ L.append("| **Version** | `%s` (backend) / `%s` (UI) |"
          % (app_version(), ui_version()))
 L.append("| **Stamped** | %s |"
          % time.strftime("%Y-%m-%d %H:%M", time.localtime()))
-L.append("| **Last commit** | %s |" % git_head())
+L.append("| **Last commit** (source state at report time; the release commit lands after) | %s |" % git_head())
 
 for nm, p in (("lore.py", os.path.join(ROOT, "lore.py")),
               ("ui.html", os.path.join(ROOT, "ui.html"))):

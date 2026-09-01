@@ -39,8 +39,8 @@ the auditor's thread as Arabic speech. Both directions share one
 trick: sound the words out into consonant classes and compare (see
 _ar_fold / _en_fold), because vowels are exactly where two scripts
 disagree. 2.85 also adds the one shape a word list can never catch -
-a line that is laughter plus a single word nobody can read ("Jali
-hehe.", which is قالي) - see _laughing_alone.
+a line that is laughter plus a single word nobody can read ("Zami
+hehe.", which is زامي) - see _laughing_alone.
 """
 import base64
 import io
@@ -553,7 +553,7 @@ def _load_en_dict():
     Missing or unreadable, this returns nothing and _laughing_alone
     stands down completely - which is the safe answer, because without
     a dictionary the only test left is the hand list that missed
-    "jali" in the first place."""
+    "zami" in the first place."""
     p = os.environ.get("LORE_ASR_DICT") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "models", "clap",
         "vocab.json")
@@ -616,8 +616,8 @@ def _is_laugh(w):
 def _laughing_alone(t):
     """Laughter, one word nobody can read, and nothing else at all.
 
-    "Jali hehe." is قالي ("he told me") plus a laugh, and no hand list
-    will ever have "jali" on it - which is exactly why _arabizi cannot
+    "Zami hehe." is زامي (a word on no list) plus a laugh, and no hand list
+    will ever have "zami" on it - which is exactly why _arabizi cannot
     see this line: it demands a known Gulf marker before it will look.
     There is no marker here to lean on, so this leans on what IS here.
     Laughter reads the same in both languages, so a line of laughter
@@ -629,8 +629,8 @@ def _laughing_alone(t):
     speaking Arabic seconds either side.
 
     Measured over all 397 transcripts: 3 lines have the shape, and 2 of
-    those also have Arabic within six seconds - "Jali hehe." and
-    "Aiba! Haha.", both Arabic. Not one ordinary English line."""
+    those also have Arabic within six seconds - "Zami hehe." and
+    "Ruba! Haha.", both Arabic. Not one ordinary English line."""
     if not _EN_DICT or not t or _latin_frac(t) < 0.9:
         return False
     toks = re.findall(r"[a-z']+", t.lower())
@@ -653,7 +653,7 @@ def _arabic_company(out, k, gap_s=6.0):
 
     Seconds, not neighbours: an Arabic utterance three minutes later is
     not company, one two seconds later is the same exchange. On his
-    library this is what separates "Jali hehe." (Arabic 2.4s later)
+    library this is what separates "Zami hehe." (Arabic 2.4s later)
     from "Haha! Dino." (English both sides)."""
     sg = out[k]
     for j in (k - 1, k + 1):
@@ -1057,7 +1057,7 @@ def main(src, dst, mic=None):
     out, last = [], "english"
     # WHICH UTTERANCE EACH LINE CAME FROM. The laughter wall below can
     # only judge a line once the whole night is on the page (it asks
-    # what was said either side of it, and "Jali hehe." is given away
+    # what was said either side of it, and "Zami hehe." is given away
     # by the line AFTER it), and by then the loop has moved on - so it
     # needs a way back to the audio. groups[] is already in memory and
     # its parts are views into the same array, so this costs a list of
@@ -1232,7 +1232,7 @@ def main(src, dst, mic=None):
     # THE SECOND READING (2.85). Some lines can only be judged once the
     # whole night is on the page, because what gives them away is what
     # was said either side - and inside the loop the next utterance has
-    # not been read yet. "Jali hehe." is the shape: one word no
+    # not been read yet. "Zami hehe." is the shape: one word no
     # dictionary knows, wearing a laugh, with Arabic spoken 2.4 seconds
     # later. Re-ask those pinned to Arabic and hold the answer to the
     # same length band the 2.84 wall uses (that band is there to catch

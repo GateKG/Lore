@@ -36,3 +36,4 @@ ai/*
 _archive/
 tools/__pycache__/
 CURRENT-BUILD.md.bak
+qa/rectests/_tmp/

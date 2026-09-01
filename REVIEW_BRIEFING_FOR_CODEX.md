@@ -88,6 +88,69 @@ review, convergent with parts of it):
   re-read automatically (owner's recorded decision: bulk re-reads are
   priced on a card, his call).
 
+### v3.24 — the response to your second review
+Your v3.23 follow-up (`CODEX_LORE_V3.23_HANDS_OFF_REVIEW.md`) was
+verified and acted on the same day:
+
+- **C1 shipped, then hardened by the pre-ship fleet**: a transcript
+  fix is refused when the span's audio re-listen (`g["ear"]`) shares
+  zero distinctive tokens with the proposal. The first cut compared
+  raw `_aud_lat` tokens and was measured refusing 27 of 308
+  known-good historical repairs (8.8%) — exact tokens are vowel- and
+  spacing-blind across scripts ("Bastin." vs باستن). The shipped gate
+  falls back to the consonant-skeleton comparator (`_aud_ear_agrees`:
+  skeleton containment + phonetic equivalence) before refusing, and a
+  refusal is no longer invisible: it writes `unclear` + the reason on
+  the row via setdefault, strikes nothing, and carries. Spans the ear
+  never reached keep prior behaviour — a gate that cannot see does
+  not guess.
+- **C2 shipped, after the fleet killed my first version as a
+  tautology**: `g["ear"]` only exists because the re-listen already
+  passed `_aud_sense` at write time, so re-asking "is the ear
+  readable?" could never say no — it would have vetoed 147 of 316
+  historical strikes (46%) and the veto froze via the carry. The
+  shipped veto demands strictly more than the write-gate guaranteed:
+  ≥2 real word-tokens, no library-unknown words, no CJK static —
+  measured 30 of 147 vetoed, each a line that genuinely reads. A
+  vetoed row (`ear_kept`) is NOT carried — it is re-litigated at the
+  next audit — and a later fix beats the downgrade in dedup.
+  Junk/absent ears still strike — the owner's recorded request ("it
+  tried and it couldnt... say unintelligible") covers exactly that
+  case and only that case.
+- **C3 shipped**: ask_video's answer prose is replaced with an
+  explicit could-not-verify verdict when every hit fails; with
+  survivors it stands, footnoted.
+- **C4 shipped**: one-word quote matching is contiguous whole-token
+  equality, both scripts ("no" can no longer verify inside "know");
+  the fleet then found Arabic punctuation (؟ ، ؛) glues tokens under
+  `\w`, so both sides shed it before tokenising.
+- **C5 shipped**: ask_library never keeps an invented time — an
+  ungrounded hit opens without seeking (t=0 is the file's own no-seek
+  convention).
+- **C8 shipped**: the quote-recovery prefix strip is script-blind
+  (your point interacted with our own 3.23 change that puts Arabic
+  voice names on lines).
+- **Your QA complaint answered**: the deterministic roster is now
+  committed at `qa/` (24 suites + runner + README) so the reported
+  numbers can be replayed from the repository. Note for your review:
+  every literal that originated in a real recording (names, quoted
+  lines, garble samples, timestamps) was rewritten as
+  structure-preserving fiction across qa/, lore.py's docstrings and
+  few-shot prompts, asr_worker's docstrings, and ui.html's demo data
+  before publication. Do not treat those strings as ground truth from
+  the library — they are synthetic stand-ins with the same shape.
+- **Rejected by measurement**: "the re-listen always primes Arabic" —
+  deliberate, not a bug. The shortlist it serves is precisely
+  suspected-Arabic-misrendered-as-Latin (the garble detector's shape)
+  and 258 of 307 historical fixes are Latin→Arabic rewrites; an
+  auto/English pin would defeat the ear on the class it exists for.
+- **Open, agreed, queued**: your decode-panel consensus (multi-decode
+  agreement before corrections), describer token-bounded chunking,
+  claim-level (not just quote-level) validation, lineage-aware auditor
+  voting, `ins_validation` retroactive pass, and OCR/vision
+  persistence. These are on the ledger with your specs as the design
+  reference.
+
 ### v3.23 — the response to your review
 See `CURRENT-BUILD.md` and the v3.23 commit message for the precise
 list. In summary, the confirmed subset of your findings was shipped

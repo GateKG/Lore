@@ -1963,8 +1963,12 @@ body.editing .insmark,body.editing .hlmark{pointer-events:none}
   box-sizing:border-box;transform-origin:50% 100%;
   transition:transform .12s ease,box-shadow .12s ease,background .12s ease,
              opacity .12s ease}
-.hlmark::after{content:'';position:absolute;left:-8px;right:-8px;
-  top:-5px;bottom:-2px}                     /* the real click target */
+/* HIS LAW: activation is the mark itself, nothing around it. The old
+   ±8px halo lit marks half a centimetre away and, once lit, the 2x
+   hover scale doubled the halo again - so a neighbour could never
+   steal the highlight. No halo. The mark grows when lit, and that
+   grown body is the whole hit target. */
+.hlmark::after{content:'';position:absolute;inset:0}
 .hlmark:hover,.hlmark.hot{background:#fff1cf;opacity:1;
   transform:scale(2,2.1);
   box-shadow:0 0 10px 2px var(--gold),0 0 3px #fff}
@@ -2866,7 +2870,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.23'};},
+      webhook:true,version:'3.24'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3035,7 +3039,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.23'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.24'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -3078,9 +3082,9 @@ function makeMock(){
        and it still wrote itself down as finished. */
     audit:async(_p,run)=>({v:1,complete:false,
       started:run?false:undefined,
-      corrected:[{t:892.8,was:'Jali hehe.',
-        now:'قال لي Hey Hey',put_back:false}],
-      names_fixed:[{from:'Faizal',to:'فيصل'}],
+      corrected:[{t:941.2,was:'Zami hehe.',
+        now:'قال لي Ho Ho',put_back:false}],
+      names_fixed:[{from:'Marid',to:'مارد'}],
       warnings:[
         'the eye wanted 24 looks and kept 7 - it asked six times, '
           +'skipped four, and still wrote itself down as finished',

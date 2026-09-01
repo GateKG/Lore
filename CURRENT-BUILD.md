@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | `3.23` (backend) / `3.23` (UI) |
-| **Stamped** | 2026-09-01 10:43 |
-| **Last commit** | 6ff787e LORE v3.22 - the transcripts stop lying |
-| **lore.py** | 1.2 MB, 27,093 lines, saved 2026-09-01 10:40 |
-| **ui.html** | 0.9 MB, 13,789 lines, saved 2026-09-01 10:40 |
-| **Built exe** | 13.3 MB, 2026-09-01 10:43 |
+| **Version** | `3.24` (backend) / `3.24` (UI) |
+| **Stamped** | 2026-09-01 12:36 |
+| **Last commit** (source state at report time; the release commit lands after) | 6da17da LORE v3.23 - every claim must cite its evidence |
+| **lore.py** | 1.2 MB, 27,230 lines, saved 2026-09-01 12:31 |
+| **ui.html** | 0.9 MB, 13,793 lines, saved 2026-09-01 12:31 |
+| **Built exe** | 13.3 MB, 2026-09-01 12:35 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
