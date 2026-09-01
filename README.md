@@ -27,10 +27,19 @@ one person can read all of it.
 
 ## Things a reviewer might care about
 
-- **Fully offline.** The app makes no network calls of its own. The only
-  outbound traffic possible is the user-configured Discord webhook share, and
-  `_post_discord_file` refuses any host that is not `discord.com` /
-  `discordapp.com`.
+- **Local by default - and exact about the three exceptions.** All
+  recording, transcription, description, auditing and search run on
+  the local machine. Network traffic exists in exactly three cases,
+  each user-initiated or user-configured: (1) **model downloads** -
+  the in-app fetcher (`models_fetch`) pulls model files from Hugging
+  Face / Zenodo / GitHub when the user asks it to; nothing downloads
+  on its own; (2) **optional cloud naming** - with an Anthropic key
+  saved (DPAPI-encrypted, never in a file in this repo), the app may
+  ask Claude to name a newly-met game as a last resort, sending only
+  the executable name, window title and install-folder name, gated by
+  a hard spending ceiling that fails closed; (3) **Discord sharing** -
+  the user-configured webhook, and `_post_discord_file` refuses any
+  host that is not `discord.com` / `discordapp.com`.
 - **The in-app player** streams from a loopback-only HTTP server
   (`_start_media_server`) because WebView2 rejects `file://` media. It binds
   `127.0.0.1`, uses a fresh random token per launch, and only serves files that

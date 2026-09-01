@@ -109,14 +109,30 @@ L.append("|---|---|---|")
 for nm, rel in (("The app", os.path.join("dist", "Lore", "Lore.exe")),
                 ("Its libraries", os.path.join("dist", "Lore", "_internal")),
                 ("The tome (UI)", "ui.html"),
-                ("ffmpeg", "ffmpeg"),
-                ("Workers", "ai")):
+                ("ffmpeg", "ffmpeg")):
     p = os.path.join(ROOT, rel)
     if not os.path.exists(p):
         continue
     sz = tree_size(p) if os.path.isdir(p) else os.path.getsize(p)
     L.append("| %s | `%s` | %s |"
              % (nm, rel, gb(sz) if sz > 1024 ** 3 else mb(sz)))
+# THE WORKERS THAT SHIP, not the source ai/ tree - counting the whole
+# directory dragged the dev venv and any parked models into "what
+# ships", which an external review rightly flagged as untrue.
+try:
+    _wsz = sum(os.path.getsize(os.path.join(ROOT, "ai", f))
+               for f in os.listdir(os.path.join(ROOT, "ai"))
+               if f.endswith(".py"))
+    for _wd in ("packs", "torchlibrosa", "vendor_ocr", "vendor_sb",
+                "venv"):
+        _wp = os.path.join(ROOT, "ai", _wd)
+        if os.path.isdir(_wp):
+            _wsz += tree_size(_wp)
+    L.append("| Workers (scripts + vendored libs + venv) | `ai/` | %s |"
+             % (gb(_wsz) if _wsz > 1024 ** 3 else mb(_wsz)))
+    L.append("| *(models install separately - not counted)* | | |")
+except OSError:
+    pass
 
 mods = os.path.join(ROOT, "ai", "models")
 if os.path.isdir(mods):

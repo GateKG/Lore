@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.22"
+APP_VERSION = "3.23"
 
 try:
     import psutil
@@ -85,8 +85,10 @@ DEFAULTS = {
     # for a whole night - enough to name every place it passed through
     # without turning a review into an afternoon.
     "eye_looks":         24,
-    # A hard ceiling in cents that the request layer itself refuses to cross.
-    # 500 = five dollars. Zero means no ceiling.
+    # A hard ceiling in cents that the request layer itself refuses to
+    # cross. 500 = five dollars. ZERO MEANS NEVER SPEND - there is no
+    # "unlimited" value; set it huge instead. (A wallet guard that
+    # fails open on a typo is no guard: see the $10 night above.)
     "ai_budget_cents":   500.0,
     "ai_spent_cents":    0.0,
 
@@ -12471,23 +12473,53 @@ def _ai_spent():
 
 
 def _ai_budget():
-    """The ceiling, in cents. 0 means 'ask me first, never spend on your own'."""
+    """The ceiling, in cents. ONE meaning: a real numeric 0 is "never
+    spend"; anything unparseable or negative is a broken hand-edit and
+    falls back to the default, out loud. The old `or 0.0` idiom
+    collapsed None/'' into 0 and _ai_spend_room then read 0 as
+    UNLIMITED - a wallet guard that failed open on a typo."""
+    raw = SETTINGS.get("ai_budget_cents")
+    seen = raw                           # what was actually persisted -
+    #                                      the log must name IT, not the
+    #                                      excluder's rewrite
+    if isinstance(raw, bool):
+        raw = None                       # True would parse as 1 cent
+    if isinstance(raw, (int, float)) and raw == 0:
+        return 0.0                       # deliberate: never spend
     try:
-        return float(SETTINGS.get("ai_budget_cents") or 0.0)
-    except Exception:
-        return 0.0
+        v = float(raw)
+        # FINITE ONLY: float('inf') (or '1e999') is unlimited wearing a
+        # number's clothes, and "no unlimited value" is the whole point.
+        # A huge finite ceiling serves every honest need.
+        if v > 0 and v == v and v != float("inf"):
+            return v
+    except (TypeError, ValueError):
+        pass
+    d = float(DEFAULTS.get("ai_budget_cents") or 500.0)
+    if seen is not None and not _AI.get("_budget_said"):
+        # ONCE. The status bridge reads this on a poll; a persisted bad
+        # value must not write the same line every few seconds.
+        _AI["_budget_said"] = True
+        log("ai_budget_cents is %r - not a usable ceiling; using the "
+            "default of %d cents." % (seen, int(d)))
+    return d
 
 
 def _ai_spend_room(kind="fast"):
-    """Is there room for one more request? Returns (ok, why)."""
+    """Is there room for one more request? Returns (ok, why).
+
+    FAILS CLOSED. b <= 0 used to mean unlimited, which turned the one
+    enforcement door every cloud request passes through into a door
+    that a typo left open."""
     b = _ai_budget()
     if b <= 0:
-        return True, ""                    # no ceiling set: unlimited
+        return False, ("AI budget is 0 - cloud calls are off "
+                       "(ai_budget_cents in settings.json)")
     need = _COST_GUESS_CENTS.get(kind, 1.0)
     if _ai_spent() + need > b:
         return False, (f"spending limit reached "
                        f"(${_ai_spent() / 100:.2f} of ${b / 100:.2f}) - "
-                       f"raise it in Settings \u203a Video")
+                       f"raise ai_budget_cents in settings.json")
     return True, ""
 
 
@@ -12512,7 +12544,12 @@ def _claude(system, user, tool, max_tokens=2000, timeout=180, model=None):
         return None, "no key"
     # THE CEILING IS ENFORCED HERE, at the one door every request goes through,
     # so no caller can spend around it.
-    _kind = "deep" if (model or "") == CLAUDE_MODELS.get("deep") else "fast"
+    # BY THE ACTUAL MODEL. This looked up CLAUDE_MODELS["deep"], a key
+    # that has never existed (fast/good/best), so the guess was always
+    # "fast" - right today by accident (the only caller IS haiku),
+    # wrong for the first future caller that picks a bigger model.
+    _kind = ("fast" if (model or _claude_model()) == CLAUDE_MODELS["fast"]
+             else "deep")
     _ok, _why = _ai_spend_room(_kind)
     if not _ok:
         return None, _why
@@ -12884,7 +12921,75 @@ def _title_unheard(title, heard, game=""):
                 continue
         except Exception:
             pass
+        # A POSSESSIVE IS NOT A NEW PERSON. "Otak" heard 24 times did
+        # not vouch "Otak's" - near half of this guard's false flags
+        # were that artifact, and every false flag becomes a "a friend"
+        # rewrite of a TRUE name. Strip exactly one suffix ('s first,
+        # then a bare s - never rstrip, which turns "boss" into "bo")
+        # and vouch the base through the same doors.
+        _b = (w[:-2] if w.lower().endswith("'s")
+              else (w[:-1] if w.lower().endswith("s") else ""))
+        if _b:
+            _bl = _b.lower()
+            _vouched = _bl in ok
+            if not _vouched and len(_bl) >= 3 and _bl in hay:
+                _vouched = True
+            if not _vouched:
+                try:
+                    if int((_fr or {}).get(_bl, 0)) >= 3:
+                        _vouched = True
+                except Exception:
+                    pass
+            if _vouched:
+                continue
         bad.append(w)
+
+    # ARABIC LIES WITHOUT CAPITALS. The served Big Walk title asserted
+    # شقيقته - "his sister" - heard ZERO times in 166,661 characters,
+    # and the Latin-only regex above could never see it. The old
+    # defence ("Arabic script carries no capitals to lie with") was
+    # measured and disproved. This arm is deliberately NARROW: only
+    # kinship nouns carrying a possessive suffix - claims about PEOPLE
+    # - are judged, so abstract Arabic in an honest title is never
+    # touched. Replayed over every existing title: exactly one flag,
+    # the invented sister.
+    def _ar_base(x):
+        x = re.sub("[\u064B-\u0652\u0670\u0640]", "", x)
+        return (x.replace("\u0623", "\u0627")
+                 .replace("\u0625", "\u0627")
+                 .replace("\u0622", "\u0627")
+                 .replace("\u0629", "\u0647")
+                 .replace("\u0649", "\u064a"))
+    _KIN = ("شقيق", "زوج", "خطيب", "اخت", "ابن", "بنت", "والد",
+            "والده")
+    _SUF = ("ه", "ها", "هم", "هن", "تي", "ته", "تها", "تهم", "نا",
+            "كم", "ي", "ك")
+    hay_n = _ar_base(hay)
+    _frn = {}
+    try:
+        _fr2, _ = _aud_vocab()
+        for _k, _n in (_fr2 or {}).items():
+            _kk = _ar_base(str(_k))
+            _frn[_kk] = _frn.get(_kk, 0) + int(_n)
+    except Exception:
+        pass
+    for m in re.finditer("[\u0600-\u06FF]{4,}", str(title or "")):
+        w0 = m.group(0)
+        wn = _ar_base(w0)
+        wn2 = wn[1:] if wn.startswith("\u0648") else wn  # leading waw
+        kin = None
+        for _k in _KIN:
+            _kb = _ar_base(_k)
+            if wn2.startswith(_kb) and wn2[len(_kb):] in _SUF:
+                kin = _kb
+                break
+        if not kin:
+            continue
+        if wn in hay_n or wn2 in hay_n:
+            continue
+        if _frn.get(wn, 0) >= 3 or _frn.get(wn2, 0) >= 3:
+            continue
+        bad.append(w0)
     return bad
 
 
@@ -13647,7 +13752,92 @@ def _insights_one(video_path, forced=False, fresh=False):
         t = int((sg.get("a") or 0) / 1000)
         gl = " (probably the game's own audio)" if sg.get("g") else ""
         yv = "YOU: " if sg.get("src") == "you" else ""
+        # WHO SPOKE, when a named voice overlaps the line. The prompt
+        # has said "use the names" for weeks while the lines carried
+        # none - an invitation to guess. _aud_voice is overlap-only by
+        # design (a nameless quote is worth more than a wrong one), so
+        # nameless nights and game audio stay bare.
+        if not yv and not sg.get("g"):
+            try:
+                _w = _aud_voice(_sd0, (sg.get("a") or 0) / 1000.0,
+                                (sg.get("b") or 0) / 1000.0)
+                if _w:
+                    yv = ("YOU: " if str(_w).strip().lower() == "you"
+                          else str(_w).strip()[:24] + ": ")
+            except Exception:
+                pass
         return f"[#{i} {t // 60}:{t % 60:02d}] {yv}{(sg.get('t') or '').strip()}{gl}"
+
+    _qf = [0]          # quotes blanked/repaired this describe
+
+    def _qnorm(x):
+        x = str(x or "").lower()
+        for c1, c2 in (("\u2018", "'"), ("\u2019", "'"),
+                       ("\u201c", '"'), ("\u201d", '"')):
+            x = x.replace(c1, c2)
+        return re.sub("[^a-z0-9\u0600-\u06ff]+", " ", x).strip()
+
+    def _q_check(sgm, seq):
+        """A stretch quote must exist inside the lines it cites -
+        normalised, never fuzzy. A miss blanks the quote (the stretch
+        stays) and banks the text as quote_was."""
+        q = str(sgm.get("quote") or "").strip()
+        if not q:
+            return
+        try:
+            lo = max(0, min(len(seq) - 1, int(sgm.get("from_line"))))
+            hi = max(0, min(len(seq) - 1, int(sgm.get("to_line"))))
+        except (TypeError, ValueError):
+            sgm["quote_was"] = q[:200]
+            sgm["quote"] = ""
+            _qf[0] += 1
+            return
+        if hi < lo:
+            lo, hi = hi, lo
+        hayq = _qnorm(" ".join(str(x.get("t") or "")
+                               for x in seq[lo:hi + 1]))
+        qn = _qnorm(q)
+        if qn and qn in hayq:
+            return
+        # THE MODEL COPIES THE LINE AS SHOWN. Lines reach it dressed
+        # as "[#12 4:05] YOU: text"; the raw transcript has none of
+        # that, so an honestly copied quote missed. Recovery only -
+        # and the CLEANED text is kept, because the dressing is not
+        # speech either.
+        q2 = re.sub(r"^\s*\[#?\d+\s+\d+:\d{2}\]\s*", "", q)
+        q2 = re.sub(r"^[A-Za-z][\w' .-]{0,24}:\s+", "", q2).strip()
+        q2n = _qnorm(q2)
+        if q2n and q2n in hayq:
+            sgm["quote"] = q2[:200]
+            return
+        sgm["quote_was"] = q[:200]
+        sgm["quote"] = ""
+        _qf[0] += 1
+
+    def _m_qcheck(mm, why, seq):
+        """A moment's leading quoted span must appear in the cited line
+        or its neighbours; a false quote is cut and the explanation
+        kept. Checked on the RAW why, before _devoice rewrites it."""
+        # the closing mark may not land mid-word, or the lazy
+        # body stops at a contraction's apostrophe ("Don't
+        # move" probing as "Don") and the cut garbles the tail
+        mq = re.match("^[\"'\u201c\u2018](.{3,120}?)"
+                      "[\"'\u201d\u2019]"
+                      "(?![A-Za-z0-9\u0600-\u06ff])",
+                      why)
+        if not mq:
+            return why
+        try:
+            li = max(0, min(len(seq) - 1, int(mm.get("line"))))
+        except (TypeError, ValueError):
+            return why
+        hayq = _qnorm(" ".join(str(x.get("t") or "")
+                               for x in seq[max(0, li - 1):li + 2]))
+        if _qnorm(mq.group(1)) in hayq:
+            return why
+        _qf[0] += 1
+        tail = why[mq.end():].lstrip(" -\u2014:;,")
+        return tail if len(tail) >= 8 else why
 
     def _tokens(txt):
         # count the SCRIPT, not the characters: 3.5 chars/token is an English
@@ -13898,6 +14088,8 @@ def _insights_one(video_path, forced=False, fresh=False):
     except Exception:
         pass
     _who_names = {}
+    _sd0 = {}          # _line() closes over this - it must exist even
+    #                    when the senses sidecar cannot be read
     try:
         with open(_ai_sidecar(video_path, "sns"), encoding="utf-8") as fh:
             _sd0 = json.load(fh) or {}
@@ -14114,6 +14306,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                     return fallback
             mapped = []
             for sgm in stretches:
+                _q_check(sgm, use)
                 a_sg = _lt(sgm.get("from_line"), None)
                 b_sg = _lt(sgm.get("to_line"), None)
                 if a_sg is not None:
@@ -14128,6 +14321,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                 why = str(mm.get("why") or "").strip()
                 if m_sg is None or not why:
                     continue
+                why = _m_qcheck(mm, why, use)
                 wmoments.append(
                     {"t": round(((m_sg.get("a") or 0)
                                  + (m_sg.get("b") or 0)) / 2000.0, 1),
@@ -14178,6 +14372,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                     except (TypeError, ValueError):
                         return None
                 for sgm in ((got2 or {}).get("segments") or []):
+                    _q_check(sgm, rest)
                     a_sg = _lt2(sgm.get("from_line"))
                     b_sg = _lt2(sgm.get("to_line"))
                     if a_sg is None or b_sg is None:
@@ -14190,6 +14385,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                     why = str(mm.get("why") or "").strip()
                     if m_sg is None or not why:
                         continue
+                    why = _m_qcheck(mm, why, rest)
                     wmoments.append(
                         {"t": round(((m_sg.get("a") or 0)
                                      + (m_sg.get("b") or 0)) / 2000.0, 1),
@@ -14206,10 +14402,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # nothing that was already described
                 _assemble(windows, False, tries)
 
-        if guard_cov or guard_retry:
+        if guard_cov or guard_retry or _qf[0]:
             log(f"{name}: describer guards - {guard_retry} parse "
                 f"retr{'y' if guard_retry == 1 else 'ies'}, "
-                f"{guard_cov} coverage re-ask(s).")
+                f"{guard_cov} coverage re-ask(s), "
+                f"{_qf[0]} quote(s) not found in their cited lines "
+                f"(blanked or trimmed, the stretch kept).")
         complete = all(str(int(lo)) in windows for lo, hi in edges)
         if complete:
             # A TITLE FOR THE WHOLE THING, from every window's chapter
@@ -14259,10 +14457,44 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # nowhere in 168,000 characters of transcript. One
                 # re-ask with the offenders named; if the model
                 # insists, the invention is replaced, not believed.
-                if title:
+                if title or summary:
                     heard = _ins_heard_corpus(
                         video_path, extra=game + " " + " ".join(names))
-                    bad = _title_unheard(title, heard, game)
+                    # THE SUMMARY IS HELD TO THE SAME STANDARD. The
+                    # gate used to be the title alone, so a re-ask
+                    # could launder a fresh invention into the summary
+                    # while the title came back clean.
+                    bt = _title_unheard(title, heard, game)
+                    bs = _title_unheard(summary, heard, game)
+                    # A TITLE FLAG IS A PERSON-CLAIM; A SUMMARY-ONLY
+                    # FLAG IS PROSE. Replayed on the shelf: treating
+                    # them alike would have rewritten "Hallownest" -
+                    # the game's own world, never spoken aloud - into
+                    # "a friend". Summary-only flags are said out
+                    # loud and left alone; only a title flag arms the
+                    # re-ask and the rewrite (of both fields).
+                    bad = sorted(set(bt))
+                    _sonly = [w for w in bs if w not in bt]
+                    if _sonly:
+                        log("Summary words nobody was heard to say, "
+                            "left as prose (not person-claims): "
+                            + ", ".join(_sonly))
+                    # LAUNDERING MADE VISIBLE (never blocking): a word
+                    # vouched ONLY by generated chapter names is the
+                    # loop that let BoKhama survive once. Removing the
+                    # names from the corpus was measured and rejected
+                    # (~100 good titles mutilated to catch ~3), so the
+                    # residue is logged instead.
+                    try:
+                        _hd = _ins_heard_corpus(video_path, extra=game)
+                        _laund = [w for w in _title_unheard(
+                                      title, _hd, game) if w not in bad]
+                        if _laund:
+                            log("Title words vouched only by generated "
+                                "chapter names (laundering watch): "
+                                + ", ".join(_laund))
+                    except Exception:
+                        pass
                     if bad:
                         t2 = srv.ask(
                             t_sys, t_ask
@@ -14277,23 +14509,41 @@ def _insights_one(video_path, forced=False, fresh=False):
                                 r"\{.*\}", t2, _re.S).group(0))
                             cand = _descrub(str(
                                 t_d2.get("title") or "").strip())
-                            if cand and not _title_unheard(
-                                    cand, heard, game):
-                                title = cand
-                                summary = _descrub(str(
-                                    t_d2.get("summary")
-                                    or summary).strip())
+                            cs = _descrub(str(
+                                t_d2.get("summary") or summary).strip())
+                            # BOTH fields must come back clean - the
+                            # re-ask could otherwise move the invention
+                            # from the title into the summary
+                            if (cand and not _title_unheard(
+                                    cand, heard, game)
+                                    and not _title_unheard(
+                                        cs, heard, game)):
+                                title, summary = cand, cs
                                 bad = []
                         except Exception:
                             pass
                     if bad:
                         for w in bad:
-                            title = re.sub(
-                                r"\b" + re.escape(w) + r"\b",
-                                "a friend", title)
+                            # IN THE RIGHT SCRIPT, and without \b -
+                            # which mis-splits a waw-attached Arabic
+                            # word. The lookaround forbids letter
+                            # neighbours in either alphabet.
+                            _rep = ("\u0623\u062d\u062f "
+                                    "\u0627\u0644\u0623\u0635"
+                                    "\u062f\u0642\u0627\u0621"
+                                    if re.search("[\u0600-\u06FF]", w)
+                                    else "a friend")
+                            _pat = ("(?<![\u0600-\u06FFA-Za-z])"
+                                    + re.escape(w)
+                                    + "(?![\u0600-\u06FFA-Za-z])")
+                            title = re.sub(_pat, _rep, title)
+                            if w in bt:
+                                summary = re.sub(_pat, _rep, summary)
                         title = re.sub(r"\s{2,}", " ",
                                        title).strip(" ,-")
-                        log("The title tried to invent "
+                        summary = re.sub(r"\s{2,}", " ",
+                                         summary).strip(" ,-")
+                        log("The title/summary tried to invent "
                             + ", ".join(bad) + " - nobody by that "
                             "name was heard, so it says 'a friend' "
                             "instead.")
@@ -20220,9 +20470,9 @@ def _moment_of(path, why, question):
         with open(_ai_sidecar(path, "stt"), encoding="utf-8") as fh:
             segs = (json.load(fh) or {}).get("segments") or []
     except Exception:
-        return 0
+        return -1
     if not segs:
-        return 0
+        return -1
     stop = {"the", "and", "a", "an", "of", "to", "in", "is", "it", "that",
             "this", "for", "on", "was", "with", "at", "he", "she", "they",
             "you", "i", "we", "his", "her", "them", "there", "here", "what",
@@ -20246,8 +20496,8 @@ def _moment_of(path, why, question):
             try:
                 return int(best.get("a") or 0)
             except Exception:
-                return 0
-    return 0
+                return -1
+    return -1
 
 
 def _search_index():
@@ -21666,16 +21916,101 @@ class _JsApi:
             tool["input_schema"], max_tokens=900, wait=150)
         if data is None:
             return {"ok": False, "why": why}
+        # EVERY HIT IS JUDGED AGAINST THE TRANSCRIPT IT CLAIMS TO
+        # QUOTE. The model was told never to invent a quote or a time,
+        # and its answer was then believed wholesale. Three tiers now:
+        # exact (normalised, NEVER fuzzy) -> the time snaps to the real
+        # segment; word-overlap -> the hit keeps its place but speaks
+        # the real line; nothing -> the hit is dropped and the answer
+        # says so. _aud_lat only - the skeleton/phonetic neighbours
+        # are how a non-match becomes a "match", so they stay out.
+
+        def _qvn(x):
+            try:
+                return re.sub(r"[^a-z0-9]+", " ", _aud_lat(x)).strip()
+            except Exception:
+                return re.sub(r"[^a-z0-9]+", " ",
+                              str(x or "").lower()).strip()
+
+        segn = [_qvn(sg.get("t") or "") for sg in segs]
+        # DISTINCTIVENESS, for the overlap tier: a word carried by more
+        # than ~2% of this transcript's lines localises nothing -
+        # measured, 'then' + 'like' could anchor a fabricated quote to
+        # a random line.
+        _df = {}
+        for _sn0 in segn:
+            for _w0 in set(_sn0.split()):
+                _df[_w0] = _df.get(_w0, 0) + 1
+        _cap = max(3, len(segn) // 50)
         hits = []
+        _misses = 0
         for h in (data.get("hits") or [])[:20]:
             try:
-                hits.append({"t_ms": int(max(0.0, float(h.get("t") or 0))
-                                         * 1000),
-                             "text": str(h.get("quote") or "")[:200]})
+                q0 = str(h.get("quote") or "").strip()
+                if not q0:
+                    continue               # malformed, not counted
+                tm = max(0.0, float(h.get("t") or 0))
+                qn = _qvn(q0)
+                words = [w for w in qn.split() if len(w) >= 3]
+                # the one-word tier compares RAW text - fold the
+                # apostrophes a model actually emits and shed the
+                # enclosing punctuation, or "Let's go!" quoted with a
+                # curly apostrophe is branded an invention and the
+                # honesty note lies about it
+                q0r = (q0.lower().replace("\u2019", "'")
+                       .replace("\u2018", "'")
+                       .strip(" \t.!?,;:\u2026\u061f\u060c"))
+                cands = []
+                for j, sn in enumerate(segn):
+                    if not sn:
+                        continue
+                    if len(words) >= 2:
+                        # the pair join only reaches across a breath -
+                        # two seconds - never across a silence that
+                        # would splice unrelated speech
+                        if qn in sn or (j + 1 < len(segn)
+                                        and segn[j + 1]
+                                        and (segs[j + 1].get("a") or 0)
+                                        - (segs[j].get("b") or 0)
+                                        <= 2000
+                                        and qn in sn + " "
+                                        + segn[j + 1]):
+                            cands.append(j)
+                    elif q0r and q0r in (segs[j].get("t") or "") \
+                            .lower().replace("\u2019", "'") \
+                            .replace("\u2018", "'"):
+                        # one word: raw letters only - the normaliser
+                        # is many-to-one and would false-verify it
+                        cands.append(j)
+                if cands:
+                    j0 = min(cands, key=lambda j: abs(
+                        (segs[j].get("a") or 0) / 1000.0 - tm))
+                    txt0 = q0
+                else:
+                    # overlap finds WHERE, never certifies WHAT: the
+                    # hit keeps its place but speaks the REAL line
+                    _dw = [w for w in set(words)
+                           if _df.get(w, 0) <= _cap]
+                    best, bn = None, 1
+                    for j, sn in enumerate(segn):
+                        _sw = set(sn.split())
+                        n2 = sum(1 for w in _dw if w in _sw)
+                        if n2 > bn:
+                            best, bn = j, n2
+                    if best is None:
+                        _misses += 1
+                        continue
+                    j0 = best
+                    txt0 = str(segs[j0].get("t") or "")
+                hits.append({"t_ms": int(segs[j0].get("a") or 0),
+                             "text": str(txt0)[:200]})
             except Exception:
                 continue
-        return {"ok": True, "answer": str(data.get("answer") or "")[:600],
-                "hits": hits}
+        ans = str(data.get("answer") or "")[:600]
+        if _misses:
+            ans += (" (" + str(_misses) + " quoted line(s) were not "
+                    "in the transcript and were left out.)")
+        return {"ok": True, "answer": ans, "hits": hits}
 
     _ASK_SHELF = {"at": 0.0, "rows": None, "order": None}
 
@@ -21808,10 +22143,19 @@ class _JsApi:
                 # time, find one: the words it gave as its reason are quoted
                 # from the transcript, so look them up in that recording's own
                 # transcript and jump to where they were actually said.
-                ms = int(float(h.get("t") or 0) * 1000)
+                # THE ROWS THE MODEL READ CARRY NO TIMESTAMPS, so
+                # any nonzero t it returns is invented by
+                # construction. Ground in the recording's own
+                # transcript FIRST - the exact lookup the zero branch
+                # has always used - and keep the model's number only
+                # when the words genuinely appear nowhere.
                 why = str(h.get("why") or "")[:160]
-                if ms <= 0:
-                    ms = _moment_of(path, why, q)
+                ms = _moment_of(path, why, q)
+                if ms < 0:
+                    # -1 = the words appear nowhere; 0 is a REAL hit
+                    # on the opening line and must not be mistaken
+                    # for it
+                    ms = int(float(h.get("t") or 0) * 1000)
                 out.append({"path": path,
                             "file": os.path.splitext(
                                 os.path.basename(path))[0],

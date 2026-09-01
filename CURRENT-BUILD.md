@@ -4,23 +4,24 @@
 
 | | |
 |---|---|
-| **Version** | `3.18` (backend) / `3.18` (UI) |
-| **Stamped** | 2026-08-26 00:54 |
-| **Last commit** | 6b6fc46 LORE v3.17 - names must be heard, not invented |
-| **lore.py** | 1.1 MB, 26,155 lines, saved 2026-08-26 00:49 |
-| **ui.html** | 0.9 MB, 13,392 lines, saved 2026-08-26 00:51 |
-| **Built exe** | 13.2 MB, 2026-08-26 00:53 |
+| **Version** | `3.23` (backend) / `3.23` (UI) |
+| **Stamped** | 2026-09-01 10:43 |
+| **Last commit** | 6ff787e LORE v3.22 - the transcripts stop lying |
+| **lore.py** | 1.2 MB, 27,093 lines, saved 2026-09-01 10:40 |
+| **ui.html** | 0.9 MB, 13,789 lines, saved 2026-09-01 10:40 |
+| **Built exe** | 13.3 MB, 2026-09-01 10:43 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
 
 | Piece | Where | Size |
 |---|---|---|
-| The app | `dist\Lore\Lore.exe` | 13.2 MB |
-| Its libraries | `dist\Lore\_internal` | 261.3 MB |
+| The app | `dist\Lore\Lore.exe` | 13.3 MB |
+| Its libraries | `dist\Lore\_internal` | 261.5 MB |
 | The tome (UI) | `ui.html` | 0.9 MB |
 | ffmpeg | `ffmpeg` | 433.5 MB |
-| Workers | `ai` | 12.33 GB |
+| Workers (scripts + vendored libs + venv) | `ai/` | 1.40 GB |
+| *(models install separately - not counted)* | | |
 
 ## The models it needs (never committed, never installed)
 
