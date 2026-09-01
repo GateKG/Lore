@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.24"
+APP_VERSION = "3.25"
 
 try:
     import psutil
@@ -15734,11 +15734,58 @@ def _aud_phon(k, h):
     return len(d) == 1 and d[0] in _AUD_PAIRS
 
 
+def _aud_filler():
+    """Words the library treats as filler: the top two percent of the
+    latinized vocabulary by frequency, plus a short bilingual hand
+    list. A shared filler word proves two lines were spoken in the
+    same language, not that they are the same line - it must never
+    authorize a mutation on its own (measured: "the" alone admitted a
+    fabricated line, and zero good repairs need filler-only overlap
+    once identity is exempt)."""
+    freq = _AUD_VOCAB.get("freq") or {}
+    if (_AUD_VOCAB.get("filler") is not None
+            and _AUD_VOCAB.get("filler_at") == _AUD_VOCAB.get("at")):
+        return _AUD_VOCAB["filler"]
+    low = _AUD_VOCAB.get("low") or {}
+    agg, lowc = {}, {}
+    for w, n in freq.items():
+        # Arabic has no case - its words carry full "ordinary word"
+        # evidence; a Latin word's evidence is its lowercase count,
+        # so a NAME (mostly capitalised - the friends the library
+        # says hi to every night) can never become filler.
+        ev = int(n or 0) if re.match("[\u0600-\u06ff]", str(w)) \
+            else int(low.get(w, 0) or 0)
+        for t in re.findall(r"[a-z0-9]+", _aud_lat(str(w))):
+            if len(t) >= 3:
+                agg[t] = agg.get(t, 0) + int(n or 0)
+                lowc[t] = lowc.get(t, 0) + ev
+    f = set()
+    if len(freq) >= 1000:
+        # a tiny or flat vocabulary makes a percentile cut absurd
+        # (the whole library becomes "filler") - same guard as
+        # _aud_revert_nonsense
+        vals = sorted(agg.values())
+        cut = vals[int(len(vals) * 0.98)] if vals else 10 ** 9
+        f = set(t for t, n in agg.items()
+                if n >= cut and lowc.get(t, 0) * 2 >= n)
+    f |= {"the", "and", "you", "not", "but", "for", "with", "that",
+          "this", "what", "was", "are", "have", "they", "then",
+          "them", "there", "here", "your", "its", "get", "got",
+          "now", "yeah", "yes", "okay", "just", "like", "know",
+          "going", "dont", "can", "cant", "will", "would", "gonna",
+          "wanna", "yalla", "wallah", "khalas", "tayeb", "zain",
+          "habibi", "aywa", "laish", "ana", "inta", "howa", "heya",
+          "shu", "wesh", "allah", "don", "won", "isn", "ain"}
+    _AUD_VOCAB["filler"] = f
+    _AUD_VOCAB["filler_at"] = _AUD_VOCAB.get("at")
+    return f
+
+
 def _aud_ear_agrees(ear, heard):
     """Exact tokens failed - judge agreement the way names are judged:
     consonant skeletons with containment, because the ear glues words
-    it heard and Arabic transliterates without vowels. 'Bastin.' and
-    باستن share no _aud_lat token yet are the same word."""
+    it heard and Arabic transliterates without vowels. 'Rastin.' and
+    راستن share no _aud_lat token yet are the same word."""
     ek = [k for k in (_aud_skel(w) for w in
                       re.findall(r"[a-z0-9]+", _aud_lat(ear)))
           if len(k) >= 3]
@@ -17293,17 +17340,45 @@ def _aud_parse(got, garble):
                 # static (which slid through on a lone Arabic token).
                 _er = str(row.get("ear") or "").strip()
                 if _er and not row.get("ear_junk"):
-                    _etk = re.findall(
-                        "[\u0600-\u06ff]{2,}|[A-Za-z']{3,}", _er)
-                    _eok, _ebad = _aud_sense(
-                        _er, (_AUD_VOCAB.get("freq") or {}))
-                    if (_eok and len(_etk) >= 2 and not _ebad
-                            and not re.search(
-                                "[\u3040-\u30ff\u31f0-\u4dbf"
-                                "\u4e00-\u9fff\uac00-\ud7af]",
-                                _er)):
+                    # TWO INDEPENDENT LISTENERS CONVERGED. When the
+                    # relisten repeats the line itself - whole tokens,
+                    # or the skeleton comparator across scripts - the
+                    # agreement IS the evidence, and the vocabulary
+                    # test is deliberately skipped: a name the library
+                    # never heard is exactly this case: 8 such
+                    # one-word names were measured banked away as
+                    # [unintelligible], each one re-heard verbatim.
+                    _txt = str(row.get("text") or "").strip()
+                    # the equality arm demands substance: [] == []
+                    # (pure static on both sides) is agreement about
+                    # nothing and must not veto a correct strike
+                    _elt = re.findall(r"[a-z0-9]+", _aud_lat(_er))
+                    _sk1 = _aud_skel(_er)
+                    if _txt and (
+                            (_elt and _elt == re.findall(
+                                r"[a-z0-9]+", _aud_lat(_txt)))
+                            or _aud_ear_agrees(_er, _txt)
+                            # short names skeletonize under the >=3
+                            # containment floor (Ateka -> tk): whole-
+                            # string equality at two consonants is
+                            # still two listeners converging
+                            or (len(_sk1) >= 2
+                                and _sk1 == _aud_skel(_txt))):
                         v = "unclear"
                         row["ear_kept"] = True
+                    else:
+                        _etk = re.findall(
+                            "[\u0600-\u06ff]{2,}|[A-Za-z']{3,}",
+                            _er)
+                        _eok, _ebad = _aud_sense(
+                            _er, (_AUD_VOCAB.get("freq") or {}))
+                        if (_eok and len(_etk) >= 2 and not _ebad
+                                and not re.search(
+                                    "[\u3040-\u30ff\u31f0-\u4dbf"
+                                    "\u4e00-\u9fff\uac00-\ud7af]",
+                                    _er)):
+                            v = "unclear"
+                            row["ear_kept"] = True
             row["verdict"] = v
             row["vwhy"] = _aud_clip(str(c.get("why") or "").strip())
     fx_raw = got.get("fixes")
@@ -17336,6 +17411,22 @@ def _aud_parse(got, garble):
             continue
         okS, badW = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}))
         if not okS:
+            # TWO LISTENERS BEAT THE DICTIONARY here exactly as they
+            # do in the noise veto: a fix that adopts a non-junk
+            # ear's own words verbatim (or by skeleton) is recording-
+            # supported even when every word is library-new - a
+            # first-and-last-name the library never met is the
+            # motivating case, and the old order refused it upstream
+            # of the identity exemption.
+            _erS = str((garble or [])[i].get("ear") or "").strip()
+            if _erS and not (garble or [])[i].get("ear_junk"):
+                _eaS = re.findall(r"[a-z0-9]+", _aud_lat(_erS))
+                if _eaS and (
+                        _eaS == re.findall(r"[a-z0-9]+",
+                                           _aud_lat(heard))
+                        or _aud_ear_agrees(_erS, heard)):
+                    okS = True
+        if not okS:
             gated.append(str((garble or [])[i].get("t")))
             (garble or [])[i].setdefault("verdict", "unclear")
             (garble or [])[i].setdefault(
@@ -17362,12 +17453,28 @@ def _aud_parse(got, garble):
             _ht = set(w for w in re.findall(r"[a-z0-9]+",
                                             _aud_lat(heard))
                       if len(w) >= 3)
-            # EXACT TOKENS FIRST, SKELETONS BEFORE REFUSING. Raw
-            # _aud_lat equality is vowel- and spacing-blind across
-            # scripts - it refused 27 of 308 known-good repairs
-            # ("Bastin." vs باستن), the exact bug the skeleton
-            # comparator was built to kill.
-            if (_et and _ht and not (_et & _ht)
+            # ORDER OF EVIDENCE. (1) Identity: a fix that adopts
+            # the ear's own words is definitionally recording-
+            # supported - 82% of the 308-repair history is this
+            # shape, and it used to pass only by stopword luck.
+            # (2) A content token: one shared word the library does
+            # not treat as filler. A lone "the" authorized a
+            # fabricated line - and once identity is exempt, zero
+            # good repairs need filler-only overlap. (3) The skeleton
+            # comparator, vowel-blind across scripts ("Rastin." vs
+            # راستن - it refused 27 of 308 before it existed).
+            # Else refuse, with the trace.
+            _ea = re.findall(r"[a-z0-9]+", _aud_lat(_er2))
+            _ha = re.findall(r"[a-z0-9]+", _aud_lat(heard))
+            # WHOLE-LIST EQUALITY ONLY. The subset arms carried
+            # zero unique historical repairs (all nine double-covered
+            # by content/skeleton) while admitting the one shape
+            # models love: echo the ear's words, then fabricate the
+            # tail ("yeah okay now" + an invented kill). And sets
+            # forgave duplicates - "The, the!" counted as substance.
+            _idn = bool(_ea) and _ea == _ha
+            if (_et and _ht and not _idn
+                    and not ((_et & _ht) - _aud_filler())
                     and not _aud_ear_agrees(_er2, heard)):
                 gated.append(str((garble or [])[i].get("t")))
                 # A REFUSAL MUST LEAVE A TRACE: verdict-less rows were

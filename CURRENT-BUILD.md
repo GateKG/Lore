@@ -4,19 +4,19 @@
 
 | | |
 |---|---|
-| **Version** | `3.24` (backend) / `3.24` (UI) |
-| **Stamped** | 2026-09-01 12:36 |
-| **Last commit** (source state at report time; the release commit lands after) | 6da17da LORE v3.23 - every claim must cite its evidence |
-| **lore.py** | 1.2 MB, 27,230 lines, saved 2026-09-01 12:31 |
-| **ui.html** | 0.9 MB, 13,793 lines, saved 2026-09-01 12:31 |
-| **Built exe** | 13.3 MB, 2026-09-01 12:35 |
+| **Version** | `3.25` (backend) / `3.25` (UI) |
+| **Stamped** | 2026-09-01 15:01 |
+| **Last commit** (source state at report time; the release commit lands after) | d54cbc4 LORE v3.24 - the auditor's ear earns its vote |
+| **lore.py** | 1.2 MB, 27,337 lines, saved 2026-09-01 15:00 |
+| **ui.html** | 0.9 MB, 13,793 lines, saved 2026-09-01 14:58 |
+| **Built exe** | 13.4 MB, 2026-09-01 15:00 |
 | **dist\Lore total** | 0.27 GB |
 
 ## What ships
 
 | Piece | Where | Size |
 |---|---|---|
-| The app | `dist\Lore\Lore.exe` | 13.3 MB |
+| The app | `dist\Lore\Lore.exe` | 13.4 MB |
 | Its libraries | `dist\Lore\_internal` | 261.5 MB |
 | The tome (UI) | `ui.html` | 0.9 MB |
 | ffmpeg | `ffmpeg` | 433.5 MB |

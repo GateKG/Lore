@@ -7,7 +7,7 @@ and drives the REAL decision functions:
 
     _window_track          alt-tab / minimise / move / resize -> None|split|restart
     _apply_track_act       split=save / restart=discard + direct re-attach
-    the watcher gone-block (lines 8131-8235) - replicated verbatim, driven
+    the watcher gone-block (lines ~8589-8700) - replicated verbatim, driven
                            through the real running_process_names /
                            _process_walk_trustworthy / _exe_has_any_window
     _note_restart / _restart_streak_now   60s decay
@@ -158,7 +158,7 @@ SHORT = ["a.exe", "b.exe", "c.exe", "d.exe", "e.exe"]  # refused/cut-off walk
 
 def gone_block_poll(session, current):
     """VERBATIM replica of the watcher's suspended-session gone test,
-    lore.py lines 8136-8144 + the >=3 trigger at 8199 - but through the
+    lore.py lines ~8594-8602 + the >=3 trigger at ~8657 - but through the
     real running_process_names / _process_walk_trustworthy /
     _exe_has_any_window. Returns (game_gone, fired)."""
     _names = lore.running_process_names()
@@ -171,12 +171,16 @@ def gone_block_poll(session, current):
 
 
 def active_gone_poll(state, current):
-    """VERBATIM replica of the ACTIVE-recording gone test, lore.py lines
-    8641-8646 (elif current not in running_process_names(): gone += 1;
-    if gone >= 2: stop+save) and the else: gone = 0 at 8657-8658."""
-    if current is not None and current not in lore.running_process_names():
+    """The ACTIVE-recording gone test as v3.24 ships it: the decision
+    itself is the REAL lore._looks_gone (trustworthy walk + absent +
+    no window); only the call-site debounce is mirrored here - THREE
+    consecutive positive polls (lore.py ~9147-9155), else reset. An
+    earlier revision of this file replicated the pre-fix 2-poll raw
+    walk by hand and kept reporting a defect production had already
+    fixed - the oracle must ride the live function, never a copy."""
+    if current is not None and lore._looks_gone(current):
         state["gone"] += 1
-        if state["gone"] >= 2:
+        if state["gone"] >= 3:
             state["gone"] = 0
             return True                      # stop + save + (re-detect next poll)
     else:
@@ -194,14 +198,16 @@ def check(name, cond):
     print(("  OK      " if cond else "  FAIL    ") + name)
 
 
-def finding(name, demonstrated):
-    """A real-code behavior check: OK means the misbehavior IS demonstrated
-    by the real code (the harness is honest); the finding itself is reported
-    in prose at the end."""
+def finding(name, fixed):
+    """A real-code behavior check on a site that once carried a bug:
+    OK means the FIXED behavior holds. A demonstrated defect fails the
+    suite - a green roster must never contain a live finding (the old
+    demonstrated-defect-counts-as-ok design let a stale oracle report
+    a fixed bug as ACTIVE while the run stayed green)."""
     global ok, bad
-    ok += bool(demonstrated)
-    bad += not demonstrated
-    print(("  FINDING " if demonstrated else "  FAIL    ") + name)
+    ok += bool(fixed)
+    bad += not fixed
+    print(("  OK      " if fixed else "  FAIL    ") + name)
 
 
 # =========================================================================
@@ -349,19 +355,27 @@ check("...and the active-recording check matches it too",
       not active_gone_poll(st, GAME) and st["gone"] == 0)
 
 # =========================================================================
-print("\n--- real-code findings: the trust gate exists in ONE of the three "
-      "gone checks ---")
+print("\n--- real-code checks: the trust gate holds in ALL three gone "
+      "checks ---")
 
-# F1. ACTIVE recording (lore.py 8641-8646): raw walk, debounce 2, no trust
-# gate, no window check. Two short walks while the game is running stop the
-# recording, save it, and the next poll re-detects the game and starts a new
-# one: exactly the reported Bazaar mid-game auto-stop/save/restart.
+# F1. ACTIVE recording (lore.py ~9147, via the real _looks_gone at
+# ~887): trustworthy walk + absent + no window, debounced to THREE.
+# The pre-fix site used a raw walk with a debounce of two - exactly
+# the Bazaar mid-game auto-stop - and an earlier revision of this
+# suite reimplemented that dead branch and kept reporting it ACTIVE.
 PROCS["names"] = SHORT                          # walk refused mid-game
 st = {"gone": 0}
-stopped = [active_gone_poll(st, GAME) for _ in range(2)]
-finding("ACTIVE gone check (8641): 2 untrustworthy walks STOP a live "
-        "recording (suspended path would have refused)",
-        stopped == [False, True])
+stopped = [active_gone_poll(st, GAME) for _ in range(4)]
+finding("ACTIVE gone check: untrustworthy walks can NEVER stop a "
+        "live recording, however many arrive",
+        stopped == [False, False, False, False] and st["gone"] == 0)
+PROCS["names"] = BIG                            # honest walk, game gone
+WINDOWED["val"] = False                         # ...and no window left
+st = {"gone": 0}
+stopped = [active_gone_poll(st, GAME) for _ in range(3)]
+finding("ACTIVE gone check: a genuinely-gone game stops on the THIRD "
+        "honest poll, not the second",
+        stopped == [False, False, True])
 
 # ...the very same two walks through the fixed suspended-path logic: held.
 s = FakeSession(6, win=rect(2560, 1440))
@@ -369,7 +383,7 @@ held = not any(gone_block_poll(s, GAME)[1] for _ in range(2))
 check("same 2 short walks through the suspended-path logic -> held",
       held)
 
-# F2. _apply_track_act re-attach guard (lore.py 7731): raw walk again. A
+# F2. _apply_track_act re-attach guard (lore.py ~8156; gone-guard at ~8187): raw walk again. A
 # short walk at the moment of a split makes it believe the game closed, so
 # it clears force_record and does NOT re-attach - the chapter ends and no
 # follow-up recording starts from here.
@@ -385,14 +399,14 @@ finding("_apply_track_act (fixed): untrustworthy walk at split time -> "
         "the game is NOT presumed gone; a fresh session re-attaches",
         CALLS["finalize"] == 1 and FakeNext.made)
 
-# F3. window-scope capture-death recovery (lore.py 8373): game_alive uses a
+# F3. window-scope capture-death recovery (lore.py ~8879): game_alive uses a
 # raw walk. ffmpeg dying on alt-tab (the common display-mode teardown) plus
 # one short walk = game_alive False = the pause-and-wait recovery is skipped
 # and the chapter is split/restarted instead of resumed.
 PROCS["names"] = SHORT
 # FIXED: the real site now asks _looks_gone, which refuses to trust a
 # short walk - the game reads alive and the alt-tab recovery proceeds
-game_alive = (not lore._looks_gone(GAME))               # the fixed 8373
+game_alive = (not lore._looks_gone(GAME))               # the fixed ~8879
 finding("capture-death recovery (fixed): a short walk cannot read the "
         "game as dead - recovery proceeds",
         game_alive is True)

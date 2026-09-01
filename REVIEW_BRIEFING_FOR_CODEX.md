@@ -97,7 +97,7 @@ verified and acted on the same day:
   zero distinctive tokens with the proposal. The first cut compared
   raw `_aud_lat` tokens and was measured refusing 27 of 308
   known-good historical repairs (8.8%) — exact tokens are vowel- and
-  spacing-blind across scripts ("Bastin." vs باستن). The shipped gate
+  spacing-blind across scripts ("Rastin." vs راستن). The shipped gate
   falls back to the consonant-skeleton comparator (`_aud_ear_agrees`:
   skeleton containment + phonetic equivalence) before refusing, and a
   refusal is no longer invisible: it writes `unclear` + the reason on
@@ -150,6 +150,47 @@ verified and acted on the same day:
   voting, `ins_validation` retroactive pass, and OCR/vision
   persistence. These are on the ledger with your specs as the design
   reference.
+
+### v3.25 — the response to your third review
+Your v3.24 review (`CODEX_LORE_V3.24_VALUE_REVIEW.md`) was verified
+the same day. All four findings CONFIRMED (both P0s functionally, on
+the live functions). Your P0-1 *remedy* was measured NET HARMFUL
+before it could ship — replayed over all 308 historical repairs, the
+content-anchor rule caught zero bad corrections and refused 12–31
+good ones, because 80% of real fixes adopt the ear's own words
+verbatim and short Gulf colloquial lines are all "stopwords". What
+shipped instead (each arm measured at zero historical cost):
+
+- **P0-1 closed**: order of evidence in the correction gate —
+  (1) identity: the fix adopts the ear's words (whole latinized
+  token-list equality ONLY — subset arms were measured carrying zero
+  unique repairs while admitting echo-prefix fabrications, and were
+  dropped); (2) a content token: at least one shared non-filler word
+  (`_aud_filler`: top-2% latinized vocab by frequency, name-aware via
+  the lowercase counts so frequent friend-names can never become
+  filler, hand-list-only under 1,000 words, cached on the vocab
+  rebuild stamp); (3) the skeleton comparator; else refuse with the
+  `unclear` trace. Your synthetic ("The sniper boss" on a shared
+  "the") refuses; all 291 historically-accepted repairs still accept.
+- **P0-2 closed**: an agreement veto runs BEFORE the readable veto
+  and deliberately skips `_aud_sense` — a non-junk ear whose token
+  list equals the row's own text, or which agrees by skeleton
+  (including whole-string skeleton equality at length ≥2, for the
+  two-consonant names), downgrades `noise` to `unclear` + `ear_kept`.
+  Replayed: every previously-banked one-word genuine repetition now
+  survives; junk/CJK/unrelated ears still strike.
+- **Consistency**: the sense gate now honours the same convergence —
+  a verbatim ear adoption passes even when every word is
+  library-new (two listeners beat the dictionary in both gates).
+- **Your QA-1 fixed**: the recorder scenario drives the real
+  `_looks_gone()` with the production 3-poll debounce; `finding()`
+  now FAILS the suite on a demonstrated defect; stale line citations
+  refreshed.
+- **Your QA-2 fixed**: `run_all.bat` preflights python imports
+  (psutil, PyAudioWPatch) and node with a precise one-shot message;
+  the README documents the environment and the two installed-app-
+  dependent suites. `codex325test` (19 checks) locks your acceptance
+  bar plus the fleet's round-2 fabrication shapes.
 
 ### v3.23 — the response to your review
 See `CURRENT-BUILD.md` and the v3.23 commit message for the precise

@@ -170,10 +170,10 @@ check("an Arabic-prefixed honest quote is recovered, prefix shed",
 print("\n--- the W round: the gates earn their keep ---")
 # W2: a fix that transcribes what the ear heard, across scripts
 g5 = [{"t": 10.0, "text": "gibber",
-       "ear": "باستن"}]
-_, _, _, _, _, fx5 = parse(g5, [{"n": 0, "heard": "Bastin.",
+       "ear": "راستن"}]
+_, _, _, _, _, fx5 = parse(g5, [{"n": 0, "heard": "Rastin.",
                                  "why": "the name"}])
-check("W2: 'Bastin.' agrees with its Arabic ear by skeleton",
+check("W2: 'Rastin.' agrees with its Arabic ear by skeleton",
       len(fx5) == 1)
 # W3: a refusal leaves a visible, strike-proof verdict
 g6 = [{"t": 10.0, "text": "gibber",
@@ -183,7 +183,8 @@ check("W3: a refused fix leaves 'unclear' + the reason on the row",
       g6[0].get("verdict") == "unclear"
       and "refused" in (g6[0].get("vwhy") or ""))
 # W1: the veto demands a FULLY readable ear
-check("W1: a single-token ear does not veto a strike",
+check("W1: an UNRELATED single-token ear does not veto a strike "
+      "(one that repeats the line does - codex325test)",
       verdict_of({"t": 5.0, "text": "abc",
                   "ear": "door"}) == "noise")
 check("W1: a CJK-static ear does not veto",

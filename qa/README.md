@@ -30,7 +30,15 @@ product stays hands-off; QA is where human judgment lives.
 
 Everything assumes this machine's layout (`D:\Gate LLC`, `D:\Records`
 read-only). Python suites: `python <suite>.py` — each prints
-`N ok, M failed` and exits nonzero on failure. JS: `node paneltest.js`.
+`N ok, M failed` and exits nonzero on failure. JS: `node paneltest.js` / `node checkui.js ..\ui.html`.
+
+**Environment**: the roster needs a python that can
+`import psutil, pyaudiowpatch` (`pip install psutil PyAudioWPatch`)
+and `node` on PATH — `run_all.bat` preflights both and stops with a
+precise message instead of failing mid-suite. Two suites additionally
+lean on the *installed* app: `audiotest` and `midchange` execute the
+ffmpeg at `C:\Program Files\Lore\ffmpeg\bin`; on a machine without
+LORE installed, expect exactly those two to fail.
 
 Run the lot:
 

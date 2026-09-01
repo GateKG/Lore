@@ -2870,7 +2870,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.24'};},
+      webhook:true,version:'3.25'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3039,7 +3039,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.24'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.25'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
