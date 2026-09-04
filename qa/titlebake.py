@@ -310,7 +310,8 @@ def _app():
     src = io.open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "lore.py"), encoding="utf-8").read()
     ns = {"re": re, "json": json, "os": os}
-    for name in ("_TITLE_SWEAR", "_TITLE_MOOD", "_TITLE_STOP"):
+    for name in ("_TITLE_SWEAR", "_TITLE_MOOD", "_TITLE_STOP",
+                 "_TITLE_FILLER"):
         m = re.search(r"^%s = frozenset\(\((.*?)\)\)" % name, src,
                       re.M | re.S)
         ns[name] = frozenset(eval("(" + m.group(1) + ")"))
@@ -345,7 +346,8 @@ def prompt_D(ev):
 def ask_D(url, ev, temp):
     """The ask, the guard, the one re-ask - as lore.py does it."""
     app = _app()
-    said = [c["quote"] for c in ev["ranked"]]
+    said = ([c["quote"] for c in ev["ranked"]]
+            + [str(m.get("why") or "") for m in ev["moments"]])
     user = prompt_D(ev)
     got = ask(url, app["_TITLE_SYS"], user, SCHEMA_B, temp, max_tokens=360)
     title = str(got.get("title") or "")

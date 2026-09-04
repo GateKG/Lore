@@ -13491,6 +13491,12 @@ _TITLE_STOP = frozenset((
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
     "with", "is", "was", "it", "its", "his", "her", "their", "our",
     "\u0627\u0644", "\u0648", "\u0641\u064a"))
+# a title that opens or closes on one of these is a transcript
+# fragment wearing a title's hat ("he restarted his uh.")
+_TITLE_FILLER = frozenset((
+    "uh", "um", "umm", "hmm", "hm", "mm", "mhm", "yeah", "yah", "ya",
+    "okay", "ok", "oh", "ah", "eh", "huh", "like", "so", "and", "but",
+    "\u064a\u0639\u0646\u064a", "\u0627\u0647", "\u0627\u064a\u0647"))
 _TITLE_MOOD = frozenset((
     "session", "initial", "chat", "talk", "discussion", "gameplay",
     "adventures", "adventure", "struggles", "struggle", "chaos", "journey",
@@ -13504,9 +13510,11 @@ def _title_guard(title, said):
     The shapes the model still reaches for after being told not to,
     each caught by arithmetic: swearing (it copies the room's mouth),
     a colon or a two-comma list (the old shelf's whole disease), a
-    mood word standing in for an event, and a title that is 70%% the
-    words of a line it was shown - that is a quotation wearing a
-    title's hat, and it went in the title on one night in two."""
+    mood word standing in for an event, a filler at either end (a
+    fragment of speech), and a title that is 70% the words of a line
+    it was shown - chapter quotes AND the moments' lines, because the
+    model lifts from both - that is a quotation wearing a title's hat,
+    and it went in the title on one night in two."""
     t = str(title or "").strip()
     if not t:
         return ""
@@ -13520,6 +13528,8 @@ def _title_guard(title, said):
         return "a list"
     if any(w in _TITLE_MOOD for w in toks):
         return "a mood word, not an event"
+    if toks and (toks[-1] in _TITLE_FILLER or toks[0] in _TITLE_FILLER):
+        return "a transcript fragment"
     # the overlap is counted on the words that carry meaning - "the"
     # and "a" match every line ever said
     core = [w for w in toks if w not in _TITLE_STOP]
@@ -15397,6 +15407,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                 return sorted(cs, key=lambda c: -c["s"])
             title = summary = ""
             t_max = 250
+            _said = []
             if names and _TITLE_GEN >= 1:
                 _ranked = _sal(list(cinfo))[:14]
                 _moms = []
@@ -15433,6 +15444,10 @@ def _insights_one(video_path, forced=False, fresh=False):
                 t_ask = _title_evidence(_ev)
                 t_sys = _TITLE_SYS
                 t_max = 360
+                # every line the page showed it, chapter quotes and the
+                # moments' whys alike - the guard compares against all
+                _said = ([c.get("q") for c in cinfo]
+                         + [str(m.get("why") or "") for m in _moms])
             elif names:
                 _ranked = _sal(list(cinfo))[:40]
                 _lines = "\n".join(
@@ -15482,7 +15497,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # in its own words, the model usually finds the event.
                 # If it insists, the swearing is cut and the rest stands
                 # - a line the room said is still truer than a list.
-                _why = (_title_guard(title, [c.get("q") for c in cinfo])
+                _why = (_title_guard(title, _said)
                         if (_TITLE_GEN >= 1 and title) else "")
                 if _why:
                     t2 = srv.ask(
@@ -15501,8 +15516,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                                           or summary).strip())
                     except Exception:
                         pass
-                    if cand and not _title_guard(
-                            cand, [c.get("q") for c in cinfo]):
+                    if cand and not _title_guard(cand, _said):
                         log("The title \"" + title[:60] + "\" was " + _why
                             + " - asked again, it named the night \""
                             + cand[:60] + "\".")
