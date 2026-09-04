@@ -2878,7 +2878,7 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
-      webhook:true,version:'3.29'};},
+      webhook:true,version:'3.30'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3047,7 +3047,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.29'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.30'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -6234,21 +6234,11 @@ function workPlate(){
     /* one switch, two views - the mirror now rides ask() with the
        shutdown state; this older call stays for non-work pages */
     if(window._paintAnyread)_paintAnyread(chasing);
-    const catchBtn=(o,k)=>{
-      /* THIS WAS THE SWITCH FROM THE BOTTOM BAR, PRINTED AGAIN. Same
-         setting, two places, and in here it read as "Turn it on" with no
-         hint of what "it" was. The bar owns that switch. */
-      return;
-      /* eslint-disable no-unreachable */
-      if(!k||!k.left||chasing)return;
-      /* the switch itself lives beside the glyph; this is the shortcut you
-         want at the moment you are looking at the queue */
-      setGo(o,'Turn it on',async()=>{
-        try{await api.ai_catchup(true);}catch(e){}
-        whisper('reading anytime \u2014 it will work while you play and watch');
-        ask();
-      },true);
-    };
+    /* THIS WAS THE SWITCH FROM THE BOTTOM BAR, PRINTED AGAIN. Same
+       setting, two places, and in here it read as "Turn it on" with no
+       hint of what "it" was. The bar owns that switch; the rows keep
+       calling this so the call sites need not change. */
+    const catchBtn=()=>{};
     const WHAT={
       listening:{noun:'sound curve and set of gold moments',
                  cost:'about 6 seconds a recording, and free'},
@@ -6990,7 +6980,11 @@ function renderSet(cL,cR,app,spreadIdx){
          + 'and how long is left — and Hold, to make it wait — all live on the '
          + 'Working page. It used to be repeated here too, which meant two '
          + 'places to look and two chances to disagree.');
-    hint(R,'Accurate uses a large multilingual model that handles accents properly — it is what makes the words trustworthy, and costs about 1.7x the time. Quick uses a small English-only model: faster, but on this library it produced almost nothing and repeated itself. Detect works out the language itself, but it decides ONCE per recording — a sentence that switches between Arabic and English mid-way still lands in whichever language won, so pin it if your sessions lean one way. All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
+    /* the Accurate/Quick/Detect paragraph that stood here described the
+       whisper models LORE stopped shipping in 2.8 - there is no such
+       choice any more, and a hint about a switch that does not exist is
+       a hint that lies */
+    hint(R,'All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
@@ -8793,7 +8787,12 @@ function paintSeen(){
     &&(c.ts||[]).length);
   const looks=(vis.looks||[]).filter(l=>l&&isFinite(+l.t))
     .slice().sort((a,b)=>(+a.t||0)-(+b.t||0));
-  const any=!!(places.length||crs.length||looks.length);
+  /* what the screen itself named - a boss bar, a mode, a menu - read
+     off one frame a minute by the senses; in time order like the rest */
+  const scr=(vis.screen||[]).filter(s=>s&&s.n)
+    .slice().sort((a,b)=>(+a.a||0)-(+b.a||0));
+  const looked=(vis.eye!==false);
+  const any=!!(places.length||crs.length||looks.length||scr.length);
   const btn=$('#vsaw');
   if(btn)btn.classList.toggle('has',any);
   /* a closed panel does not need its rows walked four times a second */
@@ -8803,14 +8802,15 @@ function paintSeen(){
     +'\u2016'+places.map(p=>p.name+'@'+p.a+'-'+p.b).join('\u241f')
     +'\u2016'+crs.map(c=>c.name+':'+(c.ts||[]).join(','))
       .join('\u241f')
-    +'\u2016'+looks.length;
+    +'\u2016'+looks.length
+    +'\u2016'+scr.map(s=>s.n+'@'+s.a+'-'+s.b).join('\u241f');
   if(box._sig!==sig){
     box._sig=sig; box.innerHTML='';
     if(!any){
       /* a sidecar that came back empty is not the same answer as no
          sidecar at all, and telling him to run a pass he has already
          run would be the panel lying to him */
-      box.append(el('div','vempty', _vis
+      box.append(el('div','vempty', (_vis&&looked)
         ?'the eye looked and found nothing it could name here - no place '
          +'it could put words to, and nobody else on screen.'
         :'the eye has not looked at this one yet. Open the \u22ef menu, '
@@ -8886,6 +8886,19 @@ function paintSeen(){
           String(l.doing||'nothing worth a word'),
           bits.join('  \u00b7  '),t,
           looks[i+1]?(+looks[i+1].t||0):Infinity));
+      });
+    }
+    if(scr.length){
+      box.append(el('div','ehead'+(places.length||crs.length||looks.length
+        ?'':' first'),'The screen named'));
+      if(!looked)
+        box.append(el('div','enote','the eye has not looked yet - this is '
+          +'what the game printed on screen, read one frame a minute'));
+      scr.forEach(s=>{
+        const a=+s.a||0, b=((+s.b||0)>a)?(+s.b||0):a, n=+s.k||0;
+        box.append(row(fmtT(a),String(s.n),
+          'to '+fmtT(b)+(n>1?('  \u00b7  '+n+' frames'):''),
+          a,Math.max(b,a+4)));
       });
     }
   }
@@ -12980,7 +12993,7 @@ function wireViewer(){
     h.addEventListener('pointermove',move); h.addEventListener('pointerup',up);
     h.addEventListener('pointercancel',up);   /* [L3] */
     e.preventDefault();e.stopPropagation();});
-  addEventListener('resize',()=>{if(V.ed.on)setTimeout(layEd,100);});
+  addEventListener('resize',()=>{if(V.ed&&V.ed.on)setTimeout(layEd,100);});   /* V.ed is built by the first open - a resize before that threw (seen in the log) */
   /* no-overlap watch: refit whenever the window, the video, or the bottom group
      changes. the ResizeObserver sees every .on toggle on the editor rows
      (display:none <-> flex IS a size change), so no toggle site has to remember */

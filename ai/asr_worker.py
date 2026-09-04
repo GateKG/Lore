@@ -345,7 +345,7 @@ def _arabizi(t):
 # read yesterday - and nothing on disk said which reader had written a
 # transcript, so there was no way even to ask. Every transcript carries
 # this number now; the app counts them and says the number out loud.
-READER = 4
+READER = 5      # 5: the six-word echo band (see _ctx_echo)
 
 # HOW MANY EXTRA REQUESTS THE TWO NEW WALLS MAY SPEND, the same
 # reasoning as TRANSLIT_MAX: not a budget, a stop, so a night that goes
@@ -667,6 +667,123 @@ def _arabic_company(out, k, gap_s=6.0):
         if d / 1000.0 <= gap_s:
             return True
     return False
+
+
+# ===================================================================
+#  THE FABRICATION GATES. At module level on purpose: the app lifts
+#  these three by NAME out of this file to judge the transcripts that
+#  were written before the gates existed (lore._fab_gates), so there
+#  is exactly one definition of what a fabricated line is. A hand
+#  copy in lore.py would drift - the strike migration learned that.
+# ===================================================================
+
+_CTX_STOP = frozenset(
+    "the a an and or of in on with they we our your his her its it he "
+    "she you i to for at by is are was were be this that".split())
+
+def _ctx_echo(t, c):
+    """Does this 'transcription' mostly restate the biasing context?
+
+    On a thin, music-only utterance the model can regurgitate its own
+    prompt as speech, embellished - a whole night was titled around a
+    game nobody mentioned because the first "line" was the context
+    paraphrased, with an invented favourite game stitched on. Compared
+    on 4-letter word prefixes so 'gaming' still matches 'games'; seven
+    content words minimum, so a real short callout ("let's play
+    backrooms with friends on discord") never even costs the retry."""
+    def toks(s):
+        return [w for w in re.findall(r"[a-z']+", s.lower())
+                if len(w) > 3 and w not in _CTX_STOP]
+    # THE SHORT ARM. The seven-word floor below exempts exactly the
+    # shape the library is full of: "Bloodthief." as a whole line,
+    # nine times in one night nobody said it. A short line that
+    # collapses to the game's own title (give or take one word) IS
+    # the prompt speaking. Only the title clause is consulted -
+    # never the boilerplate, whose words ("friends", "chat",
+    # "discord") are ordinary speech in this house - and the remedy
+    # is the same no-context retry as the long form, so a genuine
+    # shout of the game's name survives by answering the same
+    # words without the prompt.
+    # the clause ends at the first period FOLLOWED BY WHITESPACE -
+    # exactly how the builder terminates it - so a title with its
+    # own periods ("R.E.P.O") survives the parse
+    mg = re.match(r"\s*gaming session of (.+?)\.(?:\s|$)", c.lower())
+    if mg:
+        gt = re.findall(r"[a-z0-9']+", mg.group(1))
+        lt = re.findall(r"[a-z0-9']+", t.lower())
+        gj, lj = "".join(gt), "".join(lt)
+        # the >=4 floor guards against one-letter accidents, but an
+        # EXACT collapse match is the bare-title shape itself - a
+        # shelf named "Ds" deserves the same guard as Bloodthief
+        if (gj and (len(gj) >= 4 or gj == lj)
+                and lt and len(lt) <= len(gt) + 1
+                and len(lj) <= len(gj) + 8):
+            # BOUNDARY-ALIGNED ONLY. The join exists so a split or
+            # fused title still matches ("Blood thief." ~
+            # "Bloodthief") - but without boundaries 'peak' hides
+            # inside "don't speak" and a real line on a PEAK night
+            # reads as the prompt leaking. A match must start and
+            # end where a word starts or ends.
+            bounds = {0}
+            acc = 0
+            for w in lt:
+                acc += len(w)
+                bounds.add(acc)
+            k = lj.find(gj)
+            while k != -1:
+                if k in bounds and (k + len(gj)) in bounds:
+                    return True
+                k = lj.find(gj, k + 1)
+    tw = toks(t)
+    if len(tw) < 6:
+        return False
+    cp = {w[:4] for w in toks(c)}
+    hit = sum(1 for w in tw if w[:4] in cp)
+    # SIX WORDS NEED HALF. The seven-word floor let "Megabonk's
+    # friends are chatting in the game while they play it." stand as
+    # the ONLY line of a 77-minute night - and the describer named
+    # the night from it. Measured over 99,712 lines: a six-word
+    # band at >=0.5 adds exactly four lines, three of them the
+    # prompt verbatim; the fourth costs one no-context re-ask, which
+    # a real line survives. At seven and up the 0.4 bar is unchanged.
+    return hit / float(len(tw)) >= (0.5 if len(tw) == 6 else 0.4)
+
+def _impossible(t, secs):
+    """More characters than a human mouth can make in the time.
+
+    Real speech in this library: median 11.4 chars/sec, p99 26.8.
+    Genuine in-game voice lines max at 16.0. The fabrications - the
+    prompt paraphrased onto music, the "Oh yeah!" x27 attractor -
+    run 78 to 263. Counted on speech characters only: whitespace,
+    punctuation and Arabic tashkeel stripped (full diacritics
+    inflate Arabic counts 40-90% and were the one measured
+    collision risk), and judged by the SCRIPT actually written,
+    never the language tag, because the tag lies."""
+    if not t or secs <= 0:
+        return False
+    body = re.sub("[\u064B-\u0652\u0670]", "", t)
+    body = "".join(ch for ch in body if ch.isalnum())
+    if not body:
+        return False
+    letters = [ch for ch in body if ch.isalpha()]
+    arab = sum(1 for ch in letters if "\u0600" <= ch <= "\u06ff")
+    limit = 30.0 if letters and arab / float(len(letters)) > 0.5 \
+        else 40.0
+    return len(body) / float(secs) > limit
+
+def _foreign(t):
+    """Written in an alphabet nobody in this house uses? Only Latin
+    and Arabic scripts may ship - the model wandered into CHINESE on a
+    real night and the leash (which trusts the language TAG) never saw
+    it, because the tag lied."""
+    letters = [c for c in t if c.isalpha()]
+    if not letters:
+        return False
+    ok = sum(1 for c in letters
+             if ("a" <= c.lower() <= "z")
+             or ("؀" <= c <= "ۿ")
+             or ("ݐ" <= c <= "ݿ"))
+    return ok / len(letters) < 0.5
 
 
 def main(src, dst, mic=None):
@@ -1024,106 +1141,8 @@ def main(src, dst, mic=None):
     # next nearly as often as this model thinks.
     KEEP = ("english", "arabic")
 
-    _CTX_STOP = frozenset(
-        "the a an and or of in on with they we our your his her its it he "
-        "she you i to for at by is are was were be this that".split())
-
-    def _ctx_echo(t, c):
-        """Does this 'transcription' mostly restate the biasing context?
-
-        On a thin, music-only utterance the model can regurgitate its own
-        prompt as speech, embellished - a whole night was titled around a
-        game nobody mentioned because the first "line" was the context
-        paraphrased, with an invented favourite game stitched on. Compared
-        on 4-letter word prefixes so 'gaming' still matches 'games'; seven
-        content words minimum, so a real short callout ("let's play
-        backrooms with friends on discord") never even costs the retry."""
-        def toks(s):
-            return [w for w in re.findall(r"[a-z']+", s.lower())
-                    if len(w) > 3 and w not in _CTX_STOP]
-        # THE SHORT ARM. The seven-word floor below exempts exactly the
-        # shape the library is full of: "Bloodthief." as a whole line,
-        # nine times in one night nobody said it. A short line that
-        # collapses to the game's own title (give or take one word) IS
-        # the prompt speaking. Only the title clause is consulted -
-        # never the boilerplate, whose words ("friends", "chat",
-        # "discord") are ordinary speech in this house - and the remedy
-        # is the same no-context retry as the long form, so a genuine
-        # shout of the game's name survives by answering the same
-        # words without the prompt.
-        # the clause ends at the first period FOLLOWED BY WHITESPACE -
-        # exactly how the builder terminates it - so a title with its
-        # own periods ("R.E.P.O") survives the parse
-        mg = re.match(r"\s*gaming session of (.+?)\.(?:\s|$)", c.lower())
-        if mg:
-            gt = re.findall(r"[a-z0-9']+", mg.group(1))
-            lt = re.findall(r"[a-z0-9']+", t.lower())
-            gj, lj = "".join(gt), "".join(lt)
-            # the >=4 floor guards against one-letter accidents, but an
-            # EXACT collapse match is the bare-title shape itself - a
-            # shelf named "Ds" deserves the same guard as Bloodthief
-            if (gj and (len(gj) >= 4 or gj == lj)
-                    and lt and len(lt) <= len(gt) + 1
-                    and len(lj) <= len(gj) + 8):
-                # BOUNDARY-ALIGNED ONLY. The join exists so a split or
-                # fused title still matches ("Blood thief." ~
-                # "Bloodthief") - but without boundaries 'peak' hides
-                # inside "don't speak" and a real line on a PEAK night
-                # reads as the prompt leaking. A match must start and
-                # end where a word starts or ends.
-                bounds = {0}
-                acc = 0
-                for w in lt:
-                    acc += len(w)
-                    bounds.add(acc)
-                k = lj.find(gj)
-                while k != -1:
-                    if k in bounds and (k + len(gj)) in bounds:
-                        return True
-                    k = lj.find(gj, k + 1)
-        tw = toks(t)
-        if len(tw) < 7:
-            return False
-        cp = {w[:4] for w in toks(c)}
-        hit = sum(1 for w in tw if w[:4] in cp)
-        return hit / float(len(tw)) >= 0.4
-
-    def _impossible(t, secs):
-        """More characters than a human mouth can make in the time.
-
-        Real speech in this library: median 11.4 chars/sec, p99 26.8.
-        Genuine in-game voice lines max at 16.0. The fabrications - the
-        prompt paraphrased onto music, the "Oh yeah!" x27 attractor -
-        run 78 to 263. Counted on speech characters only: whitespace,
-        punctuation and Arabic tashkeel stripped (full diacritics
-        inflate Arabic counts 40-90% and were the one measured
-        collision risk), and judged by the SCRIPT actually written,
-        never the language tag, because the tag lies."""
-        if not t or secs <= 0:
-            return False
-        body = re.sub("[\u064B-\u0652\u0670]", "", t)
-        body = "".join(ch for ch in body if ch.isalnum())
-        if not body:
-            return False
-        letters = [ch for ch in body if ch.isalpha()]
-        arab = sum(1 for ch in letters if "\u0600" <= ch <= "\u06ff")
-        limit = 30.0 if letters and arab / float(len(letters)) > 0.5 \
-            else 40.0
-        return len(body) / float(secs) > limit
-
-    def _foreign(t):
-        """Written in an alphabet nobody in this house uses? Only Latin
-        and Arabic scripts may ship - the model wandered into CHINESE on a
-        real night and the leash (which trusts the language TAG) never saw
-        it, because the tag lied."""
-        letters = [c for c in t if c.isalpha()]
-        if not letters:
-            return False
-        ok = sum(1 for c in letters
-                 if ("a" <= c.lower() <= "z")
-                 or ("؀" <= c <= "ۿ")
-                 or ("ݐ" <= c <= "ݿ"))
-        return ok / len(letters) < 0.5
+    # _CTX_STOP, _ctx_echo, _impossible and _foreign live at module
+    # level now - THE FABRICATION GATES, above main()
     speech_total = sum(g["len"] for g in groups) / float(sr)
     speech_done = 0.0
     out, last = [], "english"

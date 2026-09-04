@@ -44,7 +44,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.29"
+APP_VERSION = "3.30"
 
 try:
     import psutil
@@ -5076,8 +5076,9 @@ _LVL_V = 2          # the loudness curve behind the sound graph
 
 # WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
 # learns to hear something it could not hear before; 2 is the reader
-# whose transliteration wall faces both ways.
-_STT_READER = 4
+# whose transliteration wall faces both ways; 5 closes the six-word
+# echo band the prompt was slipping through.
+_STT_READER = 5
 
 _STT_RD_CACHE = {}
 
@@ -11900,6 +11901,219 @@ def _bank_sidecar(video_path, kind):
         pass
 
 
+# THE SCREEN READER (3.30). Banners last four seconds and forty targeted
+# frames on a two-hour night found one - but a boss's health bar, a mode,
+# a menu STAND on screen for minutes. One centre 16:9 frame a minute,
+# read by the same RapidOCR, every string kept; what stood across
+# neighbouring frames and is not the chrome that is always there is
+# what the screen NAMED - the boss they fought, for how long. Measured
+# on a 132-minute night: 264 frames in eight CPU minutes, the boss's name
+# on seventeen of them, zero death banners.
+_HUD_STEP = 60.0
+_HUD_OWE_CACHE = {}
+# the recorder's own overlay, read back off its own frames
+_HUD_STOP = frozenset(("videocapturepaused", "alttabbed", "capturepaused"))
+
+
+def _hud_paths():
+    """The HUD reader's script and its vendored OCR - both, or nothing."""
+    ow = os.path.join(_here(), "ai", "ocr_worker.py")
+    if os.path.isfile(ow) and os.path.isdir(os.path.join(_here(), "ai",
+                                                         "vendor_ocr")):
+        return ow
+    return None
+
+
+def _hud_names(hud):
+    """What the screen NAMED and for how long, from the grid's rows.
+
+    A string is a name when it stood on screen across neighbouring
+    frames (a boss bar, a mode, a menu) and is not the chrome that is
+    always there (his own tag, the flask slot) - the chrome is whatever
+    sits on a third of the frames or more (half, on a short night).
+    Near-duplicate readings of the same words ("GODSKINAPOSTLE" /
+    "Godskin Apostle") fold on their letters and the most-read spelling
+    is kept. Numbers, counters, strings that are mostly symbols and the
+    recorder's own overlay never name anything. Ranked by how long a
+    name stood times how much of a name it is (a boss bar of two words
+    over eight minutes beats a one-word menu label over one), sixteen
+    at most: [{n, a, b, k}] in seconds and frames, in that order."""
+    rows = (hud or {}).get("rows") or []
+    try:
+        step = float((hud or {}).get("step") or 60.0)
+    except (TypeError, ValueError):
+        step = 60.0
+    frames, forms = [], {}
+    for r in rows:
+        try:
+            t = float(r[0])
+            strs = r[1] or []
+        except (TypeError, ValueError, IndexError):
+            continue
+        ks = set()
+        for x in strs:
+            x = " ".join(str(x).split())
+            k = re.sub(r"[^a-z\u0600-\u06ff]", "", x.lower())
+            if len(k) < 4 or len(k) > 40 or k in _HUD_STOP:
+                continue
+            body = x.replace(" ", "")
+            if not body or sum(ch.isalpha() for ch in body) < 0.7 * len(body):
+                continue          # digits, symbols, a misread icon
+            ks.add(k)
+            f = forms.setdefault(k, {})
+            f[x] = f.get(x, 0) + 1
+        frames.append((t, ks))
+    n = len(frames)
+    if n < 3:
+        return []
+    count = {}
+    for _t, ks in frames:
+        for k in ks:
+            count[k] = count.get(k, 0) + 1
+    thr = n * (0.5 if n < 30 else 0.34)
+    chrome = {k for k, c in count.items() if c >= 4 and c >= thr}
+    spans = []
+    for k, c in count.items():
+        if k in chrome or c < 2:
+            continue
+        cur = None
+        for t, ks in frames:
+            if k not in ks:
+                continue
+            if cur is not None and t - cur[1] <= 2 * step + 1:
+                cur[1] = t
+                cur[2] += 1
+            else:
+                if cur is not None and cur[2] >= 2:
+                    spans.append((k, cur))
+                cur = [t, t, 1]
+        if cur is not None and cur[2] >= 2:
+            spans.append((k, cur))
+    res = []
+    for k, (a, b, c) in spans:
+        form = max(forms[k].items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+        res.append((c * min(len(k), 24), a,
+                    {"n": form[:48], "a": int(round(a)),
+                     "b": int(round(b + step)), "k": int(c)}))
+    res.sort(key=lambda r: (-r[0], r[1]))
+    return [r[2] for r in res[:16]]
+
+
+def _hud_owing(video_path):
+    """A finished senses pass written before the grid owes the grid
+    alone: one CPU pass, no ear re-run. Never owed when the senses are
+    owed whole (absent, stale, failed) - that pass brings the grid with
+    it. Cached on the sidecar's clock and size: the sweep asks this
+    about every recording, every beat."""
+    if _senses_paths() is None or _hud_paths() is None:
+        return False
+    sp = _ai_sidecar(video_path, "sns")
+    try:
+        st = os.stat(sp)
+        if st.st_mtime < os.path.getmtime(video_path):
+            return False
+    except OSError:
+        return False
+    key = (round(st.st_mtime, 1), st.st_size)
+    hit = _HUD_OWE_CACHE.get(sp)
+    if hit and hit[0] == key:
+        return hit[1]
+    owed = False
+    try:
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        owed = bool(not d.get("failed") and "hud" not in d)
+    except Exception:
+        owed = False
+    _HUD_OWE_CACHE[sp] = (key, owed)
+    return owed
+
+
+def _hud_topup_one(video_path):
+    """The grid over a night whose senses are already written: read the
+    frames, fold the names in, and put the sidecar back with ITS OWN
+    CLOCK. Nothing the audit or the review reads has changed (the
+    events, the voices, the names are as they were), and a moved clock
+    here would have re-owed twelve hundred audits for a field they do
+    not read. Left alone if a senses pass rewrote the file meanwhile -
+    that pass brought its own grid."""
+    got = _senses_paths()
+    ow = _hud_paths()
+    if got is None or ow is None:
+        return False
+    py, _w = got
+    sp = _ai_sidecar(video_path, "sns")
+    name = os.path.basename(video_path)
+    try:
+        st0 = os.stat(sp)
+        with open(sp, encoding="utf-8") as fh:
+            sns = json.load(fh) or {}
+    except Exception:
+        return False
+    if sns.get("failed") or "hud" in sns:
+        return True
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    dur = float(_AI.get("job_secs") or _probe_duration(video_path) or 0)
+    game = _display_name(_parse_clip_name(name))
+    oj = os.path.join(_work_dir(),
+                      f"hud_{os.getpid()}_{threading.get_ident()}.json")
+    _source_busy_add(video_path)
+    try:
+        rc, _o, err = _ai_run(
+            [py, ow, video_path, SETTINGS["ffmpeg_path"], oj, "", game,
+             f"{_HUD_STEP:.1f}", f"{dur:.1f}"],
+            max(1200, int(dur / _HUD_STEP * 4) + 300), flags)
+        if _AI["abort"]:
+            return False
+        hud = None
+        if rc == 0 and os.path.isfile(oj):
+            try:
+                with open(oj, encoding="utf-8") as fh:
+                    hud = (json.load(fh) or {}).get("hud")
+            except Exception:
+                hud = None
+        if not isinstance(hud, dict):
+            # written down as read-and-found-nothing, so a frame the
+            # reader cannot open is not asked about every beat forever
+            hud = {"step": _HUD_STEP, "rows": [],
+                   "failed": (err or b"").decode("utf-8", "replace")[-120:]
+                   if rc != 0 else ""}
+        try:
+            st1 = os.stat(sp)
+        except OSError:
+            return False
+        if (st1.st_mtime, st1.st_size) != (st0.st_mtime, st0.st_size):
+            return True
+        sns["hud"] = hud
+        sns["screen"] = _hud_names(hud)
+        _atomic_write_json(sp, sns)
+        try:
+            os.utime(sp, (st0.st_atime, st0.st_mtime))
+        except OSError:
+            pass
+        _HUD_OWE_CACHE.pop(sp, None)
+        named = ", ".join(x["n"] for x in sns["screen"][:4])
+        log(f"The screen reader on {name}: {len(hud.get('rows') or [])} "
+            f"frame(s) read; the screen named "
+            + (named if named else "nothing that stood") + ".")
+        return True
+    except Exception as e:
+        # SOFT: a stumble here must not memo the whole night as failed
+        # and stand every lane on it down until the video changes
+        _AI["soft_fail"] = True
+        log(f"The screen reader stumbled on {name}: {str(e)[:120]}")
+        return False
+    finally:
+        _source_busy_done(video_path)
+        try:
+            if os.path.isfile(oj):
+                os.remove(oj)
+        except OSError:
+            pass
+
+
 def _sns_owing(video_path):
     """Does this recording still owe its senses pass? Missing or older than
     the video = owed; failed with tries left = owed; complete = settled."""
@@ -12105,15 +12319,26 @@ def _senses_one(video_path):
                 except Exception:
                     pass
                 secs = sorted({round(x, 1) for x in secs if x >= 0})[:40]
-                if secs:
+                if secs or _HUD_STEP:
+                    # the targeted frames AND the grid, one worker run
                     oj = wav + ".ocr.json"
                     rc2, _o2, _e2 = _ai_run(
                         [py, ow, video_path, SETTINGS["ffmpeg_path"], oj,
-                         ",".join(f"{x:.1f}" for x in secs), game],
-                        1200, flags)
+                         ",".join(f"{x:.1f}" for x in secs), game,
+                         f"{_HUD_STEP:.1f}", f"{float(dur or 0):.1f}"],
+                        max(1200, int(float(dur or 0) / _HUD_STEP * 4)
+                            + 300), flags)
                     if rc2 == 0 and os.path.isfile(oj):
                         with open(oj, encoding="utf-8") as fh:
-                            sns["ocr"] = (json.load(fh) or {}).get("events")                                 or []
+                            _oc = json.load(fh) or {}
+                            sns["ocr"] = _oc.get("events") or []
+                            # the grid rides in the same file; an empty one is
+                            # still an answer (a clip too short for a frame)
+                            _hg = _oc.get("hud")
+                            if not isinstance(_hg, dict):
+                                _hg = {"step": _HUD_STEP, "rows": []}
+                            sns["hud"] = _hg
+                            sns["screen"] = _hud_names(_hg)
                     try:
                         if os.path.isfile(oj):
                             os.remove(oj)
@@ -12276,6 +12501,32 @@ def _repick_moments(video_path):
     return True
 
 
+def _asr_context_for(video_path):
+    """The biasing context the reader is given for one recording: the
+    game's name off its shelf, and the register of the room. The echo
+    test - in the worker and in the migration that replays it over the
+    old transcripts - compares against THIS string, so it is built in
+    one place."""
+    try:
+        pp = os.path.dirname(video_path)
+        gname = (os.path.basename(os.path.dirname(pp))
+                 if os.path.basename(pp).lower() in ("videos", "clips")
+                 else "")
+        if not gname:
+            # a recording sitting outside its shelf still knows its
+            # game - the filename is the only truth we ever have, and
+            # it is how the whole app names a clip anyway
+            gname = _display_name(_parse_clip_name(video_path))
+            if gname == "Recording":
+                gname = ""      # that is the app's word for "no idea"
+    except Exception:
+        gname = ""
+    return (("Gaming session of " + gname + ". " if gname else "")
+            + "Friends on Discord playing together; casual gaming chat, "
+              "callouts, jokes. They speak Emirati Gulf Arabic and English, "
+              "often switching within one sentence.")
+
+
 def _transcribe_one(video_path):
     """Qwen3-ASR over one recording -> .stt.json sidecar.
 
@@ -12372,25 +12623,9 @@ def _transcribe_one(video_path):
         # WHAT THE AUDIO IS. Qwen3-ASR takes a free-text biasing context and
         # it has been sitting unused - the game's name and the register of
         # the room measurably steer names and jargon the right way.
-        try:
-            pp = os.path.dirname(video_path)
-            gname = (os.path.basename(os.path.dirname(pp))
-                     if os.path.basename(pp).lower() in ("videos", "clips")
-                     else "")
-            if not gname:
-                # a recording sitting outside its shelf still knows its
-                # game - the filename is the only truth we ever have, and
-                # it is how the whole app names a clip anyway
-                gname = _display_name(_parse_clip_name(video_path))
-                if gname == "Recording":
-                    gname = ""      # that is the app's word for "no idea"
-        except Exception:
-            gname = ""
-        env["LORE_ASR_CONTEXT"] = (
-            ("Gaming session of " + gname + ". " if gname else "")
-            + "Friends on Discord playing together; casual gaming chat, "
-              "callouts, jokes. They speak Emirati Gulf Arabic and English, "
-              "often switching within one sentence.")
+        # ONE builder (the echo migration asks the same question of the
+        # transcripts written before the reader could ask it itself).
+        env["LORE_ASR_CONTEXT"] = _asr_context_for(video_path)
         # LEAVE THE GAME ITS CORES - BUT ONLY WHILE HE IS PLAYING ONE.
         # This used to ask find_active_game(), i.e. "is a game running", and
         # then freeze the answer for the whole job. Measured on his machine:
@@ -13053,6 +13288,16 @@ _DESC_SCHEMA = {
             "required": ["line", "kind", "why"]}}},
     "required": ["segments"]}
 
+# WHICH TITLE ASK NAMED A REVIEW. 0 = the old ask (chapter names alone,
+# which is how 339 of 368 titles on the shelf came out as lists of
+# nouns). A finished review stamped below the current number owes ONE
+# title ask over the windows it already has - in place, banked, not a
+# window re-described. Raised to 1 the day the evidence-shaped ask is
+# measured better on real nights; at 0 the lane is inert.
+# 1 (3.30): the evidence-shaped ask with the code guard - baked on
+# twelve real nights against the old ask before the number moved.
+_TITLE_GEN = 1
+
 _TITLE_COMMON = frozenset(
     "The A An And Or But With Without For From Into Onto Over Under "
     "After Before When While His Her Their Our They She He It We You "
@@ -13195,8 +13440,156 @@ def _ins_heard_corpus(video_path, extra=""):
 _TITLE_SCHEMA = {
     "type": "object",
     "properties": {"title": {"type": "string"},
-                   "summary": {"type": "string"}},
+                   "summary": {"type": "string"},
+                   "because": {"type": "array", "maxItems": 4,
+                               "items": {"type": "string"}}},
     "required": ["title", "summary"]}
+
+# THE TITLE ASK, 3.30. The old ask handed the model the chapter NAMES
+# alone - and the names are lists ("Goals and Frustrations"), so 339 of
+# 368 titles on the shelf came back lists of nouns. Measured on real
+# nights, CPU-baked: the same model given the EVIDENCE (what happened in
+# each chapter, a real line, what the ears marked, the moments, what the
+# screen and the eye saw) names the event - "Baldur's Gate wins every
+# award" for the night the old ask called "Ruben Derra and Dying Light".
+# What it still does wrong is copy the strongest quote as the title and
+# swear in it; that is caught below by code, not by more prompt.
+_TITLE_SYS = ("You name one recorded night of a game for the friend who "
+              "was there. The people speak Emirati Gulf Arabic and English "
+              "mid-sentence; never mention the language. Reply with STRICT "
+              "JSON and nothing else.")
+_TITLE_WRITE = (
+    "- \"title\": what HAPPENED that night, in the narrator's voice - the "
+    "first line of the story a friend would tell about it. A subject and a "
+    "verb, or the one concrete thing that stood out (a boss, a place, a "
+    "run, a fight, a phone call, a bet). Not a mood, not a theme, not a "
+    "list. It is NEVER a line somebody said - lines go in \"because\", not "
+    "in the title. No swearing in the title. Never 'X and Y', never a "
+    "colon, never 'Session', 'Initial', 'Chat', 'Talk', 'Discussion', "
+    "'Gameplay', 'Adventures', 'Struggles', 'Chaos', 'Journey', 'Vibes', "
+    "'Shenanigans'. At most nine words. Use only names, places, bosses and "
+    "words that appear in the evidence above - a name not written above "
+    "must not appear. Arabic in Arabic letters.\n"
+    "- \"summary\": two sentences telling what happened, the same way, "
+    "with the one or two details that made this night this night.\n"
+    "- \"because\": up to four short quotes or facts copied from the "
+    "evidence above that the title rests on.\n"
+    "GOOD (shape only): \"The goat demon finally goes down\", \"Nobody "
+    "survives the generator night\", \"Three hours lost to one kickoff\", "
+    "\"A bachelor party plan takes over the Hearthstone table\", "
+    "\"Fifteen deaths to the same bridge\".\n"
+    "BAD: \"Battles and Minions\" (a list), \"Late Game Chaos\" (a mood), "
+    "\"What a pass!\" (a quote), \"Rocket League Session: Boost, "
+    "Frustration, and Victory\" (a colon and a list).")
+_TITLE_SWEAR = frozenset((
+    "fuck", "fucking", "fucked", "fucker", "fuckin", "motherfucker",
+    "shit", "shitty", "bullshit", "damn", "damned", "bitch", "bitches",
+    "ass", "asshole", "dick", "pussy", "bastard", "cunt", "crap",
+    "\u0643\u0633", "\u062e\u0631\u0627", "\u0632\u0628",
+    "\u0639\u064a\u0631"))
+_TITLE_STOP = frozenset((
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
+    "with", "is", "was", "it", "its", "his", "her", "their", "our",
+    "\u0627\u0644", "\u0648", "\u0641\u064a"))
+_TITLE_MOOD = frozenset((
+    "session", "initial", "chat", "talk", "discussion", "gameplay",
+    "adventures", "adventure", "struggles", "struggle", "chaos", "journey",
+    "vibes", "shenanigans", "moments", "highlights", "antics", "banter",
+    "misadventures", "frustrations", "frustration"))
+
+
+def _title_guard(title, said):
+    """Why a title is not a name for the night, or '' when it is.
+
+    The shapes the model still reaches for after being told not to,
+    each caught by arithmetic: swearing (it copies the room's mouth),
+    a colon or a two-comma list (the old shelf's whole disease), a
+    mood word standing in for an event, and a title that is 70%% the
+    words of a line it was shown - that is a quotation wearing a
+    title's hat, and it went in the title on one night in two."""
+    t = str(title or "").strip()
+    if not t:
+        return ""
+    toks = [w.strip("'") for w in re.findall(r"[\w']+", t.lower())]
+    toks = [w for w in toks if w]
+    if any(w in _TITLE_SWEAR for w in toks):
+        return "swearing"
+    if ":" in t:
+        return "a colon"
+    if len(re.findall("[,\u060c]", t)) >= 2:
+        return "a list"
+    if any(w in _TITLE_MOOD for w in toks):
+        return "a mood word, not an event"
+    # the overlap is counted on the words that carry meaning - "the"
+    # and "a" match every line ever said
+    core = [w for w in toks if w not in _TITLE_STOP]
+    if len(core) >= 3:
+        for q in said or []:
+            qt = set(w.strip("'")
+                     for w in re.findall(r"[\w']+", str(q or "").lower()))
+            if qt and sum(1 for w in core if w in qt) >= 0.7 * len(core):
+                return "a line somebody said"
+    return ""
+
+
+def _title_evidence(ev):
+    """The evidence pack the title is asked over - one page, in order:
+    the night in a line, the chapters (name / what / a real line / what
+    the ears marked), the moments somebody would clip, the senses, the
+    screen's names, the eye's places and creatures, then the ask."""
+    def mmss(t):
+        try:
+            t = int(float(t or 0))
+        except (TypeError, ValueError):
+            t = 0
+        return "%d:%02d" % (t // 60, t % 60)
+
+    chs = []
+    for c in sorted(ev.get("ranked") or [], key=lambda c: c.get("a") or 0):
+        bits = "%s-%s  %s" % (mmss(c.get("a")), mmss(c.get("b")), c.get("n"))
+        if c.get("w"):
+            bits += "\n     what: " + str(c["w"])[:180]
+        if c.get("q"):
+            bits += "\n     said: \"" + str(c["q"])[:120] + "\""
+        gk = ", ".join("%s x%d" % (k, n) for k, n in sorted(
+            (c.get("gk") or {}).items(), key=lambda kv: -kv[1])[:4])
+        if gk:
+            bits += "\n     heard: " + gk
+        chs.append(bits)
+    moms = ["%s [%s] %s" % (mmss(m.get("t")), m.get("kind") or "-",
+                            str(m.get("why") or "")[:140])
+            for m in sorted(ev.get("moments") or [],
+                            key=lambda m: -len(str(m.get("why") or "")))[:8]]
+    senses = ", ".join("%s x%d" % (k, n) for k, n in sorted(
+        (ev.get("kinds") or {}).items(), key=lambda kv: -kv[1])[:8])
+    ocr = "; ".join("%s %s \"%s\"" % (mmss(t), k, x)
+                    for t, k, x in (ev.get("ocr") or [])[:10])
+    scr = "; ".join("%s (%s-%s)" % (x.get("n"), mmss(x.get("a")),
+                                    mmss(x.get("b")))
+                    for x in (ev.get("screen") or [])[:8])
+    names = [n for n in (ev.get("names") or []) if n and n != "you"]
+    body = ("THE NIGHT: %s, %d minutes, %d spoken lines"
+            % (ev.get("game"), int(float(ev.get("dur") or 0) // 60),
+               int(ev.get("lines") or 0))
+            + (", %d named voice(s): %s" % (len(names), ", ".join(names[:5]))
+               if names else "") + ".\n\n"
+            "THE CHAPTERS, in order (name / what happened / a real line / "
+            "what the ears marked):\n"
+            + "\n".join("  " + x for x in chs) + "\n\n"
+            + ("THE MOMENTS somebody would clip:\n  " + "\n  ".join(moms)
+               + "\n\n" if moms else "")
+            + ("THE SENSES over the whole night: %s.\n" % senses
+               if senses else "")
+            + ("THE SCREEN printed: %s.\n" % ocr if ocr else "")
+            + ("THE SCREEN NAMED (a boss bar, a mode, a menu that stood): "
+               "%s.\n" % scr if scr else "")
+            + ("THE EYE saw these places: %s.\n"
+               % "; ".join(ev.get("places") or [])
+               if ev.get("places") else "")
+            + ("THE EYE saw: %s.\n" % "; ".join(ev.get("creatures") or [])
+               if ev.get("creatures") else "")
+            + "\nWRITE:\n" + _TITLE_WRITE)
+    return body
 
 
 def _devoice(text):
@@ -13809,6 +14202,16 @@ def _ins_owing_raw(video_path):
         return True
     if (d.get("cov") or {}).get("owed"):
         return True
+    # A NAME FROM THE OLD ASK OWES A NEW ONE - never a re-telling. The
+    # windows stay exactly as described; only the title and summary are
+    # asked again, from the evidence those windows already hold. Gated
+    # on a whole, counted review with no retell in flight, so it can
+    # never race the staged lane. Inert while _TITLE_GEN is 0.
+    if _TITLE_GEN > 0 and d.get("complete") and d.get("chapters") \
+            and isinstance(d.get("cov"), dict) \
+            and int(d.get("tgen") or 0) < _TITLE_GEN \
+            and not os.path.isfile(sp + ".new"):
+        return True
     # A NEWER EAR RE-OWES THE REVIEW. When a transcript is replaced
     # by a newer READER GENERATION (the re-read lane), a complete
     # review built on the old ear follows it automatically - and the
@@ -13951,8 +14354,23 @@ def _insights_one(video_path, forced=False, fresh=False):
             _bank_sidecar(video_path, "ins")
         except Exception:
             pass
+        # STAMPED WITH THE EAR IT WAS BUILT ON, like every other review.
+        # An empty review carried no src_stt, and the owing judge reads
+        # a missing stamp as "built on reader zero" - so on any night
+        # whose transcript names a reader it was owed again on the very
+        # next beat: re-described (this same write, a new clock), which
+        # re-owed the audit, which re-owed this. Measured on his shelf:
+        # two nights, ~15,000 audits in eight hours, the sweep's focus
+        # latched on them and eight hundred unread recordings behind.
+        _sst0 = {}
+        try:
+            _sst0 = {"mt": os.path.getmtime(_ai_sidecar(video_path, "stt")),
+                     "reader": _stt_reader_of(video_path)}
+        except OSError:
+            pass
         _atomic_write_json(_ai_sidecar(video_path, "ins"),
-                           {"v": 3, "empty": True, "complete": True})
+                           {"v": 3, "empty": True, "complete": True,
+                            "src_stt": _sst0})
         return True
 
     # THE PICTURE'S length, not the container's - on a drifted recording the
@@ -14140,9 +14558,23 @@ def _insights_one(video_path, forced=False, fresh=False):
                     and isinstance(prior.get("windows"), dict)
                     and prior.get("windows")
                     and not isinstance(prior.get("cov"), dict))
-    staged = upgrade and not cov_only
+    # A NEW NAME IS NOT A RE-TELLING EITHER. A whole, counted review
+    # whose title came from the old ask owes one title ask over the
+    # windows already on disk - in place, banked first, and not one
+    # window re-described. It shares cov_only's road all the way: the
+    # served windows, no .new, and the review keeps its clock (see the
+    # completion below for why the audit is not owed again).
+    retitle = bool(_TITLE_GEN > 0 and upgrade and not forced and not fresh
+                   and not cov_only
+                   and isinstance(prior.get("windows"), dict)
+                   and prior.get("windows")
+                   and isinstance(prior.get("cov"), dict)
+                   and not (prior.get("cov") or {}).get("owed")
+                   and int(prior.get("tgen") or 0) < _TITLE_GEN
+                   and not os.path.isfile(side_p + ".new"))
+    staged = upgrade and not cov_only and not retitle
     work_p = side_p + ".new" if staged else side_p
-    if cov_only:
+    if cov_only or retitle:
         windows = prior["windows"]
         # THE FIELD, READ THE WAY THE OWING TEST READS IT. Defaulting
         # a gen-less review to the CURRENT generation quietly settled
@@ -14250,9 +14682,12 @@ def _insights_one(video_path, forced=False, fresh=False):
             m["why"] = _devoice(_descrub(str(m.get("why") or "")))[:140]
         return raw, moms
 
-    def _assemble(done_map, complete, tries_now):
+    def _assemble(done_map, complete, tries_now, titled=False):
         """Every landed window -> one sidecar, rewritten after each window
-        so the tome shows chapters filling in while the job runs."""
+        so the tome shows chapters filling in while the job runs.
+        `titled` says the title was ASKED in this run, so the document
+        wears the current title generation; a rebuild that only counted
+        or only refilled windows carries the old stamp forward."""
         raw, moms = _assemble_raw(done_map)
         # ONE EVENT, ONE MOMENT. The model loves an echo - 'Fuck that!'
         # arrived twice at 20:59 with two wordings. Twins inside 8 seconds
@@ -14339,6 +14774,8 @@ def _insights_one(video_path, forced=False, fresh=False):
             _cov = {}
         out = {"v": 3, "engine": "local",
                "gen": min(int(carry_gen), _INS_GENERATION),
+               "tgen": (_TITLE_GEN if titled
+                        else int(prior.get("tgen") or 0)),
                "src_stt": _sst, "cov": _cov,
                "title": (lambda _t: _t if len(_t) <= 120 else
                          (_t[:120].rsplit(" ", 1)[0] or _t[:120]))(
@@ -14434,12 +14871,15 @@ def _insights_one(video_path, forced=False, fresh=False):
     except Exception:
         pass
     _who_names = {}
+    _screen = []       # what the screen itself named, as spans
     _sd0 = {}          # _line() closes over this - it must exist even
     #                    when the senses sidecar cannot be read
     try:
         with open(_ai_sidecar(video_path, "sns"), encoding="utf-8") as fh:
             _sd0 = json.load(fh) or {}
         _who_names = _sd0.get("names") or {}
+        _screen = [x for x in (_sd0.get("screen") or [])
+                   if isinstance(x, dict) and x.get("n")]
         for e0 in _sd0.get("ocr") or []:
             _heard.append((float(e0.get("t") or 0),
                            "on-screen: "
@@ -14490,7 +14930,7 @@ def _insights_one(video_path, forced=False, fresh=False):
     _AI["ins_prog"] = {"done": len(edges) - len(missing),
                        "total": len(edges), "tail": False,
                        "at": time.time()}
-    if not missing and windows:
+    if not missing and windows and not retitle:
         # THE CLOCK BELONGS TO THE TELLING. A coverage stamp adds a
         # count and changes not one word - so the review keeps the
         # mtime the audit recorded, or 212 finished audits go silver
@@ -14627,6 +15067,26 @@ def _insights_one(video_path, forced=False, fresh=False):
                 ears += ("Voices with names: " + ", ".join(
                     f"speaker {k} = {v}" for k, v in _who_names.items())
                     + " - use the names.\n")
+            # WHAT THE SCREEN NAMED. A boss bar that stood for eight
+            # minutes is the fight's own name for itself - the one
+            # noun the transcript never says out loud.
+            scr_here = []
+            for x in _screen:
+                try:
+                    a0, b0 = float(x.get("a") or 0), float(x.get("b") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if a0 < hi and b0 > lo:
+                    scr_here.append((a0, b0, str(x["n"])[:40]))
+            if scr_here:
+                scr_here = sorted(scr_here[:8])   # strongest 8, in time
+                ears += ("The SCREEN itself printed these names in this "
+                         "window (a boss bar, a mode, a menu) - they are "
+                         "real, use them for what was fought or where it "
+                         "was: " + "; ".join(
+                             f"{n0} ({int(a0 // 60)}:{int(a0 % 60):02d}-"
+                             f"{int(b0 // 60)}:{int(b0 % 60):02d})"
+                             for a0, b0, n0 in scr_here) + "\n")
             saw_here = [(t0, s0) for t0, s0 in _seen if lo <= t0 < hi]
             eyes = ""
             if saw_here:
@@ -14893,7 +15353,15 @@ def _insights_one(video_path, forced=False, fresh=False):
                                   "m": sum(1 for _mm in _wm
                                            if _a2 <= float(_mm.get("t")
                                                            or -1) <= _b2),
-                                  "g": 0})
+                                  "g": 0, "gk": {},
+                                  # the chapter's own account and its
+                                  # line, for the evidence-shaped ask;
+                                  # a quote sometimes carries the
+                                  # transcript's dressing ("#172 89:53")
+                                  "w": str(sgm.get("what") or "")[:180],
+                                  "q": re.sub(r"^#\d+\s+\d+:\d\d\s+", "",
+                                              str(sgm.get("quote")
+                                                  or ""))[:120]})
             # the gold marks are model-independent evidence that
             # something happened in a stretch - the one signal in the
             # ledger no describer wrote
@@ -14907,6 +15375,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                         for _c in cinfo:
                             if _c["a"] <= float(_tt) <= _c["b"]:
                                 _c["g"] += 1
+                                _k0 = str(_e.get("kind") or "loud")[:16]
+                                _c["gk"][_k0] = _c["gk"].get(_k0, 0) + 1
                                 break
             except Exception:
                 pass
@@ -14926,7 +15396,44 @@ def _insights_one(video_path, forced=False, fresh=False):
                               + 0.25 * (c["m"] + c["g"]) / _mg)
                 return sorted(cs, key=lambda c: -c["s"])
             title = summary = ""
-            if names:
+            t_max = 250
+            if names and _TITLE_GEN >= 1:
+                _ranked = _sal(list(cinfo))[:14]
+                _moms = []
+                for _w0 in windows.values():
+                    if isinstance(_w0, dict):
+                        _moms += [m for m in (_w0.get("moments") or [])
+                                  if isinstance(m, dict)]
+                _kinds = {}
+                for _t0, _k0 in _heard:
+                    if not str(_k0).startswith("on-screen"):
+                        _kinds[_k0] = _kinds.get(_k0, 0) + 1
+                _vd1 = _read_sidecar(video_path, "vis") or {}
+                try:
+                    _vdur = float(_AI.get("job_secs") or 0) \
+                        or max(c["b"] for c in cinfo)
+                except (TypeError, ValueError):
+                    _vdur = 0.0
+                _ev = {"game": game, "dur": _vdur,
+                       "lines": sum(c["r"] for c in cinfo),
+                       "names": list(_who_names.values()),
+                       "ranked": _ranked, "moments": _moms, "kinds": _kinds,
+                       "ocr": [(e.get("t"), e.get("kind"), e.get("text"))
+                               for e in (_sd0.get("ocr") or [])
+                               if isinstance(e, dict)],
+                       "screen": _screen,
+                       "places": [str(p.get("name") or "")[:40]
+                                  for p in (_vd1.get("places") or [])
+                                  if isinstance(p, dict)
+                                  and p.get("name")][:8],
+                       "creatures": [str(c.get("name") or "")[:40]
+                                     for c in (_vd1.get("creatures") or [])
+                                     if isinstance(c, dict)
+                                     and c.get("name")][:6]}
+                t_ask = _title_evidence(_ev)
+                t_sys = _TITLE_SYS
+                t_max = 360
+            elif names:
                 _ranked = _sal(list(cinfo))[:40]
                 _lines = "\n".join(
                     "- %s [%d min, %d lines%s]"
@@ -14958,7 +15465,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                 t_sys = ("You name recordings of gaming sessions. Reply "
                          "with STRICT JSON and nothing else, in exactly "
                          "the shape the user asks for.")
-                t_txt = srv.ask(t_sys, t_ask, max_tokens=250,
+            if names:
+                t_txt = srv.ask(t_sys, t_ask, max_tokens=t_max,
                                 schema=_TITLE_SCHEMA)
                 if t_txt:
                     try:
@@ -14969,6 +15477,48 @@ def _insights_one(video_path, forced=False, fresh=False):
                                                or "").strip())
                     except Exception:
                         pass
+                # THE GUARD. A quotation, a swear, a colon, a list or a
+                # mood word is not the name of a night; told once more,
+                # in its own words, the model usually finds the event.
+                # If it insists, the swearing is cut and the rest stands
+                # - a line the room said is still truer than a list.
+                _why = (_title_guard(title, [c.get("q") for c in cinfo])
+                        if (_TITLE_GEN >= 1 and title) else "")
+                if _why:
+                    t2 = srv.ask(
+                        t_sys, t_ask + "\n\nYour title \"" + title[:80]
+                        + "\" is " + _why + ". Name what HAPPENED instead "
+                        "- a subject and a verb, in your own words: no "
+                        "quotation, no swearing, no colon, no list, no "
+                        "mood word. Same JSON.",
+                        max_tokens=t_max, schema=_TITLE_SCHEMA)
+                    cand = cs = ""
+                    try:
+                        t_d2 = json.loads(
+                            _re.search(r"\{.*\}", t2, _re.S).group(0))
+                        cand = _descrub(str(t_d2.get("title") or "").strip())
+                        cs = _descrub(str(t_d2.get("summary")
+                                          or summary).strip())
+                    except Exception:
+                        pass
+                    if cand and not _title_guard(
+                            cand, [c.get("q") for c in cinfo]):
+                        log("The title \"" + title[:60] + "\" was " + _why
+                            + " - asked again, it named the night \""
+                            + cand[:60] + "\".")
+                        title, summary = cand, cs or summary
+                    else:
+                        if _why == "swearing" or (
+                                cand and _title_guard(cand, []) == "swearing"):
+                            _tk = [w for w in title.split()
+                                   if re.sub(r"[^\w']", "", w.lower())
+                                   .strip("'") not in _TITLE_SWEAR]
+                            title = re.sub(r"\s{2,}", " ",
+                                           " ".join(_tk)).strip(" ,-!")
+                        log("The title \"" + title[:60] + "\" is " + _why
+                            + " and the re-ask did no better - it stands"
+                            + (" with the swearing cut"
+                               if _why == "swearing" else "") + ".")
                 # NAMES MUST BE HEARD. "Big Walk with BoKhama, Ahmed,
                 # Faisal, and Musa" - and two of those people appear
                 # nowhere in 168,000 characters of transcript. One
@@ -15020,7 +15570,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                             + ", ".join(bad)
                             + ". Use only names from the chapter list, "
                             "or 'a friend'.",
-                            max_tokens=250, schema=_TITLE_SCHEMA)
+                            max_tokens=t_max, schema=_TITLE_SCHEMA)
                         try:
                             t_d2 = json.loads(_re.search(
                                 r"\{.*\}", t2, _re.S).group(0))
@@ -15095,7 +15645,35 @@ def _insights_one(video_path, forced=False, fresh=False):
             prior["title"] = title or prior.get("title") or \
                 (names[0] if names else "")
             prior["summary"] = summary or prior.get("summary") or ""
-            out = _assemble(windows, True, 0)
+            _rt_mt = None
+            if retitle:
+                # the served review is about to be rewritten in place
+                # with a new name: the old one banks like any redo
+                _bank_sidecar(video_path, "ins")
+                try:
+                    _rt_mt = os.path.getmtime(side_p)
+                except OSError:
+                    _rt_mt = None
+            out = _assemble(windows, True, 0, titled=bool(names))
+            if retitle and _rt_mt is not None:
+                # THE CLOCK STAYS ON A RETITLE. The audit's verdicts are
+                # about lines, moments and names, and the one thing it
+                # checks in a title - that every name was heard - the
+                # new ask enforces by the same rule before the name is
+                # written. So the audit it recorded still stands; a
+                # moved clock here would have re-owed every finished
+                # audit on the shelf (1,334 nights, ~4 minutes of the
+                # card each) for a field it already agrees with. Both
+                # owing judges are told the clock lied, as cov_only
+                # does, and the search index re-reads the new name.
+                try:
+                    os.utime(side_p, (_rt_mt, _rt_mt))
+                except OSError:
+                    pass
+                _k = os.path.normcase(os.path.abspath(video_path))
+                _INS_OWE_CACHE.pop(_k, None)
+                _AUD_OWE_CACHE.pop(_k, None)
+                _AI["index"] = None
             if staged:
                 # the moment of the swap - and the ONLY moment the old
                 # review is touched. It is BANKED first, never destroyed.
@@ -18961,7 +19539,7 @@ def _aud_restrike(video_path, freq):
 # that had never run - measured on his own machine, where the file
 # said "3" and not one sidecar carried a stamp. A name can only
 # retire itself.
-_MIG_WALKS = ("refold", "eye", "strike")
+_MIG_WALKS = ("refold", "eye", "strike", "echo")
 _MIG_BUSY = [False]
 _MIG_BANKED = set()
 _MIG_SKIPPED = [0]      # files a walk could not read this pass
@@ -19022,9 +19600,12 @@ def _shelf_migrations():
                                 ("eye", _vis_promote_migration,
                                  "eye-gate"),
                                 ("strike", _aud_strike_migration,
-                                 "strike")):
+                                 "strike"),
+                                ("echo", _echo_strike_migration,
+                                 "echo-strike")):
                 # the fold and the eye first: both edit gold marks,
-                # and the strike walk reads them
+                # and the strike walk reads them; the echo walk last,
+                # because it rewrites transcripts the strike walk read
                 if key not in todo:
                     continue
                 try:
@@ -19212,6 +19793,227 @@ def _aud_strike_migration():
             + " struck line(s) across " + str(files)
             + " recording(s) - words the re-listen had read all "
             "along. Each is re-judged fresh at its next audit.")
+
+
+_FAB_GATES = {"mt": None, "fn": None}
+
+
+def _fab_gates():
+    """(ctx_echo, impossible) - THE READER'S OWN GATES, lifted by name out
+    of the installed ai/asr_worker.py so this file never carries a copy
+    that can drift from the one the reader runs (the strike migration's
+    ear-veto learned that lesson: one source of truth, or two verdicts).
+    None when the worker is not installed or the names are not there -
+    and then the walk that needs them is not retired, it waits."""
+    rp = _reader_paths()
+    if rp is None:
+        return None
+    work = rp[1]
+    try:
+        mt = os.path.getmtime(work)
+    except OSError:
+        return None
+    if _FAB_GATES["fn"] is not None and _FAB_GATES["mt"] == mt:
+        return _FAB_GATES["fn"]
+    try:
+        import ast as _ast
+        import textwrap as _tw
+        with open(work, encoding="utf-8") as fh:
+            src = fh.read()
+        want = {"_CTX_STOP": None, "_ctx_echo": None, "_impossible": None}
+        for node in _ast.walk(_ast.parse(src)):
+            if isinstance(node, _ast.FunctionDef) and node.name in want:
+                want[node.name] = node
+            elif isinstance(node, _ast.Assign):
+                for tg in node.targets:
+                    if isinstance(tg, _ast.Name) and tg.id in want:
+                        want[tg.id] = node
+        if any(v is None for v in want.values()):
+            return None
+        ns = {"re": re}
+        rows = src.splitlines()
+        for name in ("_CTX_STOP", "_ctx_echo", "_impossible"):
+            node = want[name]
+            code = "\n".join(rows[node.lineno - 1:node.end_lineno])
+            exec(compile(_tw.dedent(code), work, "exec"), ns)
+        fn = (ns["_ctx_echo"], ns["_impossible"])
+    except Exception as e:
+        log("The reader's gates could not be read out of asr_worker.py: "
+            + str(e)[:100])
+        return None
+    _FAB_GATES["mt"], _FAB_GATES["fn"] = mt, fn
+    return fn
+
+
+# readers from this generation on ran the fabrication gates themselves,
+# with a no-context re-ask behind every strike; their lines are the
+# re-ask's answer and are not judged again offline
+_ECHO_MIG_READER = 3
+
+
+def _echo_key(t):
+    return re.sub(r"\s+", " ", str(t or "").lower()).strip(" .!?؟،")
+
+
+def _echo_strike_migration():
+    """3.30, once per transcript: the reader's fabrication gates replayed
+    over every line written by a reader that did not have them.
+
+    On a silent night the old reader wrote its own biasing prompt down
+    as speech - "Megabonk's gaming session with friends in the Discord
+    server. Casual chatting about games they play..." eleven times over
+    seventy-seven minutes - and the describer, faithfully, named the
+    night "Repeating the Introduction". 84% of the shelf's transcripts
+    predate the gates. Measured over all 99,712 lines: 936 are
+    physically impossible (more characters than a mouth makes in the
+    time), 1,064 restate the prompt; thirteen nights are more than half
+    fabrication.
+
+    THE LAW, because there is no audio and no re-ask out here: blank
+    only what physics forbids, or what was said the same way twice
+    (temperature is zero, so a fabrication is byte-identical across
+    nights - and a seven-word sentence spoken verbatim on two different
+    nights is not speech). A prompt-shaped line said ONCE stays: that
+    bucket holds real speech ("Calling down a sentry!" collides with
+    "sentence" on a four-letter prefix) and only a re-read may judge it.
+    Banked first, the original kept under `was`, nn set, the windows
+    those lines lived in staged for re-describe. Pins never. Nothing is
+    written that did not change - the clock is lineage."""
+    gates = _fab_gates()
+    if gates is None:
+        # NOT retired: the walk runs again when the worker is there
+        raise RuntimeError("the reader's gates are not readable")
+    ctx_echo, impossible = gates
+    out = SETTINGS.get("output_dir", "")
+    # PASS ONE: how often every line was written, library-wide
+    counts = {}
+    paths = []
+    for d0, kind in _library_dirs(out):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            sp = _ai_sidecar(p, "stt")
+            if not os.path.isfile(sp):
+                continue
+            try:
+                with open(sp, encoding="utf-8") as fh:
+                    sd = json.load(fh) or {}
+            except Exception:
+                _MIG_SKIPPED[0] += 1
+                continue
+            for sg in (sd.get("segments") or []):
+                if not isinstance(sg, dict) or sg.get("nn") \
+                        or sg.get("pin"):
+                    continue
+                k = _echo_key(sg.get("t"))
+                if k:
+                    counts[k] = counts.get(k, 0) + 1
+            paths.append((p, sp))
+    # PASS TWO: the verdicts
+    _AI["_mig_quiet"] = True       # one ask at the end, not dozens
+    total = files = retold = 0
+    touched = []          # the nights sent for re-describe
+    try:
+        for p, sp in paths:
+            try:
+                with open(sp, encoding="utf-8") as fh:
+                    sd = json.load(fh) or {}
+            except Exception:
+                _MIG_SKIPPED[0] += 1
+                continue
+            if int(sd.get("eg") or 0) >= 1:
+                continue
+            if int(sd.get("reader") or 0) >= _ECHO_MIG_READER:
+                continue          # this reader ran the gates itself
+            ctx = _asr_context_for(p)
+            struck = []
+            live = 0
+            for sg in (sd.get("segments") or []):
+                if not isinstance(sg, dict) or sg.get("nn"):
+                    continue
+                t = str(sg.get("t") or "").strip()
+                if not t or t == "[unintelligible]":
+                    continue
+                live += 1
+                if sg.get("pn") or sg.get("pin"):
+                    continue
+                try:
+                    secs = max(0.001, (float(sg.get("b") or 0)
+                                       - float(sg.get("a") or 0)) / 1000.0)
+                except (TypeError, ValueError):
+                    continue
+                why = ""
+                if impossible(t, secs):
+                    why = ("struck by the reader's physics gate - %d "
+                           "characters in %.1f seconds is more than a "
+                           "mouth makes; the old reader wrote this over "
+                           "music or silence" % (len(t), secs))
+                elif ctx_echo(t, ctx):
+                    n = counts.get(_echo_key(t), 0)
+                    if n >= 2:
+                        why = ("struck by the reader's echo gate - this is "
+                               "the transcriber's own prompt written down "
+                               "as speech, word for word, %d times across "
+                               "the library" % n)
+                if not why:
+                    continue
+                if not (sg.get("fx") and sg.get("was") is not None):
+                    sg["was"] = sg.get("t")
+                sg["t"] = "[unintelligible]"
+                sg["nn"] = 1
+                sg.pop("pn", None)
+                sg["fx"] = 1
+                sg["fxw"] = _aud_clip(why)
+                try:
+                    struck.append(float(sg.get("a") or 0) / 1000.0)
+                except (TypeError, ValueError):
+                    pass
+            if not struck:
+                continue          # nothing changed: nothing written
+            # THE RE-DESCRIBE IS EARNED, NOT AUTOMATIC. Measured on the
+            # shelf: 351 transcripts carry a strike, but on 300 of them
+            # it is one or two lines among hundreds - a re-telling of
+            # those minutes would cost hours of the card to change a
+            # chapter by a phrase. The words are struck everywhere (the
+            # transcript, the search, the said panel read clean); the
+            # chapters are re-told only where the strikes were a real
+            # share of what the describer read - which is exactly the
+            # poisoned nights, where the fabrication WAS the story.
+            n = len(struck)
+            retell = (n >= 3 and n >= 0.05 * live) or n >= 0.25 * live
+            try:
+                sd["eg"] = 1
+                _mig_bank(p, "stt")
+                _atomic_write_json(sp, sd)
+                if retell:
+                    _aud_retell(p, struck, refill=False)
+                    retold += 1
+                    touched.append(p)
+                total += len(struck)
+                files += 1
+            except Exception:
+                _MIG_SKIPPED[0] += 1
+                continue
+    finally:
+        _AI["_mig_quiet"] = False
+    if touched:
+        # ONLY A NIGHT THAT WAS RE-TOLD goes to the head of the queue: a
+        # forced think on a night whose chapters were left standing
+        # would have re-described it whole for one struck line
+        try:
+            _ai_ask_first(max(touched, key=lambda x: os.path.getmtime(x)),
+                          "think",
+                          "fabricated lines were struck from its "
+                          "transcript and the description must catch up")
+        except Exception:
+            pass
+    if total:
+        log("The echo migration struck " + str(total) + " fabricated "
+            "line(s) across " + str(files) + " transcript(s) - the old "
+            "reader's prompt and its impossible speech, written before "
+            "the gates existed. Each original is kept under the line; "
+            "on " + str(retold) + " night(s) the strikes were a real "
+            "share of the words and those minutes are re-described by "
+            "the sweep.")
 
 
 def _aud_refresh_whys(video_path, garble):
@@ -21235,9 +22037,18 @@ def _ai_tick(ctl):
 
         def work():
             ok = False
-            _ask_srv_drop()        # the card belongs to this job now
-            if kind != "thinking":
-                _desc_keep_drop()  # ...and to this job's KIND of model
+            hud_only = (_AI.pop("hud_only", None) == path)
+            if hud_only:
+                # the Working page reads busy[1]; the audit names itself
+                # the same way so its row does not read as the describer
+                _AI["busy"] = (kind, "the screen \u00b7 "
+                               + os.path.basename(path))
+            if not hud_only:
+                # a grid-only visit never touches the card: the warm
+                # describer stays warm for the review behind it
+                _ask_srv_drop()    # the card belongs to this job now
+                if kind != "thinking":
+                    _desc_keep_drop()  # ...and to this job's KIND of model
             # the probe belongs HERE: on the watcher thread it stalled game
             # detection for up to 15s per spawn (an uncached ffprobe against
             # a spun-down platter, up to three times per video)
@@ -21326,7 +22137,13 @@ def _ai_tick(ctl):
                                 + os.path.basename(path) + ": "
                                 + str(_ae)[:120])
                 else:
-                    ok = _highlights_one(path)
+                    if hud_only:
+                        ok = True          # the ears are fresh: grid only
+                    else:
+                        ok = _highlights_one(path)
+                    # a redo of the ears tops the grid up too, when owed
+                    if ok and not _AI["abort"] and _hud_owing(path):
+                        ok = _hud_topup_one(path)
             except Exception:
                 # A JOB THAT DIES MUST SAY SO. An uncaught exception here
                 # used to kill the worker thread in perfect silence - the
@@ -21338,7 +22155,10 @@ def _ai_tick(ctl):
                 log(f"The {kind} job on {os.path.basename(path)} CRASHED: "
                     + " | ".join(tb[-3:]))
             finally:
-                if ok and not _AI["abort"]:
+                if ok and not _AI["abort"] and not hud_only:
+                    # a grid-only visit is not the ears' pace: minutes
+                    # of OCR would have taught the listening lane's
+                    # estimate that a night takes ten times longer
                     if kind == "hearing":
                         _ai_note_speech(_AI.get("job_secs") or 0.0,
                                         _AI.get("last_speech_s") or 0.0,
@@ -21695,6 +22515,33 @@ def _ai_tick(ctl):
                 _owes_more = False
             if not _owes_more:
                 _AI["focus"] = None
+    # THE SCREEN READER FILLS THE QUIET. Every lane shares ONE job slot
+    # (a single worker thread), so a grid - minutes of CPU a night -
+    # dispatched inside the walk above would have stood in front of the
+    # card's work on every night behind it: eighty hours of it on this
+    # shelf, serialised ahead of the re-tellings. It starts only when
+    # the whole walk found nothing louder to start; newest first, never
+    # while he plays, and the focus is not held for it. It rides the
+    # listening lane's name because that is the CPU lane's switch, and
+    # a grid-only visit never touches the card (see hud_only in work).
+    if do_hl and not playing:
+        for p in vids:
+            if _ai_skipped_recently(p) or _queued_finish_badge(p):
+                continue
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if _AI["failed"].get(p) == mt:
+                continue
+            veto = _AI.get("veto")
+            if veto and veto[0] == os.path.basename(p) \
+                    and time.time() - veto[1] < 15:
+                continue
+            if _hud_owing(p) and _ai_sidecar_fresh(p, "hl"):
+                _AI["hud_only"] = p
+                _spawn("listening", p, mt)
+                return
 
 
 def _queued_finish_badge(path):
@@ -23199,8 +24046,10 @@ class _JsApi:
                       if kind == "auditing" else
                       # LOCAL now - the only requirements are the switch and
                       # the model on disk; the old Claude key kept this row
-                      # dark on any machine without one
-                      (bool(SETTINGS.get("claude_insights", True))
+                      # dark on any machine without one. The switch is the
+                      # describe-by-itself one, not the retired cloud flag
+                      # (claude_insights) this read until 3.30.
+                      (bool(SETTINGS.get("insights_auto", True))
                        and _describer_paths() is not None))
                 out["kinds"].append({
                     "kind": kind, "label": label, "on": bool(on),
@@ -25235,7 +26084,19 @@ class _JsApi:
         if not p:
             return None
         d = _read_sidecar(p, "vis")
+        # what the screen named rides in the senses sidecar and shows in
+        # this panel beside the places - it is a sight, not a sound
+        screen = []
+        try:
+            screen = [x for x in ((_read_sidecar(p, "sns") or {})
+                                  .get("screen") or [])
+                      if isinstance(x, dict) and x.get("n")]
+        except Exception:
+            screen = []
         if not d or d.get("failed"):
+            if screen:
+                return {"looks": [], "places": [], "creatures": [],
+                        "complete": True, "eye": False, "screen": screen}
             return None
         looks = d.get("looks") or []
         places = d.get("places") or []
@@ -25253,7 +26114,8 @@ class _JsApi:
         return {"looks": looks,
                 "places": places,
                 "creatures": d.get("creatures") or [],
-                "complete": bool(d.get("complete"))}
+                "complete": bool(d.get("complete")),
+                "eye": True, "screen": screen}
 
     def audit(self, path, run=False, redo=False):
         """What the auditor made of this recording, in the one shape the

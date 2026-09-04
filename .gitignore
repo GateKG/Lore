@@ -40,3 +40,6 @@ qa/rectests/_tmp/
 # round-4 review docs quote real transcript lines - private
 CODEX_LORE_FULL_EVIDENCE_AND_FUNCTIONAL_AUDIT.md
 CODEX_TO_CLAUDE_IMPLEMENTATION_BRIEF.md
+
+# the title bake: its rows and plan quote real transcript lines - private
+qa/bake/
