@@ -3036,7 +3036,7 @@ function makeMock(){
     edit_cancel:async()=>{const m=window.__mockEd;if(m){m.done=true;m.ok=false;m.why='cancelled';}return {ok:true};},
     get_settings:async()=>({settings:{output_dir:'C:/mock',framerate:60,bitrate_mbps:25,
       encoder:'auto',amf_quality:'balanced',monitor_index:0,safe_capture:false,
-      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,ai_transcribe:true,ai_highlights:true,seek_step:'5',
+      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,capture_by_source:true,voice_apps:['discord.exe','discordptb.exe','discordcanary.exe'],read_game_lines:true,ai_transcribe:true,ai_highlights:true,seek_step:'5',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',
@@ -6999,8 +6999,12 @@ function renderSet(cL,cR,app,spreadIdx){
     divider(L,'Sources');
     row(L,'System sound',ctlToggle('capture_system'));
     row(L,'Microphone',ctlToggle('capture_mic'));
-    row(L,'Game audio only',ctlToggle('game_audio_only'));
-    hint(L,'EXPERIMENTAL: record only the game’s own sound — Discord calls, Spotify and system dings stay out of your videos. If the game’s stream can’t be tapped, LORE falls back to normal system sound automatically.');
+    row(L,'Tell the sources apart',ctlToggle('capture_by_source'));
+    hint(L,'Listens to the game and to Discord each on its own, with your mic beside them. The video still has everything you heard — a YouTube video in the background stays in the recording — but the tome knows who said what: you and your friends are the room, the game’s own voices are the game, and a video or a song is neither. Only the room makes gold marks and the excitement curve. What a video said is folded away in the transcript unless you ask for it, and the tome uses it only to say what you were watching when nobody in the room was talking.');
+    hint(L,'If Discord is not running, the room is your mic alone that night. If the game or Discord cannot be heard on its own, the tome records everything as one for that night, like before, and says so on the Working page and under the seal while it writes.');
+    hint(L,'Switch this off for the old way: one stream of whatever the speakers played, plus your mic, nothing told apart. Do that if a game’s sound goes missing while the sources are told apart.');
+    row(L,'Keep only the game in the video',ctlToggle('game_audio_only'));
+    hint(L,'Only the game’s own sound lands in the video — Discord calls, Spotify and system dings stay out. With the sources told apart this also means the tome stops listening to what the speakers play, so a video in the background cannot be found. If the game’s stream can’t be tapped, LORE falls back to normal system sound automatically.');
     const outs=[['','Default — follow Windows']].concat((st.devices.outputs||[]).map(o=>[o,o]));
     const mics=[['','Default microphone']].concat((st.devices.mics||[]).map(o=>[o,o]));
     row(L,'Game sound from',(()=>{const s=ctlSelect('audio_output_device',outs);

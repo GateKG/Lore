@@ -33,7 +33,9 @@ for %%t in (codex327test codex326test codex325test codex324test codex323test asr
             afkai320test afkrace320test fresh319test fleet319test
             afk2test afktest pairtest freezetest schedtest sched4test
             aud302test aud303test silvertest gatetest295 micheal
-            mictest audiotest midchange fetchtest) do (
+            mictest audiotest midchange fetchtest
+            hud330test echo330test title330test owing330test
+            tracks331test src331settingstest src331dumptest) do (
   echo ===== %%t =====
   python "%%t.py"
   if errorlevel 1 set FAILED=!FAILED! %%t

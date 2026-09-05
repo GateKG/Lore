@@ -28,6 +28,7 @@ FIRST-TIME SETUP (from source; the installer does all this for friends):
 """
 
 import argparse
+import collections
 import datetime as _dt
 import urllib.error as _urlerr
 import urllib.request as _urlreq
@@ -189,11 +190,23 @@ DEFAULTS = {
     # The moment he touches anything it goes back exactly as it was.
     "afk_ai":            False,
     "afk_ai_minutes":    15,
-    # EXPERIMENTAL: record ONLY the game's own audio (WASAPI process
-    # loopback) instead of everything the speakers play - Discord and
-    # Spotify stay out of the video. Falls back to normal system audio
-    # if the game's stream can't be tapped.
+    # KEEP ONLY THE GAME in the video's sound (the Mix): Discord and
+    # Spotify stay out of the video. The game's own stream (a WASAPI
+    # process loopback) stands in for the device loopback; if it can't
+    # be tapped the device loopback is opened after all. With
+    # capture_by_source on this also means no device loopback is opened,
+    # so a background video cannot be found (no media layer).
     "game_audio_only":   False,
+    # 3.31 CAPTURE BY SOURCE: besides the Mix (everything the speakers play)
+    # LORE taps the GAME's own process tree and the voice app's tree as
+    # separate layers, so the reader can tell the room from a video.
+    "capture_by_source": True,
+    # which apps carry the room's voices, in order of preference (one tap:
+    # the first one running wins). Add "steam.exe" for Steam voice.
+    "voice_apps":        ["discord.exe", "discordptb.exe", "discordcanary.exe"],
+    # whether the game's own voice lines (the Game layer) are written into
+    # the transcript or only counted. Hidden: no row on the settings page.
+    "read_game_lines":   True,
     # The tome's own intelligence, all local: transcribe recordings with
     # Qwen3-ASR so the library is searchable by what was SAID - it keeps
     # English and Arabic in the same line instead of forcing one - and mark
@@ -688,6 +701,25 @@ def _sanitize_settings(d):
                                  if str(x).strip()][:500]
     except Exception:
         d["cap_pinned_games"] = []
+    # 3.31 sources: a hand-edited settings.json must not feed a non-list
+    # into the tap resolver; the .exe rule mirrors load_game_list. A
+    # string is not a list of apps - it collapses to the default list.
+    try:
+        raw = d.get("voice_apps")
+        if raw is None:
+            raw = DEFAULTS["voice_apps"]
+        if not isinstance(raw, (list, tuple)):
+            raise TypeError("voice_apps is not a list")
+        d["voice_apps"] = [str(x).strip().lower() for x in raw
+                           if str(x).strip()][:20]
+        d["voice_apps"] = [x if x.endswith(".exe") else x + ".exe"
+                           for x in d["voice_apps"]]
+    except Exception:
+        d["voice_apps"] = list(DEFAULTS["voice_apps"])
+    d["capture_by_source"] = bool(d.get("capture_by_source",
+                                        DEFAULTS["capture_by_source"]))
+    d["read_game_lines"] = bool(d.get("read_game_lines",
+                                      DEFAULTS["read_game_lines"]))
 
 
 def load_settings():
@@ -2036,6 +2068,27 @@ def _pa_close(pa):
             pass
 
 
+def _prewarm_proctap():
+    """Pay the one-off cost of per-app capture at boot, on a daemon
+    thread, never inside start(). The first ProcessAudioCapture() in a
+    process takes 3.4-3.8 s because proctap.backends.windows imports its
+    converter, which imports scipy.signal (measured with -X importtime;
+    scipy ships in _internal) - the native activation itself is 9 ms.
+    Warmed here, the first source tap of the night opens in 1-2 ms like
+    every later one. An import that fails is remembered in _PROCTAP so
+    the recorder can say so once and record the Mix and Mic only, as
+    before."""
+    t = time.time()
+    try:
+        import proctap  # noqa: F401
+        from proctap.backends.windows import WindowsBackend  # noqa: F401
+        _PROCTAP.update(ok=True, err="", ms=int((time.time() - t) * 1000))
+    except Exception as e:
+        _PROCTAP.update(ok=False, err=str(e)[:160])
+        log(f"Sources: per-app capture unavailable ({e}) - recording the "
+            f"Mix and Mic only, as before.")
+
+
 class AudioRecorder:
     """Captures system loopback (default playback device) and/or the mic to
     separate WAV files using WASAPI. No rerouting, no added latency."""
@@ -2649,7 +2702,15 @@ class AudioRecorder:
         own wall-clock end instead of guessing - the guess ('trim half a
         segment') left clip audio 1-2s EARLY whenever the open segment was
         young. trim_tail still drops the most-recent N seconds first (the clip's
-        video ends in the past; audio buffered beyond it is useless)."""
+        video ends in the past; audio buffered beyond it is useless).
+
+        A voice or game layer ring (3.31 sources) is written the same way,
+        at <out_dir>/voice_clip.wav and game_clip.wav, and ends carries
+        'voice'/'game' beside 'system'/'mic'; the return arity stays
+        (system, mic, ends) for the clip caller. ONLY A RING OF KIND 'mic'
+        IS EVER RETURNED AS THE MIC - the old else-branch handed back
+        whichever non-system ring came last, which with a layer ring
+        present would have muxed Discord (or the game) as the Mic track."""
         sys_path = mic_path = None
         ends = {}
         # Snapshot under the lock with only a shallow ref-copy of each deque (fast),
@@ -2708,7 +2769,7 @@ class AudioRecorder:
                 ends[kind] = t0 + frames / float(rate) - dropped_sec
             if kind == "system":
                 sys_path = path
-            else:
+            elif kind == "mic":
                 mic_path = path
         return sys_path, mic_path, ends
 
@@ -5820,12 +5881,21 @@ def enforce_storage_cap():
                 _save_manifest(cur - deleted)
 
 
+# THE TRACK TITLES. One place that spells them; _audio_track_names hands
+# them back lowercased, one row per audio stream, in -map order.
+_TRK_MIX, _TRK_VOICE, _TRK_GAME, _TRK_MIC, _TRK_SYSTEM = (
+    "Mix", "Voice", "Game", "Mic", "System")
+# the layers a consumer may ask _layer_args / _extract_layers for
+_LAYERS = ("mix", "room", "voice", "game", "mic", "media")
+
+
 def _audio_track_names(path):
     """What each audio track of a recording calls itself, in order.
 
-    A layered (2.81+) file names its tracks Mix / System / Mic; anything
-    older, or anything the tome did not record, comes back as a list of
-    empty strings. THE POSITION IS THE POINT - it is what -map 0:a:N
+    A layered (2.81+) file names its tracks Mix / System / Mic; a 3.31
+    sources file Mix / Voice / Game / Mic (System only when no tap ran);
+    anything older, or anything the tome did not record, comes back as a
+    list of empty strings. THE POSITION IS THE POINT - it is what -map 0:a:N
     counts - so codec_type is asked for as well as the tags, to keep one
     row per audio stream whatever ffprobe decides to print for a stream
     that carries no tags at all."""
@@ -5849,15 +5919,59 @@ def _audio_track_names(path):
         return []
 
 
-def _mic_track(path, names=None):
-    """The Mic layer's audio-stream index in a layered (2.81+) recording,
-    or None for older mixed files - callers then read the default track
-    exactly as they always did. Pass `names` when the caller has already
+
+def _title_maps(path):
+    """The '-metadata:s:a:N title=...' pairs that put a night's track
+    titles back after a remux. The mp4 muxer stores a title as the
+    'name' atom; ffmpeg reads it back as a tag the mov muxer does NOT
+    write again, so every remux that keeps the tracks must restate
+    them (measured with the installed ffmpeg 8.1.1: the finisher's
+    output carried three untitled tracks). Untitled or unknown tracks
+    get no stamp; a file that cannot be probed gets none."""
+    out = []
+    try:
+        names = _audio_track_names(path) or []
+    except Exception:
+        return out
+    word = {"mix": _TRK_MIX, "voice": _TRK_VOICE, "game": _TRK_GAME,
+            "mic": _TRK_MIC, "system": _TRK_SYSTEM}
+    for i, n in enumerate(names):
+        t = word.get(str(n or "").strip().lower())
+        if t:
+            out += ["-metadata:s:a:%d" % i, "title=" + t]
+    return out
+
+def _track_for(path, layer, names=None):
+    """The audio-stream index of one titled track - 'mix', 'voice',
+    'game', 'mic' or 'system' - or None when the file carries no such
+    title. BY TITLE, NEVER BY POSITION: a 3.31 file writes Mix, Voice,
+    Game, Mic and an older one Mix, System, Mic, so the Mic is index 3
+    on one and 2 on the other. Pass `names` when the caller has already
     probed: two probes of the same file can disagree if one of them times
     out on a cold disk, and then the mic gets extracted beside a mix that
     was never built."""
     names = _audio_track_names(path) if names is None else names
-    return names.index("mic") if "mic" in names else None
+    t = {"mix": _TRK_MIX, "voice": _TRK_VOICE, "game": _TRK_GAME,
+         "mic": _TRK_MIC, "system": _TRK_SYSTEM}.get(layer)
+    t = t.lower() if t else None
+    return names.index(t) if t and t in names else None
+
+
+def _mic_track(path, names=None):
+    """The Mic layer's audio-stream index in a layered (2.81+) recording,
+    or None for older mixed files - callers then read the default track
+    exactly as they always did."""
+    return _track_for(path, "mic", names)
+
+
+def _voice_track(path, names=None):
+    """The Voice track (the voice app's tap alone, 3.31) or None."""
+    return _track_for(path, "voice", names)
+
+
+def _game_track(path, names=None):
+    """The Game track (the game's own process tree, 3.31) or None."""
+    return _track_for(path, "game", names)
 
 
 def _mix_audio_args(path, names=None):
@@ -5884,11 +5998,122 @@ def _mix_audio_args(path, names=None):
         return ["-vn", "-map", "0:a:%d" % names.index("mix")]
     if len(names) < 2 or "mic" not in names:
         return ["-vn"]
-    ins = "".join("[0:a:%d]" % i for i in range(len(names)))
+    # only the layers that make a player's mix. With Voice and Game
+    # riding as extra tracks (3.31) summing every track would count
+    # Discord twice and the game twice on a file that lost its Mix
+    # title; the mux always writes one, but the fallback must stay
+    # honest. An old file has nothing but system/mic/untitled rows, so
+    # its arguments are unchanged.
+    idx = [i for i, n in enumerate(names) if n not in ("voice", "game")]
+    if len(idx) < 2:
+        return ["-vn", "-map", "0:a:%d" % idx[0]]
+    ins = "".join("[0:a:%d]" % i for i in idx)
     return ["-vn", "-filter_complex",
             ins + ("amix=inputs=%d:duration=longest:normalize=0[a]"
-                   % len(names)),
+                   % len(idx)),
             "-map", "[a]"]
+
+
+def _fan_args(graph, target, fan, how):
+    """Shape one resolved source as (pre, maps, how) for `fan` consumers.
+    A filter pad may feed only one consumer, so several consumers of a
+    graph get an asplit; a raw stream may simply be mapped twice; the
+    default pick (target 'a': no -map at all, exactly today's sound
+    pass) fans out through '[0:a]', which is track 0 on every tome
+    file."""
+    if fan <= 1:
+        if target == "a":
+            return ["-vn"], [[]], how
+        if graph is None:
+            return ["-vn"], [["-map", target]], how
+        return ["-vn", "-filter_complex", graph], [["-map", target]], how
+    if graph is None and target != "a":
+        return ["-vn"], [["-map", target] for _ in range(fan)], how
+    labels = "".join("[L%d]" % i for i in range(fan))
+    if graph is None:
+        g = "[0:a]asplit=%d%s" % (fan, labels)
+    else:
+        g = graph[:graph.rfind("[")] + ",asplit=%d%s" % (fan, labels)
+    return (["-vn", "-filter_complex", g],
+            [["-map", "[L%d]" % i] for i in range(fan)], how)
+
+
+def _layer_args(path, layer, names=None, fan=1):
+    """ffmpeg arguments that extract one LAYER of a recording: pre (goes
+    right after '-i path'; ['-vn'] or ['-vn', '-filter_complex', graph]),
+    maps (one ['-map', target] per consumer, `fan` of them; [] when the
+    layer does not exist), how (which track(s) really fed it - the
+    honest word for the log and the sidecar).
+
+    THE LAYERS, and where each falls back on a file that lacks it:
+      mix   - the Mix: exactly _mix_audio_args (Mix | sum | default pick)
+      room  - who was in the room: Voice + Mic (amix normalize=0, the
+              recorder's own rule) | Voice alone when there is no Mic |
+              the Mic alone when the file carries a Game track but no
+              Voice (a by-source night with Discord closed) | the mix
+      voice - the Voice track ALONE (the voice app's tap) | None
+      game  - Game | System (an old separate file: playback minus mic,
+              Discord and media inside) | the mix
+      mic   - Mic | None
+      media - the mix, but only where a Voice or Game track exists so a
+              worker has a room to subtract; None otherwise
+    BY TITLE, never by position, and an old Mix/System/Mic file resolves
+    to byte-for-byte today's arguments (the roster asserts it). `how` is
+    one of 'voice+mic' | 'voice' | 'game' | 'system' | 'mic' | 'mix' |
+    'sum' | 'default' | None (None = no such layer on this file)."""
+    names = _audio_track_names(path) if names is None else names
+    v, g, m, s = (_track_for(path, k, names)
+                  for k in ("voice", "game", "mic", "system"))
+    if layer == "mix":
+        base = _mix_audio_args(path, names)
+        if "-filter_complex" in base:
+            return _fan_args(base[2], base[4], fan, "sum")
+        if len(base) > 1:
+            return _fan_args(None, base[2], fan,
+                             "mix" if "mix" in names else "sum")
+        return _fan_args(None, "a", fan, "default")
+    if layer == "room":
+        if v is not None and m is not None:
+            return _fan_args("[0:a:%d][0:a:%d]amix=inputs=2:duration=longest"
+                             ":normalize=0[L]" % (v, m), "[L]", fan,
+                             "voice+mic")
+        if v is not None:
+            return _fan_args(None, "0:a:%d" % v, fan, "voice")
+        if g is not None and m is not None:
+            return _fan_args(None, "0:a:%d" % m, fan, "mic")
+        return _layer_args(path, "mix", names, fan)
+    if layer == "voice":
+        if v is not None:
+            return _fan_args(None, "0:a:%d" % v, fan, "voice")
+        return ["-vn"], [], None
+    if layer == "game":
+        if g is not None:
+            return _fan_args(None, "0:a:%d" % g, fan, "game")
+        if s is not None:
+            return _fan_args(None, "0:a:%d" % s, fan, "system")
+        return _layer_args(path, "mix", names, fan)
+    if layer == "mic":
+        if m is not None:
+            return _fan_args(None, "0:a:%d" % m, fan, "mic")
+        return ["-vn"], [], None
+    if layer == "media":
+        if v is None and g is None:
+            return ["-vn"], [], None
+        pre, maps, _how = _layer_args(path, "mix", names, fan)
+        return pre, maps, "mix"
+    raise ValueError("unknown layer %r" % (layer,))
+
+
+def _voice_audio_args(path, names=None):
+    """The ROOM as one stream - the voice app's tap and his mic at parity
+    - or None on a file that has no room of its own to offer (an old
+    Mix/System/Mic night, a one-track file): callers then take the mix
+    exactly as they always did. An adapter over _layer_args, so the
+    senses pass and the sound pass ask the one resolver."""
+    pre, maps, how = _layer_args(path, "room", names)
+    if how in (None, "mix", "sum", "default"):
+        return None
+    return pre + maps[0]
 
 
 def _probe_duration(path):
@@ -6019,6 +6244,10 @@ def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset
 _MICWATCH = {"dev": "", "heard": None, "last_sound": None,
              "quiet": False, "since": 0.0, "said": False,
              "cb_at": None, "fixes": 0, "state": ""}
+
+# whether per-app capture (proctap) could be imported in this process -
+# filled by _prewarm_proctap at boot; ok None = not tried yet
+_PROCTAP = {"ok": None, "err": "", "ms": 0}
 
 _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
               "busy": False, "aborted": False}
@@ -6262,6 +6491,14 @@ def _sdr_finish_worker(item, ctl=None):
                # no +faststart here: it re-writes the ENTIRE multi-GB file at
                # the end (a whole extra disk pass) and only matters for web
                # streaming - local players and Discord's own re-encode don't care.
+               # EVERY audio track, not ffmpeg's one default pick: without
+               # the maps a finished night keeps only the Mix and loses its
+               # System/Mic (3.31: Voice/Game) layers. '0:a?' because a
+               # night recorded with both sound switches off has no audio
+               # stream at all, and a bare '0:a' makes ffmpeg refuse the
+               # whole file; the titles are restated because the remux
+               # drops them (see _title_maps).
+               "-map", "0:v:0", "-map", "0:a?", *_title_maps(path),
                "-c:a", "copy", tmp_out]
         proc = _popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, creationflags=flags)
@@ -8444,6 +8681,11 @@ def _watch_core(ctl):
     """Detection + record loop, driven by ctl events. Used by the tray app
     and by the legacy console mode."""
     load_settings()
+    # 3.31: warm the per-app capture import (scipy, ~3.4 s) on a daemon
+    # thread now, so the first source tap of the night is not the one
+    # paying for it inside start().
+    if SETTINGS.get("capture_by_source") and SETTINGS.get("capture_system"):
+        threading.Thread(target=_prewarm_proctap, daemon=True).start()
     # ONE-TIME REPAIR: compatible ('safe') capture mode used to be switched on
     # and remembered whenever a capture died mid-run - and the commonest cause
     # of that was never the encoder at all, it was alt-tabbing out of an
@@ -11109,6 +11351,76 @@ def _ai_run(cmd, timeout, flags, env=None):
         _AI["proc"] = None
 
 
+_Layer = collections.namedtuple("_Layer", "path how")
+
+
+def _extract_layers(video_path, names, base_wav, want, rate, timeout,
+                    flags):
+    """ONE ffmpeg read of the recording writes every layer a pass needs,
+    mono pcm_s16le at `rate`. want[0] lands at base_wav itself (the
+    worker's first argument, and what the .ctl/.prog files are keyed
+    on); the rest at base_wav + '.<layer>.wav'. Layers that resolve to
+    the same source - an old file's room IS its mix - are ALIASED to one
+    file and decoded once. Returns {layer: _Layer(path, how)} with path
+    '' for a layer the file does not have or that failed to land, plus
+    'rc' (ffmpeg's return code; the caller owns the failure ladder). A
+    single source produces exactly today's one-output command, so an
+    old night's arguments do not move."""
+    plan = {}
+    for L in want:
+        pre, maps, how = _layer_args(video_path, L, names, fan=1)
+        if not maps:
+            plan[L] = None
+            continue
+        plan[L] = (pre[2] if len(pre) > 1 else None,
+                   maps[0][1] if maps[0] else "a", how)
+    groups = {}                      # (graph, target) -> [layers], want order
+    for L in want:
+        if plan[L]:
+            groups.setdefault(plan[L][:2], []).append(L)
+    single = len(groups) == 1
+    graph_parts, outs, paths = [], [], {}
+    for k, ((graph, target), Ls) in enumerate(groups.items()):
+        if graph is None:
+            pad = None if target == "a" else target
+        elif single:
+            pad = target
+            graph_parts.append(graph)
+        else:
+            pad = "[G%d]" % k
+            graph_parts.append(graph[:graph.rfind(target)] + pad)
+        p = base_wav if Ls[0] == want[0] else base_wav + "." + Ls[0] + ".wav"
+        for L in Ls:
+            paths[L] = p
+        outs.append((pad, p))
+    cmd = [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+           "-i", video_path]
+    if graph_parts and not single:
+        cmd += ["-filter_complex", ";".join(graph_parts)]
+    for pad, p in outs:
+        cmd += ["-vn"]
+        if single and graph_parts:
+            cmd += ["-filter_complex", graph_parts[0]]
+        if pad is None:
+            cmd += ["-map", "0:a:0"] if graph_parts else []
+        else:
+            cmd += ["-map", pad]
+        cmd += ["-ac", "1", "-ar", str(rate), "-c:a", "pcm_s16le", p]
+    rc = 0
+    if outs:
+        rc, _o, _e = _ai_run(cmd, timeout, flags)
+    out = {}
+    for L in want:
+        pl = plan[L]
+        if pl is None:
+            out[L] = _Layer("", None)
+        else:
+            out[L] = _Layer(paths[L] if rc == 0 and os.path.isfile(paths[L])
+                            else "", pl[2])
+    out["rc"] = rc
+    return out
+
+
 #  Two models ship. base.en is small and quick but it is ENGLISH-ONLY and
 #  weak on accents: on this library it produced one usable line per two
 #  minutes of speech and fell into repetition loops ("...the same sentence
@@ -13098,6 +13410,10 @@ def _speech_times(video_path):
             continue
         txt = (sg.get("t") or "").strip().lower()
         if not txt:
+            continue
+        # a video's 'no way' or an NPC's line is not the room reacting
+        # (3.31 sources: src 'media' / 'game'; absent = the room, as today)
+        if str(sg.get("src") or "") in ("media", "game"):
             continue
         said.append(t)
         # what a reaction sounds like. Not clever, but it does not have to be:
@@ -22743,8 +23059,11 @@ def _moment_of(path, why, question):
 
 
 def _search_index():
-    """{video_path: [(ms, text_lower, text)]} built from every .stt.json,
-    cached until a new transcript lands. A few thousand lines of text -
+    """{video_path: [(ms, text_lower, text, src)]} built from every
+    .stt.json, cached until a new transcript lands. src is the line's
+    source ('media' / 'game' from a 3.31 reader, '' for the room) so a
+    hit can say a video said this, not the room - a media line is still
+    findable; he may remember its words. A few thousand lines of text -
     substring search over it is instant."""
     if _AI["index"] is not None and time.time() - _AI["index_t"] < 300:
         return _AI["index"]
@@ -22758,7 +23077,8 @@ def _search_index():
                 with open(os.path.join(tdir, name), encoding="utf-8") as fh:
                     data = json.load(fh)
                 base = name[:-len(".stt.json")]
-                rows = [(s["a"], s["t"].lower(), s["t"])
+                rows = [(s["a"], s["t"].lower(), s["t"],
+                         s.get("src") or "")
                         for s in data.get("segments", [])
                         if s.get("t") and not s.get("nn")]
                 if rows:
@@ -22774,17 +23094,20 @@ def _search_index():
 
 def _search_words(query, limit=40):
     """Substring search over every transcript; newest videos first. Returns
-    [{file, t_ms, text}] - the UI matches `file` against its own library
-    model (same basenames) and jumps playback to t_ms."""
+    [{file, t_ms, text, src}] - the UI matches `file` against its own
+    library model (same basenames) and jumps playback to t_ms; src is
+    '' for the room, 'media' / 'game' for a line the reader filed to a
+    video or to the game."""
     q = (query or "").strip().lower()
     if len(q) < 2:
         return []
     idx = _search_index()
     hits = []
     for base, rows in idx.items():
-        for ms, low, txt in rows:
+        for ms, low, txt, src in rows:
             if q in low:
-                hits.append({"file": base, "t_ms": ms, "text": txt})
+                hits.append({"file": base, "t_ms": ms, "text": txt,
+                             "src": src})
                 if len(hits) >= 400:
                     break
     hits.sort(key=lambda h: h["file"], reverse=True)   # stamped names = newest first
@@ -27550,6 +27873,11 @@ class _JsApi:
                        "-ss", f"{start:.3f}", "-i", p, "-t", f"{dur:.3f}",
                        "-vf", vf, "-c:v", enc,
                        *encoder_quality_flags(enc, br),
+                       # Save&Replace must not demote a layered night to
+                       # a one-track file (titles ride per stream); a cut
+                       # for sharing stays one-track and small.
+                       *((["-map", "0:v:0", "-map", "0:a?"] + _title_maps(p))
+                         if replace else []),
                        "-c:a", "aac", "-b:a", "192k", tmp]
                 r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE, creationflags=flags,
