@@ -2093,10 +2093,27 @@ class AudioRecorder:
     """Captures system loopback (default playback device) and/or the mic to
     separate WAV files using WASAPI. No rerouting, no added latency."""
 
-    def __init__(self, tmp_dir, tag="", game_pid=None):
+    def __init__(self, tmp_dir, tag="", game_pid=None, sources=None):
         self.tmp_dir = tmp_dir
         self.tag = tag                       # per-run suffix so pause/resume parts don't clash
         self.game_pid = game_pid             # for the EXPERIMENTAL game-audio-only tap
+        # 3.31 CAPTURE BY SOURCE. The session passes what it knows - the
+        # game's exe and root pid, the voice app list - and the recorder
+        # owns liveness, anchors and the manifest. sources=None keeps every
+        # older constructor call valid.
+        self.sources = sources or {}         # {"game_exe", "game_pid", "voice_apps"}
+        self.t0 = None                       # ONE anchor for every tap ring start() opens
+        self.voice_wav = None
+        self.game_wav = None
+        self._taps = {}                      # kind -> ring (the layer rings, for the watch)
+        self._said = set()                   # once-per-session log keys
+        self._manifest = {"t0": None, "voice": None, "game": None,
+                          "media": "none"}
+        # the status rows are per capture run: a new run starts clean
+        for _k in ("voice", "game"):
+            _TAPWATCH[_k] = {"exe": "", "pid": None, "state": "", "since": 0.0,
+                             "fixes": 0, "err": ""}
+        _TAPWATCH["media"] = "none"
         self._sys_done = False
         self._pa = None
         self._streams = []
@@ -2284,26 +2301,74 @@ class AudioRecorder:
                         f"disk backlog (slow/full drive); memory was capped to protect the app.")
 
         t = threading.Thread(target=writer, daemon=True)
+        t.lore_kind = "the %s writer" % kind
         t.start()
         self._threads.append(t)
         log(f"Audio: capturing {label} -> {channels}ch @ {rate}Hz")
 
-    def _open_process_tap(self, pid, path):
-        """EXPERIMENTAL game-audio-only: capture ONLY the given process tree's
-        sound via WASAPI process loopback (proc-tap) instead of everything the
-        speakers play - Discord/Spotify stay out of the video. Mirrors
-        _open_capture's contract exactly: int16 WAV, replay ring, wall-clock
-        silence-fill (process loopback delivers NOTHING while the game is
-        silent - unfilled, the track would drift early, the same starvation
-        bug the loopback path already solves). Returns True when the tap is
-        live; the caller falls back to normal loopback on False."""
+    def _open_process_tap(self, pid, path, kind="system", label="game",
+                          exe=None, anchor=None, wait=2.5):
+        """A WASAPI process-loopback tap (proctap) on one process TREE,
+        written like every other stream the recorder keeps: int16 WAV,
+        replay ring, wall-clock silence-fill (process loopback delivers
+        NOTHING while the target is silent - unfilled, the track would
+        drift early, the same starvation bug the loopback path solves).
+
+        TWO CALLERS, ONE CONTRACT. The legacy game_audio_only path calls
+        it as _open_process_tap(pid, path): kind 'system', synchronous
+        (`wait` seconds for the tap to prove itself), True/False back,
+        and the caller falls back to the device loopback on False. The
+        3.31 SOURCES layers call it with kind 'voice'/'game', an `exe`
+        (the liveness gate), an `anchor` (the run's shared t0, so the
+        layer's WAV starts at the same wall instant as the others) and
+        wait=0: the tap commits ITSELF from its own thread and the ring
+        comes back at once in state 'opening' - start() never waits on
+        a layer, so the mic and the Mix keep their 'open in well under
+        a second' promise.
+
+        THE LIVENESS GATE comes before construction: a tap on a DEAD pid
+        constructs fine, reports process-specific and stays silent for
+        ever (measured), so the honesty check cannot catch a stale pid -
+        only a pid that is alive and wears the expected exe is tapped.
+        THE HONESTY CHECK stays: Windows silently hands back a
+        SYSTEM-WIDE loopback when process activation fails, and
+        recording everything under a layer's name is the opposite of
+        the feature. The sync wait is 8 s on the legacy path now (was
+        2.5): native activation can take up to 10 s, and the first tap
+        of a lore.exe lifetime pays ~3.4 s importing scipy inside
+        proctap's converter unless _prewarm_proctap got there first."""
         try:
-            from proctap import ProcessAudioCapture
+            from proctap import ProcessAudioCapture  # noqa: F401
             import numpy as np
             from collections import deque
             import queue
         except Exception as e:
-            log(f"Game-audio tap unavailable ({e}); using system audio.")
+            if kind == "system":
+                log(f"Game-audio tap unavailable ({e}); using system audio.")
+            else:
+                _PROCTAP.update(ok=False, err=str(e)[:160])
+                if "proctap" not in self._said:
+                    self._said.add("proctap")
+                    log(f"Sources: per-app capture unavailable ({e}) - "
+                        f"recording the Mix and Mic only, as before.")
+            return False
+        if exe and not _pid_wears(pid, exe):
+            # the reason rides the status row: the gao fallback line reads
+            # _TAPWATCH['game']['err'], and a bare gate left it reading
+            # 'failed to start ()'. 'is gone' only when the pid is dead;
+            # a pid that is alive under another name says so.
+            alive = _pid_alive(pid)
+            why = (f"pid {pid} does not wear {exe}" if alive
+                   else f"pid {pid} is gone")
+            if isinstance(_TAPWATCH.get(kind), dict):
+                _TAPWATCH[kind].update(exe=exe or "", pid=pid, err=why)
+            key = ("gone_pid", kind, pid)
+            if key not in self._said:
+                self._said.add(key)
+                if alive:
+                    log(f"Sources: pid {pid} is not {exe} - looking for it again.")
+                else:
+                    log(f"Sources: {exe} pid {pid} is gone - looking for it again.")
             return False
         rate, channels = 48000, 2
         frame_bytes = channels * 2
@@ -2311,20 +2376,50 @@ class AudioRecorder:
         wf.setnchannels(channels)
         wf.setsampwidth(2)
         wf.setframerate(rate)
-        ring = {"kind": "system", "rate": rate, "channels": channels,
+        ring = {"kind": kind, "rate": rate, "channels": channels,
                 "chunks": deque(), "bytes": 0,
                 "max": rate * channels * 2 * self._replay_seconds,
                 "t_first": None, "frames": 0, "push": None,
-                "frame_bytes": frame_bytes}
+                "frame_bytes": frame_bytes,
+                # the keys _open_capture gives its rings, so the deaf
+                # backstop and the watches read every ring alike
+                "dev": exe or "", "heard": None, "last_sound": None,
+                "cb_at": time.time(),
+                # the tap's own bookkeeping (see _tap_watch / _tap_reopen)
+                "pid": pid, "exe": exe, "state": "opening", "live_at": None,
+                "reopens": 0, "stop_evt": threading.Event(), "path": path,
+                "label": label, "is_tap": True, "gen": 0, "err": None,
+                "gap_s": 0.0, "down_at": None, "wf": wf,
+                # the stall cadence (_tap_watch C): when the last stall
+                # reopen was, and whether the kind is on the 60 s cadence
+                "stall_at": None, "stall_backoff": False}
+        if anchor is not None:
+            # THE SHARED ANCHOR: a layer start() opens counts its frames
+            # from the run's t0, so however late the tap activates its
+            # first chunk is preceded by real silence up to its own wall
+            # moment and the layer WAVs line up sample for sample. A tap
+            # opened later by the watch keeps first-sample anchoring
+            # (anchor None) - no zero burst for the hours before it.
+            ring["t_first"] = anchor
+            ring["frames"] = 0
         with self._ring_lock:
             self.rings.append(ring)
-        q = queue.Queue(maxsize=4096)
+        if kind != "system":
+            self._taps[kind] = ring
+            _TAPWATCH[kind].update(exe=exe or "", pid=pid, state="opening",
+                                   since=time.time(), err="")
+        # ~60 s of 480-frame buffers, bounded like _open_capture's queue,
+        # overflow counted and reported at writer exit
+        qmax = max(256, int(rate * 60 / 480) + 16)
+        q = queue.Queue(maxsize=qmax)
+        qdrops = {"n": 0}
+        ring["qdrops"] = qdrops
 
         def _push(data):
             try:
                 q.put_nowait(data)
             except queue.Full:
-                pass
+                qdrops["n"] += 1
             with self._ring_lock:
                 ring["chunks"].append(data)
                 ring["bytes"] += len(data)
@@ -2332,13 +2427,17 @@ class AudioRecorder:
                     ring["bytes"] -= len(ring["chunks"].popleft())
         ring["push"] = _push
 
-        def on_pcm(pcm, *_a):
+        def on_pcm(pcm, gen):
             # float32 [-1,1] -> int16, then the same clock-fill discipline
             # as the WASAPI callback: the WAV timeline always equals wall
-            # time, however the tap starves.
+            # time, however the tap starves. `gen` is the tap's generation:
+            # a tap retired by a reopen may deliver a few late chunks, and
+            # counting them would push the clock ahead of the wall for the
+            # rest of the run.
             now = time.time()
-            if ring.get("closed"):
+            if ring.get("closed") or ring.get("gen") != gen:
                 return
+            ring["cb_at"] = now       # ALIVE - whatever it is delivering
             fl = np.frombuffer(pcm, dtype=np.float32)
             data = (np.clip(fl, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
             nfr = len(data) // frame_bytes
@@ -2360,25 +2459,63 @@ class AudioRecorder:
                     ring["frames"] += n
                     miss -= n
             if nfr:
+                if data.strip(b"\x00"):
+                    # parity with the loopback: a booming game or a
+                    # talking friend is not deafness (_afk_deaf_seconds)
+                    ring["last_sound"] = now
                 _push(data)
                 ring["frames"] += nfr
+        ring["on_pcm"] = on_pcm
 
         state = {"live": False, "err": None}
 
+        def _done(live, err):
+            if live:
+                state["live"] = True
+            else:
+                state["err"] = err
+            if wait == 0:
+                # async: the tap thread commits (or retires) itself
+                if live:
+                    self._tap_commit(ring, wf, q, path, label)
+                else:
+                    self._tap_failed(ring, wf, path, err)
+
+        self._spawn_tap(ring, pid, _done)
+        if wait == 0:
+            return ring
+        # commit only once start() ran and the tap proved process-specific
+        for _ in range(int(wait * 10)):
+            if state["err"] is not None or state["live"]:
+                break
+            time.sleep(0.1)
+        if state["err"] is not None or not state["live"]:
+            self._tap_failed(ring, wf, path, state["err"])
+            return False
+        return bool(self._tap_commit(ring, wf, q, path, label))
+
+    def _spawn_tap(self, ring, pid, done):
+        """One tap on its own clean thread (it initialises COM itself and
+        must not inherit pywebview's apartment). `done(live, err)` is
+        called exactly once, from that thread, when the tap has proved
+        itself or failed; the thread then holds the tap open until the
+        run ends or the ring's stop_evt retires it (a reopen puts a new
+        tap on the same ring, see _tap_reopen)."""
+        stop_evt = ring["stop_evt"]
+        gen = ring.get("gen", 0)
+        on_pcm = ring["on_pcm"]
+
         def tap_thread():
-            # dedicated clean thread: the tap initialises COM itself and must
-            # not inherit pywebview's apartment
             tap = None
             try:
-                tap = ProcessAudioCapture(int(pid), on_data=on_pcm)
+                from proctap import ProcessAudioCapture
+                tap = ProcessAudioCapture(
+                    int(pid), on_data=lambda pcm, *_a: on_pcm(pcm, gen))
                 tap.start()
                 # THE HONESTY CHECK: proctap's native layer silently falls
                 # back to SYSTEM-WIDE loopback when process activation fails
-                # (dead pid, protected process) - construction still
-                # succeeds. Recording everything while labelled "game only"
-                # is the exact opposite of the feature, so a non-specific
-                # tap is treated as a failure and LORE's own loopback path
-                # (which honours the user's device pick) takes over.
+                # (protected process) - construction still succeeds. A
+                # non-specific tap is treated as a failure.
                 try:
                     native = getattr(getattr(tap, "_backend", None),
                                      "_native", None)
@@ -2391,45 +2528,51 @@ class AudioRecorder:
                     raise
                 except Exception:
                     pass          # introspection unavailable: trust the tap
-                state["live"] = True
             except Exception as e:
-                state["err"] = e
                 try:
                     if tap is not None:
                         tap.stop()
                         tap.close()
                 except Exception:
                     pass
+                done(False, e)
                 return
-            self._stop.wait()
+            done(True, None)
+            while not self._stop.is_set() and not stop_evt.is_set():
+                self._stop.wait(0.5)
             try:
                 tap.stop()
                 tap.close()
             except Exception:
                 pass
         tt = threading.Thread(target=tap_thread, daemon=True)
+        tt.lore_kind = "the %s tap" % ring["kind"]
         tt.start()
-        self._threads.append(tt)
-        # commit only once start() ran and the tap proved process-specific
-        for _ in range(25):
-            if state["err"] is not None or state["live"]:
-                break
-            time.sleep(0.1)
-        if state["err"] is not None or not state["live"]:
-            log(f"Game-audio tap failed to start ({state['err']}); "
-                "using system audio.")
-            ring["closed"] = True      # a late-finishing tap must push nothing
-            with self._ring_lock:
-                try:
-                    self.rings.remove(ring)
-                except ValueError:
-                    pass
+        with self._ring_lock:
+            self._threads.append(tt)
+
+    def _tap_commit(self, ring, wf, q, path, label):
+        """The success half of a tap: the writer thread starts ONLY now
+        (so the WAV handle is never held by a writer when the file must
+        be deleted), the ring turns 'live', the status row and the
+        manifest learn it. Called from the tap thread (async) or the
+        wait loop (sync)."""
+        import queue
+        if self._stop.is_set() or ring["stop_evt"].is_set() or ring.get("closed"):
+            if ring["kind"] == "system":
+                return self._tap_failed(ring, wf, path, "the run ended first")
+            # a layer that proves itself after signal_stop has nothing to
+            # say: finalize drops every never-live ring by name and says
+            # 'never came up in time' once - a line here named the same
+            # tap twice. Seal it so a late chunk lands nowhere; finalize
+            # closes the WAV, removes it and marks the ring 'failed'.
+            ring["closed"] = True
             try:
-                wf.close()
-                os.remove(path)
+                ring["stop_evt"].set()
             except Exception:
                 pass
             return False
+        qdrops = ring.get("qdrops") or {"n": 0}
 
         def writer():
             try:
@@ -2442,63 +2585,120 @@ class AudioRecorder:
                 # one write error used to kill this thread in silence while
                 # the video kept encoding - a 3-hour session with audio
                 # ending at minute 40 and nothing anywhere saying why
-                log(f"Audio writer DIED mid-recording: {e} - this "
+                log(f"Audio writer DIED mid-recording ({label}): {e} - this "
                     f"recording's sound ends early.")
             finally:
                 try:
                     wf.close()
                 except Exception:
                     pass
+                if qdrops["n"]:
+                    log(f"Audio WARNING: '{label}' dropped {qdrops['n']} buffer(s) to a "
+                        f"disk backlog (slow/full drive); memory was capped to protect the app.")
         t = threading.Thread(target=writer, daemon=True)
+        t.lore_kind = "the %s tap's writer" % ring["kind"]
         t.start()
-        self._threads.append(t)
-        log(f"Audio: capturing the GAME's own sound only (pid {pid}).")
+        with self._ring_lock:
+            self._threads.append(t)
+        now = time.time()
+        ring["state"] = "live"
+        ring["live_at"] = now
+        # the stall clock starts HERE, not at construction: native
+        # activation can take seconds, and a tap seen 8 s after its
+        # ring was built had not had 8 s to deliver anything
+        ring["cb_at"] = now
+        kind = ring["kind"]
+        if kind == "system":
+            log(f"Audio: capturing the GAME's own sound only (pid {ring['pid']}).")
+            return True
+        self._taps[kind] = ring
+        _TAPWATCH[kind].update(exe=ring.get("exe") or "", pid=ring["pid"],
+                               state="live", since=now, specific=True, err="")
+        self._manifest[kind] = {"exe": ring.get("exe"), "pid": ring["pid"],
+                                "specific": True, "opened": now,
+                                "anchor": ring.get("t_first"),
+                                "reopens": ring.get("reopens", 0)}
+        log(f"Sources: capturing the {label} layer from {ring.get('exe')} "
+            f"(pid {ring['pid']}) -> 2ch @ 48000Hz")
         return True
+
+    def _tap_failed(self, ring, wf, path, why):
+        """The failure half: seal the ring, drop it, close and delete the
+        WAV, forget the layer, say why - once per (kind, reason). The
+        ring's state flips to 'failed' LAST: it is the flag the watch and
+        the tests poll, and it must mean the file is gone."""
+        ring["closed"] = True      # a late-finishing tap must push nothing
+        ring["err"] = None if why is None else str(why)[:160]
+        try:
+            ring["stop_evt"].set()
+        except Exception:
+            pass
+        with self._ring_lock:
+            try:
+                self.rings.remove(ring)
+            except ValueError:
+                pass
+        try:
+            wf.close()
+        except Exception:
+            pass
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        kind, label = ring["kind"], ring.get("label") or "game"
+        if kind == "system":
+            log(f"Game-audio tap failed to start ({why}); using system audio.")
+            ring["state"] = "failed"
+            return False
+        self._taps.pop(kind, None)
+        if kind == "voice":
+            self.voice_wav = None
+        if kind == "game":
+            self.game_wav = None
+        _TAPWATCH[kind].update(state="failed", err=ring["err"] or "")
+        honest = isinstance(why, RuntimeError) and "system-wide" in str(why)
+        key = ("failed", kind, "wide" if honest else str(why)[:60])
+        if key not in self._said:
+            self._said.add(key)
+            if honest:
+                log(f"Sources: Windows would only give a system-wide tap for "
+                    f"{ring.get('exe')} (pid {ring['pid']}) - the {label} layer "
+                    f"is off for this run; the Mix is unaffected.")
+            else:
+                log(f"Sources: the {label} tap could not start ({why}) - the "
+                    f"{label} layer is off for this run; the Mix is unaffected.")
+        ring["state"] = "failed"
+        return False
 
     def start(self):
         import pyaudiowpatch as pyaudio
+        # ONE ANCHOR for every layer this run opens (see _open_process_tap)
+        self.t0 = time.time()
+        self._manifest["t0"] = self.t0
         self._pa = _pa_open(pyaudio)
         wasapi = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        by_src = bool(SETTINGS.get("capture_by_source"))
+        gao = bool(SETTINGS.get("game_audio_only"))
 
-        if SETTINGS["capture_system"] and SETTINGS.get("game_audio_only") \
+        # the legacy game-audio-only tap (capture_by_source OFF): the game's
+        # own tree stands in for the device loopback, ring kind 'system'
+        if SETTINGS["capture_system"] and gao and not by_src \
                 and getattr(self, "game_pid", None):
             self.system_wav = os.path.join(
                 self.tmp_dir, f"system{('_' + self.tag) if self.tag else ''}.wav")
-            if self._open_process_tap(self.game_pid, self.system_wav):
+            if self._open_process_tap(self.game_pid, self.system_wav, wait=8.0):
                 self._sys_done = True
             else:
                 self.system_wav = None      # fall through to normal loopback
 
-        if SETTINGS["capture_system"] and not getattr(self, "_sys_done", False):
-            # Which playback device to listen to: the user's explicit pick from
-            # Settings > Audio, or the Windows default. (It was always the default
-            # before, which looked random to anyone who switches outputs.)
-            out = self._pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
-            want = str(SETTINGS.get("audio_output_device", "") or "").strip().lower()
-            if want:
-                for i in range(self._pa.get_device_count()):
-                    d0 = self._pa.get_device_info_by_index(i)
-                    if (d0.get("maxOutputChannels", 0) > 0
-                            and not d0.get("isLoopbackDevice")
-                            and want in str(d0.get("name", "")).lower()):
-                        out = d0
-                        break
-                else:
-                    log(f"Audio: chosen output '{want}' not found; using the default.")
-            loop = None
-            for d in self._pa.get_loopback_device_info_generator():
-                if out["name"] in d["name"]:
-                    loop = d
-                    break
-            if loop is None:  # fall back to first loopback device
-                gen = self._pa.get_loopback_device_info_generator()
-                loop = next(gen, None)
-            if loop is not None:
-                self.system_wav = os.path.join(
-                    self.tmp_dir, f"system{('_' + self.tag) if self.tag else ''}.wav")
-                self._open_capture(loop, self.system_wav, f"system ({out['name']})", "system")
-            else:
-                log("Audio: no WASAPI loopback device found; system sound skipped.")
+        # the device loopback - the Mix source. Under 'Keep only the game' +
+        # by-source it is not opened at all: the game tap IS the Mix's system
+        # half (see Session._stop_run), and if that tap fails _open_sources
+        # opens the loopback after all.
+        if SETTINGS["capture_system"] and not getattr(self, "_sys_done", False) \
+                and not (by_src and gao and self.sources.get("game_pid")):
+            self._open_loopback(wasapi)
 
         if SETTINGS["capture_mic"]:
             mic = self._resolve_mic(wasapi)
@@ -2509,11 +2709,120 @@ class AudioRecorder:
             else:
                 log("Audio: no microphone found yet; LORE will keep "
                     "looking while this records.")
+        # THE LAYERS COME LAST, so the instant devices are never behind a
+        # tap; they ride behind on the shared t0.
+        if SETTINGS["capture_system"] and by_src:
+            self._open_sources(wasapi)
         if SETTINGS.get("capture_mic", True):
             # the watch runs for the life of the session
             _t = threading.Thread(target=self._mic_watch, daemon=True)
+            _t.lore_kind = "the mic watch"
             _t.start()
             self._threads.append(_t)
+
+    def _open_loopback(self, wasapi):
+        """The device loopback (the Mix source): the user's explicit pick
+        from Settings > Audio, or the Windows default. A pure move out of
+        start() so the by-source path can open it late (after a failed
+        game tap under 'Keep only the game')."""
+        # Which playback device to listen to: the user's explicit pick from
+        # Settings > Audio, or the Windows default. (It was always the default
+        # before, which looked random to anyone who switches outputs.)
+        out = self._pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+        want = str(SETTINGS.get("audio_output_device", "") or "").strip().lower()
+        if want:
+            for i in range(self._pa.get_device_count()):
+                d0 = self._pa.get_device_info_by_index(i)
+                if (d0.get("maxOutputChannels", 0) > 0
+                        and not d0.get("isLoopbackDevice")
+                        and want in str(d0.get("name", "")).lower()):
+                    out = d0
+                    break
+            else:
+                log(f"Audio: chosen output '{want}' not found; using the default.")
+        loop = None
+        for d in self._pa.get_loopback_device_info_generator():
+            if out["name"] in d["name"]:
+                loop = d
+                break
+        if loop is None:  # fall back to first loopback device
+            gen = self._pa.get_loopback_device_info_generator()
+            loop = next(gen, None)
+        if loop is not None:
+            self.system_wav = os.path.join(
+                self.tmp_dir, f"system{('_' + self.tag) if self.tag else ''}.wav")
+            self._open_capture(loop, self.system_wav, f"system ({out['name']})", "system")
+            self._sys_done = True
+            self._manifest["media"] = "loopback"
+            _TAPWATCH["media"] = "loopback"
+        else:
+            log("Audio: no WASAPI loopback device found; system sound skipped.")
+
+    def _open_sources(self, wasapi):
+        """start()'s step 4 (3.31): the GAME tap on the game's root pid and
+        the VOICE tap on the voice app's root, both async on the shared
+        t0, then the watch that keeps them on their feet. Every failure
+        here drops a layer and nothing else - the Mix and the mic are
+        already open."""
+        if _PROCTAP.get("err"):
+            if "proctap" not in self._said:
+                self._said.add("proctap")
+                log(f"Sources: per-app capture unavailable ({_PROCTAP['err']}) "
+                    f"- recording the Mix and Mic only, as before.")
+            return
+        sfx = ("_" + self.tag) if self.tag else ""
+        gao = bool(SETTINGS.get("game_audio_only"))
+        gexe = self.sources.get("game_exe")
+        gpid = self.sources.get("game_pid")
+        if gpid:
+            self.game_wav = os.path.join(self.tmp_dir, f"game{sfx}.wav")
+            # under 'Keep only the game' the loopback was NOT opened, so this
+            # tap must be known good (or not) before start() returns - the
+            # one place a layer is waited on
+            r = self._open_process_tap(gpid, self.game_wav, kind="game",
+                                       label="game", exe=gexe, anchor=self.t0,
+                                       wait=(8.0 if gao else 0))
+            if r is False:
+                self.game_wav = None
+                if gao and not getattr(self, "_sys_done", False):
+                    log(f"Game-audio tap failed to start "
+                        f"({_TAPWATCH['game'].get('err')}); using system audio.")
+                    try:
+                        self._open_loopback(wasapi)
+                    except Exception as e:
+                        log(f"Audio: the loopback could not be opened either ({e}).")
+            elif gao and "gao_media" not in self._said:
+                self._said.add("gao_media")
+                log("Sources: 'Keep only the game' is on, so there is no device "
+                    "loopback to find a video in - the media layer is off for "
+                    "this recording.")
+        elif gexe:
+            if "game_wait" not in self._said:
+                self._said.add("game_wait")
+                log(f"Sources: no live process for {gexe} yet - the game layer "
+                    f"will start when it appears.")
+        elif "game_desk" not in self._said:
+            self._said.add("game_desk")
+            log("Sources: no game process to follow for a desktop recording - "
+                "the game layer is off.")
+        apps = list(self.sources.get("voice_apps") or SETTINGS.get("voice_apps") or [])
+        vexe, vpid = _voice_target(apps)
+        if vpid:
+            self.voice_wav = os.path.join(self.tmp_dir, f"voice{sfx}.wav")
+            if self._open_process_tap(vpid, self.voice_wav, kind="voice",
+                                      label="voice", exe=vexe, anchor=self.t0,
+                                      wait=0) is False:
+                self.voice_wav = None
+        elif "voice_off" not in self._said:
+            self._said.add("voice_off")
+            who = ("Discord" if (not apps or str(apps[0]).startswith("discord"))
+                   else str(apps[0]))
+            log(f"Sources: {who} is not running - the voice layer is your "
+                f"microphone alone until it starts.")
+        _t = threading.Thread(target=self._tap_watch, daemon=True)
+        _t.lore_kind = "the tap watch"
+        _t.start()
+        self._threads.append(_t)
 
     def _resolve_mic(self, wasapi):
         want = SETTINGS["mic_name_contains"].strip().lower()
@@ -2529,13 +2838,42 @@ class AudioRecorder:
             return None
 
     def first_sample_wallclock(self, kind):
-        """Wall-clock time of this stream's first captured sample ('system'/'mic'),
-        or None. The A/V sync anchors on this instead of guessing from durations."""
+        """Wall-clock time of this stream's first captured sample ('system',
+        'mic', and since 3.31 'voice'/'game'), or None. The A/V sync anchors
+        on this instead of guessing from durations; a layer start() opened
+        answers the run's shared t0."""
         with self._ring_lock:
             for r in self.rings:
                 if r["kind"] == kind:
                     return r["t_first"]
         return None
+
+    def sources_manifest(self):
+        """What this run captured by source, for Session.runs and the
+        .src.json sidecar: {t0, voice: {exe, pid, specific, opened, anchor,
+        reopens, state, gap_s} | None, game: {...} | None, media:
+        'loopback' | 'none'}. gap_s is the seconds a layer spent not live
+        after it first came up (its app dead, or a reopen failing) - the
+        reader stands media detection down when the voice layer was lost
+        for long, because friends heard only in the Mix would otherwise be
+        filed as a video."""
+        m = dict(self._manifest)
+        m["t0"] = self.t0
+        now = time.time()
+        for kind, ring in list(self._taps.items()):
+            gap = float(ring.get("gap_s") or 0.0)
+            if ring.get("down_at"):
+                gap += max(0.0, now - float(ring["down_at"]))
+            m[kind] = {"exe": ring.get("exe"), "pid": ring.get("pid"),
+                       "specific": True, "opened": ring.get("live_at"),
+                       "anchor": ring.get("t_first"),
+                       "reopens": int(ring.get("reopens") or 0),
+                       "state": ring.get("state"), "gap_s": round(gap, 1)}
+        with self._ring_lock:
+            loop = any(r.get("kind") == "system" and not r.get("is_tap")
+                       for r in self.rings)
+        m["media"] = "loopback" if loop else "none"
+        return m
 
     def signal_stop(self):
         """Tell capture threads to stop now (non-blocking), so audio and video
@@ -2584,12 +2922,54 @@ class AudioRecorder:
             except Exception:
                 pass
         self._streams = []
+        # every tap thread returns promptly, a still-opening one included
+        # (its commit then routes to _tap_failed: no writer, no file)
+        for r in list(self._taps.values()):
+            try:
+                r["stop_evt"].set()
+            except Exception:
+                pass
         # ...then let the writer threads drain whatever's left and close files.
-        for t in self._threads:
+        with self._ring_lock:
+            threads = list(self._threads)
+        for t in threads:
             t.join(timeout=10)
             if t.is_alive():
-                log("Audio: a writer thread is still flushing after 10s (slow/full "
+                # by name: 'a writer thread' could be any of seven
+                what = getattr(t, "lore_kind", None) or "a writer"
+                log(f"Audio: {what} thread is still flushing after 10s (slow/full "
                     "disk); its track may be slightly truncated.")
+        # A LAYER THAT NEVER CAME UP leaves a header-only WAV, and _stop_run
+        # would hand that to the mux as a track. Drop it here, by name.
+        for kind, r in list(self._taps.items()):
+            if r.get("live_at") is not None:
+                continue
+            r["closed"] = True
+            with self._ring_lock:
+                try:
+                    self.rings.remove(r)
+                except ValueError:
+                    pass
+            try:
+                r["wf"].close()
+            except Exception:
+                pass
+            try:
+                os.remove(r["path"])
+            except Exception:
+                pass
+            r["state"] = "failed"        # LAST: it means the file is gone
+            self._taps.pop(kind, None)
+            if kind == "voice":
+                self.voice_wav = None
+            if kind == "game":
+                self.game_wav = None
+            _TAPWATCH[kind].update(state="failed", err="never came up in time")
+            label = r.get("label") or kind
+            if ("late", kind) not in self._said:
+                self._said.add(("late", kind))
+                log(f"Sources: the {label} tap never came up in time - the "
+                    f"{label} layer is off for this run.")
         # and terminate under the gate, so a recording starting right now
         # cannot be inside PyAudio() while this one is inside terminate()
         _pa_close(self._pa)
@@ -2636,6 +3016,81 @@ class AudioRecorder:
             log("Microphone could not be reopened yet ("
                 + str(e)[:100] + ") - trying again shortly.")
             return False
+
+    def _tap_reopen(self, ring, pid, why, exe=None):
+        """Put a layer back on its feet IN PLACE, like _mic_reopen: same
+        ring, same queue, same WAV - only the tap is replaced. The ring's
+        clock keeps running, so the next chunk's wall-clock fill writes
+        real silence for the dead stretch and the timeline never shifts.
+        A failed reopen leaves the ring 'dead' - the watch keeps trying
+        on the same or a new root - because a Discord that keeps running
+        while its tap is lost must not have its friends filed as a video
+        for the rest of the night."""
+        kind, label = ring["kind"], ring.get("label") or ring["kind"]
+        if exe:
+            ring["exe"] = exe
+        if not _pid_wears(pid, ring.get("exe")):
+            return False
+        old = ring.get("pid")
+        try:
+            ring["stop_evt"].set()             # retire the old tap thread
+        except Exception:
+            pass
+        ring["stop_evt"] = threading.Event()
+        ring["gen"] = int(ring.get("gen") or 0) + 1
+        ring["pid"] = pid
+        ring["reopens"] = int(ring.get("reopens") or 0) + 1
+        ring["state"] = "opening"
+        res = {"done": False, "live": False, "err": None}
+        ev = threading.Event()
+
+        def _done(live, err):
+            if res["done"]:
+                return                         # a late answer to a given-up try
+            res.update(done=True, live=live, err=err)
+            ev.set()
+        self._spawn_tap(ring, pid, _done)
+        ev.wait(10.0)
+        now = time.time()
+        if not res["live"]:
+            res["done"] = True
+            try:
+                ring["stop_evt"].set()         # a late success closes itself
+            except Exception:
+                pass
+            err = res["err"] if res["err"] is not None else "it did not come up in time"
+            ring["state"] = "dead"
+            ring["err"] = str(err)[:160]
+            ring["down_at"] = ring.get("down_at") or now
+            _TAPWATCH[kind].update(pid=pid, state="dead", err=ring["err"])
+            if ("reopen_fail", kind) not in self._said:
+                self._said.add(("reopen_fail", kind))
+                log(f"Sources: the {label} tap could not be reopened yet "
+                    f"({str(err)[:100]}) - trying again shortly.")
+            return False
+        ring["state"] = "live"
+        ring["cb_at"] = now
+        ring["err"] = None
+        if ring.get("down_at"):
+            ring["gap_s"] = float(ring.get("gap_s") or 0.0) + max(
+                0.0, now - float(ring["down_at"]))
+            ring["down_at"] = None
+        self._said.discard(("reopen_fail", kind))
+        _TAPWATCH[kind].update(exe=ring.get("exe") or "", pid=pid,
+                               state="reconnected", err="",
+                               fixes=int(_TAPWATCH[kind].get("fixes") or 0) + 1)
+        if isinstance(self._manifest.get(kind), dict):
+            self._manifest[kind]["reopens"] = ring["reopens"]
+            self._manifest[kind]["pid"] = pid
+        if pid != old:
+            log(f"Sources: {ring.get('exe')} restarted (pid {old} -> {pid}) - "
+                f"the {label} layer follows the new one; the gap is filled "
+                f"with silence so the sound stays in step with the picture.")
+        else:
+            log(f"Sources: the {label} tap is back on {ring.get('exe')} "
+                f"(pid {pid}) - {why}; the gap is filled with silence so the "
+                f"sound stays in step with the picture.")
+        return True
 
     def _mic_watch(self):
         """A virtual microphone can stop delivering while its handle
@@ -2690,6 +3145,134 @@ class AudioRecorder:
                 self._mic_reopen(
                     ring, "it had been silent for eight minutes")
 
+    def _tap_watch(self):
+        """The layers' watch, a mirror of _mic_watch on the same 4 s beat.
+        Liveness is a pid check (0.02 ms): the stream gives NO signal when
+        its target dies (measured: after a kill the tap keeps delivering
+        zeros, is_running stays True, is_process_specific stays True).
+        Three cases, like the mic's:
+          B  never opened - look for the app every 20 s and open it with
+             its OWN anchor (first sample, not t0: no zero burst for the
+             hours before it appeared);
+          A  the pid died, or a reopen failed ('dead') - re-walk every 8 s
+             and reopen into the SAME ring on a new root (or the same one
+             when it is alive again); after 60 s with nothing AND the pid
+             really dead, say the app closed (once) and keep looking. A
+             'dead' ring whose pid is alive (Discord runs, its tap will
+             not reopen) keeps its 'could not be reopened yet' line and
+             stays 'dead', retried - never 'gone', never 'closed';
+          C  alive but the tap stalled (cb_at older than 8 s; proctap
+             swallows worker errors, so silence is the only symptom) -
+             reopen on the same pid, said once per kind. Only while the
+             Mix heard sound in the last 30 s: a device playing nothing
+             starves every process loopback by design (no chunk at all
+             while the endpoint idles), and that is not a stall - no line,
+             no reopen. A same-pid reopen whose fresh tap goes quiet again
+             within the minute is not fixed by an 8 s hammer: one try a
+             minute from then, until a reopened tap has run a good minute."""
+        last_look = {"voice": 0.0, "game": 0.0}
+        gone_since = {}
+        while not self._stop.wait(4.0):
+            if not (SETTINGS.get("capture_by_source")
+                    and SETTINGS.get("capture_system")):
+                continue
+            now = time.time()
+            for kind in ("voice", "game"):
+                try:
+                    ring = self._taps.get(kind)
+                    if ring is None:
+                        if now - last_look[kind] < 20:
+                            continue
+                        last_look[kind] = now
+                        if kind == "voice":
+                            exe, pid = _voice_target(list(
+                                self.sources.get("voice_apps")
+                                or SETTINGS.get("voice_apps") or []))
+                        else:
+                            exe = self.sources.get("game_exe")
+                            pid = _root_pids((exe,)).get(exe) if exe else None
+                        if not pid:
+                            continue
+                        path = os.path.join(
+                            self.tmp_dir,
+                            "%s%s.wav" % (kind, ("_" + self.tag) if self.tag else ""))
+                        r = self._open_process_tap(pid, path, kind=kind, label=kind,
+                                                   exe=exe, anchor=None, wait=0)
+                        if r is not False:
+                            if kind == "voice":
+                                self.voice_wav = path
+                            else:
+                                self.game_wav = path
+                            log(f"Sources: {exe} found on a second look (pid {pid}) "
+                                f"- the {kind} layer is being recorded from here on.")
+                        continue
+                    st = ring.get("state")
+                    if st in ("opening", "failed"):
+                        continue
+                    if st == "dead" or not _pid_wears(ring.get("pid"), ring.get("exe")):
+                        if kind not in gone_since:
+                            gone_since[kind] = now
+                            ring["down_at"] = ring.get("down_at") or now
+                        if now - last_look[kind] < 8:
+                            continue
+                        last_look[kind] = now
+                        exe = ring.get("exe")
+                        if kind == "voice":
+                            exe, pid = _voice_target(list(
+                                self.sources.get("voice_apps")
+                                or SETTINGS.get("voice_apps") or []))
+                        else:
+                            pid = _root_pids((exe,)).get(exe) if exe else None
+                        if pid and (pid != ring.get("pid") or st == "dead"):
+                            if self._tap_reopen(ring, pid,
+                                                "it restarted" if pid != ring.get("pid")
+                                                else "it is back", exe=exe):
+                                gone_since.pop(kind, None)
+                        elif (now - gone_since[kind] > 60
+                              and not _pid_alive(ring.get("pid"))
+                              and ("gone_" + kind) not in self._said):
+                            self._said.add("gone_" + kind)
+                            ring["state"] = "gone"
+                            _TAPWATCH[kind]["state"] = "gone"
+                            log(f"Sources: {ring.get('exe')} closed - the {kind} "
+                                f"layer is "
+                                f"{'your microphone alone' if kind == 'voice' else 'silent'}"
+                                f" from here.")
+                        continue
+                    cb = ring.get("cb_at") or 0
+                    if not (cb and now - cb > 8):
+                        continue
+                    # C: quiet is a stall only while the Mix is hearing
+                    # something (a silent device starves the taps by design)
+                    mix = None
+                    with self._ring_lock:
+                        for r in self.rings:
+                            if r.get("kind") == "system" and not r.get("is_tap"):
+                                mix = r
+                                break
+                    if mix is not None and not (
+                            mix.get("last_sound")
+                            and now - float(mix["last_sound"]) <= 30):
+                        continue
+                    # the cadence rides the ring (stall_at / stall_backoff,
+                    # beside reopens and down_at): a reopened tap that went
+                    # quiet again within the minute waits a minute per try
+                    prev = ring.get("stall_at")
+                    if prev:
+                        # cb - prev: how long the reopened tap kept delivering
+                        ring["stall_backoff"] = not (cb - prev > 60)
+                        if ring["stall_backoff"] and now - prev < 60:
+                            continue
+                    if ("stall", kind) not in self._said:
+                        self._said.add(("stall", kind))
+                        log(f"Sources: the {kind} tap stopped sending sound - "
+                            f"reopening it.")
+                    ring["stall_at"] = now
+                    self._tap_reopen(ring, ring.get("pid"),
+                                     "it stopped sending sound")
+                except Exception:
+                    pass
+
     def stop(self):
         self.signal_stop()
         self.finalize()
@@ -2738,9 +3321,14 @@ class AudioRecorder:
                         miss -= n
                 except Exception:
                     pass
+            # a layer still opening, failed or gone has no sound of this
+            # moment to lend a clip; 'dead' keeps its clock (silence) so
+            # the clip's layout holds
             snap_refs = [(r["kind"], r["rate"], r["channels"], list(r["chunks"]),
                           r.get("t_first"), r.get("frames", 0))
-                         for r in self.rings]
+                         for r in self.rings
+                         if not r.get("is_tap")
+                         or r.get("state") in ("live", "reconnected", "dead")]
         snapshot = [(kind, rate, channels, b"".join(chunks), t0, frames)
                     for (kind, rate, channels, chunks, t0, frames) in snap_refs]
         for kind, rate, channels, data, t0, frames in snapshot:
@@ -2761,6 +3349,14 @@ class AudioRecorder:
                 wf.writeframes(tail); wf.close()
             except Exception as e:
                 log(f"Replay: could not write {kind} audio ({e})")
+                continue
+            if not tail:
+                # a ring that has delivered nothing yet: a header-only WAV
+                # offered as a track fails the clip's mux, so it is not
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
                 continue
             # Wall-clock of the wav's last sample: ring start + frames delivered
             # (the silence top-up keeps 'frames' tracking wall time), minus what
@@ -3510,12 +4106,23 @@ def _game_window_title(pname):
 
 
 def _pid_for_exe(pname):
-    """First live pid with this exe name, or None. Used to aim the
-    game-audio-only tap (process loopback captures the pid + its children,
-    so the main process is the right target even for launcher-spawned
-    games)."""
+    """The pid to tap for this exe name, or None. Used to aim the game
+    tap (process loopback captures the pid + its children, so the main
+    process is the right target even for launcher-spawned games). The
+    ROOT (the process whose parent does not wear the same name) is the
+    right target: process loopback captures the pid + its children,
+    never its parent or siblings - a game whose exe re-spawns a child of
+    the same name would be tapped at the child and miss the parent's
+    sound. Falls back to the first live match when the walk gives
+    nothing."""
     if not pname:
         return None
+    try:
+        root = _root_pids((pname.lower(),)).get(pname.lower())
+        if root:
+            return root
+    except Exception:
+        pass
     try:
         for pr in psutil.process_iter(["pid", "name"]):
             try:
@@ -3526,6 +4133,130 @@ def _pid_for_exe(pname):
     except Exception:
         pass
     return None
+
+
+def _root_pids(names):
+    """{exe name: root pid} for the given lowercase exe names - the root
+    is a process of that name whose PARENT does not wear the same name.
+    Discord.exe is six processes and the renderer is not the one to tap:
+    INCLUDE_TARGET_PROCESS_TREE follows the tree DOWN from the pid it is
+    given (proven by qa/proctap_tree.py), so the root hears them all.
+    A process whose parent is already dead counts as a root.
+
+    Toolhelp32 through ctypes, not psutil: the snapshot walk costs 10-14
+    ms for ~300 processes here, where psutil.process_iter with ppid took
+    3.4 s cold on this machine - and the tap watch walks this every 8 s
+    while a layer's app is missing."""
+    want = {str(n or "").strip().lower() for n in (names or ()) if n}
+    if not want or os.name != "nt":
+        return {}
+    import ctypes
+    from ctypes import wintypes
+
+    class _PE32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32FirstW.restype = wintypes.BOOL
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PE32W)]
+    k32.Process32NextW.restype = wintypes.BOOL
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PE32W)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)        # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return {}
+    procs = {}                                         # pid -> (exe, ppid)
+    try:
+        e = _PE32W()
+        e.dwSize = ctypes.sizeof(_PE32W)
+        if k32.Process32FirstW(snap, ctypes.byref(e)):
+            while True:
+                procs[int(e.th32ProcessID)] = (
+                    (e.szExeFile or "").lower(), int(e.th32ParentProcessID))
+                if not k32.Process32NextW(snap, ctypes.byref(e)):
+                    break
+    finally:
+        try:
+            k32.CloseHandle(snap)
+        except Exception:
+            pass
+    out = {}
+    for pid, (nm, pp) in procs.items():
+        if nm in want and nm not in out and procs.get(pp, ("",))[0] != nm:
+            out[nm] = pid
+    return out
+
+
+def _climb_to_root(pid, exe):
+    """The window's owner may be a child of the same exe; the tap must
+    sit on the tree root. Returns the same pid when its parent does not
+    wear the game's name, or on any error."""
+    if not pid:
+        return pid
+    try:
+        cur = psutil.Process(int(pid))
+        want = str(exe or "").lower()
+        for _ in range(32):                # a same-name chain, never a loop
+            pp = cur.parent()
+            if pp is None or (pp.name() or "").lower() != want:
+                return cur.pid
+            cur = pp
+        return cur.pid
+    except Exception:
+        return pid
+
+
+def _pid_alive(pid):
+    """Is this pid simply alive, whatever it wears? The watch's 'closed for
+    good' verdict wants the process REALLY gone: _pid_wears also says no
+    for a pid that is alive under a name it cannot read (AccessDenied) or
+    a reopen that keeps failing while the app runs, and neither of those
+    is an app that closed."""
+    try:
+        return bool(pid) and psutil.pid_exists(int(pid))
+    except Exception:
+        return False
+
+
+def _pid_wears(pid, exe):
+    """THE LIVENESS GATE (0.02 ms measured): is this pid alive AND wearing
+    this exe name? A tap on a dead pid is granted, process-specific, and
+    silent for ever - so nothing may tap a pid this has not just said
+    yes to."""
+    try:
+        return bool(pid) and psutil.pid_exists(int(pid)) and (
+            psutil.Process(int(pid)).name() or "").lower() == str(exe or "").lower()
+    except Exception:
+        return False
+
+
+def _voice_target(voice_apps):
+    """(exe, root pid) of the voice app to tap - the FIRST running name in
+    the setting's order - or (None, None). One tap only: with Discord and
+    Steam both listed and running, the layer follows the first and says
+    so once (the other's voices land in the Mix only)."""
+    apps = [str(n or "").strip().lower() for n in (voice_apps or ()) if n]
+    roots = _root_pids(apps)
+    for nm in apps:
+        if nm in roots:
+            if (sum(1 for n in apps if n in roots) > 1
+                    and "voice_two" not in _TAPWATCH["said"]):
+                _TAPWATCH["said"].add("voice_two")
+                log(f"Sources: more than one voice app is running; the "
+                    f"voice layer follows {nm}.")
+            return nm, roots[nm]
+    return None, None
 
 
 def _screen_capture_wh(mon_idx):
@@ -5469,9 +6200,17 @@ def _cache_survey():
     return safe, orphan
 
 
-def _concat_copy(ffmpeg, seg_files, out_path, watch=None):
+def _concat_copy(ffmpeg, seg_files, out_path, watch=None, keep_tracks=False):
     # `watch`, when given, is handed each ffmpeg child so the caller can end
     # it. Recording saves pass nothing and behave exactly as before.
+    # `keep_tracks` is the RUN-FINAL stitch's alone (a paused / alt-tabbed
+    # session joining its runs): map every stream and restate the titles,
+    # the way the finisher does. A bare '-c copy' keeps ffmpeg's ONE
+    # default audio pick and the concat demuxer carries no titles, so a
+    # Mix/Voice/Game/Mic night stitched from two runs came out with one
+    # untitled track (measured with the installed ffmpeg). The export,
+    # rescue and clip callers pass nothing and their commands are
+    # byte-identical to before.
     """Concatenate segments into out_path with no re-encode (instant). If the
     join fails - which usually means the final segment was truncated by a crash
     or a force-kill - retry once without that last segment, so a long recording
@@ -5490,7 +6229,10 @@ def _concat_copy(ffmpeg, seg_files, out_path, watch=None):
             return False
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path]
+               "-f", "concat", "-safe", "0", "-i", list_path,
+               *(["-map", "0:v:0", "-map", "0:a?", *_title_maps(files[0])]
+                 if keep_tracks else []),
+               "-c", "copy", out_path]
         # `watch` lets the caller keep a handle on this child. Without it the
         # export's stitch was unreachable by Stop.
         # The stitch of a PAUSED recording lands here, and for a long session
@@ -6134,28 +6876,67 @@ def _probe_duration(path):
         return None
 
 
+# once-per-bind guard for build_mux_cmd's 'one track' line (reset by
+# _assemble and the clip path before every bind)
+_MUX_SAID = {"one_track": False}
+
+
 def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset_ms=None,
-                  video_is_concat=False):
+                  video_is_concat=False, taps=None):
     """offset_ms shifts the system track; mic_offset_ms the mic track (defaults to
     the same). Each stream gets its OWN correction because they start at slightly
     different wall-clock moments. video_is_concat=True treats `video` as a concat
     list file (the segments are read directly - saves writing the multi-GB merged
-    intermediate, which doubled save time on hard drives)."""
+    intermediate, which doubled save time on hard drives).
+
+    3.31 THE TRACK CONTRACT. taps = [{'label': 'Voice'|'Game', 'path': wav|None,
+    'off': ms, 'secs': float|None}] - the layers the recorder tapped. With
+    taps the file carries Mix (track 0, unchanged: the playback loopback
+    + mic), then Voice, Game, Mic as their own titled tracks and NO System
+    track (it is the Mix's own half; the AI reads the game from the Game
+    track). A tap joins the Mix ONLY when the loopback is absent - with it
+    they are already inside the Mix and summing again would double Discord
+    and the game. A tap with path None and secs > 0 is a silent PLACEHOLDER
+    (anullsrc) so a paused session's runs keep one layout. Same-label taps
+    are pre-summed. With no taps the command is byte-for-byte today's."""
     s = SETTINGS
     vin = (["-f", "concat", "-safe", "0", "-i", video] if video_is_concat
            else ["-i", video])
     cmd = [s["ffmpeg_path"], "-y", "-hide_banner", "-loglevel", "warning"] + vin
 
+    # the tap inputs, in the fixed order Voice*, Game; a placeholder is
+    # dropped when a real input of the same label exists
+    real = {t["label"] for t in (taps or ())
+            if t.get("path") and os.path.isfile(t["path"])}
+    tap_ins = []       # (label, path|None, off, secs)
+    for want in (_TRK_VOICE, _TRK_GAME):
+        for t in (taps or ()):
+            if t.get("label") != want:
+                continue
+            if t.get("path") and os.path.isfile(t["path"]):
+                tap_ins.append((want, t["path"], int(t.get("off") or 0), None))
+            elif want not in real and t.get("secs") and float(t["secs"]) > 0:
+                tap_ins.append((want, None, int(t.get("off") or 0),
+                                float(t["secs"])))
+
     audio_inputs = []  # (label, path, offset_ms)
     if system_wav and os.path.isfile(system_wav):
         cmd += ["-i", system_wav]
-        audio_inputs.append(("System", system_wav, offset_ms))
+        audio_inputs.append((_TRK_SYSTEM, system_wav, offset_ms))
+    for label, path, off, secs in tap_ins:
+        if path is None:
+            cmd += ["-f", "lavfi", "-t", "%.3f" % secs, "-i",
+                    "anullsrc=r=48000:cl=stereo"]
+        else:
+            cmd += ["-i", path]
+        audio_inputs.append((label, path, off))
     if mic_wav and os.path.isfile(mic_wav):
         cmd += ["-i", mic_wav]
-        audio_inputs.append(("Mic", mic_wav,
+        audio_inputs.append((_TRK_MIC, mic_wav,
                              offset_ms if mic_offset_ms is None else mic_offset_ms))
 
     n = len(audio_inputs)
+    any_tap = bool(tap_ins)
     if n == 0:
         cmd += ["-map", "0:v", "-c:v", "copy", out_final]
         return cmd
@@ -6182,6 +6963,63 @@ def build_mux_cmd(video, system_wav, mic_wav, out_final, offset_ms=0, mic_offset
     # everywhere.
     pre = [f"[{i + 1}:a]aresample=48000,aformat=channel_layouts=stereo"
            f"{_sync(audio_inputs[i][2])}[a{i}]" for i in range(n)]
+
+    if any_tap:
+        # THE LAYERED BIND WITH SOURCES (3.31). Every input is a unit; a
+        # repeated label is pre-summed into one. A unit is a TRACK unless
+        # it is System (the Mix's own half - written on its own only when
+        # no tap ran), and a MEMBER of the Mix when it is System or Mic,
+        # or a tap on a night with no loopback. Track and member both:
+        # asplit (a pad feeds one consumer); member only: straight in;
+        # track only: mapped as it is.
+        if s["audio_mode"] == "mix" and not _MUX_SAID.get("one_track"):
+            _MUX_SAID["one_track"] = True
+            log("Audio: 'one track' is set, but sources were captured - bound "
+                "layered (Mix + Voice + Game + Mic) so the tome can tell the "
+                "room from the game.")
+        parts = list(pre)
+        seen = []
+        for label, _p, _o in audio_inputs:
+            if label not in seen:
+                seen.append(label)
+        has_system = any(lab == _TRK_SYSTEM for lab, _p, _o in audio_inputs)
+        members, tracks = [], []
+        for label in seen:
+            idxs = [i for i, (lab, _p, _o) in enumerate(audio_inputs) if lab == label]
+            i0 = idxs[0]
+            if len(idxs) > 1:
+                parts.append("".join(f"[a{i}]" for i in idxs)
+                             + f"amix=inputs={len(idxs)}:duration=longest"
+                             f":normalize=0[v{i0}]")
+                pad = f"v{i0}"
+                log(f"{label}: {len(idxs)} taps summed into one track.")
+            else:
+                pad = f"a{i0}"
+            track = label != _TRK_SYSTEM
+            member = label in (_TRK_SYSTEM, _TRK_MIC) or (
+                label in (_TRK_VOICE, _TRK_GAME) and not has_system)
+            if track and member:
+                parts.append(f"[{pad}]asplit=2[s{i0}][t{i0}]")
+                members.append(f"[s{i0}]")
+                tracks.append((label, f"[t{i0}]"))
+            elif member:
+                members.append(f"[{pad}]")
+            else:
+                tracks.append((label, f"[{pad}]"))
+        if len(members) >= 2:
+            parts.append("".join(members) + f"amix=inputs={len(members)}"
+                         ":duration=longest:normalize=0[a]")
+        else:
+            parts.append(f"{members[0]}anull[a]")
+        cmd += ["-filter_complex", ";".join(parts), "-map", "0:v", "-map", "[a]"]
+        for _label, tpad in tracks:
+            cmd += ["-map", tpad]
+        cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-metadata:s:a:0", f"title={_TRK_MIX}"]
+        for k, (label, _tpad) in enumerate(tracks):
+            cmd += [f"-metadata:s:a:{k + 1}", f"title={label}"]
+        cmd += [out_final]
+        return cmd
 
     if n >= 2:
         # THE LAYERED BIND (2.81), NOW FOR BOTH MODES (3.10). Track 0 is
@@ -6248,6 +7086,19 @@ _MICWATCH = {"dev": "", "heard": None, "last_sound": None,
 # whether per-app capture (proctap) could be imported in this process -
 # filled by _prewarm_proctap at boot; ok None = not tried yet
 _PROCTAP = {"ok": None, "err": "", "ms": 0}
+
+# 3.31 SOURCES: what the voice and game taps are doing right now, for the
+# tome's status line (state()['sources'] via _sources_state). The two rows
+# are reset per capture run by AudioRecorder.__init__; 'media' is set by
+# start() when it opens or skips the device loopback; 'said' keeps the
+# once-per-process log keys. state values: '' (never opened) | 'opening'
+# | 'live' | 'reconnected' | 'dead' (lost, reopen failing, still retried)
+# | 'failed' | 'gone' (its app closed for good).
+_TAPWATCH = {"voice": {"exe": "", "pid": None, "state": "", "since": 0.0,
+                       "fixes": 0, "err": ""},
+             "game": {"exe": "", "pid": None, "state": "", "since": 0.0,
+                      "fixes": 0, "err": ""},
+             "media": "none", "said": set()}
 
 _FINISHING = {"proc": None, "path": None, "t0": 0.0, "pct": None,
               "busy": False, "aborted": False}
@@ -6716,7 +7567,10 @@ class Session:
         self._replay_lock = threading.Lock()
         self.suspended = False
         self._hdr_used = False          # did the active run use HDR tone-mapping?
-        self.runs = []                 # finished runs: {"sys","mic","nseg"}
+        # finished runs: {"sys","mic","nseg","v_end_wall","sys_t0","mic_t0"}
+        # + (3.31) "voice","game" (layer wavs | None), "voice_t0","game_t0",
+        # "sources" (AudioRecorder.sources_manifest() | None)
+        self.runs = []
         self._run_index = 0
         self._seg_start = 0            # next segment number (continues across pauses)
         self._run_vstart = 0          # first segment number of the current run
@@ -6762,8 +7616,12 @@ class Session:
         if SETTINGS["capture_system"] or SETTINGS["capture_mic"]:
             try:
                 # re-resolve the tap target EVERY run: a crash-relaunched
-                # game keeps its exe name (same session) but a new pid
-                if SETTINGS.get("game_audio_only") and SETTINGS.get("capture_system"):
+                # game keeps its exe name (same session) but a new pid.
+                # 3.31: the by-source GAME layer needs it every session,
+                # not only under game_audio_only, and on the tree ROOT
+                if SETTINGS.get("capture_system") and (
+                        SETTINGS.get("game_audio_only")
+                        or SETTINGS.get("capture_by_source")):
                     try:
                         pid_now = None
                         if self.win and self.win.get("hwnd"):
@@ -6776,11 +7634,16 @@ class Session:
                         if not pid_now and self.game.lower() != "screen":
                             pid_now = _pid_for_exe(self.game)
                         if pid_now:
-                            self.game_pid = pid_now
+                            self.game_pid = _climb_to_root(pid_now, self.game)
                     except Exception:
                         pass
-                self.audio = AudioRecorder(self.tmp, tag=f"{self._run_index:02d}",
-                                           game_pid=getattr(self, "game_pid", None))
+                self.audio = AudioRecorder(
+                    self.tmp, tag=f"{self._run_index:02d}",
+                    game_pid=getattr(self, "game_pid", None),
+                    sources={"game_exe": (None if self.game.lower() == "screen"
+                                          else self.game.lower()),
+                             "game_pid": getattr(self, "game_pid", None),
+                             "voice_apps": list(SETTINGS.get("voice_apps") or [])})
                 self.audio.start()
             except Exception as e:
                 log(f"Audio init failed ({e}); recording video only.")
@@ -6950,13 +7813,35 @@ class Session:
                 and os.path.isfile(self.audio.system_wav) else None)
         micw = (self.audio.mic_wav if self.audio and self.audio.mic_wav
                 and os.path.isfile(self.audio.mic_wav) else None)
-        if nseg > 0 or sysw or micw:
-            self.runs.append({
+        # 3.31 the layers: a tap that never came up was dropped by finalize
+        # (its wav deleted), so a path here is a real layer
+        voicew = (self.audio.voice_wav if self.audio
+                  and getattr(self.audio, "voice_wav", None)
+                  and os.path.isfile(self.audio.voice_wav) else None)
+        gamew = (self.audio.game_wav if self.audio
+                 and getattr(self.audio, "game_wav", None)
+                 and os.path.isfile(self.audio.game_wav) else None)
+        by_src = bool(SETTINGS.get("capture_by_source"))
+        if nseg > 0 or sysw or micw or voicew or gamew:
+            run = {
                 "sys": sysw, "mic": micw, "nseg": nseg,
                 "v_end_wall": v_end_wall,
                 "sys_t0": self.audio.first_sample_wallclock("system") if self.audio else None,
                 "mic_t0": self.audio.first_sample_wallclock("mic") if self.audio else None,
-            })
+                "voice": voicew, "game": gamew,
+                "voice_t0": (self.audio.first_sample_wallclock("voice")
+                             if voicew else None),
+                "game_t0": (self.audio.first_sample_wallclock("game")
+                            if gamew else None),
+                "sources": (self.audio.sources_manifest()
+                            if (self.audio and by_src) else None),
+            }
+            if (run["sys"] is None and gamew and by_src
+                    and SETTINGS.get("game_audio_only")):
+                # 'Keep only the game': the game IS the Mix's system half -
+                # same file, no copy; build_mux_cmd sees a System input
+                run["sys"], run["sys_t0"] = gamew, run["game_t0"]
+            self.runs.append(run)
         self._seg_start = total
         self._run_index += 1
         self.vproc = None
@@ -6992,10 +7877,14 @@ class Session:
                 log("Window capture: waiting for the game's window before "
                     "recording (no desktop is captured).")
         log(f"Detected '{self.game}'. Recording -> {self.final}")
-        # who to tap for game-audio-only: the window's owner when we have it
-        # (exact), else the first process wearing the game's name
+        # who to tap for the game layer (3.31) or game-audio-only: the
+        # window's owner when we have it (exact), else the first process
+        # wearing the game's name - climbed to its tree ROOT either way,
+        # because process loopback follows children, never parents
         self.game_pid = None
-        if SETTINGS.get("game_audio_only") and SETTINGS.get("capture_system"):
+        if SETTINGS.get("capture_system") and (
+                SETTINGS.get("game_audio_only")
+                or SETTINGS.get("capture_by_source")):
             try:
                 if self.win and self.win.get("hwnd"):
                     import ctypes
@@ -7004,6 +7893,8 @@ class Session:
                     ctypes.windll.user32.GetWindowThreadProcessId(
                         self.win["hwnd"], ctypes.byref(_p))
                     self.game_pid = _p.value or None
+                if self.game_pid:
+                    self.game_pid = _climb_to_root(self.game_pid, self.game)
                 if not self.game_pid and self.game.lower() != "screen":
                     self.game_pid = _pid_for_exe(self.game)
             except Exception:
@@ -7048,12 +7939,17 @@ class Session:
             return None
 
         ok = False
+        # 3.31 ONE LAYOUT ACROSS RUNS: the concat demuxer needs identical
+        # stream layouts, so every run-final carries every layer ANY run
+        # had (a run that lacked one gets a silent placeholder track).
+        want = {L for r in self.runs for L in ("Voice", "Game")
+                if r.get(L.lower())}
         if len(self.runs) <= 1:
             # Common path: a single uninterrupted run. Concatenate the segments and
             # mux the audio in (see _assemble), writing straight to the final file.
             run = self.runs[0] if self.runs else {}
             ok = self._assemble(all_segs, run.get("sys"), run.get("mic"), self.final,
-                                run)
+                                run, want_taps=want)
         else:
             # Pauses happened: assemble each run on its own (so each stays in sync),
             # then concatenate the runs into one gap-free file.
@@ -7066,7 +7962,8 @@ class Session:
                 if not rsegs:
                     continue
                 rfin = os.path.join(self.tmp, f"_runf{k}.mp4")
-                if self._assemble(rsegs, run["sys"], run["mic"], rfin, run):
+                if self._assemble(rsegs, run["sys"], run["mic"], rfin, run,
+                                  want_taps=want):
                     run_finals.append(rfin)
                 else:
                     # A run that won't assemble is silently missing from the
@@ -7102,7 +7999,10 @@ class Session:
                     ok = False
             elif len(run_finals) > 1:
                 tmp_final = self.final + ".__assembling__.mp4"
-                if _concat_copy(SETTINGS["ffmpeg_path"], run_finals, tmp_final):
+                # keep_tracks: every titled track of every run, not
+                # ffmpeg's one default pick (see _concat_copy)
+                if _concat_copy(SETTINGS["ffmpeg_path"], run_finals, tmp_final,
+                                keep_tracks=True):
                     # _concat_copy salvages a bad join by DROPPING the last file and
                     # still returns True - which would silently lose the entire final
                     # run of a paused recording. Verify the stitched length first.
@@ -7133,6 +8033,10 @@ class Session:
                         _ai_sidecar(self.final, "inp")), exist_ok=True)
                     _atomic_write_json(_ai_sidecar(self.final, "inp"),
                                        {"v": 1, "s": buf})
+            except Exception:
+                pass
+            try:
+                self._write_src_sidecar()
             except Exception:
                 pass
             _record_made_file(self.final)   # own it before the cap can consider it
@@ -7213,6 +8117,12 @@ class Session:
                 # at the video's length - aligned at BOTH ends, no guessing.
                 sys_wav, mic_wav, ends = aud.dump_ring(self.tmp, d + 2 * seg,
                                                        trim_tail=0.0)
+            # 3.31 the layer clips land at deterministic names beside the
+            # others; a kind in `ends` means its ring wrote one
+            voice_wav = (os.path.join(self.tmp, "voice_clip.wav")
+                         if "voice" in ends else None)
+            game_wav = (os.path.join(self.tmp, "game_clip.wav")
+                        if "game" in ends else None)
             clips_dir = _game_shelf(self.base, "clip")
             out_final = os.path.join(clips_dir, f"{self.base}_clip_{stamp}.mp4")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -7223,7 +8133,7 @@ class Session:
             # segment' guess was wrong by up to +-2s depending on how young the
             # open segment was - that's the 'clip sound is 1-2s early' bug.
             user_ms = int(SETTINGS.get("audio_offset_ms", 0))
-            off_sys = off_mic = user_ms
+            off_sys = off_mic = off_voice = off_game = user_ms
             lo = -int((2 * seg + 6) * 1000)     # head-trim can legitimately be ~2 segments
             try:
                 v_t0 = os.path.getmtime(use[-1]) - d
@@ -7243,12 +8153,24 @@ class Session:
                     return max(lo, min(max(8000, int(d * 1000) + 2000), o))
                 off_sys = _off(sys_wav, "system")
                 off_mic = _off(mic_wav, "mic")
+                off_voice = _off(voice_wav, "voice")
+                off_game = _off(game_wav, "game")
                 if sys_wav or mic_wav:
-                    log(f"Clip A/V sync: system {off_sys:+d} ms, mic {off_mic:+d} ms")
+                    log(f"Clip A/V sync: system {off_sys:+d} ms, mic {off_mic:+d} ms"
+                        + (f", voice {off_voice:+d} ms" if voice_wav else "")
+                        + (f", game {off_game:+d} ms" if game_wav else ""))
             except Exception:
                 pass
+            taps = []
+            if voice_wav:
+                taps.append({"label": "Voice", "path": voice_wav,
+                             "off": off_voice, "secs": None})
+            if game_wav:
+                taps.append({"label": "Game", "path": game_wav,
+                             "off": off_game, "secs": None})
+            _MUX_SAID["one_track"] = False
             cmd = build_mux_cmd(clip_video, sys_wav, mic_wav, out_final,
-                                off_sys, off_mic)
+                                off_sys, off_mic, taps=taps)
             cmd = cmd[:-1] + ["-t", f"{d:.3f}", cmd[-1]]   # end audio WITH the video
             try:
                 # Bounded so a stuck encoder can't hold the replay lock (and wedge
@@ -7258,7 +8180,7 @@ class Session:
             except subprocess.TimeoutExpired:
                 log("Replay: clip mux timed out; skipping this clip.")
                 return None
-            for p in (clip_video, sys_wav, mic_wav):
+            for p in (clip_video, sys_wav, mic_wav, voice_wav, game_wav):
                 if p and os.path.isfile(p):
                     try:
                         os.remove(p)
@@ -7279,7 +8201,7 @@ class Session:
         finally:
             self._replay_lock.release()
 
-    def _assemble(self, segs, sys_wav, mic_wav, out, run=None):
+    def _assemble(self, segs, sys_wav, mic_wav, out, run=None, want_taps=()):
         """Turn the captured segments + audio into one finished file. Two proven
         steps: (1) concatenate the segments with no re-encode into a single file -
         this is the codec-safe route that survives every encoder, including AMD's
@@ -7294,10 +8216,45 @@ class Session:
         the skew from (video length - audio length), which silently included every
         second the loopback device spent idle (WASAPI sends nothing during
         silence) and over-delayed the whole track - the '4-6 seconds late' bug.
-        The duration guess remains only as a fallback when anchors are missing."""
+        The duration guess remains only as a fallback when anchors are missing.
+
+        3.31 THE LAYERS ride the same anchors: run['voice'] / run['game']
+        (wall-clock-filled wavs) with run['voice_t0'] / run['game_t0'],
+        bound as their own titled tracks (see build_mux_cmd). want_taps
+        names the labels every run-final of this session must carry; a
+        label a run lacks is bound as a silent placeholder so the runs
+        concatenate. On a tap night every audio input is probed first (an
+        unreadable wav would fail the whole bind), and a bind that fails
+        WITH the tap tracks is tried once more without them before the
+        two-step route - a graph error must never cost the night. A run
+        with no taps takes exactly the 3.30 path."""
         if not segs:
             return False
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        run = run or {}
+        voice_wav = run.get("voice") if (run.get("voice")
+                                         and os.path.isfile(run["voice"])) else None
+        game_wav = run.get("game") if (run.get("game")
+                                       and os.path.isfile(run["game"])) else None
+        want_taps = set(want_taps or ())
+        tap_night = bool(voice_wav or game_wav or want_taps)
+        if tap_night:
+            # pre-validate EVERY audio input: an empty layer is dropped, not
+            # fatal (the no-tap path keeps today's arguments untouched)
+            probed = []
+            for lab, w in (("System", sys_wav), ("Mic", mic_wav),
+                           ("Voice", voice_wav), ("Game", game_wav)):
+                if not w or not os.path.isfile(w):
+                    probed.append(None)
+                    continue
+                dur = _probe_duration(w)
+                if dur is None or dur < 0.05:
+                    log(f"A/V: the {lab} track's audio was empty - bound "
+                        f"without it.")
+                    probed.append(None)
+                else:
+                    probed.append(w)
+            sys_wav, mic_wav, voice_wav, game_wav = probed
         # FAST PATH: mux STRAIGHT from the segment list (concat demuxer input).
         # The old route wrote a multi-GB '_merged.mp4' first and then copied all
         # of it AGAIN into the final - two full disk passes, which is most of
@@ -7326,9 +8283,9 @@ class Session:
             video_src = merged
         # 2. Per-stream A/V offsets from wall-clock anchors.
         user_ms = int(SETTINGS.get("audio_offset_ms", 0))
-        off_sys = off_mic = user_ms
-        run = run or {}
-        if sys_wav or mic_wav:
+        off_sys = off_mic = off_voice = off_game = user_ms
+        vdur = None        # the probed picture length, when a branch has it
+        if sys_wav or mic_wav or voice_wav or game_wav:
             # Video t0, wallclock. Preferred: the FIRST segment's own clock -
             # its mtime is the moment the muxer finalised it (= its last frame),
             # so mtime - duration = the first captured frame. One cheap probe,
@@ -7348,11 +8305,16 @@ class Session:
                 v_end = run.get("v_end_wall")
                 if vdur is not None and v_end is not None:
                     v_t0 = v_end - vdur
-            if v_t0 is not None and (run.get("sys_t0") or run.get("mic_t0")):
+            if v_t0 is not None and (run.get("sys_t0") or run.get("mic_t0")
+                                     or run.get("voice_t0") or run.get("game_t0")):
                 if sys_wav and run.get("sys_t0"):
                     off_sys = int(round((run["sys_t0"] - v_t0) * 1000)) + user_ms
                 if mic_wav and run.get("mic_t0"):
                     off_mic = int(round((run["mic_t0"] - v_t0) * 1000)) + user_ms
+                if voice_wav and run.get("voice_t0"):
+                    off_voice = int(round((run["voice_t0"] - v_t0) * 1000)) + user_ms
+                if game_wav and run.get("game_t0"):
+                    off_game = int(round((run["game_t0"] - v_t0) * 1000)) + user_ms
                 # A LARGE positive offset is legitimate: a game silent through a
                 # long splash/menu means the first loopback sample genuinely
                 # arrives that late, and the audio belongs exactly there. Only
@@ -7361,8 +8323,12 @@ class Session:
                 hi = max(8000, int((vdur if vdur else len(segs) * segsec) * 1000))
                 off_sys = max(-8000, min(hi, off_sys))
                 off_mic = max(-8000, min(hi, off_mic))
+                off_voice = max(-8000, min(hi, off_voice))
+                off_game = max(-8000, min(hi, off_game))
                 log(f"A/V sync: video t0 anchored; system {off_sys:+d} ms, "
-                    f"mic {off_mic:+d} ms")
+                    f"mic {off_mic:+d} ms"
+                    + (f", voice {off_voice:+d} ms" if voice_wav else "")
+                    + (f", game {off_game:+d} ms" if game_wav else ""))
             else:
                 # fallback: the legacy duration guess (anchors unavailable).
                 # Needs the total video length - probe FIRST + LAST segment and
@@ -7380,10 +8346,11 @@ class Session:
                             vdur = None
                     else:
                         vdur = _probe_duration(video_src)
-                adur = _probe_duration(sys_wav or mic_wav)
+                adur = _probe_duration(sys_wav or mic_wav or voice_wav or game_wav)
                 if vdur is not None and adur is not None:
                     off_sys = off_mic = max(-6000, min(6000,
                         int(round((vdur - adur) * 1000)) + user_ms))
+                    off_voice = off_game = off_sys
                     log(f"A/V sync (fallback): video {vdur:.2f}s vs audio "
                         f"{adur:.2f}s -> {off_sys:+d} ms")
         # 3. Mux to a temp file, then rename so the final appears atomically.
@@ -7404,10 +8371,39 @@ class Session:
         _BINDING.update({"name": os.path.basename(out), "pct": None, "eta": None,
                          "mbps": None, "t0": time.time(), "total": bind_total,
                          "tok": _btok})
+        # the tap tracks: the real layers with their own offsets, and a
+        # silent placeholder for a label this run lacked but another had
+        taps = []
+        if voice_wav:
+            taps.append({"label": "Voice", "path": voice_wav, "off": off_voice,
+                         "secs": None})
+        if game_wav:
+            taps.append({"label": "Game", "path": game_wav, "off": off_game,
+                         "secs": None})
+        # A PLACEHOLDER MUST NEVER OUTLIVE THE PICTURE: the concat demuxer
+        # takes a run's length from its LONGEST stream, so silence running
+        # 2 s past the last frame opened a 2 s frozen hole before the next
+        # run of the stitched night (measured). The probed picture length
+        # when a branch has it, else the session estimate above; a
+        # placeholder shorter than the picture only leaves silence inside
+        # its own run, which is what it is anyway.
+        ph_secs = float(vdur) if vdur else float(bind_total)
+        if ph_secs <= 0:
+            # every probe failed (the bind is unlikely to survive either):
+            # the closed segments' nominal length, never the open tail
+            ph_secs = max(0.5, (len(segs) - 1) * max(
+                2, int(SETTINGS.get("segment_seconds", 4))))
+        for L in ("Voice", "Game"):
+            if L in want_taps and not any(t["label"] == L for t in taps):
+                taps.append({"label": L, "path": None, "off": 0,
+                             "secs": ph_secs})
+                log(f"Run had no {L} sound (Discord closed, or its tap failed) "
+                    f"- a silent {L} track keeps the file's layout.")
+        _MUX_SAID["one_track"] = False
 
-        def _mux(src, is_concat):
+        def _mux(src, is_concat, taps=taps):
             cmd = build_mux_cmd(src, sys_wav, mic_wav, tmp_out, off_sys, off_mic,
-                                video_is_concat=is_concat)
+                                video_is_concat=is_concat, taps=taps)
             # live progress on stdout (out_time_us lines); stderr kept for errors
             cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
             t_start = time.time()
@@ -7492,13 +8488,19 @@ class Session:
             return good
 
         ok = _mux(video_src, src_is_concat)
+        if not ok and taps:
+            # a graph error on the tap tracks must never cost the night
+            log("Bind with the Voice/Game tracks failed; binding again "
+                "without them.")
+            taps = []
+            ok = _mux(video_src, src_is_concat, taps)
         if not ok and src_is_concat:
             # Direct route rejected on this machine: fall back to the proven
             # two-step (write merged, then mux from it).
             log("Direct save failed; using the two-step route.")
             merged = os.path.join(self.tmp, "_merged.mp4")
             if _concat_copy(SETTINGS["ffmpeg_path"], segs, merged):
-                ok = _mux(merged, False)
+                ok = _mux(merged, False, taps)
         for p in (list_path, merged):
             if p:
                 try:
@@ -7529,6 +8531,43 @@ class Session:
         except Exception:
             pass
         return False
+
+    def _write_src_sidecar(self):
+        """<name>.src.json beside the other sidecars: the ONE record of
+        what this recording captured by source - which layers exist, from
+        which exe, whether a media layer was even possible, and per run
+        which layers were real (a placeholder track is honest only with
+        this beside it). Written ONLY when a run carried a voice or game
+        layer: absence means 'Mix/System/Mic only', for every pre-3.31
+        night and every 3.31 night where no layer was live. 'src' is not
+        in _ATTIC_OF - it is a recording fact, not a lane product, so a
+        fresh pass never archives it."""
+        runs = list(self.runs or [])
+        if not any(r.get("voice") or r.get("game") for r in runs):
+            return
+
+        def _first(kind):
+            for r in runs:
+                m = (r.get("sources") or {}).get(kind) or {}
+                if m.get("exe"):
+                    return m["exe"]
+            return None
+        doc = {"v": 1,
+               "capture_by_source": bool(SETTINGS.get("capture_by_source")),
+               "game_audio_only": bool(SETTINGS.get("game_audio_only")),
+               "layers": {"voice": any(bool(r.get("voice")) for r in runs),
+                          "game": any(bool(r.get("game")) for r in runs),
+                          "media": any((r.get("sources") or {}).get("media")
+                                       == "loopback" for r in runs)},
+               "voice_exe": _first("voice"), "game_exe": _first("game"),
+               "runs": [{"voice": bool(r.get("voice")), "game": bool(r.get("game")),
+                         "voice_t0": r.get("voice_t0"), "game_t0": r.get("game_t0"),
+                         "sys_t0": r.get("sys_t0"), "mic_t0": r.get("mic_t0"),
+                         "v_end_wall": r.get("v_end_wall"),
+                         "sources": r.get("sources")} for r in runs]}
+        p = _ai_sidecar(self.final, "src")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        _atomic_write_json(p, doc)
 
     def _cleanup(self):
         # Remove the whole temp folder (segments, wavs, concatenated video). Take
@@ -8808,7 +9847,10 @@ def _watch_core(ctl):
         parts.append("mic" + (f" [{SETTINGS['mic_name_contains']}]"
                               if SETTINGS["mic_name_contains"] else ""))
     log("Audio: " + (" + ".join(parts) if parts else "none") +
-        (f"  [{SETTINGS['audio_mode']}]" if len(parts) == 2 else ""))
+        (f"  [{SETTINGS['audio_mode']}]" if len(parts) == 2 else "") +
+        (" + sources (Discord/Steam voice tap, game tap -> Mix/Voice/Game/Mic)"
+         if SETTINGS.get("capture_by_source") and SETTINGS["capture_system"]
+         else ""))
 
     if SETTINGS.get("ai_transcribe", True) and _reader_paths() is None:
         log("The tome's reader isn't installed next to the app; "
@@ -24025,6 +25067,88 @@ def _mic_trouble():
     return ""
 
 
+def _sources_state(active=True):
+    """state()['sources']: how this night is being heard, from _TAPWATCH
+    alone (no syscalls) - {voice: {exe, state, fixes}, game: {...},
+    media: 'loopback'|'none', on: bool, note: str}. The note is one
+    plain sentence for the status strip and the Working page; its short
+    form is the text before ' - ' (an em dash). Empty while nothing is
+    being recorded, so an old row never describes a night that ended."""
+    on = bool(SETTINGS.get("capture_by_source")) and bool(
+        SETTINGS.get("capture_system", True))
+    out = {}
+    for k in ("voice", "game"):
+        w = _TAPWATCH.get(k) or {}
+        out[k] = {"exe": str(w.get("exe") or ""),
+                  "state": str(w.get("state") or ""),
+                  "fixes": int(w.get("fixes") or 0)}
+    out["media"] = str(_TAPWATCH.get("media") or "none")
+    out["on"] = on
+    # the two switches, so the note with 'by source' off can say which
+    # of the speakers and the mic this night actually keeps
+    out["system"] = bool(SETTINGS.get("capture_system", True))
+    out["mic"] = bool(SETTINGS.get("capture_mic", True))
+    out["note"] = _sources_note(out) if active else ""
+    return out
+
+
+def _sources_note(st):
+    """The sentence behind state()['sources'].note (see _sources_state).
+    'live'/'reconnected' means a layer is being heard on its own; every
+    other state says, by name, why it is not."""
+    try:
+        dash = " \u2014 "
+        if not st.get("on"):
+            # worded from the switches: with the loopback off there is no
+            # 'whatever the speakers played' to promise
+            sys_on = bool(st.get("system", True))
+            mic_on = bool(st.get("mic", True))
+            if sys_on and mic_on:
+                return ("everything, as one" + dash + "one stream of whatever the "
+                        "speakers played, plus your mic.")
+            if mic_on:
+                return ("your mic only" + dash + "the speakers are not being "
+                        "recorded, so nothing but your voice is heard.")
+            if sys_on:
+                return ("everything, as one" + dash + "one stream of whatever the "
+                        "speakers played; your mic is off.")
+            return "no sound" + dash + "both sound switches are off."
+        vs = str((st.get("voice") or {}).get("state") or "")
+        gs = str((st.get("game") or {}).get("state") or "")
+        vexe = str((st.get("voice") or {}).get("exe") or "")
+        who = "Discord" if (not vexe or vexe.startswith("discord")) else vexe
+        c = vs in ("live", "reconnected")
+        g = gs in ("live", "reconnected")
+        if c and g:
+            return ("by source" + dash + "the game, " + who + " and your mic "
+                    "are each heard on their own. What you hear stays in the "
+                    "video; only the room makes gold marks.")
+        if vs == "gone":
+            vwhy = who + " closed - the room is your mic alone from here."
+        elif vs in ("failed", "dead"):
+            vwhy = who + " could not be heard on its own, so the room is your mic alone."
+        else:
+            vwhy = (who + " was not running when this began, so the room is "
+                    "your mic alone.")
+        if gs == "gone":
+            gwhy = "the game closed - its sound rides the mix from here."
+        elif gs in ("failed", "dead"):
+            gwhy = ("the game could not be heard on its own tonight, so its "
+                    "sound rides the mix and nothing is marked as the game.")
+        else:
+            gwhy = ("no game process was found to follow, so its sound rides "
+                    "the mix and nothing is marked as the game.")
+        if c and not g:
+            return "by source" + dash + who + " and your mic; " + gwhy
+        if g and not c:
+            return "by source" + dash + "the game and your mic; " + vwhy
+        return ("everything, as one" + dash + "neither the game nor " + who
+                + " could be heard on its own; this night is recorded the "
+                "old way, nothing told apart.")
+    except Exception:
+        return ""
+
+
 class _JsApi:
     def __init__(self, ctl):
         self._ctl = ctl
@@ -24089,6 +25213,7 @@ class _JsApi:
                 mic_bad = ""
         return {"status": s, "game": game, "elapsed": elapsed,
                 "mic_trouble": mic_bad,
+                "sources": _sources_state(s in ("recording", "paused")),
                 "saving": getattr(ctl, "saving", 0) > 0,
                 "binding": binding,
                 "ai": ({"kind": ai_busy[0], "name": ai_busy[1]}

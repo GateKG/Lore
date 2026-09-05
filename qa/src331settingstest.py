@@ -170,6 +170,24 @@ check("_prewarm_proctap is defined after _pa_close",
 check("nothing else imports proctap at module level",
       not re.search(r"^(?:import proctap|from proctap)", SRC, re.M))
 
+print("\n--- _sources_note with 'by source' off (stage C) ---")
+note = extract("_sources_note", ns)
+check("both switches on: the old sentence",
+      note({"on": False, "system": True, "mic": True}).startswith(
+          "everything, as one \u2014 one stream of whatever the speakers played, plus your mic."))
+check("the loopback off: 'your mic only'",
+      note({"on": False, "system": False, "mic": True}).startswith("your mic only \u2014 "))
+check("the mic off: the speakers, and 'your mic is off'",
+      note({"on": False, "system": True, "mic": False}).startswith("everything, as one")
+      and "your mic is off" in note({"on": False, "system": True, "mic": False}))
+check("both off: 'no sound'",
+      note({"on": False, "system": False, "mic": False}).startswith("no sound \u2014 "))
+check("a state without the switches reads as before",
+      note({"on": False}).startswith("everything, as one"))
+check("_sources_state carries the two switches for it",
+      'out["system"] = bool(SETTINGS.get("capture_system", True))' in SRC
+      and 'out["mic"] = bool(SETTINGS.get("capture_mic", True))' in SRC)
+
 print("\n--- ui.html ---")
 m = re.search(r"get_settings:async\(\)=>\(\{settings:\{(.*?)\}\}\)", USRC, re.S)
 mock = m.group(1) if m else ""

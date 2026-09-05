@@ -85,7 +85,7 @@ ns = {"os": os, "json": json, "subprocess": subprocess, "time": time,
       "SETTINGS": {"ffmpeg_path": FF, "audio_mode": "separate"},
       "_AI": {"proc": None, "abort": False}, "_popen": subprocess.Popen,
       "log": SAID.append}
-for nm in ("_TRK_MIX", "_LAYERS", "_Layer"):
+for nm in ("_TRK_MIX", "_LAYERS", "_Layer", "_MUX_SAID"):
     lift_assign(nm, ns)
 for nm in ("_audio_track_names", "_track_for", "_mic_track", "_voice_track",
            "_game_track", "_mix_audio_args", "_fan_args", "_layer_args",
@@ -318,18 +318,13 @@ rc = run([FF, "-y", "-v", "error", "-i", VID, "-i", SYS_, "-i", MIC_,
           "-metadata:s:a:1", "title=Mic", F_PRE])
 check("a pre-3.10 separate file (System/Mic, no Mix)",
       rc == 0 and names_of(F_PRE) == ["system", "mic"])
-# the 3.31 layout, hand-bound here (build_mux_cmd learns taps in stage B):
+# the 3.31 layout, bound by the REAL build_mux_cmd(taps=) (stage B):
 # Mix = System + Mic at parity, then Voice, Game, Mic as their own tracks
 F_NEW = os.path.join(TD, "new.mp4")
-rc = run([FF, "-y", "-v", "error", "-i", VID, "-i", SYS_, "-i", VOI_,
-          "-i", GAM_, "-i", MIC_, "-filter_complex",
-          "[1:a][4:a]amix=inputs=2:duration=longest:normalize=0[a]",
-          "-map", "0:v", "-map", "[a]", "-map", "2:a", "-map", "3:a",
-          "-map", "4:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-          "-metadata:s:a:0", "title=Mix", "-metadata:s:a:1", "title=Voice",
-          "-metadata:s:a:2", "title=Game", "-metadata:s:a:3", "title=Mic",
-          F_NEW])
-check("a Mix/Voice/Game/Mic night binds",
+TAPS2 = [{"label": "Voice", "path": VOI_, "off": 0, "secs": None},
+         {"label": "Game", "path": GAM_, "off": 0, "secs": None}]
+rc = run(build_mux_cmd(VID, SYS_, MIC_, F_NEW, taps=TAPS2))
+check("a Mix/Voice/Game/Mic night binds through build_mux_cmd(taps=)",
       rc == 0 and names_of(F_NEW) == ["mix", "voice", "game", "mic"])
 
 nm_old = names_of(F_OLD)
@@ -588,6 +583,333 @@ check("_title_maps restates every known title by index and skips the rest",
       ["-metadata:s:a:0", "title=Mix", "-metadata:s:a:1", "title=Voice",
        "-metadata:s:a:3", "title=Mic"]
       and _title_maps_probe([]) == [])
+
+# ---------------------------------------------------------------------------
+# THE MUX WITH SOURCES (stage B) - numbered by the mux spec's tests
+print("\n--- M2: the taps graph ---")
+
+
+def maps_of(c):
+    return [c[i + 1] for i in range(len(c) - 1) if c[i] == "-map"]
+
+
+def titles_of(c):
+    return [c[i + 1].split("=", 1)[1] for i in range(len(c) - 1)
+            if c[i].startswith("-metadata:s:a:")]
+
+
+def graph_of(c):
+    return c[c.index("-filter_complex") + 1]
+
+
+SAID[:] = []
+c = build_mux_cmd("VID", SYSW, MICW, "OUT", taps=TAPS2)
+g = graph_of(c)
+check("inputs in the fixed order System, Voice, Game, Mic",
+      [c[i + 1] for i in range(len(c) - 1) if c[i] == "-i"]
+      == ["VID", SYSW, VOI_, GAM_, MICW])
+check("maps: video, the Mix, Voice and Game direct, the Mic split",
+      maps_of(c) == ["0:v", "[a]", "[a1]", "[a2]", "[t3]"])
+check("titles in order Mix, Voice, Game, Mic - NO System track",
+      titles_of(c) == ["Mix", "Voice", "Game", "Mic"])
+check("exactly one amix, of System + Mic (the taps are NOT summed into the Mix)",
+      g.count("amix=") == 1 and "[a0][s3]amix=inputs=2:duration=longest:normalize=0[a]" in g
+      and "[a3]asplit=2[s3][t3]" in g and "[a0]asplit" not in g)
+check("each tap carries its own offset",
+      "[2:a]aresample=48000,aformat=channel_layouts=stereo,adelay=delays=150:all=1[a1]"
+      in graph_of(build_mux_cmd("VID", SYSW, MICW, "OUT", taps=[
+          {"label": "Voice", "path": VOI_, "off": 150, "secs": None}]))
+      and ",atrim=start=0.200,asetpts=PTS-STARTPTS[a1]" in graph_of(
+          build_mux_cmd("VID", SYSW, MICW, "OUT", taps=[
+              {"label": "Game", "path": GAM_, "off": -200, "secs": None}])))
+check("a lone tap takes the layered route: Mix + its own titled track",
+      titles_of(build_mux_cmd("VID", SYSW, None, "OUT", taps=[TAPS2[0]]))
+      == ["Mix", "Voice"])
+check("no 'one track' line in 'separate' mode", SAID == [])
+check("taps=[] and taps=None are today's command, token for token",
+      build_mux_cmd("VID", SYSW, MICW, "OUT", taps=[])
+      == build_mux_cmd("VID", SYSW, MICW, "OUT")
+      == [FF if x == "FF" else SYSW if x == "SYS" else MICW if x == "MIC" else x
+          for x in OLD_MUX["separate"]])
+
+print("\n--- M3: no loopback ---")
+c = build_mux_cmd("VID", None, MICW, "OUT", taps=TAPS2)
+g = graph_of(c)
+check("Mix = amix of Voice, Game and Mic (the taps join the Mix only without the loopback)",
+      "[s0][s1][s2]amix=inputs=3:duration=longest:normalize=0[a]" in g
+      and g.count("asplit=2") == 3)
+check("titles Mix, Voice, Game, Mic; maps the split halves",
+      titles_of(c) == ["Mix", "Voice", "Game", "Mic"]
+      and maps_of(c) == ["0:v", "[a]", "[t0]", "[t1]", "[t2]"])
+c = build_mux_cmd("VID", None, None, "OUT", taps=[TAPS2[0]])
+check("a Voice tap alone: the Mix is that one member (anull), plus the Voice track",
+      "[s0]anull[a]" in graph_of(c) and titles_of(c) == ["Mix", "Voice"])
+
+print("\n--- M4: 'one track' set while sources were captured ---")
+SAID[:] = []
+ns["_MUX_SAID"]["one_track"] = False
+ns["SETTINGS"]["audio_mode"] = "mix"
+c = build_mux_cmd("VID", SYSW, MICW, "OUT", taps=TAPS2)
+c2 = build_mux_cmd("VID", SYSW, MICW, "OUT", taps=TAPS2)
+ns["SETTINGS"]["audio_mode"] = "separate"
+check("bound layered anyway", titles_of(c) == ["Mix", "Voice", "Game", "Mic"]
+      and c == c2)
+check("exactly ONE line containing 'bound layered' across two calls of one bind",
+      sum(1 for m in SAID if "bound layered" in m) == 1
+      and "'one track' is set, but sources were captured" in SAID[0])
+ns["SETTINGS"]["audio_mode"] = "mix"
+c = build_mux_cmd("VID", SYSW, MICW, "OUT")
+ns["SETTINGS"]["audio_mode"] = "separate"
+check("...and 'mix' with no taps is still today's one-track command",
+      c == [FF if x == "FF" else SYSW if x == "SYS" else MICW if x == "MIC" else x
+            for x in OLD_MUX["mix"]])
+
+print("\n--- M5: placeholders ---")
+c = build_mux_cmd("VID", SYSW, MICW, "OUT",
+                  taps=[{"label": "Voice", "path": None, "off": 0, "secs": 3.0}])
+i = c.index("anullsrc=r=48000:cl=stereo")
+check("a silent Voice placeholder: '-f lavfi -t 3.000 -i anullsrc', a Voice title",
+      c[i - 5:i] == ["-f", "lavfi", "-t", "3.000", "-i"]
+      and titles_of(c) == ["Mix", "Voice", "Mic"])
+c = build_mux_cmd("VID", SYSW, MICW, "OUT", taps=[
+    {"label": "Voice", "path": VOI_, "off": 0, "secs": None},
+    {"label": "Voice", "path": GAM_, "off": 0, "secs": None}])
+check("two Voice inputs -> one pre-sum amix and a single Voice title",
+      "[a1][a2]amix=inputs=2:duration=longest:normalize=0[v1]" in graph_of(c)
+      and titles_of(c) == ["Mix", "Voice", "Mic"] and maps_of(c) == ["0:v", "[a]", "[v1]", "[t3]"])
+c = build_mux_cmd("VID", SYSW, MICW, "OUT", taps=[
+    {"label": "Voice", "path": None, "off": 0, "secs": 3.0},
+    {"label": "Voice", "path": VOI_, "off": 0, "secs": None}])
+check("a placeholder beside a real Voice is dropped",
+      "anullsrc" not in " ".join(c) and titles_of(c) == ["Mix", "Voice", "Mic"])
+c = build_mux_cmd("VID", SYSW, MICW, "OUT", taps=[
+    {"label": "Voice", "path": None, "off": 0, "secs": None},
+    {"label": "Game", "path": os.path.join(TD, "nope.wav"), "off": 0, "secs": None}])
+check("a tap with no path and no secs, or a missing file, is skipped (today's command)",
+      c == build_mux_cmd("VID", SYSW, MICW, "OUT"))
+F_PH = os.path.join(TD, "placeholder.mp4")
+rc = run(build_mux_cmd(VID, SYS_, MIC_, F_PH, taps=[
+    {"label": "Voice", "path": None, "off": 0, "secs": 4.0},
+    {"label": "Game", "path": GAM_, "off": 0, "secs": None}]))
+check("a placeholder night really binds: titles Mix, Voice, Game, Mic",
+      rc == 0 and names_of(F_PH) == ["mix", "voice", "game", "mic"])
+sp = spectrum(F_PH, "voice")
+check("...and its Voice track is silence (no tone stands over the floor)",
+      sp and all(sp[h] < 30 for h in (200, 900, 1500, 3000)))
+
+# (M6 is T7 above: the real bind of the 2 s Mix/Voice/Game/Mic night through
+#  build_mux_cmd(taps=), its titles by ffprobe and each layer's tones by FFT)
+
+print("\n--- M10: _assemble's union layout on real ffmpeg ---")
+import types
+sys.path.insert(0, ROOT)
+import lore  # noqa: E402
+LSAID = []
+lore.log = LSAID.append
+lore.load_settings()
+lore.SETTINGS.update({"ffmpeg_path": FF, "audio_mode": "separate",
+                      "audio_offset_ms": 0, "segment_seconds": 2})
+TD10 = os.path.join(TD, "asm")
+os.makedirs(TD10)
+
+
+def seg(name):
+    p = os.path.join(TD10, name)
+    run([FF, "-y", "-v", "error", "-f", "lavfi", "-i",
+         "testsrc=size=160x90:rate=10:duration=2", "-c:v", "libx264",
+         "-pix_fmt", "yuv420p", "-g", "12", p])
+    return p
+
+
+S1, S2 = seg("seg_000000.mp4"), seg("seg_000001.mp4")
+EMPTY = os.path.join(TD10, "empty_voice.wav")
+open(EMPTY, "wb").close()
+
+
+def anchors(segp):
+    t0 = os.path.getmtime(segp) - 2.0
+    return {"sys_t0": t0, "mic_t0": t0, "voice_t0": t0, "game_t0": t0,
+            "v_end_wall": t0 + 2.0, "nseg": 1}
+
+
+fake = types.SimpleNamespace(tmp=TD10, runs=[])
+fake._assemble = types.MethodType(lore.Session._assemble, fake)
+run1 = dict(anchors(S1), sys=SYS_, mic=MIC_, voice=VOI_, game=None)
+run2 = dict(anchors(S2), sys=SYS_, mic=MIC_, voice=None, game=None)
+F1, F2 = os.path.join(TD10, "_runf0.mp4"), os.path.join(TD10, "_runf1.mp4")
+del LSAID[:]
+ok1 = fake._assemble([S1], SYS_, MIC_, F1, run1, want_taps={"Voice"})
+ok2 = fake._assemble([S2], SYS_, MIC_, F2, run2, want_taps={"Voice"})
+check("both run-finals bind", ok1 and ok2 and os.path.isfile(F1) and os.path.isfile(F2))
+check("both carry the SAME four titles: Mix, Voice, Mic (+ nothing else)",
+      names_of(F1) == names_of(F2) == ["mix", "voice", "mic"])
+check("run 2 says it got a placeholder",
+      any("Run had no Voice sound" in m and "a silent Voice track keeps the file's layout" in m
+          for m in LSAID))
+check("the sync log names the voice offset only where the wav exists",
+      any(m.startswith("A/V sync: video t0 anchored;") and ", voice " in m for m in LSAID)
+      and any(m.startswith("A/V sync: video t0 anchored;") and ", voice " not in m
+              for m in LSAID))
+STITCH = os.path.join(TD10, "stitched.mp4")
+check("_concat_copy of the two succeeds and the length is the sum",
+      lore._concat_copy(FF, [F1, F2], STITCH)
+      and abs((ns["_probe_duration"](STITCH) if "_probe_duration" in ns
+               else lore._probe_duration(STITCH)) - 4.0) < 0.35)
+sp = spectrum(F1, "voice")
+check("run 1's Voice track carries Discord (1500) alone",
+      carries(sp, (1500,), (200, 900, 3000)))
+del LSAID[:]
+F3 = os.path.join(TD10, "_runf2.mp4")
+run3 = dict(anchors(S1), sys=SYS_, mic=MIC_, voice=EMPTY, game=GAM_)
+ok3 = fake._assemble([S1], SYS_, MIC_, F3, run3, want_taps={"Voice", "Game"})
+check("an empty voice wav is dropped, said, and the bind still succeeds",
+      ok3 and any("the Voice track's audio was empty - bound without it" in m for m in LSAID)
+      and names_of(F3) == ["mix", "voice", "game", "mic"])
+check("...its Voice track became the placeholder (silent), the Game is real",
+      all(v < 30 for v in spectrum(F3, "voice").values())
+      and carries(spectrum(F3, "game"), (3000,), (200, 900, 1500)))
+del LSAID[:]
+F4 = os.path.join(TD10, "_runf3.mp4")
+run4 = dict(anchors(S1), sys=SYS_, mic=MIC_, voice=None, game=None)
+ok4 = fake._assemble([S1], SYS_, MIC_, F4, run4)
+check("a run with no taps and no want binds today's Mix/System/Mic",
+      ok4 and names_of(F4) == ["mix", "system", "mic"]
+      and not any("empty" in m or "placeholder" in m for m in LSAID))
+# the retry rung: a tap path that is a real file but not audio
+BAD = os.path.join(TD10, "bad_voice.wav")
+open(BAD, "wb").write(b"RIFF" + b"\x00" * 4000)
+del LSAID[:]
+F5 = os.path.join(TD10, "_runf4.mp4")
+real_probe = lore._probe_duration
+lore._probe_duration = lambda p: (1.0 if p == BAD else real_probe(p))
+run5 = dict(anchors(S1), sys=SYS_, mic=MIC_, voice=BAD, game=None)
+ok5 = fake._assemble([S1], SYS_, MIC_, F5, run5)
+lore._probe_duration = real_probe
+check("a bind that fails WITH the tap tracks is bound again without them",
+      ok5 and any("Bind with the Voice/Game tracks failed; binding again without them." in m
+                  for m in LSAID) and names_of(F5) == ["mix", "system", "mic"])
+
+print("\n--- M10b: the run-final stitch keeps every titled track (real render) ---")
+FFP = os.path.join(FFDIR, "ffprobe.exe")
+
+
+def vpts(path):
+    """The video packets' pts, sorted, by ffprobe -show_packets."""
+    r = subprocess.run([FFP, "-v", "error", "-select_streams", "v:0",
+                        "-show_packets", "-of", "json", path],
+                       capture_output=True, timeout=60,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    pk = json.loads(r.stdout.decode("utf-8", "ignore") or "{}").get("packets", [])
+    return sorted(float(p.get("pts_time") or p.get("dts_time") or 0) for p in pk)
+
+
+CMDS = []
+real_popen = lore._popen
+
+
+def spy_popen(cmd, **kw):
+    CMDS.append(list(cmd))
+    return real_popen(cmd, **kw)
+
+
+lore._popen = spy_popen
+runA = dict(anchors(S1), sys=SYS_, mic=MIC_, voice=VOI_, game=GAM_)
+runB = dict(anchors(S2), sys=SYS_, mic=MIC_, voice=VOI_, game=GAM_)
+FA, FB = os.path.join(TD10, "_runfA.mp4"), os.path.join(TD10, "_runfB.mp4")
+okA = fake._assemble([S1], SYS_, MIC_, FA, runA, want_taps={"Voice", "Game"})
+okB = fake._assemble([S2], SYS_, MIC_, FB, runB, want_taps={"Voice", "Game"})
+check("two 2 s Mix/Voice/Game/Mic run-finals bind",
+      okA and okB and names_of(FA) == names_of(FB) == ["mix", "voice", "game", "mic"])
+ST_OLD = os.path.join(TD10, "stitch_old.mp4")
+ST_NEW = os.path.join(TD10, "stitch_new.mp4")
+del CMDS[:]
+ok_old = lore._concat_copy(FF, [FA, FB], ST_OLD)
+cmd_old = list(CMDS[-1])
+del CMDS[:]
+ok_new = lore._concat_copy(FF, [FA, FB], ST_NEW, keep_tracks=True)
+cmd_new = list(CMDS[-1])
+check("the bare '-c copy' stitch (every other caller) keeps ONE untitled track - the measured bug",
+      ok_old and len(names_of(ST_OLD)) == 1)
+check("keep_tracks: the stitched night carries Mix, Voice, Game, Mic in order, titled",
+      ok_new and names_of(ST_NEW) == ["mix", "voice", "game", "mic"])
+check("...and its length is the sum of the runs",
+      abs(lore._probe_duration(ST_NEW) - 4.0) < 0.35)
+check("...each layer of the stitch still carries only its own tone",
+      carries(spectrum(ST_NEW, "voice"), (1500,), (200, 900, 3000))
+      and carries(spectrum(ST_NEW, "game"), (3000,), (200, 900, 1500))
+      and carries(spectrum(ST_NEW, "mic"), (900,), (200, 1500, 3000)))
+check("the keep_tracks command maps 0:v:0 and 0:a? and restates the four titles",
+      cmd_new[cmd_new.index("-i") + 2:cmd_new.index("-c")]
+      == ["-map", "0:v:0", "-map", "0:a?",
+          "-metadata:s:a:0", "title=Mix", "-metadata:s:a:1", "title=Voice",
+          "-metadata:s:a:2", "title=Game", "-metadata:s:a:3", "title=Mic"])
+check("...the default command is byte-identical to before (no -map, no titles)",
+      "-map" not in cmd_old and not any(a.startswith("-metadata") for a in cmd_old)
+      and cmd_old[:cmd_old.index("-i")] == cmd_new[:cmd_new.index("-i")]
+      and cmd_old[-3:-1] == cmd_new[-3:-1] == ["-c", "copy"]
+      and cmd_old[cmd_old.index("-i") + 2:] == ["-c", "copy", ST_OLD])
+check("only the run-final stitch passes keep_tracks (the source)",
+      SRC.count("keep_tracks=True") == 1
+      and "run_finals, tmp_final,\n                                keep_tracks=True)" in SRC)
+# the old three-track night: Mix/System/Mic keeps its three titles too
+F4b = os.path.join(TD10, "_runf3b.mp4")
+ok4b = fake._assemble([S2], SYS_, MIC_, F4b, dict(anchors(S2), sys=SYS_, mic=MIC_,
+                                                   voice=None, game=None))
+ST_3 = os.path.join(TD10, "stitch_three.mp4")
+check("the old three-track case (Mix/System/Mic x2) keeps its 3 titled streams",
+      ok4b and lore._concat_copy(FF, [F4, F4b], ST_3, keep_tracks=True)
+      and names_of(ST_3) == ["mix", "system", "mic"]
+      and abs(lore._probe_duration(ST_3) - 4.0) < 0.35)
+
+print("\n--- M10c: a placeholder never outlives the picture ---")
+# run 1 lacks the Voice (placeholder), run 2 has it: the stitched night's
+# 21st frame (run 2's first) must land at run 1's length, not 2 s later
+runP = dict(anchors(S1), sys=SYS_, mic=MIC_, voice=None, game=GAM_)
+FP = os.path.join(TD10, "_runfP.mp4")
+del LSAID[:]
+okP = fake._assemble([S1], SYS_, MIC_, FP, runP, want_taps={"Voice", "Game"})
+check("run 1 binds with a Voice placeholder",
+      okP and names_of(FP) == ["mix", "voice", "game", "mic"]
+      and any("Run had no Voice sound" in m for m in LSAID))
+dP = lore._probe_duration(FP)
+check("...and the placeholder did not stretch it: the file is the picture's 2 s",
+      dP is not None and abs(dP - 2.0) < 0.15)
+ST_P = os.path.join(TD10, "stitch_ph.mp4")
+okS = lore._concat_copy(FF, [FP, FB], ST_P, keep_tracks=True)
+pts = vpts(ST_P)
+check("stitched: 40 frames, run 2's first frame lands at run 1's length",
+      okS and len(pts) == 40 and abs(pts[20] - dP) < 0.15
+      and abs(lore._probe_duration(ST_P) - 4.0) < 0.35)
+# THE BUG, reproduced with the old 'bind_total + 2.0' placeholder through
+# build_mux_cmd directly: a 4 s silence under a 2 s picture, and the next
+# run starts 2 s late - a frozen hole in the film
+OLDPH = os.path.join(TD10, "_runfOld.mp4")
+rc = run(build_mux_cmd(S1, SYS_, MIC_, OLDPH, taps=[
+    {"label": "Voice", "path": None, "off": 0, "secs": 4.0},
+    {"label": "Game", "path": GAM_, "off": 0, "secs": None}]))
+ST_H = os.path.join(TD10, "stitch_hole.mp4")
+okH = lore._concat_copy(FF, [OLDPH, FB], ST_H, keep_tracks=True)
+pts_h = vpts(ST_H)
+check("(the old placeholder, 2 s past the picture: run 2's first frame at 4.0 s - the hole)",
+      rc == 0 and okH and len(pts_h) == 40 and abs(pts_h[20] - 4.0) < 0.15)
+check("the placeholder's length is the picture's, never past it (the source)",
+      '"secs": bind_total + 2.0' not in SRC
+      and "ph_secs = float(vdur) if vdur else float(bind_total)" in SRC)
+lore._popen = real_popen
+
+print("\n--- M11: the remuxers keep every track on a real render ---")
+ns["_title_maps"] = None
+extract("_title_maps", ns)
+F_FIN = os.path.join(TD, "finished.mp4")
+rc = run([FF, "-y", "-v", "error", "-i", F_NEW, "-c:v", "copy",
+          "-map", "0:v:0", "-map", "0:a?", *ns["_title_maps"](F_NEW),
+          "-c:a", "copy", F_FIN])
+check("the finisher's map arguments keep Mix/Voice/Game/Mic with their titles",
+      rc == 0 and names_of(F_FIN) == ["mix", "voice", "game", "mic"])
+F_CUT = os.path.join(TD, "cut.mp4")
+rc = run([FF, "-y", "-v", "error", "-i", F_NEW, "-c:v", "copy", "-c:a", "aac", F_CUT])
+check("...where the default pick (a share cut) keeps one track: the Mix",
+      rc == 0 and names_of(F_CUT) == [""] and carries(spectrum(F_CUT, "mix"), (200, 900), (1500, 3000)))
 
 import shutil
 shutil.rmtree(TD, ignore_errors=True)

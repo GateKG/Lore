@@ -9,11 +9,15 @@ non-system ring came last, so a clip would have got Discord as its Mic
 track); the system file is the system; ends carries all four kinds;
 voice_clip.wav / game_clip.wav land at their deterministic names with
 their own bytes; trim_tail is honoured per ring; and the old two-ring
-shape returns exactly what it always did."""
+shape returns exactly what it always did. Stage C: a tap ring lends a
+clip its sound only in state live/reconnected/dead (opening, failed,
+gone and '' are skipped), and a ring that has delivered nothing leaves
+no header-only <kind>_clip.wav behind."""
 import ast
 import collections
 import io
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -127,6 +131,45 @@ check("every ring loses its newest quarter second",
 check("...and every end moves back by that quarter second",
       all(abs(ends[k] - (T - 0.25)) < 1e-6 for k in ("system", "mic", "voice", "game")))
 
+print("\n--- tap rings by state ---")
+for st, want in (("opening", False), ("failed", False), ("gone", False),
+                 ("", False), ("live", True), ("reconnected", True),
+                 ("dead", True)):
+    TDx = tempfile.mkdtemp(prefix="dump331_")
+    cap = Cap([("system", 1), ("mic", 2), ("voice", 3), ("game", 4)])
+    for r in cap.rings:
+        r["state"] = st                  # every ring: the key alone filters nothing
+        if r["kind"] in ("voice", "game"):
+            r["is_tap"] = True
+    sp, mp, ends = cap.dump_ring(TDx, 1.0)
+    have = sorted(f for f in os.listdir(TDx) if f.endswith("_clip.wav"))
+    check("tap rings in state %r are %s; the device rings are written whatever the key says"
+          % (st, "written" if want else "skipped"),
+          sample_of(sp) == (RATE, 1) and sample_of(mp) == (RATE, 2)
+          and (have == ["game_clip.wav", "mic_clip.wav", "system_clip.wav", "voice_clip.wav"]
+               if want else have == ["mic_clip.wav", "system_clip.wav"])
+          and (("voice" in ends and "game" in ends) if want
+               else ("voice" not in ends and "game" not in ends)))
+    shutil.rmtree(TDx, ignore_errors=True)
+
+print("\n--- no empty clip wav ---")
+TD7 = tempfile.mkdtemp(prefix="dump331_")
+cap = Cap([("system", 1)])
+for kind in ("voice", "mic"):             # two rings that have delivered nothing
+    chunks = collections.deque()
+    cap.rings.append({"kind": kind, "rate": RATE, "channels": CH, "chunks": chunks,
+                      "t_first": None, "frames": 0, "push": chunks.append,
+                      "frame_bytes": CH * 2, "closed": False,
+                      "is_tap": kind == "voice", "state": "live"})
+sp, mp, ends = cap.dump_ring(TD7, 1.0)
+check("a live tap ring that delivered nothing leaves no voice_clip.wav and no end",
+      not os.path.isfile(os.path.join(TD7, "voice_clip.wav")) and "voice" not in ends)
+check("an empty mic ring: no mic_clip.wav, mic path None (the mux never sees a header-only wav)",
+      mp is None and not os.path.isfile(os.path.join(TD7, "mic_clip.wav"))
+      and sample_of(sp) == (RATE, 1) and sorted(os.listdir(TD7)) == ["system_clip.wav"])
+check("nothing was logged for the empty rings", SAID == [])
+shutil.rmtree(TD7, ignore_errors=True)
+
 print("\n--- the old shape (system + mic only) is what it always was ---")
 TD5 = tempfile.mkdtemp(prefix="dump331_")
 cap = Cap([("system", 1), ("mic", 2)])
@@ -139,7 +182,6 @@ check("nothing was logged", SAID == [])
 check("the docstring names the layer clips and the elif",
       "voice_clip.wav" in dump_ring.__doc__ and "ONLY A RING OF KIND 'mic'" in dump_ring.__doc__)
 
-import shutil
 shutil.rmtree(TD, ignore_errors=True)
 print("\n%d ok, %d failed" % (ok, bad))
 sys.exit(1 if bad else 0)

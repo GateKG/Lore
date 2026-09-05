@@ -2878,6 +2878,14 @@ function makeMock(){
       converting:location.hash.includes('conv')?{name:`Elden Ring_session_0.mp4`,pct:43}:null,
       queued:location.hash.includes('conv')?1:0,
       encoder:'AV1',fps:60,hdr:true,free_gb:412,size_mb:st.status==='recording'?880:null,
+      /* 3.31 how the night is being heard (state()['sources']); the note
+         is '' while nothing records, like the real app */
+      sources:{voice:{exe:'discord.exe',state:st.status==='recording'?'live':'',fixes:0},
+        game:{exe:'eldenring.exe',state:st.status==='recording'?'live':'',fixes:0},
+        media:'loopback',on:true,
+        note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
+          +'are each heard on their own. What you hear stays in the video; only '
+          +'the room makes gold marks.':''},
       webhook:true,version:'3.30'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
@@ -6135,9 +6143,12 @@ function workPlate(){
      moments) is one pass over the audio and takes seconds; reading (the
      transcript) is whisper and takes minutes. They were one line here, which
      is why a wait for the transcript looked like a wait for the sound. */
-  const rows={listen:mk(),hear:mk(),think:mk(),audit:mk(),cut:mk(),
+  /* 3.31 THE QUILL COMES FIRST: while a night is written, this row says
+     how it is being heard (by source, or everything as one) - the plate
+     used to say nothing about the recorder at all */
+  const rows={write:mk(),listen:mk(),hear:mk(),think:mk(),audit:mk(),cut:mk(),
               save:mk(),colour:mk(),sync:mk(),tidy:mk()};
-  ['listen','hear','think','audit','cut','save','colour','sync','tidy']
+  ['write','listen','hear','think','audit','cut','save','colour','sync','tidy']
     .forEach(k=>box.append(rows[k].r));
   /* the waiting line lives on the RIGHT LEAF now (queuePlate) - a
      real list with remove and let-go, not a footnote under the rows */
@@ -6209,6 +6220,16 @@ function workPlate(){
     try{st=await api.state();}catch(e){}
     try{ if(api.ai_status)ai=await api.ai_status(); }catch(e){}
     try{ if(api.edit_status)ed=await api.edit_status(); }catch(e){}
+    /* THE RECORDER'S ROW (3.31): what is being written and how it is heard */
+    try{
+      const rec=st&&(st.status==='recording'||st.status==='paused');
+      const srcNote=(st&&st.sources&&st.sources.note)?String(st.sources.note):'';
+      if(rec)set(rows.write,true,(st.status==='paused'?'Holding ':'Writing ')
+        +(st.game||'the screen'),srcNote,null,null);
+      else set(rows.write,false,'The quill \u2014 resting',
+        'nothing is being written; the rows below are what the tome does between games',
+        null,null);
+    }catch(e){}
     /* THE READER, one row per job it does */
     /* HOLD IS PER JOB. One button used to stop both, so holding the sound
        silently stopped transcripts too, with nothing to say it had. */
@@ -7114,7 +7135,9 @@ function renderSet(cL,cR,app,spreadIdx){
     hint(L,'The tome only works while you are away from a game: reading and '
       +'listening pause the instant one starts, and a save always finishes. '
       +'Anything with a Stop can be called off safely - what is already '
-      +'written stays written, and the original is never touched.');
+      +'written stays written, and the original is never touched. While a '
+      +'night is written, the first row says how it is being heard \u2014 by '
+      +'source, or everything as one.');
     divider(L,'While you are away');
     /* AFK CATCH-UP: the LAST thing on the page, because it is the
        thing that overrules everything above it - and built on .lab,
@@ -8157,7 +8180,8 @@ function applyState(st){
      is identical - a needless style/layout tick at 1.6Hz, all night - so
      leave early when none of the painted fields moved. */
   const fp=JSON.stringify([st.status,st.elapsed,st.game,st.size_mb,st.binding,
-    st.converting,st.queued,st.hdr,st.webhook,st.mic_trouble]);
+    st.converting,st.queued,st.hdr,st.webhook,st.mic_trouble,
+    st.sources&&st.sources.note]);
   if(fp===S.stateFp)return;
   S.stateFp=fp;
   applyBindCard(st.binding||null);
@@ -8183,7 +8207,12 @@ function applyState(st){
     t.style.color=s==='recording'?'#ffb59a':'#f0d9a0';}
   else{t.textContent='';}   /* idle: no stray dot hovering over the sub-line */
   let sub=subDefault;
-  if(s==='recording')sub=(st.game||'the screen')+(st.size_mb?` — ${st.size_mb>1000?(st.size_mb/1000).toFixed(1)+' GB':Math.round(st.size_mb)+' MB'} so far`:'');
+  /* 3.31 HOW IT IS BEING HEARD rides the line he already reads while
+     writing - the short form ('by source' / 'everything, as one'); the
+     hover carries the whole sentence. Guarded: an older lore.py sends
+     no sources at all. */
+  const srcNote=(st.sources&&st.sources.note)?String(st.sources.note):'';
+  if(s==='recording')sub=(st.game||'the screen')+(st.size_mb?` — ${st.size_mb>1000?(st.size_mb/1000).toFixed(1)+' GB':Math.round(st.size_mb)+' MB'} so far`:'')+(srcNote?' · '+srcNote.split(' \u2014 ')[0]:'');
   /* A SILENT MICROPHONE SAYS SO, HERE, WHILE IT MATTERS. He lost a
      night's voice to a virtual input that quietly died and told no
      one; this line is where he is already looking. */
@@ -8201,6 +8230,7 @@ function applyState(st){
     if(bits.length)sub=bits.join(' · ');
   }
   $('#statesub').textContent=sub;
+  $('#statesub').title=(s==='recording'||s==='paused')?(srcNote||'See everything the tome is doing'):'See everything the tome is doing';
   const bb=$('#sealbtns');
   const want=(s==='recording'||s==='paused')?'rec':'idle';
   if(bb.dataset.mode!==want){
@@ -12685,9 +12715,12 @@ function wireViewer(){
     whisper(r&&r.ok?'the reel is binding \u2014 it lands beside the recording'
                    :((r&&r.why)||'no gold moments to bind yet'));
   });
-  /* audio-track picker (System vs Mic, from 'separate' audio mode) - only
-     when the platform exposes tracks; Chromium/WebView2 usually does not,
-     so the row hides itself there */
+  /* audio-track picker (Mix / Voice / Game / Mic, by TITLE - the old
+     positional names were already wrong for Mix/System/Mic, index 0 is
+     the Mix) - only when the platform exposes tracks; Chromium/WebView2
+     usually does not, so the row hides itself there */
+  const TRACK_NAMES={mix:'Everything',voice:'Friends (voice chat)',game:'The game',
+    mic:'Your microphone',system:'Playback (game + apps)'};
   const trow=$('#vtrackrow'), tsel=$('#vtrack');
   const trackSync=()=>{ if(!trow||!tsel)return;
     const at=vd.audioTracks;
@@ -12695,7 +12728,7 @@ function wireViewer(){
     tsel.innerHTML=''; let sel=0;
     for(let i=0;i<at.length;i++){
       const o=document.createElement('option'); o.value=String(i);
-      o.textContent=at[i].label||(i===0?'System sound':i===1?'Microphone':'Track '+(i+1));
+      o.textContent=TRACK_NAMES[String(at[i].label||'').toLowerCase()]||(at[i].label||'Track '+(i+1));
       if(at[i].enabled)sel=i;
       tsel.append(o);
     }
