@@ -1,0 +1,24 @@
+# Rocket League - what the screen prints when a match ends (3.32).
+# The end screen never says VICTORY or DEFEAT. It prints WINNER and the
+# team's colour for 16-30 seconds, then the winners' podium (the tags of
+# the winning side), then MY ACCOLADES with WINNER still in the header,
+# then the scoreboard, then a fresh 5:00 kickoff clock. Read on a real
+# night, one frame every two seconds.
+#
+# outcome.win is the verdict: WIN or WINNER, then the colour on the same
+# frame - the colour is what keeps a player's title ("S5 TOURNAMENT
+# WINNER", worn on every goal replay) from counting as a match end.
+outcome.win: \bWIN(?:NER)?\b\W{0,4}(?P<team>BLUE|ORANGE)\b
+# The clock is the trigger, not an outcome: a reading under 1:00 on the
+# one-a-minute grid sat one row before every end (5 of 5 measured).
+# "+0:08" is overtime - it opens a longer window, because overtime runs
+# until somebody scores.
+outcome.clock: (?<![\d:+])(?P<m>[0-5]):(?P<s>[0-5]\d)(?![\d:])
+outcome.overtime: \+\s?0:(?P<s>\d\d)
+# The score line, read only on the wide second pass - the centre crop
+# turns "0 BLUE" into "O BLUE". Optional: a win with no score is still
+# a win.
+outcome.score: (?P<b>\d)\s*BLUE.{0,40}?(?P<o>\d)\s*ORANGE
+# The podium tags: [CLUB] Name, the winning side's own names. The app
+# matches them against the in-game name in Settings to say whose win.
+outcome.podium: \[(?P<club>[A-Z0-9]{2,6})\]\s*(?P<name>[A-Za-z0-9_]+)

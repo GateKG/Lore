@@ -241,17 +241,20 @@ check("the Game chip sits after Scream, on by default, with a tip",
       and U.index('data-m="scream"') < U.index('data-m="game"')
       < U.index('data-m="told"'))
 check("MARKS carries game (default true), the save list and gsig know it",
-      "told:true, sense:true, game:true};" in U
-      and "['gold','red','loud','laugh','scream','told','sense','game'].forEach"
-      in U
-      and "const gsig=['loud','laugh','scream','told','sense','game']" in U
-      and "sense:'sense',game:'game'};" in U)
+      # 3.32 appends the outcome chip to every one of these lists
+      "told:true, sense:true, game:true, outcome:true};" in U
+      and "['gold','red','loud','laugh','scream','told','sense','game',"
+          "'outcome'].forEach" in U
+      and "const gsig=['loud','laugh','scream','told','sense','game',"
+          "'outcome']" in U
+      and "sense:'sense',game:'game',outcome:'outcome'};" in U)
 check("stamp: a game mark hears 'a burst in the game', a room shout "
       "'a shout in the room', an old mark 'a loud moment'",
       ":ev.kind==='game'?'a burst in the game'" in U
       and ":(ev.src==='room'?'a shout in the room':'a loud moment');" in U
       and ":ev.kind==='game'?'game'" in U
-      and "k==='game'?'game':(SNSK[k]?'sense':'loud')" in U)
+      and "k==='game'?'game':k==='outcome'?'outcome':(SNSK[k]?'sense':'loud')"
+      in U)
 check("the game tick's CSS: short, dull, taller when told",
       '.hlmark[data-fk="game"]{background:#b7a37c;opacity:.5;height:4px;top:0}'
       in U and '.hlmark[data-fk="game"].told' not in U)   # a told mark wears data-fk 'told' - that rule was dead

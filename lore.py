@@ -166,6 +166,10 @@ DEFAULTS = {
     # always run, because a recording with no picture must never cost the
     # eye, the HUD reader or the describer a minute.
     "black_guard":       True,
+    # THE SCREEN DECIDED (3.32). His in-game name as the podium prints it
+    # ("[CLUB] Name" or just "Name"). Empty means the tome reports that a
+    # match ended and says "won?" - it never guesses whose win it was.
+    "handle":            "",
     # What the recorder captures: the whole watched screen (proven path) or,
     # experimentally, only the game's own window - the SAME GPU capture cropped
     # at the source to the window's client rect, tracked as the window moves
@@ -729,6 +733,7 @@ def _sanitize_settings(d):
     d["read_game_lines"] = bool(d.get("read_game_lines",
                                       DEFAULTS["read_game_lines"]))
     d["black_guard"] = bool(d.get("black_guard", DEFAULTS["black_guard"]))
+    d["handle"] = str(d.get("handle", DEFAULTS["handle"]) or "")[:40].strip()
 
 
 def load_settings():
@@ -9825,6 +9830,8 @@ def _window_track(ctl, session, current):
 
 _BLACK_PATIENCE = 10.0      # seconds of black before the guard asks the screen
 _BLACK_PATIENCE_BLIND = 20.0  # ...and twice that when the screen cannot answer
+#                               (20-25 s as felt: the verdict lands on the
+#                               watcher's five-second beat)
 
 
 def _black_track(ctl, session, current, now=None):
@@ -9842,7 +9849,8 @@ def _black_track(ctl, session, current, now=None):
     audio tracks) and that game goes to the screen-region path for the
     rest of the night - the path 33 of the last 35 starts already used.
     A black screen means the game is black: say so once and wait. When
-    the screen cannot be read at all, the guard waits twice as long and
+    the screen cannot be read at all, the guard waits twice as long -
+    20-25 s, on the watcher's five-second beat - and
     needs a sign of life (pad or keyboard input, or a loud game ring)
     before it acts. Minimised or not in front: not the guard's call -
     the pause law and the foreground rule own those.
@@ -13193,7 +13201,8 @@ def _ai_sidecar(video_path, kind):
 
 
 # WHICH SIDECARS EACH LANE OWNS. A fresh pass rebuilds these, so a
-# fresh pass is what archives them.
+# fresh pass is what archives them. pic.json and emb.json are derived
+# facts and stay outside the attic; sns.outcomes rides sns (3.32).
 _ATTIC_OF = {"listening": ("hl", "lvl"),
              "hearing": ("stt",),
              "thinking": ("ins", "sns", "vis"),
@@ -14300,7 +14309,9 @@ def _hud_topup_one(video_path):
             os.utime(sp, (st0.st_atime, st0.st_mtime))
         except OSError:
             pass
+        # a restored clock pops every cache keyed on it (the 3.28 rule)
         _HUD_OWE_CACHE.pop(sp, None)
+        _OUT_OWE_CACHE.pop(sp, None)
         named = ", ".join(x["n"] for x in sns["screen"][:4])
         log(f"The screen reader on {name}: {len(hud.get('rows') or [])} "
             f"frame(s) read; the screen named "
@@ -14311,6 +14322,697 @@ def _hud_topup_one(video_path):
         # and stand every lane on it down until the video changes
         _AI["soft_fail"] = True
         log(f"The screen reader stumbled on {name}: {str(e)[:120]}")
+        return False
+    finally:
+        _source_busy_done(video_path)
+        try:
+            if os.path.isfile(oj):
+                os.remove(oj)
+        except OSError:
+            pass
+
+
+# THE SCREEN DECIDED (3.32). The grid caught WINNER on none of five
+# Rocket League ends - a 16-30 s banner against a 60 s step - and the
+# clock it read one row earlier ("0:31") predicted every one of them.
+# Battlegrounds prints "5th Place / Rating 4782 -11" for six seconds.
+# So the app predicts where a match ended, the reader re-samples those
+# seconds two apart, and the frames that carried the game's own verdict
+# fold into sns.outcomes: one record per match, with a span, a side and
+# whose it was. The outcomes NEVER enter hl (the audit's clock is keyed
+# on it and re-owing 314 audits for a tick is the count-undoing law); the
+# bar folds them at read, the describer reads them off the sidecar, the
+# auditor reads them as a witness. A top-up puts the sidecar back with
+# its own clock, exactly as the grid does.
+_OUT_STEP = 2.0          # the dense re-sample around a predicted end
+_OUT_CAP = 12            # candidate windows a night: <= 6 CPU minutes
+_OUT_FRAMES = 300        # the reader's own frame cap on one dense run
+_OUT_OWE_CACHE = {}
+# INSTALL DRIFT (3.32). A reader on disk that predates this drop takes
+# argv[8] in silence and answers with no 'dense' key at all; the 3.32
+# reader stamps v 3 so the two can be told apart. Such a night is left
+# OWED (no outcomes key) instead of written down as looked-and-found-
+# nothing, so the drop landing settles it. The old file's clock is
+# kept so it is not spawned again every beat, and the notice is said
+# once per process.
+_OUT_OLD_READER = "the screen's reader on disk predates 3.32"
+_OUT_OLD = {"mt": None, "said": False}
+_PACK_CACHE = {}
+_OUT_VERDICT = ("win", "loss", "placement", "death")
+_OUT_RANK = {"clock": 0, "overtime": 0, "rating": 0, "placement": 0,
+             "win": 0, "loss": 0, "death": 0, "spectator": 1, "lobby": 1,
+             "ears": 2, "game": 3, "quiet": 4}
+
+
+def _pack_path(game):
+    """The pack file the reader itself opens for this game - the same key
+    the worker builds (the display name, lowercased, spaces out), never
+    the folder name, so a renamed game keeps or loses its pack the same
+    way on both sides."""
+    return os.path.join(_here(), "ai", "packs",
+                        (game or "").strip().lower().replace(" ", "")
+                        + ".ocr.txt")
+
+
+def _pack_outcomes(game):
+    """The typed `outcome.<kind>:` lines of a game's pack, [(kind, regex)],
+    cached on the file's clock - the sweep asks every beat. The head is
+    split off before the twelve-letter cut, as the reader does it."""
+    pf = _pack_path(game)
+    try:
+        mt = os.path.getmtime(pf)
+    except OSError:
+        return []
+    hit = _PACK_CACHE.get(pf)
+    if hit and hit[0] == mt:
+        return hit[1]
+    out = []
+    try:
+        with open(pf, encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln or ln.startswith("#") or ":" not in ln:
+                    continue
+                k, _, p = ln.partition(":")
+                head = k.strip().lower()
+                if not head.startswith("outcome."):
+                    continue
+                kind = head[8:].strip()[:12]
+                if not kind:
+                    continue
+                try:
+                    out.append((kind, re.compile(p.strip(), re.I)))
+                except re.error:
+                    continue
+    except Exception:
+        out = []
+    _PACK_CACHE[pf] = (mt, out)
+    return out
+
+
+def _hype_cliffs(hype, hot=0.7, cold=0.2, hot_s=15.0, cold_s=40.0):
+    """A loud stretch that goes quiet for a long while - the room shouted
+    and then the match was over. [(a, b)]: when the loud stretch began
+    and when the quiet did. The curve is arousal 0..1 on a 3 s hop."""
+    try:
+        v = [float(x) for x in ((hype or {}).get("v") or [])]
+        hop = float((hype or {}).get("hop") or 3.0)
+    except (TypeError, ValueError):
+        return []
+    if len(v) < 20 or hop <= 0:
+        return []
+    out = []
+    i, n = 0, len(v)
+    while i < n:
+        if v[i] < hot:
+            i += 1
+            continue
+        j = i
+        while j < n and v[j] >= hot:
+            j += 1
+        if (j - i) * hop >= hot_s:
+            # a few lukewarm hops between the shout and the hush are
+            # the breath after it, not a second stretch
+            k = j
+            while k < n and k - j < 4 and v[k] >= cold:
+                k += 1
+            q = k
+            while q < n and v[q] < cold:
+                q += 1
+            if (q - k) * hop >= cold_s:
+                out.append((round(i * hop, 1), round(k * hop, 1)))
+        i = j if j > i else i + 1
+    return out
+
+
+def _outcome_candidates(sns, hl, lvl, game, dur, cap=_OUT_CAP):
+    """Where a match probably ended: the windows the dense pass reads,
+    [(a, b, why)] in time order, `cap` at most. The grid's own rows carry
+    the triggers (a clock under a minute, overtime, a rating that moved
+    between two lobby rows, a spectator or lobby screen appearing, a
+    verdict the grid itself landed on); then the ears (CLAP's victory,
+    cheer and groan, a mark that borrowed 'victory'), a burst in the game
+    layer, and a long hush after a loud stretch. Overlaps merge; the
+    grid's own predictions outrank the ears', which outrank a hush."""
+    pats = _pack_outcomes(game)
+    if not pats:
+        return []
+    try:
+        dur = float(dur or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    wins = []
+    rows = ((sns or {}).get("hud") or {}).get("rows") or []
+    last_rating, last_rating_t = None, None
+    spectating = in_lobby = False
+    for r in rows:
+        try:
+            t = float(r[0])
+            strs = r[1] or []
+        except (TypeError, ValueError, IndexError):
+            continue
+        text = " ".join(str(x) for x in strs)
+        seen_spec = seen_lobby = False
+        for kind, rx in pats:
+            m = rx.search(text)
+            if not m:
+                continue
+            g = m.groupdict()
+            if kind == "clock":
+                try:
+                    left = int(g.get("m") or 0) * 60 + int(g.get("s") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if left <= 60:
+                    # the ball lands after 0:00 and the banner follows
+                    wins.append((t + left - 15, t + left + 45, "clock"))
+            elif kind == "overtime":
+                wins.append((t, t + 120, "overtime"))
+            elif kind in _OUT_VERDICT:
+                wins.append((t - 20, t + 20, kind))
+            elif kind == "rating":
+                r0 = str(g.get("r") or "")
+                if last_rating is not None and r0 and r0 != last_rating:
+                    wins.append((max(last_rating_t, t - 120), t + 10,
+                                 "rating"))
+                if r0:
+                    last_rating, last_rating_t = r0, t
+            elif kind == "spectator":
+                seen_spec = True
+                if not spectating:
+                    wins.append((t - 90, t, "spectator"))
+            elif kind == "lobby":
+                seen_lobby = True
+                if not in_lobby:
+                    wins.append((t - 90, t, "lobby"))
+        spectating, in_lobby = seen_spec, seen_lobby
+    for e in ((sns or {}).get("events") or []):
+        try:
+            t = float(e.get("t") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if str(e.get("kind") or "") in ("victory", "defeat", "cheer",
+                                        "groan"):
+            wins.append((t - 20, t + 20, "ears"))
+    for g in ((hl or {}).get("events") or []):
+        try:
+            t = float(g.get("t") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        k = str(g.get("kind") or "")
+        al = g.get("also") or []
+        if k in ("victory", "defeat", "cheer") or "victory" in al \
+                or "defeat" in al:
+            wins.append((t - 20, t + 20, "ears"))
+        elif k == "game":
+            wins.append((t - 20, t + 20, "game"))
+    for a, b in _hype_cliffs((sns or {}).get("hype")):
+        wins.append((b - 20, b + 20, "quiet"))
+    clipped = []
+    for a, b, why in wins:
+        a = max(0.0, a)
+        if dur > 0:
+            b = min(dur, b)
+        if b - a >= 4:
+            clipped.append([round(a, 1), round(b, 1), why])
+    clipped.sort(key=lambda w: w[0])
+    merged = []
+    for a, b, why in clipped:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+            if _OUT_RANK.get(why, 9) < _OUT_RANK.get(merged[-1][2], 9):
+                merged[-1][2] = why
+        else:
+            merged.append([a, b, why])
+    merged.sort(key=lambda w: (_OUT_RANK.get(w[2], 9), w[0]))
+    keep = merged[:max(0, int(cap))]
+    keep.sort(key=lambda w: w[0])
+    return [(a, b, why) for a, b, why in keep]
+
+
+def _out_norm(s):
+    return re.sub(r"[^a-z0-9\u0600-\u06ff]", "", str(s or "").lower())
+
+
+def _ordinal(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    sfx = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd",
+                                             3: "rd"}.get(n % 10, "th")
+    return "%d%s" % (n, sfx)
+
+
+def _outcome_fold(dense, game, step=_OUT_STEP, you=None, wins=None):
+    """The reader's dense frames -> the night's outcomes, one per match:
+    {t, b, kind, text, side, team?, place?, score?, rating?, delta?,
+    frames, why, line}. Frames that hit the same verdict kind within a
+    minute of each other are one run (the WINNER header stands through
+    MY ACCOLADES); a Rocket League win needs two frames (a banner stands
+    16-30 s), a placement needs one (the screen is short and the words
+    are unambiguous). Whose win: the podium's tags against his in-game
+    name (`you`, "[CLUB] Name" or "Name"); no name, no podium -> 'win?',
+    the fact and never the verdict."""
+    frames = []
+    for r in dense or []:
+        try:
+            t = float(r[0])
+            hits = r[2] if len(r) > 2 else []
+        except (TypeError, ValueError, IndexError):
+            continue
+        frames.append((t, [h for h in (hits or []) if isinstance(h, dict)]))
+    frames.sort(key=lambda f: f[0])
+    you = str(you or "").strip()
+    yc, yn = "", you
+    m = re.match(r"^\[([^\]]{1,8})\]\s*(.+)$", you)
+    if m:
+        yc, yn = m.group(1), m.group(2)
+    ycn, ynn = _out_norm(yc), _out_norm(yn)
+    runs = []               # [kind, first t, last t, [hits], frames]
+    for t, hits in frames:
+        for k in _OUT_VERDICT:
+            hk = [h for h in hits if h.get("kind") == k]
+            if not hk:
+                continue
+            cur = None
+            for r in reversed(runs):
+                if r[0] == k:
+                    cur = r
+                    break
+            if cur is not None and t - cur[2] <= 60.0:
+                cur[2] = t
+                cur[3].extend(hk)
+                cur[4] += 1
+            else:
+                runs.append([k, t, t, list(hk), 1])
+
+    def _most(items):
+        c = {}
+        for x in items:
+            if x:
+                c[x] = c.get(x, 0) + 1
+        return max(c.items(), key=lambda kv: kv[1])[0] if c else ""
+
+    outs = []
+    for k, a, b, hk, n in runs:
+        if k == "win" and n < 2:
+            continue
+        near = [(t2, h2) for t2, hs in frames for h2 in hs
+                if a - 10 <= t2 <= b + 30]
+        text = _most(" ".join(str(h.get("text") or "").upper().split())
+                     for h in hk) or k.upper()
+        o = {"t": round(a, 1), "b": round(b + float(step), 1), "kind": k,
+             "text": text[:40], "frames": int(n)}
+        team = _most(str((h.get("groups") or {}).get("team") or "").upper()
+                     for h in hk)
+        if team:
+            o["team"] = team
+        if k == "placement":
+            try:
+                place = int(_most(str((h.get("groups") or {}).get("n") or "")
+                                  for h in hk) or 0) or None
+            except ValueError:
+                place = None
+            o["place"] = place
+            o["side"] = ("win" if place and place <= 4
+                         else ("loss" if place else "win?"))
+            for t2, h2 in near:
+                if h2.get("kind") != "rating":
+                    continue
+                g2 = h2.get("groups") or {}
+                try:
+                    o["rating"] = int(g2.get("r"))
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    o["delta"] = int(str(g2.get("d") or "").replace(" ", ""))
+                except (TypeError, ValueError):
+                    pass
+                break
+        elif k == "win":
+            names = []
+            for t2, h2 in near:
+                if h2.get("kind") == "podium" and a <= t2 <= b + 10:
+                    g2 = h2.get("groups") or {}
+                    names.append((str(g2.get("club") or ""),
+                                  str(g2.get("name") or "")))
+            mine = ""
+            if ynn:
+                for cl, nm in names:
+                    if _out_norm(nm) == ynn and (not ycn
+                                                  or _out_norm(cl) == ycn):
+                        mine = ("[" + cl + "] " if cl else "") + nm
+                        break
+            if mine:
+                o["side"], o["you"] = "win", mine[:40]
+            elif ynn and names:
+                o["side"] = "loss"
+            else:
+                o["side"] = "win?"
+        else:
+            o["side"] = "loss"
+        for t2, h2 in near:
+            if h2.get("kind") != "score":
+                continue
+            g2 = h2.get("groups") or {}
+            try:
+                o["score"] = {"b": int(g2.get("b")), "o": int(g2.get("o"))}
+                break
+            except (TypeError, ValueError):
+                continue
+        o["why"] = "grid"
+        for w in (wins or []):
+            try:
+                if float(w[0]) <= a <= float(w[1]):
+                    o["why"] = str(w[2])[:12]
+                    break
+            except (TypeError, ValueError, IndexError):
+                continue
+        o["line"] = _outcome_line(o)
+        outs.append(o)
+    outs.sort(key=lambda o: o["t"])
+    return outs
+
+
+def _outcome_line(o, clock=False):
+    """The one wording every consumer prints for an outcome - the
+    describer's block, the planted moment, the tick, the auditor's
+    witness: 'WON as ORANGE 3-1', 'LOST as BLUE', 'match ended - WINNER
+    ORANGE' (whose, unknown), 'finished 5th (rating 4782 -11)'."""
+    try:
+        kind = str(o.get("kind") or "")
+        side = str(o.get("side") or "")
+        team = str(o.get("team") or "")
+        if kind == "placement":
+            s = "finished " + (_ordinal(o.get("place")) or "the match")
+            if o.get("rating"):
+                d = o.get("delta")
+                s += " (rating %s%s)" % (
+                    o["rating"],
+                    (" %+d" % int(d)) if isinstance(d, int) else "")
+        else:
+            if side == "win":
+                s = "WON"
+            elif side == "loss":
+                s = "LOST"
+            else:
+                s = "match ended - " + (str(o.get("text") or "")
+                                        or "the screen's verdict")
+            if team and side in ("win", "loss"):
+                s += " as " + team
+            sc = o.get("score") or {}
+            if isinstance(sc, dict) and "b" in sc and "o" in sc:
+                s += " %s-%s" % (sc["b"], sc["o"])
+            if side == "win" and o.get("you"):
+                s += " (%s on the podium)" % o["you"]
+        if clock:
+            t = int(float(o.get("t") or 0))
+            s = "%d:%02d %s" % (t // 60, t % 60, s)
+        return s[:120]
+    except Exception:
+        return "the screen decided"
+
+
+def _outcome_tally(outs):
+    """The night in one line: {matches, won, lost, unknown, best_place,
+    places, line}. 'won 3 of 5 matches', 'won 2 of 5 (1 unknown)',
+    'finished 5th, 3rd and 1st - best 1st', and 'won? - 3 matches ended,
+    the winner unread' when the podium never named him (no in-game name
+    set, or none read). '' for a night with nothing."""
+    outs = [o for o in (outs or []) if isinstance(o, dict)]
+    games = [o for o in outs if o.get("kind") != "placement"]
+    won = sum(1 for o in games if o.get("side") == "win")
+    lost = sum(1 for o in games if o.get("side") == "loss")
+    unknown = sum(1 for o in games if o.get("side") not in ("win", "loss"))
+    places = [int(o["place"]) for o in outs
+              if o.get("kind") == "placement" and o.get("place")]
+    parts = []
+    if games:
+        n = len(games)
+        if unknown == n:
+            parts.append("won? - %d match%s ended, the winner unread"
+                         % (n, "" if n == 1 else "es"))
+        else:
+            parts.append("won %d of %d match%s" % (won, n,
+                                                    "" if n == 1 else "es")
+                         + (" (%d unknown)" % unknown if unknown else ""))
+    if places:
+        ords = [_ordinal(p) for p in places]
+        if len(ords) == 1:
+            parts.append("finished " + ords[0])
+        else:
+            parts.append("finished " + ", ".join(ords[:-1]) + " and "
+                         + ords[-1] + " - best " + _ordinal(min(places)))
+    return {"matches": len(outs), "won": won, "lost": lost,
+            "unknown": unknown,
+            "best_place": min(places) if places else None,
+            "places": places, "line": "; ".join(parts)}
+
+
+def _outcome_block(outs, lo, hi, cap=6):
+    """The OUTCOMES lines of one describer window's head - '' when the
+    screen decided nothing in these minutes. The verdict is real and
+    final; the rule sentence keeps the model from painting it over every
+    chapter of the window."""
+    here = []
+    for o in outs or []:
+        try:
+            t = float(o.get("t") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if lo <= t < hi:
+            here.append((t, o))
+    if not here:
+        return ""
+    here.sort(key=lambda x: x[0])
+    return ("OUTCOMES the screen showed in these minutes (the game's own "
+            "verdict - real, final, name them): "
+            + "; ".join(_outcome_line(o, clock=True) for _t, o in here[:cap])
+            + ". A stretch that spans one of these is named by it unless "
+            "the room's talk was plainly about something else; then the "
+            "win still goes in \"what\".\n")
+
+
+def _outcome_plant(wmoments, outs, lo, hi):
+    """The screen's verdicts as moments, planted by CODE after the window
+    is told - the model can name a win but cannot invent one. One per
+    outcome inside the window, never within 8 s of a moment already
+    there; line -1 says no transcript row is cited (a code-only kind,
+    outside the schema). Returns how many were planted."""
+    n = 0
+    for o in outs or []:
+        try:
+            t = float(o.get("t") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not (lo <= t < hi):
+            continue
+        near = False
+        for m in wmoments:
+            try:
+                if abs(float(m.get("t") or 0) - t) <= 8.0:
+                    near = True
+                    break
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if near:
+            continue
+        wmoments.append({"t": round(t, 1), "why": _outcome_line(o)[:140],
+                         "kind": "outcome", "line": -1})
+        n += 1
+    return n
+
+
+def _outcome_owing(video_path):
+    """A written grid without its outcomes, on a game with an outcome
+    pack, owes the dense pass alone - never the ears, never the grid.
+    Never owed on a black night (the sidecar's own black hud, or
+    pic.json), never when the senses are owed whole. READ ONLY and
+    cached on the sidecar's clock and size plus the packs folder's
+    clock: the sweep asks this about every recording every beat, and a
+    probe here would stall game detection."""
+    if _senses_paths() is None or _hud_paths() is None:
+        return False
+    sp = _ai_sidecar(video_path, "sns")
+    try:
+        st = os.stat(sp)
+        if st.st_mtime < os.path.getmtime(video_path):
+            return False
+        pmt = round(os.path.getmtime(os.path.join(_here(), "ai", "packs")),
+                    1)
+    except OSError:
+        return False
+    key = (round(st.st_mtime, 1), st.st_size, pmt)
+    hit = _OUT_OWE_CACHE.get(sp)
+    if hit and hit[0] == key:
+        return hit[1]
+    owed = False
+    try:
+        game = _display_name(_parse_clip_name(os.path.basename(video_path)))
+        if _pack_outcomes(game) and not _pic_black(video_path):
+            with open(sp, encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            hud = d.get("hud")
+            owed = bool(not d.get("failed") and isinstance(hud, dict)
+                        and not hud.get("black") and "outcomes" not in d)
+    except Exception:
+        owed = False
+    _OUT_OWE_CACHE[sp] = (key, owed)
+    return owed
+
+
+def _outcome_windows_arg(wins):
+    """The dense windows as the reader's argv[8]: 'a-b:step,...'."""
+    return ",".join("%.1f-%.1f:%g" % (float(a), float(b), _OUT_STEP)
+                    for a, b, _w in (wins or []))
+
+
+def _outcome_read(video_path, game, wins, dur, py, ow, oj, flags):
+    """One reader run over the dense windows only (no targeted seconds,
+    no grid): (dense rows or None, the worker's last stderr). A reader
+    that predates 3.32 (a doc with no 'dense' key and v under 3)
+    answers (None, _OUT_OLD_READER): the callers then write NO
+    outcomes key, so the night stays owed until the drop lands."""
+    try:
+        _omt = os.stat(ow).st_mtime
+    except OSError:
+        _omt = None
+    if _omt is not None and _omt == _OUT_OLD["mt"]:
+        return None, _OUT_OLD_READER      # the same old file: no spawn
+    nfr = sum(int((float(b) - float(a)) / _OUT_STEP) + 1
+              for a, b, _w in wins)
+    rc, _o, err = _ai_run(
+        [py, ow, video_path, SETTINGS["ffmpeg_path"], oj, "", game, "0",
+         "%.1f" % float(dur or 0), _outcome_windows_arg(wins),
+         str(_OUT_FRAMES)],
+        max(600, 2 * min(nfr, _OUT_FRAMES)) + 120, flags)
+    why = (err or b"").decode("utf-8", "replace")[-120:] if rc != 0 else ""
+    dense, doc = None, None
+    if rc == 0 and os.path.isfile(oj):
+        try:
+            with open(oj, encoding="utf-8") as fh:
+                doc = json.load(fh) or {}
+            dense = doc.get("dense")
+        except Exception:
+            dense, doc = None, None
+    if isinstance(doc, dict) and "dense" not in doc:
+        try:
+            _v = int(doc.get("v") or 0)
+        except (TypeError, ValueError):
+            _v = 0
+        if _v < 3:
+            _OUT_OLD["mt"] = _omt
+            if not _OUT_OLD["said"]:
+                _OUT_OLD["said"] = True
+                log("The screen's reader on disk predates 3.32 - outcomes "
+                    "wait for the drop to land.")
+            return None, _OUT_OLD_READER
+    if not isinstance(dense, list):
+        return None, why or "the reader returned no dense rows"
+    return dense, ""
+
+
+def _outcome_topup_one(video_path):
+    """The dense pass over a night whose grid is already written: predict
+    the ends off the grid, read them, fold the verdicts in and put the
+    sidecar back with ITS OWN CLOCK - hl is never touched (the outcomes
+    live on the sidecar alone; the bar folds them at read). Left alone
+    if a senses pass rewrote the file meanwhile. A reader that falls
+    over is written down as looked-and-found-nothing with its why, so
+    the night is not asked about every beat; a reader that predates
+    3.32 writes nothing, and the night stays owed for the drop."""
+    got = _senses_paths()
+    ow = _hud_paths()
+    if got is None or ow is None:
+        return False
+    py, _w = got
+    sp = _ai_sidecar(video_path, "sns")
+    name = os.path.basename(video_path)
+    try:
+        st0 = os.stat(sp)
+        with open(sp, encoding="utf-8") as fh:
+            sns = json.load(fh) or {}
+    except Exception:
+        return False
+    hud = sns.get("hud")
+    if sns.get("failed") or "outcomes" in sns or not isinstance(hud, dict):
+        return True
+    game = _display_name(_parse_clip_name(name))
+    if not _pack_outcomes(game):
+        return True
+
+    def _put(outs, failed=""):
+        try:
+            st1 = os.stat(sp)
+        except OSError:
+            return False
+        if (st1.st_mtime, st1.st_size) != (st0.st_mtime, st0.st_size):
+            return True
+        sns["outcomes"] = outs
+        sns["tally"] = _outcome_tally(outs)
+        if failed:
+            sns["outcomes_failed"] = str(failed)[-120:]
+        _atomic_write_json(sp, sns)
+        try:
+            os.utime(sp, (st0.st_atime, st0.st_mtime))
+        except OSError:
+            pass
+        # a restored clock pops every cache keyed on it (the 3.28 rule)
+        _OUT_OWE_CACHE.pop(sp, None)
+        _HUD_OWE_CACHE.pop(sp, None)
+        return True
+
+    if hud.get("black") or _pic_black(video_path):
+        return _put([])
+    hl = {}
+    try:
+        with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
+            hl = json.load(fh) or {}
+        if isinstance(hl, list):
+            hl = {"events": hl}
+    except Exception:
+        hl = {}
+    dur = float(_AI.get("job_secs") or _probe_duration(video_path) or 0)
+    wins = _outcome_candidates(sns, hl, None, game, dur)
+    if not wins:
+        ok = _put([])
+        log(f"The screen decided nothing on {name}: no match end to look "
+            f"for.")
+        return ok
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    oj = os.path.join(_work_dir(),
+                      f"out_{os.getpid()}_{threading.get_ident()}.json")
+    _source_busy_add(video_path)
+    try:
+        dense, why = _outcome_read(video_path, game, wins, dur, py, ow, oj,
+                                   flags)
+        if _AI["abort"]:
+            return False
+        if dense is None:
+            if why == _OUT_OLD_READER:
+                # no outcomes key: the night stays owed until the
+                # 3.32 reader lands (the notice was logged once)
+                return True
+            ok = _put([], failed=why)
+            log(f"The screen reader could not read the ends of {name}: "
+                f"{why[:100]}")
+            return ok
+        outs = _outcome_fold(dense, game, _OUT_STEP,
+                             you=SETTINGS.get("handle") or "", wins=wins)
+        ok = _put(outs)
+        tl = _outcome_tally(outs)
+        log(f"The screen decided on {name}: "
+            + (tl["line"] or "no match end was read")
+            + f" ({len(wins)} window(s), {len(dense)} frame(s)).")
+        return ok
+    except Exception as e:
+        # SOFT: a stumble here must not memo the whole night as failed
+        _AI["soft_fail"] = True
+        log(f"The screen reader stumbled on the ends of {name}: "
+            f"{str(e)[:120]}")
         return False
     finally:
         _source_busy_done(video_path)
@@ -14561,6 +15263,10 @@ def _senses_one(video_path):
                 # so the grid top-up never owes it either.
                 sns["hud"] = {"step": _HUD_STEP, "rows": [], "black": True}
                 sns["screen"] = []
+                # ...and nothing to decide off it - written, so the
+                # outcome top-up never owes a black night either
+                sns["outcomes"] = []
+                sns["tally"] = _outcome_tally([])
                 log(f"The picture of {name} is black - the HUD reader did "
                     f"not run.")
             elif os.path.isfile(ow) \
@@ -14611,6 +15317,56 @@ def _senses_one(video_path):
                             os.remove(oj)
                     except OSError:
                         pass
+                    # THE SCREEN DECIDED (3.32). The grid's clock row
+                    # says where a match ended; the reader goes back
+                    # there two seconds apart, and the verdict folds
+                    # onto THIS sidecar only - never into hl. A game
+                    # with no outcome pack writes no key at all, so
+                    # a pack added later can still owe the pass.
+                    if rc2 == 0 and "hud" in sns and not _AI["abort"] \
+                            and _pack_outcomes(game):
+                        _hl0 = {}
+                        try:
+                            with open(_ai_sidecar(video_path, "hl"),
+                                      encoding="utf-8") as fh:
+                                _hl0 = json.load(fh) or {}
+                            if isinstance(_hl0, list):
+                                _hl0 = {"events": _hl0}
+                        except Exception:
+                            _hl0 = {}
+                        wins = _outcome_candidates(sns, _hl0, None, game,
+                                                   float(dur or 0))
+                        outs, old = [], False
+                        if wins:
+                            oj2 = wav + ".out.json"
+                            dense, why2 = _outcome_read(
+                                video_path, game, wins, dur, py, ow, oj2,
+                                flags)
+                            try:
+                                if os.path.isfile(oj2):
+                                    os.remove(oj2)
+                            except OSError:
+                                pass
+                            if _AI["abort"]:
+                                return False
+                            if dense is None:
+                                # a reader that predates 3.32 leaves
+                                # the night owed: no outcomes key, no
+                                # outcomes_failed - the drop settles it
+                                old = why2 == _OUT_OLD_READER
+                                if not old:
+                                    sns["outcomes_failed"] = why2
+                            else:
+                                outs = _outcome_fold(
+                                    dense, game, _OUT_STEP,
+                                    you=SETTINGS.get("handle") or "",
+                                    wins=wins)
+                        if not old:
+                            sns["outcomes"] = outs
+                            sns["tally"] = _outcome_tally(outs)
+                            if sns["tally"]["line"]:
+                                log(f"The screen decided on {name}: "
+                                    + sns["tally"]["line"] + ".")
         except Exception as e:
             sns.setdefault("counters", {})["ocr_failed"] = str(e)[:120]
         if _AI["abort"]:
@@ -15959,6 +16715,14 @@ _TITLE_MOOD = frozenset((
     "adventures", "adventure", "struggles", "struggle", "chaos", "journey",
     "vibes", "shenanigans", "moments", "highlights", "antics", "banter",
     "misadventures", "frustrations", "frustration"))
+# THE SCREEN DECIDED (3.32). The one rule the tally needs rides the
+# evidence right under the tally, and ONLY there - so the ask on a
+# night the screen decided nothing is the old ask, byte for byte, and
+# every title already baked stays comparable.
+_TITLE_TALLY_RULE = (
+    "  (The screen decided this night: the title may say so in those "
+    "words - a placement, a run of wins or losses - and the summary "
+    "carries the tally.)\n")
 
 
 def _title_guard(title, said):
@@ -16002,8 +16766,9 @@ def _title_guard(title, said):
 def _title_evidence(ev):
     """The evidence pack the title is asked over - one page, in order:
     the night in a line, the chapters (name / what / a real line / what
-    the ears marked), the moments somebody would clip, the senses, the
-    screen's names, the eye's places and creatures, then the ask."""
+    the ears marked), the moments somebody would clip, the senses, what
+    the screen decided, the screen's names, the eye's places and
+    creatures, then the ask."""
     def mmss(t):
         try:
             t = int(float(t or 0))
@@ -16034,6 +16799,17 @@ def _title_evidence(ev):
     scr = "; ".join("%s (%s-%s)" % (x.get("n"), mmss(x.get("a")),
                                     mmss(x.get("b")))
                     for x in (ev.get("screen") or [])[:8])
+    # the night's verdict, in the tally's own words plus each match's
+    # clock - absent byte-for-byte on a night the screen decided nothing
+    tally = ""
+    _tl = ev.get("tally") or {}
+    if isinstance(_tl, dict) and _tl.get("line"):
+        tally = str(_tl["line"])
+        _ol = [_outcome_line(o, clock=True)
+               for o in (ev.get("outcomes") or [])
+               if isinstance(o, dict)][:8]
+        if _ol:
+            tally += " (" + "; ".join(_ol) + ")"
     names = [n for n in (ev.get("names") or []) if n and n != "you"]
     body = ("THE NIGHT: %s, %d minutes, %d spoken lines"
             % (ev.get("game"), int(float(ev.get("dur") or 0) // 60),
@@ -16047,6 +16823,8 @@ def _title_evidence(ev):
                + "\n\n" if moms else "")
             + ("THE SENSES over the whole night: %s.\n" % senses
                if senses else "")
+            + ("THE SCREEN DECIDED: %s.\n" % tally + _TITLE_TALLY_RULE
+               if tally else "")
             + ("THE SCREEN printed: %s.\n" % ocr if ocr else "")
             + ("THE SCREEN NAMED (a boss bar, a mode, a menu that stood): "
                "%s.\n" % scr if scr else "")
@@ -17431,6 +18209,7 @@ def _insights_one(video_path, forced=False, fresh=False):
         pass
     _who_names = {}
     _screen = []       # what the screen itself named, as spans
+    _outs = []         # what the screen DECIDED (3.32): the verdicts
     _sd0 = {}          # _line() closes over this - it must exist even
     #                    when the senses sidecar cannot be read
     try:
@@ -17439,6 +18218,8 @@ def _insights_one(video_path, forced=False, fresh=False):
         _who_names = _sd0.get("names") or {}
         _screen = [x for x in (_sd0.get("screen") or [])
                    if isinstance(x, dict) and x.get("n")]
+        _outs = [o for o in (_sd0.get("outcomes") or [])
+                 if isinstance(o, dict)]
         for e0 in _sd0.get("ocr") or []:
             _heard.append((float(e0.get("t") or 0),
                            "on-screen: "
@@ -17661,6 +18442,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                              f"{n0} ({int(a0 // 60)}:{int(a0 % 60):02d}-"
                              f"{int(b0 // 60)}:{int(b0 % 60):02d})"
                              for a0, b0, n0 in scr_here) + "\n")
+            # WHAT THE SCREEN DECIDED (3.32). The describer had no way
+            # to know he won: the room said "Well played!" once in
+            # three wins. The verdict is real and final, and only a
+            # stretch that spans it is named by it. Empty on a black
+            # night and on a night whose game has no pack.
+            ears += _outcome_block(_outs, lo, hi)
             saw_here = [(t0, s0) for t0, s0 in _seen if lo <= t0 < hi]
             eyes = ""
             if saw_here:
@@ -17878,6 +18665,13 @@ def _insights_one(video_path, forced=False, fresh=False):
                     pending.insert(0, _g4)
                 if got is None:
                     break
+            # THE SCREEN'S VERDICTS ARE MOMENTS PLANTED BY CODE (3.32):
+            # the model can name a win, it cannot invent one. Outside
+            # the schema's enum (kind 'outcome', line -1), never within
+            # 8 s of a moment already told; the assembled moments carry
+            # it to the UI with no extra plumbing.
+            if _outs:
+                _outcome_plant(wmoments, _outs, lo, hi)
             log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} min -> "
                 f"{len(mapped)} stretch(es), {len(wmoments)} moment(s).")
             if _mdrop[0]:
@@ -18016,6 +18810,11 @@ def _insights_one(video_path, forced=False, fresh=False):
                                for e in (_sd0.get("ocr") or [])
                                if isinstance(e, dict)],
                        "screen": _screen,
+                       # THE SCREEN DECIDED (3.32): the tally must be IN
+                       # the evidence for "won three in a row" to be
+                       # allowed by the title's own rule
+                       "tally": _sd0.get("tally"),
+                       "outcomes": _outs,
                        "places": [str(p.get("name") or "")[:40]
                                   for p in (_vd1.get("places") or [])
                                   if isinstance(p, dict)
@@ -19445,24 +20244,31 @@ _AUD_EYE = 12.0         # the eye's fold window (_merge_vis_into_hl)
 _AUD_REVIEW = 12.0      # a described moment sits on the LINE, not the peak
 _AUD_CHAPTER = 8.0      # a chapter starts on a cut, near enough to a mark
 _AUD_LAUGH = 8.0        # the laughter ear's own fold window
+_AUD_SCREEN = 20.0      # a verdict this near is the screen's witness
+_AUD_OUT_WIN = 180.0    # a claimed win must have a screen end this close
 _AUD_PLACE_GAP = 600.0  # the same room noun this soon apart is one room
 _AUD_LIVE = 0.2         # under this a layer did not cover the night at all
 _AUD_ANCHORS = 40       # what one ask can hold and still be read as a list
 _AUD_TELL = 12          # disproved claims worth naming in the ask
 
-#  THE ONLY FIVE THINGS A BEAT MAY AGREE WITH. The panel is written
+#  THE ONLY SIX THINGS A BEAT MAY AGREE WITH. The panel is written
 #  against this vocabulary, so nothing else may ever appear in an
 #  "agrees" list. Loudness is deliberately NOT one of them: a prominence
 #  is how the sound pass chose the mark, not a second witness to it.
-_AUD_LAYERS = ("words", "sound", "eye", "review", "laugh")
+#  3.32 adds the screen - the game's own verdict, a sight and not a
+#  sound; it never earns standing (a positive counts, silence never
+#  condemns), and the UI learned the word in the same ship.
+_AUD_LAYERS = ("words", "sound", "eye", "screen", "review", "laugh")
 
 _AUD_SAY = {"words": "said: ", "sound": "heard: ", "eye": "saw: ",
+            "screen": "the screen: ",
             "review": "the review: ", "laugh": "the ear: "}
 
 _AUD_SILENT = {
     "words": "no line spoken within four seconds",
     "sound": "nothing the senses heard",
     "eye": "nothing the eye saw",
+    "screen": "nothing the screen printed",
     "review": "nothing the review called a moment",
     "laugh": "no laugh the ear could hear"}
 
@@ -20064,6 +20870,203 @@ def _aud_names(video_path, ins, stt, low):
     return rows, warn
 
 
+# WHAT THE STORY CLAIMS THE SCREEN NEVER SHOWED (3.32). The words that
+# make a claim of an outcome, in both scripts. The Arabic list is
+# dictionary Arabic until the room's own vocabulary is known (the 3.25
+# law: agreement beats dictionary) - so every row this check writes is
+# a WARNING, never a strike: a wrong word costs a line in the panel and
+# nothing else.
+_AUD_OUT_WORDS = (
+    ("win", re.compile(r"\b(?:won|wins?|winning|winner|victory|"
+                       r"victorious)\b", re.I)),
+    # bare 'lost' read "lost the ball" and "got lost" as a loss claim:
+    # a loss is 'lost the/that/this/a game/match/one/round/series' or
+    # 'we lost' closing its clause
+    ("loss", re.compile(
+        r"\b(?:lost\s+(?:the|that|this|a)\s+(?:game|match|one|round|series)"
+        r"|we\s+lost(?=\s*(?:[.,;:!?)\-]|$))|loss|losing|loses|defeat|"
+        r"defeated)\b", re.I)),
+    ("placement", re.compile(
+        r"\b(?:(?P<n>[1-8])(?:st|nd|rd|th)\s+place|(?P<first>first)\s+place"
+        r"|top\s*(?P<top>4|four)|finished\s+(?P<n2>[1-8])(?:st|nd|rd|th))\b",
+        re.I)),
+    ("win", re.compile("\u0641\u0632\u0646\u0627|\u0641\u0632\u062a|"
+                       "\u0631\u0628\u062d\u0646\u0627|\u0631\u0628\u062d\u062a")),
+    ("loss", re.compile("\u062e\u0633\u0631\u0646\u0627|\u062e\u0633\u0631\u062a|"
+                        "\u0627\u0646\u0647\u0632\u0645\u0646\u0627")),
+    ("placement", re.compile("\u0627\u0644\u0645\u0631\u0643\u0632")),
+)
+
+
+def _aud_out_match(kind, place, o):
+    """Does this outcome SHOW the claim? Kind and place are compared,
+    never mere nearness - a WINNER beside a chapter is evidence for the
+    mark, not for what the chapter says. A 'win?' (a match ended, whose
+    win unread) shows a win and a loss alike: it cannot dispute either."""
+    side = str(o.get("side") or "")
+    if kind == "win":
+        return side in ("win", "win?")
+    if kind == "loss":
+        return side in ("loss", "win?")
+    if kind == "placement":
+        # a seat is compared to a seat; 'top 4' is a range, and a claim
+        # that names no seat at all is shown by nothing
+        op = _aud_out_seat(o)
+        if place is None or op is None:
+            return False
+        if isinstance(place, tuple):
+            return op <= place[1]
+        return op == place
+    return False
+
+
+def _aud_out_seat(o):
+    """The seat a placement outcome names, or None (a win, junk)."""
+    if str(o.get("kind") or "") != "placement":
+        return None
+    try:
+        op = int(o.get("place"))
+    except (TypeError, ValueError):
+        return None
+    return op if op >= 1 else None
+
+
+def _aud_out_opposite(kind, place, o):
+    side = str(o.get("side") or "")
+    if kind == "win":
+        return side == "loss"
+    if kind == "loss":
+        return side == "win"
+    if kind == "placement":
+        op = _aud_out_seat(o)
+        if place is None or op is None:
+            return False
+        if isinstance(place, tuple):
+            return op > place[1]
+        return op != place
+    return False
+
+
+def _aud_outcomes(ins, sns, dur):
+    """Every win, loss or placement the title, summary, chapters or
+    moments CLAIM, looked up against what the screen decided within
+    three minutes of the claim's span (the title and summary: the whole
+    night). (rows, warnings): rows {where, t, claim, kind, verdict:
+    shown|unshown|contradicted, nearest}; a warning per row that is not
+    'shown'. NEVER a strike - nothing is dropped or rewritten. A night
+    the screen was never asked about (no 'outcomes' key: no pack, no
+    grid, an older sidecar) answers ([], []) - silence, never an
+    accusation."""
+    sns = sns or {}
+    if not isinstance(sns, dict) or "outcomes" not in sns:
+        return [], []
+    outs = [o for o in (sns.get("outcomes") or []) if isinstance(o, dict)]
+    ins = ins or {}
+
+    def _t(x):
+        try:
+            return float(x or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def mmss(t):
+        t = int(_t(t))
+        return "%d:%02d" % (t // 60, t % 60)
+
+    chs = sorted([c for c in (ins.get("chapters") or [])
+                  if isinstance(c, dict)], key=lambda c: _t(c.get("t")))
+    dur = _t(dur)
+    if dur <= 0:
+        dur = max([_t(o.get("t")) for o in outs]
+                  + [_t(c.get("t")) for c in chs] + [0.0]) + 600.0
+    claims = [("title", str(ins.get("title") or ""), 0.0, dur, ""),
+              ("summary", str(ins.get("summary") or ""), 0.0, dur, "")]
+    for i, c in enumerate(chs):
+        a = _t(c.get("t"))
+        b = _t(chs[i + 1].get("t")) if i + 1 < len(chs) else dur
+        label = str(c.get("label") or "")
+        claims.append(("chapter", label + " " + str(c.get("what") or ""),
+                       a, max(a, b), label))
+    for m in (ins.get("moments") or []):
+        if not isinstance(m, dict) or str(m.get("kind") or "") == "outcome":
+            continue                  # the screen's own words claim nothing
+        t0 = _t(m.get("t"))
+        why = str(m.get("why") or "")
+        claims.append(("moment", why, t0 - 8.0, t0 + 8.0, why[:40]))
+    rows, warn = [], []
+    for where, txt, a, b, label in claims:
+        if not txt.strip():
+            continue
+        done = set()
+        for kind, rx in _AUD_OUT_WORDS:
+            if kind in done:
+                continue
+            m = rx.search(txt)
+            if not m:
+                continue
+            done.add(kind)
+            word = m.group(0)
+            place = None
+            if kind == "placement":
+                # the seat the words name: an ordinal, 'first place'
+                # = 1, 'top 4' / 'top four' = the range ('top', 4); a
+                # list without one (the Arabic word) names no seat
+                _gd = m.groupdict()
+                if _gd.get("n") or _gd.get("n2"):
+                    place = int(_gd.get("n") or _gd.get("n2"))
+                elif _gd.get("first"):
+                    place = 1
+                elif _gd.get("top"):
+                    place = ("top", 4)
+            near = [o for o in outs
+                    if a - _AUD_OUT_WIN <= _t(o.get("t")) <= b + _AUD_OUT_WIN]
+            shown = next((o for o in near
+                          if _aud_out_match(kind, place, o)), None)
+            contra = None
+            if shown is None:
+                contra = next((o for o in near
+                               if a <= _t(o.get("t")) <= b
+                               and _aud_out_opposite(kind, place, o)), None)
+            verdict = ("shown" if shown is not None
+                       else ("contradicted" if contra is not None
+                             else "unshown"))
+            mid = (a + b) / 2.0
+            nearest = min(outs, key=lambda o: abs(_t(o.get("t")) - mid)) \
+                if outs else None
+            rows.append({"where": where, "t": round(a, 1),
+                         "claim": word[:30], "kind": kind,
+                         "verdict": verdict,
+                         "nearest": mmss(nearest.get("t")) if nearest
+                         else ""})
+            if verdict == "shown":
+                continue
+            who = "the " + where + ((" \"" + label[:40] + "\"")
+                                    if label and where in ("chapter",
+                                                           "moment")
+                                    else "")
+            if verdict == "contradicted":
+                msg = (who + " says \"" + word + "\" and the screen showed "
+                       "the opposite - " + _outcome_line(contra, clock=True))
+            elif nearest is not None:
+                gap = _t(nearest.get("t")) - (b if _t(nearest.get("t")) > b
+                                              else a)
+                if a <= _t(nearest.get("t")) <= b:
+                    gap = 0.0
+                msg = (who + " says \"" + word + "\" and the screen did "
+                       "not show that - the nearest "
+                       + str(nearest.get("text") or "match end")
+                       + " is " + mmss(abs(gap))
+                       + (" later" if _t(nearest.get("t")) > b
+                          else " earlier" if _t(nearest.get("t")) < a
+                          else " off")
+                       + " (" + _outcome_line(nearest, clock=True) + ")")
+            else:
+                msg = (who + " says \"" + word + "\" and the screen did "
+                       "not show that - no match ended near it")
+            warn.append(msg[:240])
+    return rows, warn
+
+
 _AUD_SKEL_IX = {"at": 0.0, "ix": None}
 
 
@@ -20411,14 +21414,26 @@ def _aud_says(t, src):
                 break
         except (TypeError, ValueError):
             continue
-    if "sound" not in det:
+    # THE SCREEN (3.32): a sight, not a sound. The game's own verdict
+    # within twenty seconds is the witness for this second; the
+    # banner reads the senses caught (sns.ocr) ride the same slot,
+    # where the sound slot used to carry them.
+    for o in (sns.get("outcomes") or []):
+        try:
+            if abs(float(o.get("t") or 0) - t) <= _AUD_SCREEN:
+                lay.append("screen")
+                det["screen"] = _outcome_line(o)[:90]
+                break
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if "screen" not in det:
         for o in (sns.get("ocr") or []):
             try:
                 if abs(float(o.get("t") or 0) - t) <= _AUD_SOUND:
-                    lay.append("sound")
-                    det["sound"] = ("on screen: "
-                                    + str(o.get("text")
-                                          or o.get("kind") or "")[:30])
+                    lay.append("screen")
+                    det["screen"] = ("on screen: "
+                                     + str(o.get("text")
+                                           or o.get("kind") or "")[:30])
                     break
             except (TypeError, ValueError):
                 continue
@@ -20452,6 +21467,10 @@ def _aud_says(t, src):
     # the vote is withdrawn.
     _mb = None
     for m in (ins.get("moments") or []):
+        if isinstance(m, dict) and m.get("kind") == "outcome":
+            continue          # planted by code off the screen's
+            #                   verdict (3.32) - the screen's word,
+            #                   already a witness, never the review's
         try:
             _d3 = abs(float(m.get("t") or 0) - t)
         except (TypeError, ValueError):
@@ -20494,8 +21513,11 @@ def _aud_live(seen, n):
     layer its veto, never its word. That is why the laughter ear is in
     here - it will almost never earn standing (15 laughs in 972 marks)
     and it must never need to, because a laugh IS evidence."""
+    # the screen is hard-excluded: a match ends a handful of times a
+    # night, and its silence about any one second proves nothing
     return set(k for k in _AUD_LAYERS
-               if seen.get(k, 0) >= 3
+               if k != "screen"
+               and seen.get(k, 0) >= 3
                and seen.get(k, 0) >= _AUD_LIVE * max(1, n))
 
 
@@ -21279,6 +22301,13 @@ def _aud_dossier(g, src, ins):
                                         str(lk.get("creature") or "")) if x)
     if lb:
         bits.append("on screen: " + lb[:70])
+    for o in ((src.get("sns") or {}).get("outcomes") or []):
+        try:
+            if abs(float(o.get("t") or 0) - t) <= 45.0:
+                bits.append("the screen said: " + _outcome_line(o)[:60])
+                break
+        except (TypeError, ValueError, AttributeError):
+            continue
     ch = ""
     for c in ((ins or {}).get("chapters") or []):
         try:
@@ -23374,6 +24403,13 @@ def _audit_one(video_path, redo=False):
             names, nwarn = _aud_names(video_path, ins, stt, _low)
         except Exception:
             names, nwarn = [], []
+        # THE SCREEN'S VERDICT AGAINST THE STORY'S (3.32): a chapter
+        # that claims a win the screen never showed is questioned,
+        # never struck - a row beside the unsaid names.
+        try:
+            outrows, owarn = _aud_outcomes(ins, sns, dur)
+        except Exception:
+            outrows, owarn = [], []
         try:
             _beat("checking old corrections", 0.10)
             took_back = _aud_revert_nonsense(video_path, _freq)
@@ -23418,6 +24454,7 @@ def _audit_one(video_path, redo=False):
             garble = []
             healed_ts = []
         warn.extend(nwarn[:4])
+        warn.extend(owarn[:4])
         ask_rows = [g for g in (garble or []) if not g.get("carried")]
         if ask_rows:
             _beat("re-listening with an Arabic ear", 0.20)
@@ -23531,9 +24568,12 @@ def _audit_one(video_path, redo=False):
                "thread": beats, "dropped": drops, "merged": merged,
                "names": names, "garble": garble, "fixes": fixes,
                "names_fixed": names_fixed, "corrected": corrected,
+               "outcomes": outrows,
                "warnings": warn[:14], "gist": gist,
                "saw": {"marks": len(events), "kept": len(rows),
                        "named": len(names),
+                       "unshown": len([r for r in outrows
+                                       if r.get("verdict") != "shown"]),
                        "unsaid": len([n for n in names
                                       if n.get("verdict") == "unsaid"]),
                        "misspelt": len([n for n in names
@@ -23902,6 +24942,24 @@ def _aud_public(d):
                       "verdict": v,
                       "how": str(r.get("how") or "")[:120],
                       "said": str(r.get("said") or "")[:40]})
+    # WHAT THE SCREEN NEVER SHOWED (3.32). Only the rows that question a
+    # claim travel - a claim the screen bore out needs no reporting.
+    outcomes = []
+    for r in _list(d, "outcomes"):
+        if not isinstance(r, dict):
+            continue
+        v = str(r.get("verdict") or "")
+        if v == "shown":
+            continue
+        try:
+            t = round(float(r.get("t") or 0), 1)
+        except (TypeError, ValueError):
+            t = 0.0
+        outcomes.append({"where": str(r.get("where") or "")[:16], "t": t,
+                         "claim": str(r.get("claim") or "")[:30],
+                         "kind": str(r.get("kind") or "")[:12],
+                         "verdict": v[:14],
+                         "nearest": str(r.get("nearest") or "")[:10]})
     # THE DOUBTFUL LINES AND THE PROPOSALS, kept apart on purpose. A
     # proposal is not a transcript and must never be able to arrive
     # looking like one, so it travels in its own list keyed by the second
@@ -23956,7 +25014,7 @@ def _aud_public(d):
     return {"v": _AUD_V, "thread": thread, "dropped": dropped,
             "merged": merged, "names": names, "garble": garble,
             "fixes": fixes, "names_fixed": names_fixed,
-            "corrected": corrected,
+            "corrected": corrected, "outcomes": outcomes,
             "warnings": [str(w)[:240] for w in _list(d, "warnings") if w],
             "complete": bool(d.get("complete"))}
 
@@ -24986,14 +26044,18 @@ def _ai_tick(ctl):
 
         def work():
             ok = False
-            hud_only = (_AI.pop("hud_only", None) == path)
-            if hud_only:
+            _tail = _AI.pop("tail", None)
+            tail = (_tail[0] if isinstance(_tail, tuple) and len(_tail) == 2
+                    and _tail[1] == path else None)
+            screen_only = (tail == "screen")
+            if tail:
                 # the Working page reads busy[1]; the audit names itself
                 # the same way so its row does not read as the describer
-                _AI["busy"] = (kind, "the screen \u00b7 "
-                               + os.path.basename(path))
-            if not hud_only:
-                # a grid-only visit never touches the card: the warm
+                _AI["busy"] = (kind, {"screen": "the screen",
+                                      "index": "the index"}.get(tail, tail)
+                               + " \u00b7 " + os.path.basename(path))
+            if not tail:
+                # a tail visit never touches the card: the warm
                 # describer stays warm for the review behind it
                 _ask_srv_drop()    # the card belongs to this job now
                 if kind != "thinking":
@@ -25086,13 +26148,17 @@ def _ai_tick(ctl):
                                 + os.path.basename(path) + ": "
                                 + str(_ae)[:120])
                 else:
-                    if hud_only:
-                        ok = True          # the ears are fresh: grid only
+                    if screen_only:
+                        ok = True          # the ears are fresh: the screen
                     else:
                         ok = _highlights_one(path)
                     # a redo of the ears tops the grid up too, when owed
                     if ok and not _AI["abort"] and _hud_owing(path):
                         ok = _hud_topup_one(path)
+                    # ...and then the ends the grid predicted (3.32):
+                    # the outcomes ride the same visit, never hl
+                    if ok and not _AI["abort"] and _outcome_owing(path):
+                        ok = _outcome_topup_one(path)
             except Exception:
                 # A JOB THAT DIES MUST SAY SO. An uncaught exception here
                 # used to kill the worker thread in perfect silence - the
@@ -25104,8 +26170,8 @@ def _ai_tick(ctl):
                 log(f"The {kind} job on {os.path.basename(path)} CRASHED: "
                     + " | ".join(tb[-3:]))
             finally:
-                if ok and not _AI["abort"] and not hud_only:
-                    # a grid-only visit is not the ears' pace: minutes
+                if ok and not _AI["abort"] and not tail:
+                    # a tail visit is not the ears' pace: minutes
                     # of OCR would have taught the listening lane's
                     # estimate that a night takes ten times longer
                     if kind == "hearing":
@@ -25472,7 +26538,12 @@ def _ai_tick(ctl):
     # the whole walk found nothing louder to start; newest first, never
     # while he plays, and the focus is not held for it. It rides the
     # listening lane's name because that is the CPU lane's switch, and
-    # a grid-only visit never touches the card (see hud_only in work).
+    # a tail visit never touches the card (see the tail in work).
+    # ONE TAIL, ONE KEY (3.32): _AI["tail"] = (what, path). The screen
+    # visit tops the grid up and then the ends it predicted; an 'index'
+    # visit is the same seat for the shelf's embedder, per night, so a
+    # new night's index never waits behind an old night's six minutes
+    # of screen work. Neither owing test opens a video.
     if do_hl and not playing:
         for p in vids:
             if _ai_skipped_recently(p) or _queued_finish_badge(p):
@@ -25487,8 +26558,9 @@ def _ai_tick(ctl):
             if veto and veto[0] == os.path.basename(p) \
                     and time.time() - veto[1] < 15:
                 continue
-            if _hud_owing(p) and _ai_sidecar_fresh(p, "hl"):
-                _AI["hud_only"] = p
+            if (_hud_owing(p) or _outcome_owing(p)) \
+                    and _ai_sidecar_fresh(p, "hl"):
+                _AI["tail"] = ("screen", p)
                 _spawn("listening", p, mt)
                 return
 
@@ -29188,7 +30260,12 @@ class _JsApi:
                     "names": d.get("names") or {},
                     "events": d.get("events") or [],
                     "ocr": d.get("ocr") or [], "inp": inp,
-                    "src": d.get("src")}
+                    "src": d.get("src"),
+                    # 3.32 what the screen decided: the bar's outcome
+                    # ticks and the line under the title
+                    "outcomes": [o for o in (d.get("outcomes") or [])
+                                 if isinstance(o, dict)],
+                    "tally": d.get("tally") or None}
         except Exception:
             return None
 
@@ -29201,13 +30278,17 @@ class _JsApi:
         d = _read_sidecar(p, "vis")
         # what the screen named rides in the senses sidecar and shows in
         # this panel beside the places - it is a sight, not a sound
-        screen = []
+        screen, outcomes = [], []
         try:
-            screen = [x for x in ((_read_sidecar(p, "sns") or {})
-                                  .get("screen") or [])
+            _sd = _read_sidecar(p, "sns") or {}
+            screen = [x for x in (_sd.get("screen") or [])
                       if isinstance(x, dict) and x.get("n")]
+            # ...and what it decided (3.32) - the same sight, the
+            # panel's "The screen decided" rows
+            outcomes = [o for o in (_sd.get("outcomes") or [])
+                        if isinstance(o, dict)]
         except Exception:
-            screen = []
+            screen, outcomes = [], []
         # the picture fact: a black night shows its one true line in the
         # panel instead of 'the eye failed' or an invitation to look
         black = False
@@ -29219,11 +30300,11 @@ class _JsApi:
             if black:
                 return {"looks": [], "places": [], "creatures": [],
                         "complete": True, "eye": False, "screen": [],
-                        "black": True}
-            if screen:
+                        "black": True, "outcomes": []}
+            if screen or outcomes:
                 return {"looks": [], "places": [], "creatures": [],
                         "complete": True, "eye": False, "screen": screen,
-                        "black": False}
+                        "black": False, "outcomes": outcomes}
             return None
         looks = d.get("looks") or []
         places = d.get("places") or []
@@ -29242,6 +30323,7 @@ class _JsApi:
                 "places": places,
                 "creatures": d.get("creatures") or [],
                 "complete": bool(d.get("complete")),
+                "outcomes": outcomes,
                 "eye": True, "screen": screen, "black": black}
 
     def audit(self, path, run=False, redo=False):
@@ -29251,7 +30333,7 @@ class _JsApi:
           {"v", "thread":[{t, what, agrees}], "dropped":[{t, what, why}],
            "merged":[{kept, folded}], "warnings":[...], "complete"}
 
-        "agrees" is drawn from exactly words/sound/eye/review/laugh.
+        "agrees" is drawn from exactly words/sound/eye/screen/review/laugh.
         Nothing in "dropped" was deleted from anything - the auditor
         writes only its own sidecar, so every one of those claims is
         still exactly where its own pass left it.
@@ -29913,7 +30995,7 @@ class _JsApi:
 
         def _forget():
             for kind in ("stt", "hl", "lvl", "ins", "usr", "sns", "inp",
-                         "vis", "aud"):
+                         "vis", "aud", "pic", "src"):
                 try:
                     os.remove(_ai_sidecar(p, kind))
                 except OSError:
@@ -30782,7 +31864,7 @@ class _JsApi:
                             # that no longer exist in the reshaped file
                             for kind in ("stt", "hl", "lvl", "ins",
                                          "usr", "sns", "inp", "vis",
-                                         "aud"):
+                                         "aud", "pic", "src"):
                                 try:
                                     os.remove(_ai_sidecar(out, kind))
                                 except OSError:
@@ -31259,7 +32341,8 @@ class _JsApi:
                         # usr too: hand-made marks cite clocks that no longer
                         # exist in the reshaped file
                         for kind in ("stt", "hl", "lvl", "ins", "usr",
-                                     "sns", "inp", "vis", "aud"):
+                                     "sns", "inp", "vis", "aud", "pic",
+                                     "src"):
                             try:
                                 os.remove(_ai_sidecar(out, kind))
                             except OSError:

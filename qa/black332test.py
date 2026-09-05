@@ -669,9 +669,12 @@ check("...says what it is, and returns before the invitation to look",
       "the picture of this one is black" in ps
       and ps.index("return;", ps.index("if(vis.black){"))
       < ps.index("the eye looked and found nothing"))
-check("...the signature moves with the fact, #vsaw stays unlit (any is untouched)",
+check("...the signature moves with the fact, #vsaw stays unlit (black never "
+      "joins any; 3.32's outcomes do)",
       "(vis.black?'black':'')" in ps
-      and "const any=!!(places.length||crs.length||looks.length||scr.length);" in ps)
+      and "const any=!!(places.length||crs.length||looks.length||scr.length\n"
+          "    ||outs.length);" in ps
+      and "black" not in ps[ps.index("const any="):ps.index("const any=") + 90])
 check("the MOCK visions know 'black' (and #black paints the one-line night)",
       "black:false," in USRC and "black:true,eye:false" in USRC
       and "location.hash.includes('black')" in USRC)

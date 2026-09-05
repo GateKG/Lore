@@ -1,0 +1,17 @@
+# Hearthstone (Battlegrounds) - what the screen prints when a match
+# ends (3.32). The result screen shows the placement as an ordinal plus
+# "Place" and the rating with its change: "5th Place", "Rating", "4782",
+# "-11" - for about six seconds, then it is clicked away. Both folders
+# ("hearthstone" and "hearthstoneheroesofwarcraft") resolve to this pack.
+#
+# The placement is the verdict; one frame is enough - the words are
+# unambiguous and the screen is short.
+outcome.placement: \b(?P<n>[1-8])\s?(?:st|nd|rd|th)\s?Place\b
+# The rating line stands in the lobby between matches too: a change
+# between two grid rows is one match ended between them, the sign says
+# which way. On the result screen the delta rides beside it.
+outcome.rating: \bRating\b\D{0,6}(?P<r>\d{3,5})(?:\D{0,6}(?P<d>[+-]\s?\d{1,3}))?
+# Triggers, never outcomes: a spectator stretch means he was eliminated
+# shortly before it; the lobby's welcome means a match just ended.
+outcome.spectator: @?\s?Spectator\s?Mode
+outcome.lobby: Welcome to Battlegrounds

@@ -31,6 +31,11 @@ whisper/
 # fetches them (see tools/ and the Models panel in Settings).
 ai/*
 !ai/*.py
+# ...and the packs are source too (3.32: the outcome packs and their
+# README are what the screen's verdict hinges on) - the folder first,
+# then what is in it; a folder git ignores cannot have a file let in
+!ai/packs/
+!ai/packs/*
 
 # ---- history, kept on disk and out of the repo ----
 _archive/

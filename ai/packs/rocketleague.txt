@@ -1,0 +1,3 @@
+cheer: friends cheering and screaming after a goal
+groan: a loud frustrated groan after a missed save
+music: stadium goal-horn and crowd roar

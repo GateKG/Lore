@@ -859,6 +859,9 @@ body.reduced .proj-glare::after{animation:none}
 /* 3.31 a burst in the game: a shorter, duller tick reads as secondary
    next to the gold without a legend */
 .hlmark[data-fk="game"]{background:#b7a37c;opacity:.5;height:4px;top:0}
+/* 3.32 the screen decided: the brightest gold, outlined, so a win reads
+   as the game's own word and not as one more loud second */
+.hlmark[data-fk="outcome"]{background:var(--gold-hi);box-shadow:0 0 0 2px rgba(255,228,170,.7),0 0 9px rgba(255,210,120,.8)}
 /* with a band present the page must not center-split its overflow - the
    band stays whole at the top and only the grid's bottom edge may shave */
 .pbody:has(.evband){justify-content:flex-start}
@@ -1580,6 +1583,9 @@ body.vfull.vthread #vstage video{max-width:calc(100vw - 392px)}
 #vtitle{order:2;margin-bottom:8px;font-family:var(--serif);font-size:14px;color:#d6c8a4;letter-spacing:.05em;
   max-width:90vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   text-shadow:0 2px 8px rgba(0,0,0,.8)}   /* order:2 + small margin-bottom -> details sit as a tight group DIRECTLY ABOVE the toolbar */
+/* 3.32 the tally under the title: what the screen decided, in one line */
+#vtally{order:2;margin:-4px 0 8px;font-family:var(--serif);font-size:12px;color:#e2c88a;letter-spacing:.06em;
+  max-width:90vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-shadow:0 2px 8px rgba(0,0,0,.8)}
 #vbar{order:3;display:flex;align-items:center;gap:12px;padding:9px 16px;border-radius:22px;width:100%;box-sizing:border-box;
   background:rgba(16,11,6,.82);box-shadow:0 6px 22px rgba(0,0,0,.5),
     0 0 0 1px rgba(200,160,95,.35);backdrop-filter:blur(3px);max-width:88vw}
@@ -1996,6 +2002,9 @@ body.editing .insmark,body.editing .hlmark{pointer-events:none}
 /* a mark Claude could describe stands a little taller - it has something
    to say when you hover it */
 .hlmark.told{height:9px;top:-4px;background:#ffe9b8}
+/* ...and the screen's verdict keeps its own gold when told: the
+   outcome rule above ties .told on specificity and would lose to it */
+.hlmark[data-fk="outcome"].told{background:var(--gold-hi)}
 .hlmark:active{background:#fff;transform:scale(2.2,2.3);
   box-shadow:0 0 14px 3px var(--gold-hi)}
 /* ONE LINE. The field and the two marks share a row, and the marks sit
@@ -2398,6 +2407,8 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
 
 <div id="viewer">
   <div id="vtitle"></div>
+  <!-- 3.32 what the screen decided, as one line under the title -->
+  <div id="vtally" hidden></div>
   <!-- where an edit came from: written when a cut is saved, read on open -->
   <div id="vlineage"></div>
   <!-- what was said: the transcript as a readable column beside the video.
@@ -2533,6 +2544,7 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
           <button data-m="game" class="on" title="Bursts in the game itself (3.31, a night recorded by source) - a side focus, never the room">Game</button>
           <button data-m="told" class="on">Told</button>
           <button data-m="sense" class="on">Senses</button>
+          <button data-m="outcome" class="on" title="What the screen decided (3.32): WINNER and the colour, a placement - the game's own verdict, read off the frames">Outcome</button>
           <button data-m="red" class="on">Chapters</button>
         </span></div>
       <div class="vmsec">Cut &amp; share</div>
@@ -3068,7 +3080,7 @@ function makeMock(){
       detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,capture_by_source:true,voice_apps:['discord.exe','discordptb.exe','discordcanary.exe'],read_game_lines:true,ai_transcribe:true,ai_highlights:true,seek_step:'5',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
-      notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,
+      notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,handle:'',
       popup_style:'slide',popup_size:'large',sfx_volume:25,
       hotkey_record:'ctrl+alt+f7',hotkey_replay:'ctrl+alt+f9',
       hotkey_pause:'ctrl+alt+f10',hotkey_clip_discord:'ctrl+alt+f8',clip_hotkey_seconds:60,
@@ -3082,13 +3094,22 @@ function makeMock(){
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
     test_sound:async()=>true,preview_popup:async()=>true,browse_folder:async()=>null,
     resize_to:async()=>true,stream_url:async()=>null,
-    senses:async()=>null,
+    /* #outcome in the address: a night the screen decided (3.32) */
+    senses:async()=>(location.hash.includes('outcome')
+      ?{hype:null,speakers:[],names:{},events:[],ocr:[],inp:null,src:null,
+        outcomes:[{t:672,b:702,kind:'win',text:'WINNER ORANGE',side:'win?',
+          team:'ORANGE',frames:15,why:'clock',line:'match ended - WINNER ORANGE'},
+          {t:1118,b:1134,kind:'win',text:'WINNER BLUE',side:'win?',
+          team:'BLUE',frames:8,why:'clock',line:'match ended - WINNER BLUE'}],
+        tally:{matches:2,won:0,lost:0,unknown:2,best_place:null,places:[],
+          line:'won? - 2 matches ended, the winner unread'}}
+      :null),
     sns_rename:async()=>({ok:true,names:{}}),
     /* #black in the address: the one-line black night, as 3.32 paints it */
     visions:async()=>(location.hash.includes('black')
       ?{v:1,complete:true,black:true,eye:false,looks:[],places:[],
-        creatures:[],screen:[]}
-      :{v:1,complete:true,black:false,
+        creatures:[],screen:[],outcomes:[]}
+      :{v:1,complete:true,black:false,outcomes:[],
       places:[{name:'a yellow office corridor, damp carpet',a:6,b:184,n:4},
         {name:'a flooded boiler room',a:184,b:421,n:3},
         {name:'a tiled pool hall, every light humming',a:421,b:562,n:2}],
@@ -3123,6 +3144,9 @@ function makeMock(){
        and it still wrote itself down as finished. */
     audit:async(_p,run)=>({v:1,complete:false,
       started:run?false:undefined,
+      /* 3.32 a chapter claiming a win the screen never showed */
+      outcomes:[{where:'chapter',t:271.6,claim:'a win',kind:'win',
+        verdict:'unshown',nearest:'11:12'}],
       corrected:[{t:941.2,was:'Zami hehe.',
         now:'قال لي Ho Ho',put_back:false}],
       names_fixed:[{from:'Marid',to:'مارد'}],
@@ -5450,7 +5474,7 @@ function clipNeedsWebhook(){
 
 function wireMarks(){
   const box=$('#vmarkpick'); if(!box)return;
-  const NAME={red:'chapter',loud:'loud',laugh:'laughter',scream:'scream',told:'told',sense:'sense',game:'game'};
+  const NAME={red:'chapter',loud:'loud',laugh:'laughter',scream:'scream',told:'told',sense:'sense',game:'game',outcome:'outcome'};
   /* SAY WHAT THE CHIPS ARE EATING. "44 marks" in the versions panel and a
      dozen on the bar is not a mystery, it is a filter - an old save's
      single Sound switch could leave four kinds off without a word. The
@@ -5603,7 +5627,7 @@ function delProg(on,msg,pct){
      bottom group is taller and the card lands ON the bar. measure, don't guess */
   if(on&&$('#viewer').classList.contains('on')){
     const H=s=>{const n=$(s);return n?n.offsetHeight:0;};
-    b.style.bottom=(16+H('#vbar')+H('#vtitle')+H('#vedrow')+H('#vedprog')+H('#vedconfirm')+H('#vcliprow')+20)+'px';   /* [L14] the Clipper row is part of the bottom group too */
+    b.style.bottom=(16+H('#vbar')+H('#vtitle')+H('#vtally')+H('#vedrow')+H('#vedprog')+H('#vedconfirm')+H('#vcliprow')+20)+'px';   /* [L14] the Clipper row is part of the bottom group too */
   }else b.style.bottom='';
   b.classList.toggle('on',!!on);
   if(msg!=null)$('#delphase').textContent=msg;
@@ -7058,6 +7082,14 @@ function renderSet(cL,cR,app,spreadIdx){
        choice any more, and a hint about a switch that does not exist is
        a hint that lies */
     hint(R,'All local, all idle-time — nothing leaves your PC and nothing runs while you play. Transcription makes every recording searchable by what was said: type words on the Contents page and jump straight to the second they were spoken. Loud moments — fights, shouts, explosions — appear as gold ticks on the player’s timeline.');
+    divider(R,'The screen');
+    row(R,'Your in-game name',ctlText('handle',false,'[CLUB] Name'),
+        'as the podium prints it, club tag and all');
+    hint(R,'When a match ends the tome reads the game\u2019s own verdict off the '
+          +'frames \u2014 WINNER and the colour, a placement \u2014 and the podium '
+          +'says whose it was. With this empty it still counts the matches and '
+          +'says \u201cwon?\u201d, honestly, rather than guess. A wrong name '
+          +'would flip every verdict, so copy it exactly.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
@@ -8646,6 +8678,7 @@ async function openViewer(vid,seekTo){
   const cq=$('#vedcrop'); if(cq)cq.value='0';
   const cb=$('#vcrop'); if(cb)cb.classList.remove('on');
   $('#vtitle').textContent=`${fmtWhen(vid.mtime)} — ${vid.kind==='clip'?'a caught moment':'a full session'}`;
+  { const vt=$('#vtally'); if(vt){vt.textContent='';vt.hidden=true;} }   /* the last video's tally */
   $('#vnext').disabled=!viewerSibling(1);   /* ⏭ now only goes dead at the last video of the whole library */
   document.body.classList.add('cinema');   /* ribbons rest; region = book only */
   sendShape();
@@ -8806,6 +8839,15 @@ async function loadSenses(vid,req){
   if(req!==_viewerReq)return;
   _sns=r;
   if(_sns){ snsWireWho(); drawLevels(); saidRender(null); }
+  /* 3.32 WHAT THE SCREEN DECIDED. The verdicts live on the senses
+     sidecar alone (never in the gold marks), so the bar is drawn again
+     now that they are here, and the line under the title says the
+     night's tally - 'won?' is honest when the podium never named him. */
+  const vt=$('#vtally');
+  if(vt){ const ln=(_sns&&_sns.tally&&_sns.tally.line)||'';
+    vt.textContent=ln?('The screen decided: '+ln):''; vt.hidden=!ln;
+    vt.title=ln?((_sns.outcomes||[]).map(o=>fmtT(+o.t||0)+' '+(o.line||o.text||'')).join('\n')):''; }
+  if(_sns&&(_sns.outcomes||[]).length)renderHlMarks(vid,req);
 }
 async function loadInsights(v){
   if(!v){_ins=null;_insPath=null;return null;}
@@ -8884,8 +8926,13 @@ function paintSeen(){
      off one frame a minute by the senses; in time order like the rest */
   const scr=(vis.screen||[]).filter(s=>s&&s.n)
     .slice().sort((a,b)=>(+a.a||0)-(+b.a||0));
+  /* 3.32 what the screen DECIDED - the game's own verdict, read off
+     the frames around each match end; the first head in the panel */
+  const outs=(vis.outcomes||[]).filter(o=>o&&isFinite(+o.t))
+    .slice().sort((a,b)=>(+a.t||0)-(+b.t||0));
   const looked=(vis.eye!==false);
-  const any=!!(places.length||crs.length||looks.length||scr.length);
+  const any=!!(places.length||crs.length||looks.length||scr.length
+    ||outs.length);
   const btn=$('#vsaw');
   if(btn)btn.classList.toggle('has',any);
   /* a closed panel does not need its rows walked four times a second */
@@ -8897,6 +8944,7 @@ function paintSeen(){
       .join('\u241f')
     +'\u2016'+looks.length
     +'\u2016'+scr.map(s=>s.n+'@'+s.a+'-'+s.b).join('\u241f')
+    +'\u2016'+outs.map(o=>(o.line||o.text||'')+'@'+o.t).join('\u241f')
     +'\u2016'+(vis.black?'black':'');
   if(box._sig!==sig){
     box._sig=sig; box.innerHTML='';
@@ -8947,8 +8995,18 @@ function paintSeen(){
     if(vis.complete===false)
       box.append(el('div','enote','still looking - this is what the eye '
         +'has so far'));
+    if(outs.length){
+      box.append(el('div','ehead first','The screen decided'));
+      outs.forEach(o=>{
+        const a=+o.t||0, b=((+o.b||0)>a)?(+o.b||0):a, n=+o.frames||0;
+        box.append(row(fmtT(a),String(o.line||o.text||'the screen decided'),
+          'to '+fmtT(b)+(n>1?('  \u00b7  '+n+' frames'):'')
+          +(o.why?('  \u00b7  found by the '+o.why):''),
+          a,Math.max(b,a+4)));
+      });
+    }
     if(places.length){
-      box.append(el('div','ehead first','Places'));
+      box.append(el('div','ehead'+(outs.length?'':' first'),'Places'));
       places.forEach(p=>{
         const a=+p.a||0, b=((+p.b||0)>a)?(+p.b||0):a, n=+p.n||0;
         box.append(row(fmtT(a),p.name,
@@ -9019,6 +9077,19 @@ async function renderHlMarks(vid,req){
   document.querySelectorAll('.hlmark').forEach(m=>m.remove());
   _hlPlace=null;                  /* a different recording, different moments */
   let evs=[];try{evs=await api.highlights(vid.path)||[];}catch(e){}
+  /* 3.32 THE SCREEN DECIDED, FIRST. An outcome never enters the gold
+     marks (the audit's clock is keyed on them); it folds here at read.
+     A mark already sitting within 8s is retagged and keeps its own kind
+     in `also` - the win must WIN the seat, or it hides under 'laughter'.
+     The moment fold below then skips the planted outcome moment. */
+  ((_sns&&_sns.outcomes)||[]).forEach(o=>{
+    if(!o||!(o.t>0))return;
+    const text=o.line||o.text||'the screen decided';
+    const near=evs.find(ev=>Math.abs(ev.t-o.t)<=8);
+    if(near){
+      if(near.kind&&near.kind!=='outcome')near.also=[near.kind].concat(near.also||[]);
+      near.kind='outcome'; near.text=text;
+    }else evs.push({t:o.t,z:1e6,kind:'outcome',text:text});});
   /* THE REVIEW'S OWN MOMENTS ARE MARKS TOO. A funny line is not always a
      loud one - "she's sprinting towards you guys" can be said almost
      quietly. A described moment with no loud peak within 8s becomes its
@@ -9064,7 +9135,8 @@ async function renderHlMarks(vid,req){
       /* the mark says WHAT it heard: the ear's verdict when it has one,
          the loudness contest's honest default when it does not. A sighting
          was never heard at all - it says who was on screen. */
-      const heard=ev.kind==='laugh'?'laughter'
+      const heard=ev.kind==='outcome'?(ev.text||'the screen decided')
+                 :ev.kind==='laugh'?'laughter'
                  :ev.kind==='scream'?'a scream'
                  :ev.kind==='creature'?visLabel(ev.t)
                  :ev.kind==='game'?'a burst in the game'
@@ -9077,7 +9149,10 @@ async function renderHlMarks(vid,req){
          would have made the Loud chip lie about what it hides. */
       const SNSK={cheer:1,groan:1,music:1,scare:1,victory:1,defeat:1,
                   kill:1,level:1,boss:1,hud:1,creature:1};
-      const fk=said?'told':(ev.kind==='laugh'?'laugh'
+      /* 3.32 the screen's verdict outranks even told: the planted
+         outcome moment IS this second, and the tick must read as the
+         game's own word, not as one more described line */
+      const fk=ev.kind==='outcome'?'outcome':said?'told':(ev.kind==='laugh'?'laugh'
               :ev.kind==='scream'?'scream'
               :ev.kind==='game'?'game'
               :SNSK[ev.kind]?'sense':'loud');
@@ -9086,7 +9161,7 @@ async function renderHlMarks(vid,req){
          WINNER under it belongs to Laughs AND to Senses, and hiding
          either chip must not hide the other's evidence */
       m._fks=[fk].concat((ev.also||[]).map(k=>k==='laugh'?'laugh'
-              :k==='scream'?'scream':k==='game'?'game':(SNSK[k]?'sense':'loud')));
+              :k==='scream'?'scream':k==='game'?'game':k==='outcome'?'outcome':(SNSK[k]?'sense':'loud')));
       m.classList.toggle('hid',!m._fks.some(k=>MARKS[k]!==false));
       m.removeAttribute('title');
     };
@@ -9663,7 +9738,8 @@ function closeViewer(){
    THE CONTRACT - api.audit(path) returns exactly:
      {v:1, thread:[{t,what,agrees}], dropped:[{t,what,why}],
       merged:[{kept,folded[]}], warnings:[str], complete:bool}
-   with agrees drawn from words / sound / eye / review / laugh.
+   with agrees drawn from the six layers: sound / words / eye / screen /
+   laugh / review (THR_LAYERS, in that order).
 
    NOTHING BELOW MAY THROW. paintThread rides tlPaint several times a
    second; the first cut of this panel raised a TypeError on a field it
@@ -9679,6 +9755,7 @@ const THR_SLACK=0.4;   /* a seek reports back a hair off where it was
 const THR_LAYERS=[['sound','\u25e0','the sound'],
   ['words','\u275d','the words'],
   ['eye','\u25c9','the eye'],
+  ['screen','\u25a3','the screen'],
   ['laugh','\u263a','the laughter ear'],
   ['review','\u2632','the review']];
 let _thr=null,_thrM=null,_thrPath=null,_thrSeq=0,_thrApi=true;
@@ -9800,11 +9877,19 @@ function thrModel(raw){
     .map(r=>({from:thrStr(r.from).trim(),to:thrStr(r.to).trim(),
       why:thrStr(r.why).trim()}))
     .filter(r=>r.from&&r.to);
+  /* 3.32 WHAT THE SCREEN NEVER SHOWED: a claim of a win, a loss or a
+     place the screen did not bear out. Questioned, never changed. */
+  const outcomes=thrArr(o.outcomes).filter(r=>r&&typeof r==='object')
+    .map(r=>({where:thrStr(r.where).trim(),t:thrNum(r.t),
+      claim:thrStr(r.claim).trim(),kind:thrStr(r.kind).trim(),
+      verdict:thrStr(r.verdict).trim(),nearest:thrStr(r.nearest).trim()}))
+    .filter(r=>r.claim&&r.verdict&&r.verdict!=='shown');
   return {beats:beats,drop:drop,fold:fold,warn:warn,
-    names:names,said:said,respelt:respelt,fixed:fixed,
+    names:names,said:said,respelt:respelt,fixed:fixed,outcomes:outcomes,
     part:o.complete===false,
     any:!!(beats.length||drop.length||fold.length||warn.length
-           ||names.length||said.length||respelt.length||fixed.length)};
+           ||names.length||said.length||respelt.length||fixed.length
+           ||outcomes.length)};
 }
 const THR_NONE=thrModel(null);
 /* one place sets the four of them, so a half-swapped state cannot
@@ -9978,7 +10063,7 @@ function thrBuild(){
                       .sort((x,y)=>((y.ag||[]).length-(x.ag||[]).length)
                                    ||(x.t-y.t));
     const lone=beats.filter(b=>((b.ag||[]).length)<2);
-    const LAYNAME={words:'words',sound:'sound',eye:'eye',
+    const LAYNAME={words:'words',sound:'sound',eye:'eye',screen:'screen',
       review:'review',laugh:'laugh'};
     const put=(b,into)=>{
       const r=el('div','trow');
@@ -9996,7 +10081,7 @@ function thrBuild(){
       const keys=Object.keys(b.say||{});
       if(keys.length){
         const ev=el('div','tev');
-        ['words','sound','eye','review','laugh'].forEach(k=>{
+        ['words','sound','eye','screen','review','laugh'].forEach(k=>{
           const v=b.say[k]; if(!v)return;
           const ln=el('div','tevline');
           ln.append(el('span','tevk',LAYNAME[k]||k),
@@ -10140,7 +10225,8 @@ function thrBuild(){
     const lone_names=m.names.filter(n=>!(n.verdict==='spelt'
       &&m.respelt.some(x=>x.from===n.name)));
     /* ===== WHAT IT QUESTIONED - nothing here was changed. ===== */
-    const nq=m.said.length+m.drop.length+lone_names.length;
+    const outq=m.outcomes||[];
+    const nq=m.said.length+m.drop.length+lone_names.length+outq.length;
     if(nq){
       box.append(el('div','twhead tbig','What it questioned \u00b7 '+nq));
     }
@@ -10162,6 +10248,26 @@ function thrBuild(){
           w.append(el('div','twhy','nobody in this recording ever says '
             +'that name, in either alphabet'));
         }
+        r.append(w);
+        box.append(r);
+      });
+    }
+    /* 3.32 the claims the screen never bore out - a warning row, never a
+       strike; the nearest match end is named so he can look himself */
+    if(outq.length){
+      box.append(el('div','twhead','What the screen never showed \u00b7 '
+        +outq.length));
+      outq.forEach(o=>{
+        const r=el('div','trow tname');
+        const whole=(o.where==='title'||o.where==='summary');
+        r.append(el('div','tt',esc(o.where+(!whole&&isFinite(o.t)?(' '+fmtT(o.t)):''))));
+        const w=el('div','twhat');
+        w.append(el('span','tbad',esc(o.claim)));
+        w.append(el('div','twhy',o.verdict==='contradicted'
+          ?('the screen showed the opposite'+(o.nearest?(' at '+o.nearest):''))
+          :('the screen did not show that'+(o.nearest
+            ?(' \u2014 the nearest match end is at '+o.nearest)
+            :' \u2014 no match ended near it'))));
         r.append(w);
         box.append(r);
       });
@@ -10803,10 +10909,10 @@ function tlWin(){
 }
 /* the chapters the tome worked out, as marks on the bar. Same tlPx as
    everything else, so they cannot drift from the gold or the head. */
-let MARKS = {gold:true, red:true, loud:true, laugh:true, scream:true, told:true, sense:true, game:true};
+let MARKS = {gold:true, red:true, loud:true, laugh:true, scream:true, told:true, sense:true, game:true, outcome:true};
 try{ const m=JSON.parse(localStorage.getItem('lore.marks')||'{}');
-     /* 3.31 game: an old save without the key keeps it on */
-     ['gold','red','loud','laugh','scream','told','sense','game'].forEach(k=>{
+     /* 3.31 game, 3.32 outcome: an old save without the key keeps it on */
+     ['gold','red','loud','laugh','scream','told','sense','game','outcome'].forEach(k=>{
        if(typeof m[k]==='boolean')MARKS[k]=m[k];});
      /* an old save's single Sound switch fans out into the four kind chips */
      if(m.gold===false&&m.loud===undefined)
@@ -10905,7 +11011,7 @@ function insMarksPlace(){
     else seen.set(key,m);
   });
   /* the kind chips cost a sweep only when one CHANGES */
-  const gsig=['loud','laugh','scream','told','sense','game'].map(k=>MARKS[k]?'1':'0').join('');
+  const gsig=['loud','laugh','scream','told','sense','game','outcome'].map(k=>MARKS[k]?'1':'0').join('');
   if(wrap._goldShown!==gsig){
     wrap._goldShown=gsig;
     wrap.querySelectorAll('.hlmark').forEach(m=>
@@ -11156,7 +11262,8 @@ function markTipShow(m){
               kill:'a kill streak on screen',level:'a level-up on screen',
               boss:'a boss felled',hud:'the game said so on screen',
               game:'a burst in the game'};
-    why=m._said?('\u2726 '+m._said.why)
+    why=ev.kind==='outcome'?('\u2694 the screen: '+(ev.text||'decided'))
+        :m._said?('\u2726 '+m._said.why)
         :ev.kind==='creature'?visLabel(ev.t)
         :(SN[ev.kind]||m._heard||'a loud moment');
     /* and whatever else happened in the same second - a WINNER under
@@ -11906,7 +12013,7 @@ function sizeViewer(){
   if(!vw||document.body.classList.contains('vfull'))return;   /* theater has its own fixed geometry */
   const H=s=>{const n=$(s);return n?n.offsetHeight:0;};        /* display:none measures 0, conveniently */
   const rows=H('#vedrow')+H('#vedprog')+H('#vedconfirm');
-  const below=H('#vtitle')+H('#vlineage')+H('#vbar')+H('#vmoments')+rows+(rows?8:0);         /* +8: the open row's margin-top - offsetHeight doesn't count margins */
+  const below=H('#vtitle')+H('#vtally')+H('#vlineage')+H('#vbar')+H('#vmoments')+rows+(rows?8:0);         /* +8: the open row's margin-top - offsetHeight doesn't count margins */
   /* 48 up top for ✕ + the drag pill · 30 under the video (the corner marks
      hang 18px past the frame and there must be air under them) · 8 for the
      details→toolbar gap (vtitle's margin) · 16 bottom padding */
@@ -13205,7 +13312,7 @@ function wireViewer(){
   addEventListener('resize',()=>{if($('#viewer').classList.contains('on'))sizeViewer();});
   if(window.ResizeObserver){
     const ro=new ResizeObserver(()=>{if($('#viewer').classList.contains('on'))sizeViewer();});
-    ['#vtitle','#vlineage','#vbar','#vedrow','#vedprog','#vedconfirm','#vcliprow'].forEach(s=>{const n=$(s);if(n)ro.observe(n);});
+    ['#vtitle','#vtally','#vlineage','#vbar','#vedrow','#vedprog','#vedconfirm','#vcliprow'].forEach(s=>{const n=$(s);if(n)ro.observe(n);});
     /* the seek bar can change width WITHOUT a window resize (the armed 🗑 widens
        the toolbar at capped widths) - refit the seg bands from the fresh rect.
        edRepos, not layEd: a rebuild mid-drag would kill pointermove */

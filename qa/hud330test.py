@@ -65,7 +65,7 @@ check("no step, no duration, a clip shorter than ten seconds: no grid",
 check("junk numbers fail open",
       grid_seconds("x", 5) == [] and grid_seconds(None, None) == [])
 check("the worker's main takes the step and the duration",
-      "def main(video, ffmpeg, dst, seconds, game=\"\", step=0.0, dur=0.0)"
+      "def main(video, ffmpeg, dst, seconds, game=\"\", step=0.0, dur=0.0,"
       in WSRC)
 check("...and its CLI passes argv[6] and argv[7] through",
       "float(sys.argv[6]) if len(sys.argv) > 6" in WSRC
@@ -199,6 +199,7 @@ ns.update({
         p, "w", encoding="utf-8").write(json.dumps(d, ensure_ascii=False)),
     "log": lambda m: logs.append(m),
     "_HUD_OWE_CACHE": {},
+    "_OUT_OWE_CACHE": {},        # 3.32: the grid top-up pops it too
     "_HUD_STEP": const(SRC, "_HUD_STEP"),
     "subprocess": __import__("subprocess"),
     "threading": __import__("threading"),
@@ -286,7 +287,7 @@ print("\n--- the wiring ---")
 check("the grid is dispatched only after the walk found nothing louder "
       "(one job slot for every lane), never while playing",
       "THE SCREEN READER FILLS THE QUIET" in SRC
-      and '_AI["hud_only"] = p' in SRC
+      and '_AI["tail"] = ("screen", p)' in SRC
       and SRC.index("THE SCREEN READER FILLS THE QUIET")
       > SRC.index("if _AI.get(\"focus\") == p:\n            try:\n"
                   "                _owes_more = (")
@@ -296,10 +297,21 @@ check("the focus is never held for a grid",
 check("the tail pass keeps the walk's own skips (skipped, badge, failed, "
       "veto)", SRC.count("if _ai_skipped_recently(p) or "
                          "_queued_finish_badge(p):") == 1)
-check("a grid-only visit skips the ears and keeps the describer warm",
-      'hud_only = (_AI.pop("hud_only", None) == path)' in SRC
-      and "if not hud_only:\n                # a grid-only visit never "
+check("a screen-only visit skips the ears and keeps the describer warm",
+      '_tail = _AI.pop("tail", None)' in SRC
+      and 'screen_only = (tail == "screen")' in SRC
+      and "if not tail:\n                # a tail visit never "
           "touches the card" in SRC)
+# 3.32 ONE TAIL, ONE KEY: the screen visit is owed by the grid OR the
+# outcomes, and tops the grid up before the ends it predicted
+check("the tail owes the screen visit for the grid or the outcomes",
+      "if (_hud_owing(p) or _outcome_owing(p)) \\\n"
+      "                    and _ai_sidecar_fresh(p, \"hl\"):" in SRC
+      and "hud_only" not in SRC)
+check("...and the screen visit reads the grid first, then the outcomes",
+      0 < SRC.index("ok = _hud_topup_one(path)")
+      < SRC.index("if ok and not _AI[\"abort\"] and _outcome_owing(path):\n"
+                  "                        ok = _outcome_topup_one(path)"))
 check("a redo of the ears tops the grid up when owed",
       "if ok and not _AI[\"abort\"] and _hud_owing(path):\n"
       "                        ok = _hud_topup_one(path)" in SRC)
@@ -320,10 +332,11 @@ check("a grid that stumbles is a soft strike, not a failed night",
       'The screen reader stumbled on' in SRC
       and SRC.index('_AI["soft_fail"] = True\n        log(f"The screen reader '
                     'stumbled') > 0)
-check("a grid-only visit names itself 'the screen' on the Working page",
-      '_AI["busy"] = (kind, "the screen \\u00b7 "' in SRC)
-check("a grid-only visit does not teach the listening lane its pace",
-      'if ok and not _AI["abort"] and not hud_only:' in SRC)
+check("a screen visit names itself 'the screen' on the Working page",
+      '_AI["busy"] = (kind, {"screen": "the screen",' in SRC
+      and '+ " \\u00b7 " + os.path.basename(path))' in SRC)
+check("a tail visit does not teach the listening lane its pace",
+      'if ok and not _AI["abort"] and not tail:' in SRC)
 
 print("\n%d ok, %d failed" % (ok, bad))
 sys.exit(1 if bad else 0)
