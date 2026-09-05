@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.31"
+APP_VERSION = "3.32"
 
 try:
     import psutil
@@ -5847,6 +5847,59 @@ def _av_durations(path):
     return None
 
 
+_PICSEC_CACHE = {}       # (path, mtime) -> picture seconds (its own name:
+#                          _PIC_CACHE below is the black-fact cache)
+_PICSEC_LOCK = threading.Lock()
+_PICTURE_DRIFT_S = 60.0  # sound past the last frame by less than this is drift
+
+
+def _picture_seconds(path):
+    """How long the PICTURE is, cached per (path, mtime); None when ffprobe
+    cannot say. The container's length is the sound's - on a night whose
+    encoder died early the two differ by an hour, and every consumer that
+    needs a FRAME must ask this, not _video_duration."""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (os.path.normcase(os.path.abspath(path)), int(mt))
+    with _PICSEC_LOCK:
+        if key in _PICSEC_CACHE:
+            return _PICSEC_CACHE[key]
+    got = None
+    try:
+        got = _av_durations(path)
+    except Exception:
+        got = None
+    pic = float(got[0]) if got and got[0] > 1 else None
+    if pic is not None:                 # a probe that timed out on a cold
+        with _PICSEC_LOCK:              # platter is asked again, like
+            if len(_PICSEC_CACHE) > 4096:   # _video_duration - never a
+                _PICSEC_CACHE.clear()       # sticky None for the process
+            _PICSEC_CACHE[key] = pic
+    return pic
+
+
+def _story_seconds(path, dur):
+    """How long the STORY is. The picture's length when the sound merely
+    runs a few seconds past the last frame (a drifted recording - chapters
+    past the end used to land in that gap); the SOUND's length when the
+    picture died early (5 Sep 2026: an encoder that wedged three minutes
+    into a 68-minute night - the room talked for the other 65, and the
+    describer told three). Returns (seconds, note-or-None)."""
+    try:
+        dur = float(dur or 0.0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    pic = _picture_seconds(path)
+    if pic is None or pic >= dur:
+        return dur, None
+    if dur - pic < _PICTURE_DRIFT_S:
+        return pic, None
+    return dur, ("the picture ends at %dm%02ds of %dm%02ds - the story "
+                 "follows the sound" % (pic // 60, pic % 60, dur // 60, dur % 60))
+
+
 def _drift_repair_one(path):
     """Stretch the picture's clock onto the sound's. Nothing is re-encoded, so
     a two-gigabyte recording takes about half a minute and loses nothing."""
@@ -6380,6 +6433,7 @@ def _clean_slate_if_needed():
             _SLATE_BUSY[0] -= 1
         _AI.pop("_tally", None)
         _AI["index"] = None
+        _AI["shelf"] = None
         _AI["failed"] = {}
         if done_walk:
             try:
@@ -8004,6 +8058,7 @@ class Session:
         # module is missing, or WGC never shows a first frame (exclusive
         # fullscreen). A resumed run must match the file's locked size.
         self._wgc = None
+        self._stall_seen = None        # a fresh run carries no stall mark
         # Say WHY when the real window capture is not used. This was silent,
         # and it hid a shipping bug for a whole release: the updater never
         # copied _internal, so `import windows_capture` failed on the user's
@@ -9871,6 +9926,11 @@ def _black_track(ctl, session, current, now=None):
         session._black_probe_t = 0.0
         return None
     now = now if now is not None else time.time()
+    _seen = getattr(session, "_stall_seen", None)
+    if _seen and getattr(feed, "frames_out", None) == _seen[0] \
+            and now - float(_seen[1]) >= _STALL_PATIENCE:
+        return None                     # the ticker is stuck: its black
+    #                                     clock stopped too (the heartbeat's)
     dark = now - float(since)
     if dark < _BLACK_PATIENCE:
         return None
@@ -9930,6 +9990,75 @@ def _black_track(ctl, session, current, now=None):
         session.win = w                 # the rect the screen path will crop
         return "rotate"
     return "split"
+
+
+_STALL_PATIENCE = 10.0      # seconds of frames_out not moving before the
+#                             encoder is declared wedged (two watcher beats)
+
+
+def _stall_track(ctl, session, now=None):
+    """THE ENCODER HEARTBEAT (3.32), once per healthy watcher beat on the
+    WGC path: 'killed' when it acted, else None.
+
+    THE LAW. ffmpeg alive is not ffmpeg encoding. On the 5 Sep 2026
+    Hearthstone night the game's process restarted 3:15 into the
+    recording, the AMF encoder inside ffmpeg wedged, and the process
+    sat there for 65 minutes taking no frames: the ticker blocked in
+    its pipe write, the death branch (vproc.poll() stayed None) never
+    fired, the black guard's clock stopped with the ticker, and the
+    resize law saw a new window of the same size. 184 s of picture
+    under 4088 s of audio, and the whole night's reading came from
+    three minutes. So the beat reads the one number a wedge cannot
+    fake - frames_out, the ticker's count of frames ffmpeg actually
+    took - and a count that has not moved for ten seconds kills the
+    process. The NEXT beat's death branch then does what it already
+    does for a display change: the same size and HDR -> the same file
+    continues; a different size -> split; a window that is away ->
+    pause. Nothing of that is duplicated here, and _note_restart's
+    streak still applies through it. No toast: a silent recovery.
+
+    A paused game is not a stall: the ticker re-sends the last frame
+    at 60 fps, so frames_out advances. Alt-tab keeps compositing under
+    WGC. Minimised: the pause law sets win_paused first. A feed whose
+    ticker died (window closed, stdin closed) under a live ffmpeg is
+    the same condition and gets the same kill. An encoder that never
+    takes its FIRST frame (frames_out stays 0 with the feed's first
+    frame in hand) is the same wedge at birth and gets the same ten
+    seconds - begin()'s timeout only proves WGC delivered a frame."""
+    feed = getattr(session, "_wgc", None)
+    if feed is None:
+        return None                     # ddagrab captures inside ffmpeg
+    vproc = getattr(session, "vproc", None)
+    if vproc is None or vproc.poll() is not None:
+        return None                     # dead: the death branch's beat
+    if getattr(session, "suspended", False) \
+            or getattr(session, "win_paused", False) \
+            or getattr(session, "_rotating", False):
+        return None
+    first = getattr(feed, "_first", None)
+    if first is None or not first.is_set():
+        return None
+    # frames_out 0 with the first frame in hand is the wedge AT BIRTH: an
+    # encoder that never reads its stdin blocks the ticker's first write
+    # and looks exactly like tonight's, so 0 is a count like any other
+    n = int(getattr(feed, "frames_out", 0) or 0)
+    now = now if now is not None else time.time()
+    seen = getattr(session, "_stall_seen", None)
+    if not seen or seen[0] != n:
+        session._stall_seen = (n, now)  # moving: refresh and stand down
+        return None
+    stuck = now - float(seen[1])
+    if stuck < _STALL_PATIENCE:
+        return None
+    log(f"Capture: the encoder stopped taking frames for {int(stuck)} s "
+        "(the game restarted?) - restarting the capture into the same "
+        "recording.")
+    try:
+        vproc.kill()                    # the in-flight 4 s segment is lost
+    except Exception:                   # either way; the pipe breaks, the
+        pass                            # ticker's write raises, it ends
+    session._stall_seen = None
+    return "killed"
 
 
 def _note_restart(session):
@@ -10232,6 +10361,7 @@ def _watch_core(ctl):
             _persist_setting("stt_reset_v203", True)
             SETTINGS["stt_reset_v203"] = True
             _AI["index"] = None
+            _AI["shelf"] = None
             if gone:
                 log(f"Cleared {gone} transcript(s) written by the old, weaker "
                     f"model. They are being re-read with the accurate one.")
@@ -10989,6 +11119,13 @@ def _watch_core(ctl):
                     _afk_track(ctl, session, current)
                     if session.suspended:              # AFK pause just landed
                         _interruptible_sleep(ctl, SETTINGS["poll_interval"])
+                        continue
+                    # THE ENCODER HEARTBEAT rides first: a wedged ffmpeg
+                    # (alive, taking no frames) is killed here and the
+                    # death branch above restarts the capture into this
+                    # same file on the very next beat.
+                    if _stall_track(ctl, session):
+                        _interruptible_sleep(ctl, 0.3)
                         continue
                     # THE BLACK-FRAME GUARD rides the beat before the
                     # resize law: a feed that gave only black under a
@@ -12386,6 +12523,8 @@ def _game_sources_daily():
 #  orphan files the cache sweep can clear.
 # ---------------------------------------------------------------------------
 _AI = {"busy": None, "t_last": 0.0, "index": None, "index_t": 0.0,
+       # the librarian's merged matrix (3.32) - falls with the word index
+       "shelf": None, "shelf_t": 0.0,
        "proc": None, "abort": False, "failed": {},
        # what the job in hand is working on, so the UI can show a real bar
        "started": 0.0, "job_secs": 0.0,
@@ -13781,6 +13920,24 @@ _MODEL_SETS = [
                  "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf"),
           13543869408),
      ]},
+    # THE LIBRARIAN (3.32). A 300 MB embedding model that reads the
+    # shelf's titles, chapters, moments and lines into vectors on the
+    # CPU, so a question in other words than the sidecar's still finds
+    # the night and the second. Same runtime as the describer (ai/llama,
+    # --embedding --pooling mean --device none), never on the card. The
+    # tier says it rides with the listening bundle: without it the Ask
+    # box simply keeps its 3.31 road.
+    {"key": "librarian", "tier": "reader",
+     "title": "The librarian",
+     "what": "finds the night, the chapter or the line you mean - ask "
+             "the shelf in your own words",
+     "dir": "embeddinggemma-gguf",
+     "files": [
+         ("embeddinggemma-300M-Q8_0.gguf",
+          _HF % ("ggml-org/embeddinggemma-300M-GGUF",
+                 "embeddinggemma-300M-Q8_0.gguf"), 333590944),
+     ],
+     "licence": "Gemma is Google's, under the Gemma Terms of Use"},
 ]
 
 # the llama.cpp servers - two builds on purpose: the auditor's thinker
@@ -14330,6 +14487,312 @@ def _hud_topup_one(video_path):
                 os.remove(oj)
         except OSError:
             pass
+
+
+# ------------------------------------------------------------ the librarian
+# ASK THE SHELF (3.32). A per-night <base>.emb.json carries one vector per
+# title, summary, chapter, moment and ~300-character stretch of what the
+# room said, written by a small embedding model on the CPU in the idle
+# tail. The file is a derived fact - it stays outside the attic and
+# re-owes itself through the clock and size of the ins and stt it was
+# read from (the mtime law: an unchanged night never rewrites its index).
+# With no model on disk nothing here runs: the tail never owes an index,
+# no server is spawned, and the Ask box keeps its 3.31 road.
+_EMB = {"srv": None, "t": 0.0, "ready": None, "ready_t": 0.0}
+_EMB_OWE_CACHE = {}
+_EMB_LOCK = threading.Lock()    # check-then-spawn: one librarian on 8910
+_EMB_STANDDOWN = 600.0      # a start that failed costs one visit, not one
+#                             per night: _emb_owing answers False this long
+_EMB_PORT = 8910            # 8906-8909 and 8912 are taken; this one is free
+_EMB_MODEL = "embeddinggemma-300M-Q8_0"
+_EMB_DIM = 256              # MRL-truncated: 15 MB for the shelf, 35 ms a query
+_EMB_DOZE = 600.0           # seconds of quiet before the embedder is let go
+_EMB_BATCH = 32
+
+
+def _emb_paths():
+    """(llama-server, gguf) for the librarian, or None. Absent = feature
+    absent: the tail never owes an index and the box asks the old way."""
+    exe = os.path.join(_runtime_dir("llama"), "llama-server.exe")
+    mdl = _model_file("embeddinggemma-gguf", _EMB_MODEL + ".gguf")
+    if os.path.isfile(exe) and os.path.isfile(mdl):
+        return exe, mdl
+    return None
+
+
+def _emb_ready():
+    """_emb_paths() for the state beat: two isfile calls at most every
+    ten seconds, never once per tick."""
+    now = time.time()
+    if _EMB["ready"] is None or now - _EMB["ready_t"] > 10:
+        _EMB["ready"] = _emb_paths() is not None
+        _EMB["ready_t"] = now
+    return bool(_EMB["ready"])
+
+
+def _shelf_items(video_path):
+    """What one night puts on the shelf: [{k, t, b, x}] in a fixed order -
+    the title, the summary, each chapter (name and what), each window's
+    moments (their why), then the room's words folded into ~300-character
+    stretches that keep the first line's second. A video's or the game's
+    lines (a 3.31 reader's src) are left out: they are findable by the
+    exact search already and are not this night's own voice. The same
+    sidecars always give the same list, so a hash of it means something."""
+    items = []
+    ins = _read_sidecar(video_path, "ins")
+    if ins and not ins.get("empty") and not ins.get("failed"):
+        t = str(ins.get("title") or "").strip()
+        if t:
+            items.append({"k": "title", "t": 0.0, "b": 0.0, "x": t[:300]})
+        s = str(ins.get("summary") or "").strip()
+        if s:
+            items.append({"k": "summary", "t": 0.0, "b": 0.0, "x": s[:600]})
+        for c in ins.get("chapters") or []:
+            if not isinstance(c, dict):
+                continue
+            try:
+                ct = float(c.get("t") or 0.0)
+                cb = float(c.get("b") or ct)
+            except Exception:
+                continue
+            x = (str(c.get("label") or "").strip() + ". "
+                 + str(c.get("what") or "").strip()).strip(". ").strip()
+            if x:
+                items.append({"k": "chapter", "t": ct, "b": cb, "x": x[:400]})
+        wins = ins.get("windows") or {}
+        if isinstance(wins, dict):
+            keys = sorted(wins.keys(), key=lambda k: ((0, int(k)) if str(k)
+                                                      .isdigit() else (1, str(k))))
+            for wk in keys:
+                w = wins.get(wk) or {}
+                if not isinstance(w, dict):
+                    continue
+                for m in w.get("moments") or []:
+                    if not isinstance(m, dict):
+                        continue
+                    try:
+                        mt = float(m.get("t") or 0.0)
+                    except Exception:
+                        continue
+                    why = str(m.get("why") or "").strip()
+                    if why:
+                        items.append({"k": "moment", "t": mt, "b": mt,
+                                      "x": why[:300]})
+    stt = _read_sidecar(video_path, "stt")
+    buf, t0, b0, n = [], None, 0.0, 0
+    for s in (stt or {}).get("segments") or []:
+        if not isinstance(s, dict) or not s.get("t") or s.get("nn"):
+            continue
+        if (s.get("src") or "") not in ("", "you"):
+            continue                    # the room only
+        try:
+            a = float(s.get("a") or 0) / 1000.0
+            b = float(s.get("b") or s.get("a") or 0) / 1000.0
+        except Exception:
+            continue
+        if buf and t0 is not None and (a - t0) > 45.0:
+            # a silence closes the stretch BEFORE this line joins it:
+            # a jump must land on the words, not ten minutes early
+            items.append({"k": "line", "t": t0, "b": b0,
+                          "x": " ".join(buf)[:400]})
+            buf, t0, b0, n = [], None, 0.0, 0
+        if t0 is None:
+            t0 = a
+        line = str(s["t"]).strip()
+        buf.append(line)
+        b0 = max(b0, b)
+        n += len(line) + 1
+        if n >= 300:
+            items.append({"k": "line", "t": t0, "b": b0,
+                          "x": " ".join(buf)[:400]})
+            buf, t0, b0, n = [], None, 0.0, 0
+    if buf and t0 is not None:
+        items.append({"k": "line", "t": t0, "b": b0, "x": " ".join(buf)[:400]})
+    return items
+
+
+def _emb_sig(video_path):
+    """The clock and size of the two sidecars an index is read from, and
+    the model and width that read them. None when neither exists."""
+    sig = {"model": _EMB_MODEL, "dim": _EMB_DIM, "ins": None, "stt": None}
+    seen = False
+    for kind in ("ins", "stt"):
+        try:
+            st = os.stat(_ai_sidecar(video_path, kind))
+        except OSError:
+            continue
+        sig[kind] = [round(st.st_mtime, 1), st.st_size]
+        seen = True
+    return sig if seen else None
+
+
+def _emb_owing(video_path):
+    """Does this night owe an index? Only with the model on disk, only
+    when its ins or stt moved past the index's own signature, and only
+    when there is something to index. Cached on the index sidecar's
+    clock and size AND the signature it was judged against: the sweep
+    asks this about every recording, every beat, and never opens a
+    video. A night that failed three times is left alone until its
+    sidecars move."""
+    if _emb_paths() is None:
+        return False
+    if time.time() - float(_EMB.get("down_t") or 0) < _EMB_STANDDOWN:
+        return False                    # the librarian would not start:
+    #                                     stand down, do not knock per night
+    sig = _emb_sig(video_path)
+    if not sig:
+        return False
+    ep = _ai_sidecar(video_path, "emb")
+    try:
+        st = os.stat(ep)
+        key = (round(st.st_mtime, 1), st.st_size)
+    except OSError:
+        key = None
+    ck = (key, json.dumps(sig, sort_keys=True))
+    hit = _EMB_OWE_CACHE.get(ep)
+    if hit and hit[0] == ck:
+        return hit[1]
+    owed = False
+    if key is None:
+        owed = bool(_shelf_items(video_path))   # once, then remembered
+    else:
+        try:
+            with open(ep, encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            if d.get("sig") != sig:
+                owed = True                     # the sidecars moved
+            elif d.get("failed"):
+                owed = int(d.get("tries") or 0) < 3
+            else:
+                owed = False
+        except Exception:
+            owed = True                         # unreadable: write it again
+    _EMB_OWE_CACHE[ep] = (ck, owed)
+    return owed
+
+
+def _emb_srv(budget=90):
+    """The running embedder, woken if it dozed; None when it would not.
+    Under _EMB_LOCK: two callers in the same second (the tail and a
+    question) must not spawn two servers on the one port."""
+    with _EMB_LOCK:
+        srv = _EMB.get("srv")
+        if srv is not None and srv.pr is not None and srv.pr.poll() is None:
+            _EMB["t"] = time.time()
+            return srv
+        if _emb_paths() is None:
+            return None
+        if time.time() - float(_EMB.get("down_t") or 0.0) < _EMB_STANDDOWN:
+            return None                 # it would not wake a moment ago:
+        srv = _EmbServer()              # the exact-word road, at once
+        if not srv.start(budget=budget):
+            _EMB["down_t"] = time.time()    # one dead server, one visit
+            return None
+        _EMB["srv"] = srv
+        _EMB["t"] = time.time()
+        return srv
+
+
+def _emb_drop():
+    """Let the embedder go, on a side thread - called from the build's
+    abort path and from the doze tick, never waited on."""
+    srv = _EMB.get("srv")
+    _EMB["srv"] = None
+    if srv is not None:
+        threading.Thread(target=srv.stop, daemon=True).start()
+
+
+def _emb_idle_tick():
+    """The librarian dozes after ten quiet minutes, like the ask server:
+    half a gigabyte of RAM never sits reserved for a question nobody is
+    asking. Nothing to do while no model has ever been woken."""
+    srv = _EMB.get("srv")
+    if srv is None:
+        return
+    if time.time() - (_EMB.get("t") or 0) > _EMB_DOZE:
+        _emb_drop()
+        log("The librarian dozes off - ten quiet minutes.")
+
+
+def _emb_one(video_path):
+    """The index visit: read the night's items, embed them in batches on
+    the CPU, write <base>.emb.json in one atomic move. Never rewrites a
+    sidecar whose signature already stands. Returns False on abort or
+    when the embedder would not wake; a failure is written into the
+    sidecar with its count, so the tail retries at most three times and
+    never every beat. The card is never touched here."""
+    name = os.path.basename(video_path)
+    sig = _emb_sig(video_path)
+    if not sig:
+        return False
+    ep = _ai_sidecar(video_path, "emb")
+    old = None
+    try:
+        with open(ep, encoding="utf-8") as fh:
+            old = json.load(fh) or {}
+        if old.get("sig") == sig and not old.get("failed"):
+            _EMB_OWE_CACHE.pop(ep, None)
+            return True                 # already indexed: nothing moves
+    except Exception:
+        old = None
+    items = _shelf_items(video_path)
+    doc = {"v": 1, "model": _EMB_MODEL, "dim": _EMB_DIM, "sig": sig,
+           "items": [], "vec": ""}
+    if not items:
+        _atomic_write_json(ep, doc)     # honest: nothing to index
+        _EMB_OWE_CACHE.pop(ep, None)
+        _AI["shelf"] = None
+        return True
+    t0 = time.time()
+    try:
+        import base64
+        import hashlib
+        import numpy as np
+        srv = _emb_srv(budget=90)
+        if srv is None:
+            raise RuntimeError("the librarian would not wake")
+        vecs = []
+        for i in range(0, len(items), _EMB_BATCH):
+            if _AI["abort"]:
+                _emb_drop()             # a game is starting: the CPU is his
+                return False
+            chunk = items[i:i + _EMB_BATCH]
+            got = srv.embed(["title: none | text: " + it["x"] for it in chunk])
+            if not got or len(got) != len(chunk):
+                raise RuntimeError("the librarian gave no vectors")
+            vecs.extend(got)
+        M = np.asarray(vecs, dtype=np.float32)
+        if M.ndim != 2 or M.shape[1] != _EMB_DIM:
+            raise RuntimeError("the librarian's width is %r" % (M.shape,))
+        doc["items"] = [
+            {"k": it["k"], "t": round(float(it["t"]), 2),
+             "b": round(float(it["b"]), 2),
+             "h": hashlib.sha1(it["x"].encode("utf-8")).hexdigest()[:12],
+             "x": it["x"][:160]} for it in items]
+        doc["vec"] = base64.b64encode(
+            M.astype(np.float16).tobytes()).decode("ascii")
+        _atomic_write_json(ep, doc)
+        _EMB_OWE_CACHE.pop(ep, None)
+        _AI["shelf"] = None
+        _EMB["t"] = time.time()
+        log("The librarian indexed " + name + ": " + str(len(items))
+            + " items in " + str(int(time.time() - t0)) + "s.")
+        return True
+    except Exception as e:
+        if _AI["abort"]:
+            return False
+        tries = 1
+        if (old or {}).get("sig") == sig:
+            tries = int((old or {}).get("tries") or 0) + 1
+        doc["failed"] = str(e)[:120]
+        doc["tries"] = tries
+        try:
+            _atomic_write_json(ep, doc)
+        except Exception:
+            pass
+        _EMB_OWE_CACHE.pop(ep, None)
+        log("The librarian could not index " + name + ": " + str(e)[:120])
+        return False
 
 
 # THE SCREEN DECIDED (3.32). The grid caught WINNER on none of five
@@ -15437,6 +15900,7 @@ def _senses_one(video_path):
                 if on or off:
                     _atomic_write_json(sp2, sd2)
                     _AI["index"] = None
+                    _AI["shelf"] = None
                     log(f"Senses on {name}: {on} transcript line(s) "
                         f"flagged as probably the game's own audio, "
                         f"{off} unflagged.")
@@ -15922,6 +16386,7 @@ def _transcribe_one(video_path):
                                               "media": False}),
                             "segments": segs})
         _AI["index"] = None
+        _AI["shelf"] = None
         # THE GOLD MOMENTS WERE PICKED WITHOUT THESE WORDS. Sound runs first on
         # purpose - seconds against minutes, and the editor needs that curve
         # immediately. But a peak earns a bonus when someone was speaking, and
@@ -17101,6 +17566,109 @@ class _DescServer:
             _AI["proc"] = None      # only OUR child leaves the slot
 
 
+class _EmbServer(_DescServer):
+    """llama-server as the librarian's embedder (3.32) - the SAME runtime
+    the describer runs inside, on its own port, and never on the card:
+    --device none -ngl 0 keeps the whole 300 MB on the CPU, so a question
+    can be embedded while a game is up. It shares stop() with its parent
+    and overrides start(): the parent's hardcodes the describer's paths,
+    its mmproj and the job slot _AI['proc'], and the card's abort path
+    must never reach for this process."""
+
+    def __init__(self, port=None):
+        self.pr = None
+        self.port = int(port or _EMB_PORT)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def start(self, budget=90):
+        import urllib.request
+        ep = _emb_paths()
+        if ep is None:
+            return False
+        exe, mdl = ep
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        _free_port(self.port)
+        t0_up = time.time()
+        for attempt in range(2):
+            try:
+                pr = _popen(
+                    [exe, "-m", mdl, "--port", str(self.port),
+                     "--embedding", "--pooling", "mean",
+                     "--device", "none", "-ngl", "0",
+                     "-c", "2048", "-b", "2048", "-ub", "2048",
+                     "-np", "2", "-t", "6", "--no-webui"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=flags)
+            except Exception as e:
+                log(f"The librarian could not be spawned: {str(e)[:120]}")
+                return False
+            self.pr = pr            # never _AI['proc']: not the card's job
+            while time.time() - t0_up < max(5, int(budget)):
+                # a stale abort flag from the last job must not gag a
+                # question; only a job in hand that was aborted stops this
+                if _AI["abort"] and _AI.get("busy") is not None:
+                    self.stop()
+                    return False
+                if pr.poll() is not None:
+                    break           # died at birth - port race, most likely
+                try:
+                    urllib.request.urlopen(self.base + "/health",
+                                           timeout=2).read()
+                    log("The librarian is up on port " + str(self.port)
+                        + ": " + os.path.basename(mdl) + ", loaded in "
+                        + str(int(time.time() - t0_up)) + "s, on the CPU.")
+                    return True
+                except Exception:
+                    time.sleep(1)
+            else:
+                self.stop()
+                return False
+            if attempt == 0:
+                time.sleep(3)       # let the old instance release the port
+        self.pr = None
+        return False
+
+    def alive(self):
+        """One /health, one second: is anyone answering on our port?"""
+        try:
+            _urlreq.urlopen(self.base + "/health", timeout=1).read()
+            return True
+        except Exception:
+            return False
+
+    def embed(self, texts, dim=None):
+        """Unit vectors for `texts`, one row each, cut to `dim` (MRL: the
+        first 256 of EmbeddingGemma's 768 carry the meaning) and
+        re-normalised. None when the server would not answer."""
+        import numpy as np
+        dim = int(dim or _EMB_DIM)
+        texts = [str(t or "")[:2000] for t in (texts or [])]
+        if not texts:
+            return []
+        try:
+            body = json.dumps({"input": texts}).encode("utf-8")
+            req = _urlreq.Request(self.base + "/v1/embeddings", data=body,
+                                  headers={"content-type": "application/json"})
+            with _urlreq.urlopen(req, timeout=600) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+            rows = sorted(d.get("data") or [],
+                          key=lambda e: int(e.get("index") or 0))
+            if len(rows) != len(texts):
+                return None
+            M = np.asarray([e["embedding"] for e in rows], dtype=np.float32)
+            if M.ndim != 2 or M.shape[1] < dim:
+                return None
+            M = M[:, :dim]
+            n = np.linalg.norm(M, axis=1, keepdims=True)
+            n[n == 0] = 1.0
+            return (M / n).tolist()
+        except Exception as e:
+            log(f"The librarian could not embed: {str(e)[:120]}")
+            return None
+
+
 _ASR_PORT = 8908
 
 
@@ -17361,7 +17929,10 @@ def _ask_llm(system, user, schema, max_tokens=900, wait=0):
     # no idea a queue exists is not. Say it immediately.
     if wait and getattr(srv, "borrowed", False):
         _busy = _AI.get("busy")
-        if _busy:
+        # a tail visit (the screen, the librarian) holds no card: the
+        # borrowed warm describer answers at once, so no refusal there
+        if _busy and not str(_busy[1] or "").startswith(
+                ("the screen \u00b7", "the librarian \u00b7")):
             _kind = {"hearing": "transcribing", "sound": "reading the sound",
                      "thinking": "reviewing",
                      "describing": "describing"}.get(_busy[0], _busy[0])
@@ -17647,6 +18218,9 @@ def _window_parts(wpart):
     return room + game, False
 
 
+_INS_SAID = threading.local()
+
+
 def _insights_one(video_path, forced=False, fresh=False):
     """What this recording actually was -> .ins.json sidecar. All local.
 
@@ -17719,16 +18293,14 @@ def _insights_one(video_path, forced=False, fresh=False):
                             "src_stt": _sst0})
         return True
 
-    # THE PICTURE'S length, not the container's - on a drifted recording the
-    # sound runs seconds past the last frame, and that gap is where chapters
-    # past the end used to land.
-    vdur = dur
-    try:
-        got = _av_durations(video_path)
-        if got and got[0] > 1:
-            vdur = min(dur, got[0])
-    except Exception:
-        pass
+    # THE STORY'S length: the picture's on a drifted recording (the sound
+    # runs seconds past the last frame, and that gap is where chapters
+    # past the end used to land), the SOUND's when the picture died early
+    # (3.32: a wedged encoder left 3 minutes of picture under 68 of talk).
+    vdur, _story_note = _story_seconds(video_path, dur)
+    if _story_note and not getattr(_INS_SAID, 'story', None) == video_path:
+        _INS_SAID.story = video_path
+        log(os.path.basename(video_path) + ": " + _story_note + ".")
 
     side_p = _ai_sidecar(video_path, "ins")
     name = os.path.basename(video_path)
@@ -18393,9 +18965,18 @@ def _insights_one(video_path, forced=False, fresh=False):
             _black_pic = _pic_black(video_path)
             if (_desc_mmproj() is not None and not _AI["abort"]
                     and not _black_pic):
+                # never past the last frame: a died-early picture has an hour of
+                # seconds with nothing to grab (3.32)
+                _hi_pic = hi
+                try:
+                    _pic_s = _picture_seconds(video_path)
+                    if _pic_s and _pic_s < hi:
+                        _hi_pic = float(_pic_s)
+                except Exception:
+                    pass
                 imgs = [(f"[frame at {int(t) // 60}:{int(t) % 60:02d}]", b)
                         for t, b in _grab_frames(
-                            video_path, _frame_times_for(video_path, lo, hi))]
+                            video_path, _frame_times_for(video_path, lo, _hi_pic))]
             if imgs:
                 see = (f"You are also SHOWN {len(imgs)} frame(s) from this "
                        f"window, each labeled with its time - use what you "
@@ -19070,6 +19651,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                 _INS_OWE_CACHE.pop(_k, None)
                 _AUD_OWE_CACHE.pop(_k, None)
                 _AI["index"] = None
+                _AI["shelf"] = None
             if staged:
                 # the moment of the swap - and the ONLY moment the old
                 # review is touched. It is BANKED first, never destroyed.
@@ -19225,6 +19807,15 @@ def _eye_looks(video_path, cap=None):
         dur = float(_video_duration(video_path) or 0.0)
     except Exception:
         dur = 0.0
+    # NEVER PAST THE LAST FRAME: the container is the sound's length, and a
+    # night whose picture died early has an hour of seconds with nothing
+    # to see (5 Sep: 22 of 24 looks failed as 'could not reach those seconds')
+    try:
+        pic = _picture_seconds(video_path)
+        if pic and pic < dur:
+            dur = float(pic)
+    except Exception:
+        pass
     lo_t, hi_t = _EYE_EDGE, dur - _EYE_EDGE
     if hi_t <= lo_t:
         return []
@@ -25864,6 +26455,7 @@ def _ai_tick(ctl):
         # the sweep, the line, forced asks, all of it - but the card is
         # RELEASED, never stranded: the parked models still doze off.
         _ask_idle_tick()
+        _emb_idle_tick()
         _desc_keep_tick()
         try:
             _aud_keep_tick()
@@ -25942,6 +26534,7 @@ def _ai_tick(ctl):
         # and the ask server - skipping them parked 15 GB on the card
         # for the whole pause.
         _ask_idle_tick()
+        _emb_idle_tick()
         _desc_keep_tick()
         try:
             _aud_keep_tick()   # the parked thinker dozes too - a full
@@ -25986,6 +26579,7 @@ def _ai_tick(ctl):
         _AI["wind_src"] = None
     _AI["t_last"] = time.time()
     _ask_idle_tick()
+    _emb_idle_tick()
     _desc_keep_tick()
     try:
         _aud_keep_tick()
@@ -26052,7 +26646,7 @@ def _ai_tick(ctl):
                 # the Working page reads busy[1]; the audit names itself
                 # the same way so its row does not read as the describer
                 _AI["busy"] = (kind, {"screen": "the screen",
-                                      "index": "the index"}.get(tail, tail)
+                                      "index": "the librarian"}.get(tail, tail)
                                + " \u00b7 " + os.path.basename(path))
             if not tail:
                 # a tail visit never touches the card: the warm
@@ -26069,7 +26663,11 @@ def _ai_tick(ctl):
                 _AI["job_secs"] = 0.0
             t0 = time.time()
             try:
-                if kind == "hearing":
+                if tail == "index":
+                    # the librarian's visit: CPU only, one night, the
+                    # card untouched, and nothing else rides along
+                    ok = _emb_one(path)
+                elif kind == "hearing":
                     ok = _transcribe_one(path)
                 elif kind == "thinking":
                     # the parked thinker steps down before the senses,
@@ -26200,6 +26798,10 @@ def _ai_tick(ctl):
                     # ran made waking from a shutdown dissolve the ask
                     # as satisfied (review 307)
                     _AI.setdefault("force_ran", set()).add(kind)
+                    _AI["_qdirty"] = True   # ai_state.json must learn it
+                    #   ran: on the 5 Sep 2026 night a finished ask came
+                    #   back from the grave at the next boot - ai_state.json
+                    #   still held it with ran=[] (no dirt, no write)
                 # A LANDED JOB ANNOUNCES ITSELF. The UI's little marks cache
                 # their first answer per recording; this counter is how they
                 # learn a sidecar just changed under them without a restart.
@@ -26358,11 +26960,13 @@ def _ai_tick(ctl):
             _AI["force"] = None            # satisfied, or gone
             _AI["force_want"] = None
             _AI["force_redo"] = False
+            _AI["_qdirty"] = True          # ai_state.json drops the row
             continue                       # the next queued item, this beat
         elif _AI["failed"].get(fp) == mt:
             _AI["force"] = None            # it refused this exact file before
             _AI["force_want"] = None
             _AI["force_redo"] = False
+            _AI["_qdirty"] = True          # ai_state.json drops the row
             log(f"Cannot read {os.path.basename(fp)}; taking the next.")
             continue
         else:
@@ -26391,6 +26995,7 @@ def _ai_tick(ctl):
                     _AI["force"] = None
                     _AI["force_want"] = None
                     _AI["force_redo"] = False
+                _AI["_qdirty"] = True      # ai_state.json keeps its ran
                 break
             kind0 = ("listening" if owed_hl else
                      ("hearing" if owed_stt else "thinking"))
@@ -26544,6 +27149,10 @@ def _ai_tick(ctl):
     # visit is the same seat for the shelf's embedder, per night, so a
     # new night's index never waits behind an old night's six minutes
     # of screen work. Neither owing test opens a video.
+    emb_ok = bool(do_hl and not playing and _emb_paths() is not None)
+    #                                   ^ once a beat, never once a night
+    emb_ok = emb_ok and (time.time() - float(_EMB.get("down_t") or 0)
+                         >= _EMB_STANDDOWN)   # one dead librarian, one visit
     if do_hl and not playing:
         for p in vids:
             if _ai_skipped_recently(p) or _queued_finish_badge(p):
@@ -26561,6 +27170,10 @@ def _ai_tick(ctl):
             if (_hud_owing(p) or _outcome_owing(p)) \
                     and _ai_sidecar_fresh(p, "hl"):
                 _AI["tail"] = ("screen", p)
+                _spawn("listening", p, mt)
+                return
+            elif emb_ok and _emb_owing(p):
+                _AI["tail"] = ("index", p)
                 _spawn("listening", p, mt)
                 return
 
@@ -26803,6 +27416,331 @@ def _search_words(query, limit=40):
                     break
     hits.sort(key=lambda h: h["file"], reverse=True)   # stamped names = newest first
     return hits[:limit]
+
+
+_SHELF_PATHS = {"at": 0.0, "map": {}}
+_SHELF_ANS = {}
+_SHELF_STOP = frozenset((
+    "the a an and or of to in on at for with we i you he she it they that "
+    "this was were is are did do does when where what which who how my "
+    "our his her them us me about from by as be been had have has not no "
+    "one time night game play played get got just like there here then "
+    "than into out up down off over again").split())
+
+
+def _shelf_paths():
+    """base -> (path, mtime) for every recording on the shelf, walked at
+    most every two minutes - the same walk ask_library remembers."""
+    if _SHELF_PATHS["map"] and time.time() - _SHELF_PATHS["at"] < 120:
+        return _SHELF_PATHS["map"]
+    m = {}
+    try:
+        for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+            for v in _scan_dir_mp4s(d, kind):
+                b = os.path.splitext(os.path.basename(v["path"]))[0]
+                m[b] = (v["path"], float(v.get("mtime") or 0))
+    except Exception:
+        pass
+    _SHELF_PATHS["map"], _SHELF_PATHS["at"] = m, time.time()
+    return m
+
+
+def _shelf_index():
+    """Every night's index merged into one matrix: {'M': float32 N x dim
+    unit rows, 'rows': [(base, k, t, b, x)], 'sig': {base: (mtime, size)}}
+    or None while no night is indexed. The walk over the sidecars is
+    remembered for a minute and the merge stands until any emb.json
+    moves - the same (mtime, size) rule every cache in this file keeps.
+    A sidecar written by another model or width is skipped (it stays
+    owed to the tail); a failed one carries no vectors and is skipped
+    the same way. Nothing is written to disk."""
+    now = time.time()
+    cur = _AI.get("shelf")
+    if cur is not None and now - float(_AI.get("shelf_t") or 0) < 60:
+        return cur
+    tdir = _thumb_dir(SETTINGS.get("output_dir", ""))
+    sig = {}
+    try:
+        for name in os.listdir(tdir):
+            if not name.endswith(".emb.json"):
+                continue
+            try:
+                st = os.stat(os.path.join(tdir, name))
+            except OSError:
+                continue
+            sig[name[:-len(".emb.json")]] = (round(st.st_mtime, 1),
+                                             st.st_size)
+    except OSError:
+        pass
+    if cur is not None and cur.get("sig") == sig:
+        _AI["shelf_t"] = now
+        return cur
+    if not sig:
+        _AI["shelf"], _AI["shelf_t"] = None, now
+        return None
+    import base64
+    import numpy as np
+    mats, rows = [], []
+    for base in sorted(sig.keys(), reverse=True):   # newest first
+        try:
+            with open(os.path.join(tdir, base + ".emb.json"),
+                      encoding="utf-8") as fh:
+                d = json.load(fh) or {}
+            if d.get("model") != _EMB_MODEL \
+                    or int(d.get("dim") or 0) != _EMB_DIM:
+                continue
+            items = d.get("items") or []
+            if not items or not d.get("vec"):
+                continue
+            M = np.frombuffer(base64.b64decode(d["vec"]), dtype=np.float16)
+            M = M.reshape(len(items), _EMB_DIM).astype(np.float32)
+            mats.append(M)
+            for it in items:
+                rows.append((base, str(it.get("k") or "line"),
+                             float(it.get("t") or 0.0),
+                             float(it.get("b") or 0.0),
+                             str(it.get("x") or "")))
+        except Exception:
+            continue
+    if not rows:
+        cur = None
+    else:
+        M = np.vstack(mats)
+        n = np.linalg.norm(M, axis=1, keepdims=True)
+        n[n == 0] = 1.0
+        cur = {"M": M / n, "rows": rows, "sig": sig}
+    _AI["shelf"], _AI["shelf_t"] = cur, now
+    return cur
+
+
+def _shelf_hit(base, path, mtime, kind, t, b, text, why, score, exact):
+    """One hit, in the shape the box paints: the night, the second, the
+    words, and why they are here. t_ms=0 keeps its 'do not seek' meaning
+    for a title or a summary."""
+    try:
+        when = _dt.datetime.fromtimestamp(mtime or 0).strftime("%d %b %Y")
+    except Exception:
+        when = ""
+    return {"file": base, "base": base, "path": path,
+            "game": _display_name(_parse_clip_name(base)), "when": when,
+            "t": round(float(t), 2), "t_ms": int(max(0.0, float(t)) * 1000),
+            "b_ms": int(max(0.0, float(b)) * 1000), "kind": kind,
+            "text": str(text or "")[:220], "why": str(why or "")[:220],
+            "score": round(float(score), 4), "exact": bool(exact)}
+
+
+def _shelf_exact(q):
+    """The exact side of a question: a NAME never depends on a vector.
+    Every word of the question that is capitalised or rare on the shelf
+    is looked up as the substring search does (a common word is noise
+    and is skipped), and so is the whole question when it is a phrase.
+    Returns [{file, t_ms, text, src, word}]."""
+    words = re.findall(r"[^\W\d_]{3,}", str(q or ""))
+    hits, seen = {}, set()
+    idx = _search_index()
+
+    def _add(rows_q, tag):
+        for h in rows_q:
+            key = (h["file"], int(h["t_ms"] // 1000))
+            if key not in hits:
+                hits[key] = dict(h, word=tag)
+
+    for w in words:
+        lw = w.lower()
+        if lw in seen or lw in _SHELF_STOP:
+            continue
+        seen.add(lw)
+        cap = w[:1].isupper() or not w.isascii()   # a name, or not Latin
+        lid = 400 if cap else 120
+        n = 0
+        for _base, rows in idx.items():
+            for _ms, low, _txt, _src in rows:
+                if lw in low:
+                    n += 1
+                    if n > lid:
+                        break
+            if n > lid:
+                break
+        if n == 0 or n > lid:
+            continue
+        _add(_search_words(w, limit=60), w)
+    if len(words) >= 2:
+        _add(_search_words(q, limit=60), str(q).strip())
+    return list(hits.values())
+
+
+def _shelf_query(q, k=40, per_night=3):
+    """Hits for a question: the question is embedded once, cosine over the
+    merged matrix takes the top of the shelf, the exact words (names!)
+    are blended in above any cosine, a chapter and the line inside it
+    collapse to the better one, and no night takes more than `per_night`
+    seats. Sorted by score, then newest night. Returns [] when neither
+    side has anything; hits carry a 1-based `n` the answer cites by."""
+    q = str(q or "").strip()
+    if len(q) < 2:
+        return []
+    import numpy as np
+    paths = _shelf_paths()
+    cands = {}
+
+    def _put(h):
+        key = ((h["file"], h["kind"])
+               if h.get("kind") in ("title", "summary")
+               else (h["file"], int(h["t"] // 10)))
+        old = cands.get(key)
+        if old is None or h["score"] > old["score"]:
+            cands[key] = h
+
+    idx = _shelf_index()
+    if idx is not None:
+        srv = _emb_srv(budget=60)
+        qv = srv.embed(["task: search result | query: " + q]) if srv else None
+        if qv:
+            s = idx["M"] @ np.asarray(qv[0], dtype=np.float32)
+            top = np.argsort(-s)[:400]
+            for i in top:
+                sc = float(s[int(i)])
+                if sc <= 0.0:
+                    break
+                base, kind, t, b, x = idx["rows"][int(i)]
+                pm = paths.get(base)
+                if pm is None:
+                    continue            # a night that is gone
+                text, why = x, ""
+                if kind == "chapter" and ". " in x:
+                    text, why = x.split(". ", 1)
+                elif kind == "moment":
+                    why = "a moment the describer marked"
+                elif kind == "line":
+                    why = "said in the room"
+                elif kind == "title":
+                    why = "the night's title"
+                elif kind == "summary":
+                    why = "the night's summary"
+                _put(_shelf_hit(base, pm[0], pm[1], kind, t, b, text, why,
+                                sc, False))
+    for h in _shelf_exact(q):
+        pm = paths.get(h["file"])
+        if pm is None:
+            continue
+        t = float(h["t_ms"]) / 1000.0
+        sc = 1.2 if h.get("word") == q else 1.0
+        why = ("these exact words" if h.get("word") == q
+               else "the word '" + str(h.get("word")) + "' is said here")
+        if h.get("src") == "media":
+            why += " - a video said it, not the room"
+        elif h.get("src") == "game":
+            why += " - the game said it"
+        _put(_shelf_hit(h["file"], pm[0], pm[1], "line", t, t, h["text"],
+                        why, sc, True))
+    hits = sorted(cands.values(), key=lambda h: (h["score"], h["file"]),
+                  reverse=True)
+    per, out = {}, []
+    for h in hits:
+        n = per.get(h["file"], 0)
+        if n >= per_night:
+            continue
+        per[h["file"]] = n + 1
+        out.append(h)
+        if len(out) >= k:
+            break
+    for i, h in enumerate(out):
+        h["n"] = i + 1
+    return out
+
+
+def _shelf_card_why():
+    """Why the describer cannot answer right now, or '' when it can. The
+    card is never woken by typing: a game on the screen, a job that holds
+    the card, or the auditor at a question all say so. A tail visit (the
+    screen, the librarian) is CPU work and holds nothing - it never
+    stands between a question and the card."""
+    if _describer_paths() is None:
+        return "the describer is not installed"
+    if _game_has_focus():
+        return "a game has the screen - the librarian answers when it is gone"
+    busy = _AI.get("busy")
+    if busy and not str(busy[1]).startswith(("the screen \u00b7",
+                                             "the librarian \u00b7")):
+        kind = {"hearing": "transcribing", "sound": "reading the sound",
+                "thinking": "reviewing", "listening": "listening to",
+                "describing": "describing"}.get(busy[0], busy[0])
+        return ("the model is %s %s right now, and one model cannot do "
+                "two things at once - the hits above are the answer for "
+                "now" % (kind, busy[1]))
+    if _AUD_ASK.get("path"):
+        return "the auditor is at a question right now"
+    return ""
+
+
+def _shelf_busy_why(ctl=None):
+    """The bridge's reasons: the card's, plus a recording running and
+    one answer at a time."""
+    if ctl is not None and getattr(ctl, "session", None) is not None:
+        return "a recording is running - the librarian answers after it"
+    why = _shelf_card_why()
+    if why:
+        return why
+    if any(v.get("state") == "thinking" for v in _SHELF_ANS.values()):
+        return "one answer at a time - the last one is still being written"
+    return ""
+
+
+def _shelf_answer(q, hits, max_hits=24):
+    """(answer, cited hit numbers, why). The describer reads ONLY the
+    numbered excerpts - it never reads the shelf - and cites by number,
+    so every citation already carries a night and a second and there is
+    no time for it to invent. None while a game has the screen or a job
+    has the card: the hits alone are the answer then."""
+    hits = list(hits or [])[:max_hits]
+    if not hits:
+        return None, [], "nothing to answer from"
+    why = _shelf_card_why()
+    if why:
+        return None, [], why
+    rows = []
+    for h in hits:
+        t = int(max(0.0, float(h.get("t") or 0.0)))
+        line = str(h.get("text") or "")[:220]
+        if h.get("kind") == "chapter" and h.get("why"):
+            line += " - " + str(h.get("why"))[:160]
+        rows.append("[%d] %s %s %d:%02d (%s): %s"
+                    % (int(h.get("n") or (len(rows) + 1)),
+                       h.get("when") or "", h.get("game") or "",
+                       t // 60, t % 60, h.get("kind") or "line", line))
+    schema = {"type": "object", "properties": {
+        "answer": {"type": "string"},
+        "cites": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["answer", "cites"]}
+    data, why = _ask_llm(
+        "You answer a question about someone's own game recordings using "
+        "ONLY the numbered excerpts. Answer in a sentence or two, in the "
+        "language the question was asked in. Cite the excerpts you used "
+        "by number, written as [n] in the answer and listed in 'cites'. "
+        "If the excerpts do not answer it, say so and cite nothing. "
+        "Never invent a night, a time or a quote. "
+        "Reply with STRICT JSON only.",
+        "Question: " + q + "\n\nExcerpts:\n" + "\n".join(rows),
+        schema, max_tokens=700, wait=150)
+    if data is None:
+        return None, [], why
+    cites = []
+    for c in data.get("cites") or []:
+        try:
+            c = int(c)
+        except Exception:
+            continue
+        if 1 <= c <= len(rows) and c not in cites:
+            cites.append(c)
+    ans = str(data.get("answer") or "").strip()[:600]
+    for c in re.findall(r"\[(\d+)\]", ans):       # a cite in the prose counts
+        c = int(c)
+        if 1 <= c <= len(rows) and c not in cites:
+            cites.append(c)
+    if not cites and not _ask_negish(ans):
+        ans = ("LORE could not tie that answer to any excerpt - treat it "
+               "as not found.")
+    return ans, cites, ""
 
 
 def _probe_color_trc(path):
@@ -27935,6 +28873,7 @@ class _JsApi:
                 "hdr": self._hdr_cache["v"],
                 "free_gb": free_gb, "size_mb": size_mb,
                 "webhook": bool(SETTINGS.get("discord_webhook", "").strip()),
+                "librarian_ready": _emb_ready(),
                 "version": APP_VERSION}
 
     def signature(self):
@@ -28616,6 +29555,68 @@ class _JsApi:
                      "found.")
         return {"ok": True, "answer": _lans,
                 "hits": out}
+
+    def ask_shelf(self, question, want_answer=True):
+        """Ask the shelf (3.32): the hits come back at once, the answer
+        follows by ticket. Without the librarian on disk this IS
+        ask_library, byte for byte - the box cannot tell the two apart."""
+        q = str(question or "").strip()
+        if _emb_paths() is None:
+            return self.ask_library(q)
+        if not q:
+            return {"ok": False, "why": "ask something"}
+        try:
+            hits = _shelf_query(q)
+        except Exception as e:
+            log("The librarian stumbled on a question: " + str(e)[:120])
+            hits = []
+        out = {"ok": bool(hits), "shelf": True, "hits": hits,
+               "ticket": None, "answering": False, "answer": "", "why": ""}
+        if not hits:
+            if _shelf_index() is None:
+                # no night indexed yet: the box must never be worse than
+                # 3.31 - ask_library's road, and its very object
+                return self.ask_library(q)
+            out["why"] = "nothing on the shelf matches"
+            return out
+        if not want_answer:
+            return out
+        why = _shelf_busy_why(self._ctl)
+        if why:
+            out["why"] = why
+            return out
+        now = time.time()
+        for k in [k for k, v in _SHELF_ANS.items()
+                  if now - float(v.get("at") or 0) > 900]:
+            _SHELF_ANS.pop(k, None)             # a ledger, not a log
+        ticket = "%x-%d" % (int(now * 1000), len(_SHELF_ANS))
+        _SHELF_ANS[ticket] = {"state": "thinking", "answer": "",
+                              "cites": [], "why": "", "at": now}
+        snap = [dict(h) for h in hits]
+
+        def run():
+            try:
+                ans, cites, w = _shelf_answer(q, snap)
+            except Exception as e:
+                ans, cites, w = None, [], str(e)[:120]
+            _SHELF_ANS[ticket] = {"state": "done", "answer": ans or "",
+                                  "cites": cites, "why": w,
+                                  "at": time.time()}
+        threading.Thread(target=run, daemon=True).start()
+        out["ticket"] = ticket
+        out["answering"] = True
+        return out
+
+    def ask_shelf_poll(self, ticket):
+        """Has the answer landed? {state: thinking|done|gone, answer,
+        cites, why}. Polled by the box; never blocks."""
+        v = _SHELF_ANS.get(str(ticket or ""))
+        if v is None:
+            return {"state": "gone", "answer": "", "cites": [], "why": ""}
+        return {"state": v.get("state") or "thinking",
+                "answer": v.get("answer") or "",
+                "cites": list(v.get("cites") or []),
+                "why": v.get("why") or ""}
 
     def have_flags(self, paths):
         """Which results each of these recordings already has. Asked for a
@@ -30208,6 +31209,7 @@ class _JsApi:
             else:
                 os.remove(old)
             _AI["index"] = None
+            _AI["shelf"] = None
             _AI["_tally"] = None
             _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
             _AI["done_path"] = p
@@ -30995,12 +31997,13 @@ class _JsApi:
 
         def _forget():
             for kind in ("stt", "hl", "lvl", "ins", "usr", "sns", "inp",
-                         "vis", "aud", "pic", "src"):
+                         "vis", "aud", "pic", "src", "emb"):
                 try:
                     os.remove(_ai_sidecar(p, kind))
                 except OSError:
                     pass
             _AI["index"] = None            # ghost transcripts must not linger
+            _AI["shelf"] = None
             try:
                 with _MANIFEST_LOCK:
                     owned, existed = _load_manifest()
@@ -31864,12 +32867,13 @@ class _JsApi:
                             # that no longer exist in the reshaped file
                             for kind in ("stt", "hl", "lvl", "ins",
                                          "usr", "sns", "inp", "vis",
-                                         "aud", "pic", "src"):
+                                         "aud", "pic", "src", "emb"):
                                 try:
                                     os.remove(_ai_sidecar(out, kind))
                                 except OSError:
                                     pass
                             _AI["index"] = None
+                            _AI["shelf"] = None
                         except Exception:
                             pass
                         log(f"Trimmed in place ({dur:.1f}s): {out}")
@@ -32342,12 +33346,13 @@ class _JsApi:
                         # exist in the reshaped file
                         for kind in ("stt", "hl", "lvl", "ins", "usr",
                                      "sns", "inp", "vis", "aud", "pic",
-                                     "src"):
+                                     "src", "emb"):
                             try:
                                 os.remove(_ai_sidecar(out, kind))
                             except OSError:
                                 pass
                         _AI["index"] = None
+                        _AI["shelf"] = None
                         log(f"Edited in place ({total:.1f}s, {len(segs)} piece(s)): {out}")
                         ctl.notify("Saved ✓", os.path.basename(out) + " now holds your edit.")
                     else:

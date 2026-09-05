@@ -34,7 +34,7 @@ for %%t in (codex327test codex326test codex325test codex324test codex323test asr
             afk2test afktest pairtest freezetest schedtest sched4test
             aud302test aud303test silvertest gatetest295 micheal
             mictest audiotest midchange fetchtest
-            hud330test echo330test title330test owing330test black332test outcome332test
+            hud330test echo330test title330test owing330test black332test outcome332test ask332test stall332test askstate332test
             tracks331test src331settingstest src331dumptest
             src331taptest src331watchtest src331runtest src331walktest
             src331test sources331_describer sources331_panel

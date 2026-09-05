@@ -2028,6 +2028,15 @@ body.editing .insmark,body.editing .hlmark{pointer-events:none}
 .askans{margin:2px 0 8px;padding:9px 12px;border-radius:9px;
   background:rgba(232,181,99,.13);border:1px solid rgba(200,160,95,.4);
   font:italic 12.5px/1.45 Georgia,serif;color:#4a3a1e}
+/* 3.32 ask the shelf: the hit's number, a [n] in the answer that jumps to
+   its row, the row an answer cited, and the quiet no-librarian line */
+.shn{display:inline-block;min-width:18px;margin-right:2px;padding:0 4px;border-radius:6px;
+  background:rgba(200,160,95,.22);font:700 10px Inter,system-ui,sans-serif;color:#6d5426;
+  text-align:center;vertical-align:1px}
+.shcite{cursor:pointer;font-weight:700;color:#8a5a18;text-decoration:underline dotted}
+.shcite.dead{cursor:default;color:#9c8963;text-decoration:none}
+.sresrow.cited{background:rgba(232,181,99,.16);box-shadow:inset 3px 0 0 rgba(200,160,95,.7)}
+.shlib{margin-top:6px;opacity:.85}
 #tsearch:focus{border-color:var(--gold);box-shadow:0 0 8px rgba(200,160,95,.25)}
 .sresrow{display:flex;flex-direction:column;gap:2px;padding:7px 10px;border-radius:10px;cursor:pointer}
 .sresrow:hover{background:rgba(200,160,95,.14)}
@@ -2915,7 +2924,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,version:'3.31'};},
+      webhook:true,librarian_ready:true,version:'3.32'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -2935,6 +2944,21 @@ function makeMock(){
         answer:'You raged at RNG most in the Hearthstone run on 9 August.',
         hits:[{path:'clip.mp4',file:'clip',t_ms:120000,
                text:'you shouted at a topdeck'}]},
+    /* 3.32 ask the shelf: the hits at once, the answer by ticket. The
+       harness has no model, so the poll answers with a canned line that
+       cites both rows - enough to paint every state the real box has. */
+    ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true,ticket:'m1',
+        answering:true,why:'',answer:'',
+        hits:[{n:1,file:'Elden Ring_session_0',path:'Elden Ring_session_0.mp4',game:'Elden Ring',when:'09 Aug 2026',
+               t:120,t_ms:120000,b_ms:124000,kind:'moment',
+               text:'you shouted at a topdeck',why:'a moment the describer marked',
+               score:0.71,exact:false},
+              {n:2,file:'Elden Ring_session_1',path:'Elden Ring_session_1.mp4',game:'Elden Ring',when:'08 Aug 2026',
+               t:600,t_ms:600000,b_ms:640000,kind:'chapter',text:'the good lobby',
+               why:'a quiet lobby that turned',score:0.64,exact:false}]},
+    ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done',
+        answer:'The shout at the topdeck is [1]; the lobby that turned is [2].',
+        cites:[1,2],why:''},
     claude_key_status:async()=>window.__mockKey||{saved:false,added:'',tail:''},
     claude_key_set:async(k)=>{ if(!String(k||'').startsWith('sk-ant-'))
         return {ok:false,why:'that does not look like an Anthropic key',saved:false};
@@ -3088,7 +3112,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.31'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.32'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -4870,7 +4894,8 @@ function renderContents(cL,cR,spreadIdx){
     mWord.classList.toggle('on',!askMode);
     mAsk.classList.toggle('on',askMode);
     sw.placeholder=askMode
-      ? 'ask about your recordings\u2026 then press Enter'
+      ? (S.librarianReady?'ask the shelf\u2026 then press Enter'
+                         :'ask about your recordings\u2026 then press Enter')
       : 'search everything ever said\u2026';
     sres.innerHTML=''; sres.style.display='none';
     if(list)list.style.display='';
@@ -4977,6 +5002,80 @@ function renderContents(cL,cR,spreadIdx){
     const id=setInterval(tick,1000);
     return ()=>clearInterval(id);
   };
+  /* 3.32 ASK THE SHELF, in two beats. The hits paint at once - one row per
+     hit, numbered, game \u00b7 night \u00b7 second \u00b7 the words \u00b7 why -
+     each a jump to its second; then, when the describer is free and no
+     game has the screen, the answer lands under them by ticket, its [n]
+     citations linked to the rows above and lighting them. Nothing here
+     waits on the model; the poll is the only clock. */
+  const askShelfPaint=async(r,q)=>{
+    const byBase={};
+    sortedGames().forEach(g=>[...g.sessions,...g.clips].forEach(v=>{
+      const b=String(v.path).replace(/\\/g,'/').split('/').pop().replace(/\.mp4$/i,'');
+      byBase[b]={...v,gkey:g.key,gname:g.display};}));
+    let rows=[];
+    (r.hits||[]).forEach((h,i)=>{
+      const v=byBase[h.file]; if(!v||!qFilterHit(FQ,v))return;
+      rows.push({n:h.n||(i+1),v,t:Math.max(0,(h.t_ms||0)/1000),h,node:null});
+    });
+    if(FQ.laugh){const kp=[];
+      for(const c of rows)if(await laughHas(c.v.path))kp.push(c);
+      if(S.searchQ!==q)return; rows=kp;}
+    if(!rows.length){
+      sres.append(el('div','vwhen',esc(r.why||'nothing on the shelf matches')));
+      return;
+    }
+    const glyph={title:'\u25a4',summary:'\u25a4',chapter:'\u00a7',moment:'\u2726',line:'\u201c'};
+    rows.forEach(c=>{
+      const rw=el('div','sresrow srich');
+      const th=el('div','sthumb');const img=new Image();th.append(img);rw.append(th);
+      const mn=el('div','smain');
+      const qrow=el('div','sresq');
+      qrow.append(el('span','shn','['+c.n+']'));
+      qrow.append(document.createTextNode(' '+(glyph[c.h.kind]||'')+' '
+        +String(c.h.text||'')+(c.h.kind==='line'?'\u201d':'')));
+      mn.append(qrow);
+      mn.append(el('div','sresw',esc(c.v.gname)+' \u00b7 '+esc(fmtWhen(c.v.mtime))
+        +(c.t?' \u00b7 '+fmtT(c.t):'')+(c.h.why?' \u00b7 '+esc(c.h.why):'')));
+      rw.append(mn);
+      rw.addEventListener('click',()=>openViewer(c.v,c.t));
+      c.node=rw; sres.append(rw); loadThumb(c.v.path,img,c.v.mtime);
+    });
+    if(!(r.answering&&r.ticket&&api.ask_shelf_poll)){
+      if(r.why)sres.append(el('div','vwhen',esc(r.why)));
+      return;
+    }
+    const a=el('div','askans'); const w=el('span','vwhen','thinking\u2026');
+    a.append(w); sres.append(a);
+    const stop=window.askWait(w);
+    const poll=async()=>{
+      if(S.searchQ!==q||!a.isConnected){stop();return;}
+      let p=null; try{p=await api.ask_shelf_poll(r.ticket);}catch(e){}
+      if(!p||p.state==='thinking'){setTimeout(poll,700);return;}
+      stop(); a.innerHTML='';
+      if(p.state!=='done'||!p.answer){
+        a.append(el('span','vwhen','no answer came back'
+          +(p&&p.why?' \u2014 '+esc(p.why):'')));
+        return;}
+      String(p.answer).split(/(\[\d+\])/g).forEach(seg=>{
+        const m=/^\[(\d+)\]$/.exec(seg);
+        if(!m){a.append(document.createTextNode(seg));return;}
+        const c=rows.find(x=>x.n===+m[1]);
+        const s=el('span','shcite'+(c?'':' dead'),seg);
+        if(c){s.title=c.v.gname+' \u00b7 '+fmtT(c.t);
+          s.addEventListener('click',ev=>{ev.stopPropagation();openViewer(c.v,c.t);});}
+        a.append(s);
+      });
+      const cited=(p.cites||[]).map(n=>rows.find(x=>x.n===+n)).filter(Boolean);
+      cited.forEach(c=>c.node.classList.add('cited'));
+      if(cited.length){
+        const pa=el('button','reelbtn','\u25b8 play all');
+        pa.title='Play every cited moment in turn \u2014 about 20 seconds of each, from the cited second';
+        pa.addEventListener('click',()=>reelStart(cited.map(c=>({v:c.v,t:c.t}))));
+        a.append(pa);}
+    };
+    setTimeout(poll,700);
+  };
   const ask=async q=>{
     if(!q||q.length<3)return;
     histAdd(q);histShow(false);
@@ -4985,10 +5084,16 @@ function renderContents(cL,cR,spreadIdx){
     const _w=el('div','vwhen','thinking\u2026'); sres.append(_w);
     const _stop=window.askWait(_w);
     /* filter tokens are UI syntax, not part of the question */
-    let r=null; try{ if(api.ask_library)r=await api.ask_library(FQ.any?(FQ.q||q):q); }catch(e){}
+    let r=null; try{
+      /* 3.32: the shelf road when the bridge has it. Without the librarian
+         on disk ask_shelf answers as ask_library did, byte for byte, and
+         the old paint below stands; an older lore.py has no ask_shelf. */
+      if(api.ask_shelf)r=await api.ask_shelf(FQ.any?(FQ.q||q):q);
+      else if(api.ask_library)r=await api.ask_library(FQ.any?(FQ.q||q):q); }catch(e){}
     _stop();
     if(S.searchQ!==q)return;
     sres.innerHTML='';
+    if(r&&r.shelf){ await askShelfPaint(r,q); return; }
     if(!r||(!r.ok&&!(r.hits||[]).length)){
       sres.append(el('div','vwhen',
         'nothing came back'+((r&&r.why)?' \u2014 '+esc(r.why):'')));
@@ -5030,6 +5135,10 @@ function renderContents(cL,cR,spreadIdx){
     });
     if(!sres.querySelector('.sresrow')&&!r.answer)
       sres.append(el('div','vwhen','nothing in the library matches'));
+    /* 3.32: say quietly which road this was, and where the other one is */
+    if(api.ask_shelf&&S.librarianReady===false)
+      sres.append(el('div','vwhen shlib',
+        'the librarian is not here yet \u2014 fetch it from the Models panel'));
   };
   sw.addEventListener('input',()=>{
     if(askMode)return;                      /* a question is not run per keystroke */
@@ -8266,6 +8375,7 @@ function applyBindCard(b){
   c.querySelector('.bc-sub').textContent=bits.join(' · ')||'measuring…';
 }
 function applyState(st){
+  S.librarianReady=!!st.librarian_ready;   /* 3.32: the Ask box's road */
   /* the idle tick is the common case: same seal, same words, same nothing.
      every textContent write below swaps its text node even when the string
      is identical - a needless style/layout tick at 1.6Hz, all night - so

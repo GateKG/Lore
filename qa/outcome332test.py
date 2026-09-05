@@ -1152,13 +1152,14 @@ check("the tail: one key, grid OR outcomes, the screen visit",
       '                    and _ai_sidecar_fresh(p, "hl"):\n'
       '                _AI["tail"] = ("screen", p)' in SRC
       and 'screen_only = (tail == "screen")' in SRC
-      and '"index": "the index"}.get(tail, tail)' in SRC
+      and '"index": "the librarian"}.get(tail, tail)' in SRC
       and "hud_only" not in SRC)
-check("the sidecar-forget tuples take pic and src with the file (delete, "
-      "trim, edit)",
-      SRC.count('"vis", "aud", "pic", "src"):') == 1
-      and SRC.count('"aud", "pic", "src"):') == 2
-      and SRC.count('"vis", "aud", "pic",\n                                     "src"):') == 1)
+check("the sidecar-forget tuples take pic, src and emb with the file "
+      "(delete, trim, edit)",
+      SRC.count('"vis", "aud", "pic", "src", "emb"):') == 1
+      and SRC.count('"aud", "pic", "src", "emb"):') == 2
+      and SRC.count('"vis", "aud", "pic",\n                                     "src", "emb"):') == 1
+      and SRC.count('"pic", "src"):') == 0)
 check("pic/emb/outcomes stay outside the attic",
       '_ATTIC_OF = {"listening": ("hl", "lvl"),\n             "hearing": ("stt",),\n'
       '             "thinking": ("ins", "sns", "vis"),' in SRC
