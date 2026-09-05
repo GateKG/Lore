@@ -310,8 +310,8 @@ check("the describer is told what the screen printed in each window",
       "The SCREEN itself printed these names in this window" in SRC
       and 'x.get("screen") or []' in SRC or "_sd0.get(\"screen\")" in SRC)
 check("the eye's bridge carries the screen names",
-      '"eye": True, "screen": screen}' in SRC
-      and '"complete": True, "eye": False, "screen": screen}' in SRC)
+      '"eye": True, "screen": screen, "black": black}' in SRC
+      and '"complete": True, "eye": False, "screen": screen,' in SRC)
 check("the eye panel lists them in time order",
       "'The screen named'" in USRC and "vis.eye!==false" in USRC
       and "scr.map(s=>s.n+'@'+s.a+'-'+s.b)" in USRC)

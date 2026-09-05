@@ -762,16 +762,18 @@ try:
     lore._vis_promote_migration = _fake("eye")
     lore._aud_strike_migration = _fake("strike")
     lore._echo_strike_migration = _fake("echo")      # 3.30's fourth walk
+    lore._black_vis_migration = _fake("black")       # 3.32's fifth walk
     lore._shelf_migrations()
     for _ in range(60):
         if not lore._MIG_BUSY[0]:
             break
         time.sleep(0.05)
-    check("a stale marker retires nothing - all four walks run",
-          sorted(ran) == ["echo", "eye", "refold", "strike"])
+    check("a stale marker retires nothing - all five walks run",
+          sorted(ran) == ["black", "echo", "eye", "refold", "strike"])
     got = json.load(io.open(MARK, encoding="utf-8"))
     check("the marker records them by name",
-          sorted(got.get("done") or []) == ["echo", "eye", "refold", "strike"])
+          sorted(got.get("done") or [])
+          == ["black", "echo", "eye", "refold", "strike"])
     ran[:] = []
     lore._shelf_migrations()
     time.sleep(0.2)

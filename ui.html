@@ -3068,7 +3068,7 @@ function makeMock(){
       detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,capture_by_source:true,voice_apps:['discord.exe','discordptb.exe','discordcanary.exe'],read_game_lines:true,ai_transcribe:true,ai_highlights:true,seek_step:'5',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
-      notify_on_record:true,quiet_popups:true,capture_scope:'screen',
+      notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,
       popup_style:'slide',popup_size:'large',sfx_volume:25,
       hotkey_record:'ctrl+alt+f7',hotkey_replay:'ctrl+alt+f9',
       hotkey_pause:'ctrl+alt+f10',hotkey_clip_discord:'ctrl+alt+f8',clip_hotkey_seconds:60,
@@ -3084,7 +3084,11 @@ function makeMock(){
     resize_to:async()=>true,stream_url:async()=>null,
     senses:async()=>null,
     sns_rename:async()=>({ok:true,names:{}}),
-    visions:async()=>({v:1,complete:true,
+    /* #black in the address: the one-line black night, as 3.32 paints it */
+    visions:async()=>(location.hash.includes('black')
+      ?{v:1,complete:true,black:true,eye:false,looks:[],places:[],
+        creatures:[],screen:[]}
+      :{v:1,complete:true,black:false,
       places:[{name:'a yellow office corridor, damp carpet',a:6,b:184,n:4},
         {name:'a flooded boiler room',a:184,b:421,n:3},
         {name:'a tiled pool hall, every light humming',a:421,b:562,n:2}],
@@ -7133,6 +7137,12 @@ function renderSet(cL,cR,app,spreadIdx){
           +'recording you never wanted. Anything shorter than this that ended '
           +'BY ITSELF is thrown away instead. Stopping it yourself always keeps '
           +'it, however short.');
+    row(L,'Black-frame guard',ctlToggle('black_guard'));
+    hint(L,'A game\u2019s window can hand the recorder nothing but black while the '
+          +'screen itself is lit. After ten seconds of that, the tome records '
+          +'the screen region instead for the rest of that game tonight. Off '
+          +'leaves the window capture alone; a recording that came out black is '
+          +'still marked at save so the eye never wastes a minute on it.');
     row(L,'Shelf space',(()=>{const w=el('div','ctl');w.append(ctlNum('max_storage_gb',0,1000000),
       el('span','sval','GB · 0 = boundless'));return w;})());
     hint(L,'Above this, the oldest of LORE’s own recordings quietly leave the shelf. Only files the tome itself wrote are ever touched.');
@@ -8886,10 +8896,20 @@ function paintSeen(){
     +'\u2016'+crs.map(c=>c.name+':'+(c.ts||[]).join(','))
       .join('\u241f')
     +'\u2016'+looks.length
-    +'\u2016'+scr.map(s=>s.n+'@'+s.a+'-'+s.b).join('\u241f');
+    +'\u2016'+scr.map(s=>s.n+'@'+s.a+'-'+s.b).join('\u241f')
+    +'\u2016'+(vis.black?'black':'');
   if(box._sig!==sig){
     box._sig=sig; box.innerHTML='';
     if(!any){
+      /* the picture fact comes first: a black night is not an eye that
+         failed and not a pass he should run again - there is nothing
+         on the film to look at, and the panel says so in one line */
+      if(vis.black){
+        box.append(el('div','vempty','the picture of this one is black '
+          +'\u2014 the capture gave no frames that night, so there is '
+          +'nothing to see. The sound and the words are all here.'));
+        return;
+      }
       /* a sidecar that came back empty is not the same answer as no
          sidecar at all, and telling him to run a pass he has already
          run would be the panel lying to him */

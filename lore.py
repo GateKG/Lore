@@ -158,6 +158,14 @@ DEFAULTS = {
     "max_storage_gb":    0,           # auto-delete oldest clips above this (0 = off)
     "notify_on_record":  True,        # subtle tray pop when a recording starts
     "quiet_popups":      True,        # hold Lore's own popups while WRITING a recording
+    # THE BLACK-FRAME GUARD (3.32). A window capture that hands the encoder
+    # nothing but black for ten seconds while the screen itself is lit is
+    # a capture that lied, not a cutscene: the recorder switches that game
+    # to the screen-region path for the rest of the night. Off disables
+    # the LIVE switch only - the black tag at save and the lane gates
+    # always run, because a recording with no picture must never cost the
+    # eye, the HUD reader or the describer a minute.
+    "black_guard":       True,
     # What the recorder captures: the whole watched screen (proven path) or,
     # experimentally, only the game's own window - the SAME GPU capture cropped
     # at the source to the window's client rect, tracked as the window moves
@@ -720,6 +728,7 @@ def _sanitize_settings(d):
                                         DEFAULTS["capture_by_source"]))
     d["read_game_lines"] = bool(d.get("read_game_lines",
                                       DEFAULTS["read_game_lines"]))
+    d["black_guard"] = bool(d.get("black_guard", DEFAULTS["black_guard"]))
 
 
 def load_settings():
@@ -1511,6 +1520,28 @@ def _afk_deaf_seconds(ctl, session):
         return max(0.0, now - heard)
     except Exception:
         return 0.0
+
+
+def _ring_loud(aud, within=10.0):
+    """Has a game/system ring heard something LOUD within the last
+    `within` seconds? Reads ring['loud_t'], a stamp a level meter may
+    set; last_sound (any non-zero byte) cannot tell a loud game from
+    a noise floor, so it is never used here. Rings without the stamp
+    answer False - the guard then leans on the input clock alone."""
+    if aud is None:
+        return False
+    try:
+        now = time.time()
+        with aud._ring_lock:
+            for r in aud.rings:
+                if r.get("kind") not in ("game", "system"):
+                    continue
+                lt = float(r.get("loud_t") or 0)
+                if lt and now - lt <= within:
+                    return True
+    except Exception:
+        pass
+    return False
 
 
 def _afk_track(ctl, session, current):
@@ -4600,6 +4631,181 @@ def build_wgc_cmd(w, h, fps, out_pattern, start_number=0):
     ]
 
 
+def _frame_black(buf, w, h, stride=8, max_lim=16, mean_lim=2.0):
+    """Is this BGRA frame black? A stride-8 sample of the BGR bytes
+    (240x135 points at 1080p - any lit block of 8x8 px or more lands at
+    least one) must have no byte at or above max_lim AND a mean under
+    mean_lim. Both, because a single dark game frame (Devour, Garden
+    of Witches: means 0.5-1.7 with maxes over 100) must never pass as
+    black, while a limited-range black (Y=16 in the file) decodes to
+    0-7 in BGRA and must. A buffer shorter than the frame is never
+    black by accident. Measured 0.61 ms at 1080p, 0.86 ms at 1440p."""
+    try:
+        import numpy as np
+        a = np.frombuffer(buf, dtype=np.uint8)
+        if a.size < w * h * 4 or w <= 0 or h <= 0:
+            return False
+        a = a[:w * h * 4].reshape(h, w, 4)[::stride, ::stride, :3]
+        return int(a.max()) < max_lim and float(a.mean()) < mean_lim
+    except Exception:
+        return False
+
+
+def _root_hwnd(h):
+    """The top-level owner of a window handle (GA_ROOT), or the handle
+    itself when Windows cannot say."""
+    try:
+        import ctypes
+        r = ctypes.windll.user32.GetAncestor(int(h or 0), 2)
+        return int(r or h or 0)
+    except Exception:
+        return int(h or 0)
+
+
+def _foreground_root():
+    """The root handle of whatever window is in front right now."""
+    try:
+        import ctypes
+        return _root_hwnd(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def _screen_probe(rect):
+    """Mean brightness (0-255) of the game window's rect AS THE SCREEN
+    SHOWS IT - a GDI StretchBlt of that screen area down to 64x36 - or
+    None when the screen could not be read. This is the guard's second
+    witness: a black feed under a lit screen means the capture lied; a
+    black feed under a black screen is a loading screen or a cutscene
+    and nothing is wrong. `rect` is the dict _game_window_rect returns;
+    its hwnd is measured afresh here (ClientToScreen under per-monitor
+    DPI awareness, the same flip _game_window_rect makes) so the probe
+    reads exactly the client area the capture is meant to carry. No
+    CAPTUREBLT: layered overlays are not the window. Measured 28 ms at
+    1080p, 41 ms at 1440p - called only after ten seconds of black, at
+    most every five seconds."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        g = ctypes.windll.gdi32
+        h = int((rect or {}).get("hwnd") or 0)
+        if not h:
+            return None
+        oldctx = None
+        try:
+            u.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            u.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            oldctx = u.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            oldctx = None
+        try:
+            cr = wintypes.RECT()
+            pt = wintypes.POINT(0, 0)
+            if not u.GetClientRect(h, ctypes.byref(cr)):
+                return None
+            if not u.ClientToScreen(h, ctypes.byref(pt)):
+                return None
+            sx, sy = int(pt.x), int(pt.y)
+            w, hh = cr.right - cr.left, cr.bottom - cr.top
+            if w < 16 or hh < 16:
+                return None
+            u.GetDC.restype = ctypes.c_void_p
+            u.GetDC.argtypes = [ctypes.c_void_p]
+            u.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            g.CreateCompatibleDC.restype = ctypes.c_void_p
+            g.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+            g.CreateDIBSection.restype = ctypes.c_void_p
+            g.CreateDIBSection.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                wintypes.DWORD]
+            g.SelectObject.restype = ctypes.c_void_p
+            g.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            g.DeleteObject.argtypes = [ctypes.c_void_p]
+            g.DeleteDC.argtypes = [ctypes.c_void_p]
+            g.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            g.StretchBlt.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+
+            class _BIH(ctypes.Structure):
+                _fields_ = [("biSize", wintypes.DWORD),
+                            ("biWidth", ctypes.c_long),
+                            ("biHeight", ctypes.c_long),
+                            ("biPlanes", wintypes.WORD),
+                            ("biBitCount", wintypes.WORD),
+                            ("biCompression", wintypes.DWORD),
+                            ("biSizeImage", wintypes.DWORD),
+                            ("biXPelsPerMeter", ctypes.c_long),
+                            ("biYPelsPerMeter", ctypes.c_long),
+                            ("biClrUsed", wintypes.DWORD),
+                            ("biClrImportant", wintypes.DWORD)]
+
+            class _BMI(ctypes.Structure):
+                _fields_ = [("bmiHeader", _BIH),
+                            ("bmiColors", wintypes.DWORD * 3)]
+
+            bmi = _BMI()
+            bmi.bmiHeader.biSize = ctypes.sizeof(_BIH)
+            bmi.bmiHeader.biWidth = 64
+            bmi.bmiHeader.biHeight = -36          # top-down
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = 0      # BI_RGB
+            hdc = u.GetDC(None)
+            if not hdc:
+                return None
+            mdc = hbm = old = None
+            try:
+                mdc = g.CreateCompatibleDC(hdc)
+                if not mdc:
+                    return None
+                bits = ctypes.c_void_p()
+                hbm = g.CreateDIBSection(hdc, ctypes.byref(bmi), 0,
+                                         ctypes.byref(bits), None, 0)
+                if not hbm or not bits.value:
+                    return None
+                old = g.SelectObject(mdc, hbm)
+                g.SetStretchBltMode(mdc, 4)      # HALFTONE
+                try:
+                    g.SetBrushOrgEx(mdc, 0, 0, None)
+                except Exception:
+                    pass
+                ok = g.StretchBlt(mdc, 0, 0, 64, 36, hdc, sx, sy, w, hh,
+                                  0x00CC0020)  # SRCCOPY
+                try:
+                    g.GdiFlush()
+                except Exception:
+                    pass
+                if not ok:
+                    return None
+                raw = ctypes.string_at(bits.value, 64 * 36 * 4)
+            finally:
+                try:
+                    if old is not None:
+                        g.SelectObject(mdc, old)
+                    if hbm:
+                        g.DeleteObject(hbm)
+                    if mdc:
+                        g.DeleteDC(mdc)
+                finally:
+                    u.ReleaseDC(None, hdc)
+            tot = 0
+            for i in range(0, len(raw), 4):
+                tot += raw[i] + raw[i + 1] + raw[i + 2]
+            return tot / float(64 * 36 * 3)
+        finally:
+            if oldctx:
+                try:
+                    u.SetThreadDpiAwarenessContext(oldctx)
+                except Exception:
+                    pass
+    except Exception:
+        return None
+
+
 def _client_crop(hwnd, frame_w, frame_h):
     """Where the window's CLIENT area sits inside a WGC frame, in frame
     pixels: (x, y, w, h) - or None if anything looks off.
@@ -4681,6 +4887,14 @@ class _WGCFeed:
         self._ticker_t = None
         self.hwnd = int(hwnd)
         self._crop = None                 # (x, y, w, h) of the CLIENT area
+        # THE BLACK CLOCK (3.32). Read by _black_track on the watcher beat.
+        self.black_since = None           # wall time the black run began
+        self.black_n = 0                  # black samples in that run
+        self.lit_at = 0.0                 # last sample that had a picture
+        self.seen_in = 0                  # frames_in at the last sample
+        self.stalled_since = None         # frames_in stopped moving here
+        self.sampler_dead = False         # the sampler raised: it is off
+        self._tick_n = 0
         from windows_capture import WindowsCapture
         # draw_border=False removes the yellow highlight Windows paints around
         # a captured window - it is part of the composed surface, so it lands
@@ -4775,10 +4989,41 @@ class _WGCFeed:
             except Exception:
                 self.dead = True                  # encoder went away
                 break
+            # every 30th write (2 Hz at 60 fps): is what ffmpeg just got a
+            # picture at all? This is the one place that sees every frame
+            # the encoder receives, including the re-sent frame of a feed
+            # that has gone quiet - on_frame_arrived never fires then.
+            self._tick_n += 1
+            if self._tick_n % 30 == 0 and not self.sampler_dead:
+                self._sample(buf, time.time())
         try:
             self.stdin.close()                    # EOF -> ffmpeg finalises
         except Exception:
             pass
+
+    def _sample(self, buf, now):
+        """One luma sample of the frame just sent: keep the black clock
+        and the stall clock. Never raises - a sampler failure turns the
+        sampler off and the write loop carries on exactly as before."""
+        try:
+            if self.sampler_dead:
+                return
+            if _frame_black(buf, self.w, self.h):
+                if self.black_since is None:
+                    self.black_since = now
+                    self.black_n = 0
+                self.black_n += 1
+            else:
+                self.black_since = None
+                self.lit_at = now
+            if self.frames_in == self.seen_in:
+                if self.stalled_since is None:
+                    self.stalled_since = now
+            else:
+                self.stalled_since = None
+                self.seen_in = self.frames_in
+        except Exception:
+            self.sampler_dead = True          # never touch the write loop
 
     def stop(self):
         self._stopev.set()
@@ -4798,6 +5043,26 @@ def _wgc_available():
     try:
         import windows_capture  # noqa: F401
         return True
+    except Exception:
+        return False
+
+
+# GAMES WHOSE WINDOW CAPTURE LIED TONIGHT: {game exe, lower: wall time}.
+# Sticky for the night (12 h) so a 'restart' - which builds a fresh
+# Session - and every later run of that game take the screen-region
+# path; cleared when the capture_backend setting changes.
+_WGC_BLACK = {}
+_WGC_BLACK_TTL = 12 * 3600.0
+
+
+def _wgc_black_banned(game, now=None):
+    """Did this game's window give only black frames earlier tonight?"""
+    try:
+        t = _WGC_BLACK.get((game or "").lower())
+        if not t:
+            return False
+        return ((now if now is not None else time.time()) - float(t)
+                < _WGC_BLACK_TTL)
     except Exception:
         return False
 
@@ -7628,6 +7893,9 @@ class Session:
         self._restart_streak = 0       # capture restarts, decayed (see _note_restart)
         self._last_restart = 0.0
         self._wgc = None               # live _WGCFeed when WGC transports this run
+        self.black = False             # every sampled frame of the saved file was black
+        self._black_probe_t = 0.0      # the guard's last screen probe (rate limit)
+        self._black_game_said = False  # 'so is the screen' logged once per session
         self._first_frame = threading.Event()
         self._err = bytearray()        # rolling tail of the encoder's stderr
         self._replay_lock = threading.Lock()
@@ -7748,6 +8016,8 @@ class Session:
             elif self.win["w"] * self.win["h"] > 4_200_000:
                 why = (f"the window is {self.win['w']}x{self.win['h']} - too "
                        f"large for the frame pipe (limit ~4.2 megapixels)")
+            elif _wgc_black_banned(self.game):
+                why = "its window gave only black frames earlier tonight"
             if why and why != getattr(self, "_wgc_said", None):
                 self._wgc_said = why
                 log(f"Window capture: recording the SCREEN REGION because "
@@ -7755,7 +8025,8 @@ class Session:
         if (self.win and self.win.get("hwnd")
                 and str(SETTINGS.get("capture_backend", "auto")) == "auto"
                 and _wgc_available() and not _hdr_active()
-                and self.win["w"] * self.win["h"] <= 4_200_000):
+                and self.win["w"] * self.win["h"] <= 4_200_000
+                and not _wgc_black_banned(self.game)):
             try:
                 feed = _WGCFeed(self.win["hwnd"], int(SETTINGS["framerate"]))
                 size = feed.begin()
@@ -8103,6 +8374,23 @@ class Session:
                 pass
             try:
                 self._write_src_sidecar()
+            except Exception:
+                pass
+            # THE BLACK TAG (3.32). Four single frames at BELOW_NORMAL,
+            # 1-8 s after the merge: a file whose every sample is black
+            # gets a pic.json fact and a settled vis.json here, at the one
+            # moment every recording passes through, so the eye, the HUD
+            # reader and the describer never spend a minute on it.
+            try:
+                _blk, _lum, _mx, _sec = _picture_probe(self.final)
+                if _blk is not None:
+                    _write_black_tag(self.final, _sec, _lum, _mx, _blk)
+                if _blk:
+                    self.black = True
+                    log(f"Saved: {os.path.basename(self.final)} - but every "
+                        f"sampled frame is black (the capture gave no "
+                        f"picture). The eye and the screen reader will not "
+                        f"look at it.")
             except Exception:
                 pass
             _record_made_file(self.final)   # own it before the cap can consider it
@@ -8691,6 +8979,7 @@ class _Ctl:
         self.optimistic_t = 0.0
         self._dash_refresh = None  # dashboard registers a fn to repaint its state instantly
         self.saving = 0            # number of recordings finalising in the background
+        self._black_toasted = set()  # games told 'recording the screen region' this session
 
     def click_feedback(self, sound, optimistic, secs=4.0):
         """Instant feedback when the user presses a control: play the sound now,
@@ -9534,6 +9823,107 @@ def _window_track(ctl, session, current):
     return "restart"
 
 
+_BLACK_PATIENCE = 10.0      # seconds of black before the guard asks the screen
+_BLACK_PATIENCE_BLIND = 20.0  # ...and twice that when the screen cannot answer
+
+
+def _black_track(ctl, session, current, now=None):
+    """THE BLACK-FRAME GUARD's verdict, once per healthy watcher beat:
+    None (nothing to do), 'rotate' (swap the capture path inside this
+    file), 'split' (save the chapter, start a fresh one on the screen
+    path) or 'restart' (the black head is a launch, not a chapter).
+
+    THE LAW. A window capture that hands the encoder only black for ten
+    seconds is not proof of anything by itself - a loading screen and a
+    fade-to-black look the same to the feed. So the guard asks a second
+    witness: the SCREEN, read through GDI over the window's own rect. A
+    lit screen over a black feed means the capture lied (the 20 Aug
+    Rocket League night: 25 minutes of exact black under three healthy
+    audio tracks) and that game goes to the screen-region path for the
+    rest of the night - the path 33 of the last 35 starts already used.
+    A black screen means the game is black: say so once and wait. When
+    the screen cannot be read at all, the guard waits twice as long and
+    needs a sign of life (pad or keyboard input, or a loud game ring)
+    before it acts. Minimised or not in front: not the guard's call -
+    the pause law and the foreground rule own those.
+
+    The size of the two paths decides the act: WGC aligns the height to
+    even, ddagrab to a multiple of eight, so 1920x1080 rotates inside
+    the same file while 2552x678 (WGC) vs 2552x672 (ddagrab) must split
+    - one file never mixes sizes ('capture size changed' would raise)."""
+    if not SETTINGS.get("black_guard", True):
+        return None
+    feed = getattr(session, "_wgc", None)
+    if feed is None or getattr(feed, "sampler_dead", False) \
+            or getattr(session, "suspended", False) \
+            or getattr(session, "win_paused", False):
+        return None                     # a dead sampler keeps no clock
+    since = getattr(feed, "black_since", None)
+    if since is None:
+        session._black_probe_t = 0.0
+        return None
+    now = now if now is not None else time.time()
+    dark = now - float(since)
+    if dark < _BLACK_PATIENCE:
+        return None
+    try:
+        w = _game_window_rect(current or session.game,
+                              hwnd=(session.win or {}).get("hwnd"))
+    except Exception:
+        w = None
+    if not w or w.get("iconic"):
+        return None                     # minimised: the pause law owns it
+    if _foreground_root() != _root_hwnd(w.get("hwnd")):
+        return None                     # alt-tabbed: the game is not in front
+    if now - float(getattr(session, "_black_probe_t", 0) or 0) < 5.0:
+        return None
+    session._black_probe_t = now
+    screen = _screen_probe(w)
+    if screen is not None:
+        if screen < 8.0:
+            # the screen is black too: it is the game, not the capture
+            if not getattr(session, "_black_game_said", False):
+                session._black_game_said = True
+                log(f"Capture: the window has been black for {int(dark)} s "
+                    f"and so is the screen - a loading screen or a "
+                    f"cutscene, not the capture.")
+            return None
+    else:
+        # no witness: activity or a loud game ring inside the black
+        # stretch, and twice the patience
+        alive = False
+        try:
+            alive = _afk_idle_recent() < 10.0
+        except Exception:
+            alive = False
+        if not alive:
+            alive = _ring_loud(getattr(session, "audio", None), 10.0)
+        if dark < _BLACK_PATIENCE_BLIND or not alive:
+            return None
+    key = (session.game or "").lower()
+    _WGC_BLACK[key] = now
+    log("Capture: the window gave only black frames for 10 s - recording "
+        "the screen region instead.")
+    try:
+        told = getattr(ctl, "_black_toasted", None)
+        if told is None:
+            told = ctl._black_toasted = set()
+        if key not in told:
+            told.add(key)
+            ctl.notify("Recording", "The game's window gave only black "
+                       "frames - recording the screen region instead.",
+                       force=True)
+    except Exception:
+        pass
+    lim = int(SETTINGS.get("min_keep_seconds", 45) or 0)
+    if lim > 0 and _captured_seconds(session) < lim:
+        return "restart"                # a black head is a launch, not a chapter
+    if session.cap_wh and (w["w"], w["h"]) == tuple(session.cap_wh):
+        session.win = w                 # the rect the screen path will crop
+        return "rotate"
+    return "split"
+
+
 def _note_restart(session):
     """Count a capture restart, with a 60-second decay, and return the new
     streak. The decay is the whole point: restarts minutes apart are separate
@@ -9720,7 +10110,10 @@ def _finalize_async(ctl, session):
             # "Saving your video..." earlier, so the user is never told a recording
             # is safe when the merge actually failed and the footage is only in the
             # hidden cache. A cancelled warm-up (nothing captured) stays quiet.
-            if ok:
+            if ok and getattr(session, "black", False):
+                ctl.notify("Saved - but the picture is black",
+                           os.path.basename(getattr(session, "final", "") or ""))
+            elif ok:
                 ctl.notify("Saved ✓", os.path.basename(getattr(session, "final", "") or ""))
             elif ok is False:
                 ctl.notify("Couldn't save your video",
@@ -10589,7 +10982,24 @@ def _watch_core(ctl):
                     if session.suspended:              # AFK pause just landed
                         _interruptible_sleep(ctl, SETTINGS["poll_interval"])
                         continue
-                    act = _window_track(ctl, session, current)
+                    # THE BLACK-FRAME GUARD rides the beat before the
+                    # resize law: a feed that gave only black under a
+                    # lit screen swaps to the screen-region path -
+                    # inside this file when the sizes agree, else the
+                    # same split/restart protocol a resize takes.
+                    bv = _black_track(ctl, session, current)
+                    if bv == "rotate":
+                        session._rotating = True
+                        try:
+                            session._stop_run()
+                            try:
+                                session._start_run()
+                            except Exception as e:
+                                log(f"Capture restart failed: {e}")
+                        finally:
+                            session._rotating = False
+                        bv = None
+                    act = bv or _window_track(ctl, session, current)
                     if act:
                         # The game window was RESIZED (or lost for good): a
                         # new frame size can't join this file. 'split' saves
@@ -12890,6 +13300,95 @@ def _read_sidecar(video_path, kind):
                 m["kind"] = ""
     return d
 
+# THE PICTURE FACT (3.32): <base>.pic.json beside the sidecars, written
+# once per recording at bind (or by a lane / the boot walk for a file
+# already on the shelf). Like .src it is a recording FACT, not a lane
+# product - it is not in _ATTIC_OF, so a 'Describe it' redo never
+# archives it and a black night is never re-owed to the eye.
+_PIC_CACHE = {}
+
+
+def _write_black_tag(video_path, secs, lumas, maxes, black):
+    """Write the pic.json fact; when the picture is black, also settle the
+    vis.json (complete, black, no looks) so the eye lane stops asking.
+    The vis is left alone when it already says black - a sidecar is
+    never rewritten just to be rewritten (the mtime-is-lineage law)."""
+    try:
+        pp = _ai_sidecar(video_path, "pic")
+        os.makedirs(os.path.dirname(pp), exist_ok=True)
+        _atomic_write_json(pp, {"v": 1, "black": bool(black),
+                                "sampled": list(secs), "luma": list(lumas),
+                                "max": list(maxes), "at": time.time()})
+        _PIC_CACHE.pop(pp, None)
+        if not black:
+            return
+        vp = _ai_sidecar(video_path, "vis")
+        try:
+            with open(vp, encoding="utf-8") as fh:
+                was = json.load(fh) or {}
+            if (isinstance(was, dict) and was.get("black")
+                    and was.get("complete") and not was.get("failed")):
+                return              # already settled as black: not a write
+        except Exception:
+            pass
+        try:
+            _bank_sidecar(video_path, "vis")
+        except Exception:
+            pass
+        _atomic_write_json(vp, {"v": 1, "looks": [], "places": [],
+                                "creatures": [], "complete": True,
+                                "tries": 0, "black": True,
+                                "counters": {"black": len(secs)}})
+    except Exception:
+        pass
+
+
+def _pic_black(video_path):
+    """Does pic.json say this recording's picture is black? READ ONLY:
+    absent means False, and it never probes - the sweep asks this about
+    every recording every beat, so it is cached on the fact's clock and
+    size like _hud_owing (the ONE JOB SLOT law: an owing test must never
+    open a video or spawn ffmpeg)."""
+    pp = _ai_sidecar(video_path, "pic")
+    try:
+        st = os.stat(pp)
+    except OSError:
+        return False
+    key = (round(st.st_mtime, 1), st.st_size)
+    hit = _PIC_CACHE.get(pp)
+    if hit and hit[0] == key:
+        return hit[1]
+    blk = False
+    try:
+        with open(pp, encoding="utf-8") as fh:
+            d = json.load(fh)
+        blk = bool(isinstance(d, dict) and d.get("black"))
+    except Exception:
+        blk = False
+    _PIC_CACHE[pp] = (key, blk)
+    return blk
+
+
+def _pic_settle(video_path):
+    """The LANE-side reader: a file with no pic.json yet is probed here
+    (1-8 s of CPU on a lane thread, never the watcher's) and tagged
+    either way, so it is asked once per file. An unanswered probe (a
+    cold platter, a seek that failed) writes nothing and fails open."""
+    if os.path.isfile(_ai_sidecar(video_path, "pic")):
+        return _pic_black(video_path)
+    try:
+        black, lumas, maxes, secs = _picture_probe(video_path)
+    except Exception:
+        return False
+    if black is None:
+        return False
+    _write_black_tag(video_path, secs, lumas, maxes, black)
+    if black:
+        log(f"The picture of {os.path.basename(video_path)} is black - the "
+            f"capture gave no frames that night. The eye will not look.")
+    return bool(black)
+
+
 def _hype_bar(vals):
     """Where the night's own flow counts as HOT, and whether it ever
     does -> (bar, flat). Night-relative - p90, or three MADs over the
@@ -14055,7 +14554,17 @@ def _senses_one(video_path):
         # ---- the HUD reader: frames around the gold moments + chapters --
         try:
             ow = os.path.join(_here(), "ai", "ocr_worker.py")
-            if os.path.isfile(ow)                     and os.path.isdir(os.path.join(_here(), "ai",
+            if _pic_black(video_path):
+                # A BLACK NIGHT HAS NO SCREEN TO READ. The grid would put
+                # ~25 black frames a night through RapidOCR (the worker has
+                # no size gate) for nothing; the sidecar says so instead,
+                # so the grid top-up never owes it either.
+                sns["hud"] = {"step": _HUD_STEP, "rows": [], "black": True}
+                sns["screen"] = []
+                log(f"The picture of {name} is black - the HUD reader did "
+                    f"not run.")
+            elif os.path.isfile(ow) \
+                    and os.path.isdir(os.path.join(_here(), "ai",
                                                    "vendor_ocr")):
                 secs = []
                 try:
@@ -15903,10 +16412,13 @@ def _describe_locally(system, user, max_tokens=2000):
         srv.stop()
 
 
-def _grab_frames(video_path, times):
+def _grab_frames(video_path, times, stats=None):
     """Keyframes for the describer's eye: one jpeg per requested second,
     scaled for gemma, base64-encoded. Any failure just means fewer eyes -
-    the review never blocks on a picture."""
+    the review never blocks on a picture. `stats`, when given, learns
+    how many jpegs EXISTED but fell under the 4000-byte floor ('small')
+    - a black frame through this exact filter is ~2,900 bytes, and the
+    eye must say 'black', not blame ffmpeg."""
     import base64
     out = []
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -15935,10 +16447,14 @@ def _grab_frames(video_path, times):
                  "-ss", f"{max(0.0, t):.2f}", "-i", video_path,
                  "-frames:v", "1", "-vf", vf, "-q:v", "5", jp],
                 capture_output=True, timeout=45, creationflags=flags)
-            if r.returncode == 0 and os.path.isfile(jp)                     and os.path.getsize(jp) > 4000:
+            if r.returncode == 0 and os.path.isfile(jp) \
+                    and os.path.getsize(jp) > 4000:
                 with open(jp, "rb") as fh:
                     out.append((t, base64.b64encode(fh.read())
                                 .decode("ascii")))
+            elif (r.returncode == 0 and os.path.isfile(jp)
+                    and stats is not None):
+                stats["small"] = int(stats.get("small") or 0) + 1
         except Exception:
             pass
         finally:
@@ -17091,15 +17607,27 @@ def _insights_one(video_path, forced=False, fresh=False):
                            else [(0, len(part))])
             got = None
             imgs = []
-            if _desc_mmproj() is not None and not _AI["abort"]:
+            # a black night is told so, and shown nothing: told it is
+            # shown 0 frames the model may still narrate a picture
+            _black_pic = _pic_black(video_path)
+            if (_desc_mmproj() is not None and not _AI["abort"]
+                    and not _black_pic):
                 imgs = [(f"[frame at {int(t) // 60}:{int(t) % 60:02d}]", b)
                         for t, b in _grab_frames(
                             video_path, _frame_times_for(video_path, lo, hi))]
-            see = (f"You are also SHOWN {len(imgs)} frame(s) from this "
-                   f"window, each labeled with its time - use what you SEE "
-                   f"(places, bosses, menus, deaths, victories) in names, "
-                   f"whats and moments; never claim to see what is not "
-                   f"there. " if imgs else "")
+            if imgs:
+                see = (f"You are also SHOWN {len(imgs)} frame(s) from this "
+                       f"window, each labeled with its time - use what you "
+                       f"SEE (places, bosses, menus, deaths, victories) in "
+                       f"names, whats and moments; never claim to see what "
+                       f"is not there. ")
+            elif _black_pic:
+                see = ("The picture of this recording is black - the "
+                       "capture gave no frames that night. Describe from "
+                       "the words and the sounds only; never guess what "
+                       "was on screen. ")
+            else:
+                see = ""
             mk_here = [(t0, k0) for t0, k0 in _heard if lo <= t0 < hi]
             ears = ""
             if mk_here:
@@ -18670,15 +19198,17 @@ def _eyes_one(video_path):
         log(f"The eye failed on {name}: {str(why)[:140]}")
         return False
 
-    def _settle(counters):
+    def _settle(counters, black=False):
         """Nothing to look at is an ANSWER, not a failure - written down,
         or the sweep asks forever for a pass it can never finish."""
         try:
             os.makedirs(os.path.dirname(vp), exist_ok=True)
             _bank_sidecar(video_path, "vis")
-            _atomic_write_json(vp, {"v": 1, "looks": [], "places": [],
-                                    "creatures": [], "complete": True,
-                                    "tries": 0, "counters": counters})
+            doc = {"v": 1, "looks": [], "places": [], "creatures": [],
+                   "complete": True, "tries": 0, "counters": counters}
+            if black:
+                doc["black"] = True
+            _atomic_write_json(vp, doc)
         except Exception:
             pass
         return True
@@ -18697,6 +19227,12 @@ def _eyes_one(video_path):
         return False
     if dur < 12:
         return _settle({"too_short": 1})
+    # A BLACK PICTURE IS AN ANSWER TOO - and a cheap one: four decodes of
+    # CPU here against a describer wake-up on the card per try (three
+    # tries burned on the 20 Aug file, logged as an ffmpeg fault). The
+    # fact is read when it exists and probed once when it does not.
+    if _pic_settle(video_path):
+        return _settle({"black": 4}, black=True)
     times = _eye_looks(video_path)
     if not times:
         return _settle({"nothing_to_look_at": 1})
@@ -18751,12 +19287,18 @@ def _eyes_one(video_path):
                                "at": time.time(), "batch": _EYE_BATCH,
                                "took": list(batch_took)}
             b0 = time.time()
-            frames = _grab_frames(video_path, times[i:i + _EYE_BATCH])
+            gst = {}
+            frames = _grab_frames(video_path, times[i:i + _EYE_BATCH],
+                                  stats=gst)
             if _AI["abort"]:
                 break
             if not frames:
                 st["skipped"] += 1
-                st["why"] = "ffmpeg could not reach those seconds"
+                # the honest reason: a jpeg that existed but fell under the
+                # floor is a black or empty frame, not a seek that failed
+                st["why"] = ("the frames were black or empty"
+                             if gst.get("small")
+                             else "ffmpeg could not reach those seconds")
                 continue
             looks.extend(_eye_pass(srv, game, frames, st))
             batch_took.append((time.time() - b0, len(frames)))
@@ -21656,12 +22198,61 @@ def _aud_restrike(video_path, freq):
     return healed_ts
 
 
+def _black_vis_migration():
+    """3.32, once per shelf: every vis.json that says FAILED and has no
+    pic.json yet is probed for a black picture. The eye gives up after
+    three tries (_vis_owing), so the one black night on the shelf sat
+    forever as 'ffmpeg could not reach those seconds' - three describer
+    wake-ups spent, and the panel still saying the eye failed. Black ->
+    the pic.json fact and a settled vis (complete, black, no looks); lit
+    -> pic.json black:false and the vis left exactly as it was. A file
+    the probe cannot answer is counted as skipped, so the walk runs
+    again next boot rather than being written off half-done."""
+    out = SETTINGS.get("output_dir", "")
+    n_black = n_lit = 0
+    for d0, kind in _library_dirs(out):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            vp = _ai_sidecar(p, "vis")
+            if not os.path.isfile(vp) or os.path.isfile(_ai_sidecar(p, "pic")):
+                continue
+            try:
+                with open(vp, encoding="utf-8") as fh:
+                    vd = json.load(fh) or {}
+            except Exception:
+                _MIG_SKIPPED[0] += 1
+                continue
+            if not (isinstance(vd, dict) and vd.get("failed")):
+                continue
+            try:
+                if float(_probe_duration(p) or 0) < 12:
+                    continue        # too short for a picture verdict, ever
+                black, lumas, maxes, secs = _picture_probe(p)
+            except Exception:
+                black = None
+            if black is None:
+                _MIG_SKIPPED[0] += 1
+                continue
+            _write_black_tag(p, secs, lumas, maxes, black)
+            if black:
+                n_black += 1
+                log("The picture of " + os.path.basename(p) + " is black - "
+                    "the eye's failed pass is settled; there was nothing "
+                    "to see.")
+            else:
+                n_lit += 1
+    if n_black or n_lit:
+        log("The black-picture walk probed " + str(n_black + n_lit)
+            + " failed eye pass(es): " + str(n_black) + " black, "
+            + str(n_lit) + " with a picture (left for the eye).")
+
+
 # THE MARKER NAMES THE WALKS THAT FINISHED. A single number
 # standing for three separately-added walks let one stamp retire work
 # that had never run - measured on his own machine, where the file
 # said "3" and not one sidecar carried a stamp. A name can only
 # retire itself.
-_MIG_WALKS = ("refold", "eye", "strike", "echo")
+_MIG_WALKS = ("refold", "eye", "strike", "echo", "black")
 _MIG_BUSY = [False]
 _MIG_BANKED = set()
 _MIG_SKIPPED = [0]      # files a walk could not read this pass
@@ -21724,7 +22315,9 @@ def _shelf_migrations():
                                 ("strike", _aud_strike_migration,
                                  "strike"),
                                 ("echo", _echo_strike_migration,
-                                 "echo-strike")):
+                                 "echo-strike"),
+                                ("black", _black_vis_migration,
+                                 "black-picture")):
                 # the fold and the eye first: both edit gold marks,
                 # and the strike walk reads them; the echo walk last,
                 # because it rewrites transcripts the strike walk read
@@ -25255,6 +25848,47 @@ def _ensure_thumb(video_path, tdir, generate=True):
         return None
 
 
+def _picture_probe(video_path, fracs=(0.10, 0.35, 0.60, 0.85), timeout=20):
+    """Is the picture of this file black? Four single frames (10/35/60/85%
+    of the way through) decoded to 64x36 gray at BELOW_NORMAL: black when
+    EVERY sample has a mean under 2 and a max under 16 (limited-range
+    black is Y=16 in the file and 0 after decode; a dark game frame keeps
+    a max over 80 somewhere). Returns (black, lumas, maxes, secs); black
+    is None - no answer, nothing written - for a file under 12 s or a
+    seek that came back short: a cold platter is a slow answer, not a
+    black one, and a black tag is only ever written on four decoded
+    frames. 0.22-0.35 s per frame on a black file, 0.5-2 s on a 5-15 GB
+    AV1 night."""
+    lumas, maxes, secs = [], [], []
+    try:
+        dur = float(_probe_duration(video_path) or 0)
+    except Exception:
+        dur = 0.0
+    if dur < 12:
+        return (None, lumas, maxes, secs)
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    for f in fracs:
+        t = max(0.5, dur * f)
+        try:
+            r = subprocess.run(
+                [SETTINGS["ffmpeg_path"], "-v", "error", "-ss", f"{t:.2f}",
+                 "-i", video_path, "-frames:v", "1",
+                 "-vf", "scale=64:36,format=gray", "-f", "rawvideo", "-"],
+                capture_output=True, timeout=timeout, creationflags=flags)
+        except Exception:
+            return (None, lumas, maxes, secs)
+        b = (r.stdout or b"")[:2304]
+        if len(b) < 2304:
+            return (None, lumas, maxes, secs)   # a failed seek is no answer
+        lumas.append(round(sum(b) / 2304.0, 2))
+        maxes.append(int(max(b)))
+        secs.append(round(t, 1))
+    black = all(m < 2.0 for m in lumas) and all(x < 16 for x in maxes)
+    return (black, lumas, maxes, secs)
+
+
 # Duration cache: ffprobe is ~50ms per file, so durations are probed lazily
 # (only for the page being looked at) and remembered against the file's mtime,
 # in memory and in a sidecar next to the thumbnails so restarts stay instant.
@@ -28574,10 +29208,22 @@ class _JsApi:
                       if isinstance(x, dict) and x.get("n")]
         except Exception:
             screen = []
+        # the picture fact: a black night shows its one true line in the
+        # panel instead of 'the eye failed' or an invitation to look
+        black = False
+        try:
+            black = bool((d or {}).get("black")) or _pic_black(p)
+        except Exception:
+            black = False
         if not d or d.get("failed"):
+            if black:
+                return {"looks": [], "places": [], "creatures": [],
+                        "complete": True, "eye": False, "screen": [],
+                        "black": True}
             if screen:
                 return {"looks": [], "places": [], "creatures": [],
-                        "complete": True, "eye": False, "screen": screen}
+                        "complete": True, "eye": False, "screen": screen,
+                        "black": False}
             return None
         looks = d.get("looks") or []
         places = d.get("places") or []
@@ -28596,7 +29242,7 @@ class _JsApi:
                 "places": places,
                 "creatures": d.get("creatures") or [],
                 "complete": bool(d.get("complete")),
-                "eye": True, "screen": screen}
+                "eye": True, "screen": screen, "black": black}
 
     def audit(self, path, run=False, redo=False):
         """What the auditor made of this recording, in the one shape the
@@ -29661,6 +30307,8 @@ class _JsApi:
             return self.get_settings()
         autostart = patch.pop("autostart", None)
         allowed = set(DEFAULTS.keys())
+        if "capture_backend" in patch:
+            _WGC_BLACK.clear()      # a new transport starts with no black bans
         HK_KEYS = ("hotkey_record", "hotkey_replay", "hotkey_pause", "hotkey_clip_discord")
         hk_before = tuple(str(SETTINGS.get(k, "") or "") for k in HK_KEYS)
         # Snapshot->merge->write under the settings lock: a concurrent
