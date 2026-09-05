@@ -856,6 +856,9 @@ body.reduced .proj-glare::after{animation:none}
   padding:1px 5px;font:600 10px var(--ui);margin:0 6px 0 2px}
 /* senses marks wear a cooler metal than the loudness gold */
 .hlmark[data-fk="sense"]{background:#9fd8c8;box-shadow:0 0 6px rgba(120,200,180,.65)}
+/* 3.31 a burst in the game: a shorter, duller tick reads as secondary
+   next to the gold without a legend */
+.hlmark[data-fk="game"]{background:#b7a37c;opacity:.5;height:4px;top:0}
 /* with a band present the page must not center-split its overflow - the
    band stays whole at the top and only the grid's bottom edge may shave */
 .pbody:has(.evband){justify-content:flex-start}
@@ -2527,6 +2530,7 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
           <button data-m="loud" class="on">Loud</button>
           <button data-m="laugh" class="on">Laugh</button>
           <button data-m="scream" class="on">Scream</button>
+          <button data-m="game" class="on" title="Bursts in the game itself (3.31, a night recorded by source) - a side focus, never the room">Game</button>
           <button data-m="told" class="on">Told</button>
           <button data-m="sense" class="on">Senses</button>
           <button data-m="red" class="on">Chapters</button>
@@ -2899,7 +2903,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,version:'3.30'};},
+      webhook:true,version:'3.31'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3072,7 +3076,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.30'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.31'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -5442,7 +5446,7 @@ function clipNeedsWebhook(){
 
 function wireMarks(){
   const box=$('#vmarkpick'); if(!box)return;
-  const NAME={red:'chapter',loud:'loud',laugh:'laughter',scream:'scream',told:'told',sense:'sense'};
+  const NAME={red:'chapter',loud:'loud',laugh:'laughter',scream:'scream',told:'told',sense:'sense',game:'game'};
   /* SAY WHAT THE CHIPS ARE EATING. "44 marks" in the versions panel and a
      dozen on the bar is not a mystery, it is a filter - an old save's
      single Sound switch could leave four kinds off without a word. The
@@ -9043,7 +9047,8 @@ async function renderHlMarks(vid,req){
       const heard=ev.kind==='laugh'?'laughter'
                  :ev.kind==='scream'?'a scream'
                  :ev.kind==='creature'?visLabel(ev.t)
-                 :'a loud moment';
+                 :ev.kind==='game'?'a burst in the game'
+                 :(ev.src==='room'?'a shout in the room':'a loud moment');
       m._heard=heard;
       /* which chip this mark answers to - told outranks the ear's kind.
          markTipShow speaks on hover now, so no native title to double up.
@@ -9054,13 +9059,14 @@ async function renderHlMarks(vid,req){
                   kill:1,level:1,boss:1,hud:1,creature:1};
       const fk=said?'told':(ev.kind==='laugh'?'laugh'
               :ev.kind==='scream'?'scream'
+              :ev.kind==='game'?'game'
               :SNSK[ev.kind]?'sense':'loud');
       m.dataset.fk=fk;
       /* a mark can answer to more than one chip now - a laugh with a
          WINNER under it belongs to Laughs AND to Senses, and hiding
          either chip must not hide the other's evidence */
       m._fks=[fk].concat((ev.also||[]).map(k=>k==='laugh'?'laugh'
-              :k==='scream'?'scream':(SNSK[k]?'sense':'loud')));
+              :k==='scream'?'scream':k==='game'?'game':(SNSK[k]?'sense':'loud')));
       m.classList.toggle('hid',!m._fks.some(k=>MARKS[k]!==false));
       m.removeAttribute('title');
     };
@@ -9260,11 +9266,15 @@ function drawLevels(){
      cool teal thread over the gold. Only when the senses pass has run. */
   if(_sns&&_sns.hype&&(_sns.hype.v||[]).length){
     const hv=_sns.hype.v, hop=_sns.hype.hop||3;
+    /* 3.31 on a room-fed curve a 0 is "nobody spoke", not arousal 0 -
+       the thread breaks there instead of drawing a floor line */
+    const gated=(_sns.hype.src==='room');
     g.beginPath();
     let started=false;
     for(let i=0;i<hv.length;i++){
       const t=i*hop+hop/2;
       if(t<win.a||t>win.a+win.len)continue;
+      if(gated&&hv[i]<=0){started=false;continue;}
       const x=PAD+((t-win.a)/win.len)*IW;
       const y=2+(1-hv[i])*(h-6);
       if(!started){g.moveTo(x,y);started=true;}else g.lineTo(x,y);
@@ -10773,9 +10783,10 @@ function tlWin(){
 }
 /* the chapters the tome worked out, as marks on the bar. Same tlPx as
    everything else, so they cannot drift from the gold or the head. */
-let MARKS = {gold:true, red:true, loud:true, laugh:true, scream:true, told:true, sense:true};
+let MARKS = {gold:true, red:true, loud:true, laugh:true, scream:true, told:true, sense:true, game:true};
 try{ const m=JSON.parse(localStorage.getItem('lore.marks')||'{}');
-     ['gold','red','loud','laugh','scream','told','sense'].forEach(k=>{
+     /* 3.31 game: an old save without the key keeps it on */
+     ['gold','red','loud','laugh','scream','told','sense','game'].forEach(k=>{
        if(typeof m[k]==='boolean')MARKS[k]=m[k];});
      /* an old save's single Sound switch fans out into the four kind chips */
      if(m.gold===false&&m.loud===undefined)
@@ -10874,7 +10885,7 @@ function insMarksPlace(){
     else seen.set(key,m);
   });
   /* the kind chips cost a sweep only when one CHANGES */
-  const gsig=['loud','laugh','scream','told','sense'].map(k=>MARKS[k]?'1':'0').join('');
+  const gsig=['loud','laugh','scream','told','sense','game'].map(k=>MARKS[k]?'1':'0').join('');
   if(wrap._goldShown!==gsig){
     wrap._goldShown=gsig;
     wrap.querySelectorAll('.hlmark').forEach(m=>
@@ -11046,7 +11057,7 @@ function markCardShow(m){
             victory:'VICTORY on screen',defeat:'defeat on screen',
             kill:'a kill streak on screen',level:'a level-up on screen',
             boss:'a boss felled',hud:'the game said so on screen',
-            laugh:'laughter',scream:'a scream'};
+            laugh:'laughter',scream:'a scream',game:'a burst in the game'};
   card.innerHTML='';
   const x0=el('span','mcx','\u00d7');
   x0.addEventListener('pointerdown',e0=>{e0.preventDefault();e0.stopPropagation();
@@ -11123,7 +11134,8 @@ function markTipShow(m){
               music:'battle music swells',scare:'a scare',
               victory:'VICTORY on screen',defeat:'defeat on screen',
               kill:'a kill streak on screen',level:'a level-up on screen',
-              boss:'a boss felled',hud:'the game said so on screen'};
+              boss:'a boss felled',hud:'the game said so on screen',
+              game:'a burst in the game'};
     why=m._said?('\u2726 '+m._said.why)
         :ev.kind==='creature'?visLabel(ev.t)
         :(SN[ev.kind]||m._heard||'a loud moment');
@@ -12063,25 +12075,52 @@ function wireViewer(){
        being. */
     if(_hype._max==null){let mx=0;
       for(let i=0;i<n;i++)if(v[i]>mx)mx=v[i];_hype._max=mx;}
-    const lo=_hype.median||0,hi=Math.max(_hype._max||1,lo+0.05);
-    const em=x=>Math.pow(Math.max(0,Math.min(1,(x-lo)/(hi-lo))),2.6);
     const PAD=7, IW=Math.max(1,w-2*PAD);
+    /* 3.31 THE ROOM'S OWN CURVE is drawn as its DEVIATION FROM CALM (0 a
+       window nobody spoke in or the night's ordinary chatter, 1 at the
+       night's bar) instead of a per-night rescale that stood every
+       night's chatter up the same; a night that never rose is a
+       baseline and a word, no peaks. An older, mix-fed curve paints
+       exactly as before. */
+    const room=(_hype.src==='room');
+    const dev=(room&&_hype.dev&&_hype.dev.length===n)?_hype.dev:null;
+    if(room&&_hype.flat){
+      g.fillStyle='rgba(255,190,110,.55)'; g.fillRect(PAD,h-2,IW,1);
+      g.fillStyle='rgba(214,199,172,.45)'; g.font='italic 10px Georgia,serif';
+      g.fillText('a calm night \u2014 the room never rose',PAD+4,10);
+      return;
+    }
+    const lo=_hype.median||0,hi=Math.max(_hype._max||1,lo+0.05);
+    const em=dev?(x=>Math.pow(Math.max(0,Math.min(1,x/2)),1.4))
+                :(x=>Math.pow(Math.max(0,Math.min(1,(x-lo)/(hi-lo))),2.6));
+    const src=dev||v;
     g.beginPath(); g.moveTo(PAD,h);
     for(let x=0;x<=IW;x++){
       const t0=a+(x/IW)*len, t1=a+((x+1)/IW)*len;
       const i0=Math.max(0,Math.floor(t0/hop)),
             i1=Math.min(n-1,Math.ceil(t1/hop));
-      let pk=0; for(let i=i0;i<=i1;i++)if(v[i]>pk)pk=v[i];
+      let pk=0; for(let i=i0;i<=i1;i++)if(src[i]>pk)pk=src[i];
       g.lineTo(PAD+x,h-1-em(pk)*(h-3));
     }
     g.lineTo(PAD+IW,h); g.closePath();
     g.fillStyle='rgba(232,150,60,.32)'; g.fill();
     g.strokeStyle='rgba(255,190,110,.85)'; g.lineWidth=1; g.stroke();
-    (_hype.peaks||[]).forEach(t=>{
+    /* a peak is a number (the mix's p90 quota) or {t, why} (a rise in
+       the room with a cause the ears named); the cause is written
+       beside the dot when the window is sparse enough to read it */
+    const pk=(_hype.peaks||[]);
+    const shown=pk.filter(p=>{const t=(typeof p==='number')?p:(p&&p.t);
+      return t!=null&&t>=a-len*0.02&&t<=a+len*1.02;});
+    const label=shown.length<=12;
+    g.font='italic 9px Georgia,serif';
+    shown.forEach(p=>{
+      const t=(typeof p==='number')?p:p.t;
       const x=PAD+((t-a)/len)*IW;
       if(x<PAD-4||x>PAD+IW+4)return;  /* outside the window - not drawn */
       g.fillStyle='#ffd98a';
       g.beginPath();g.arc(x,3.5,2.4,0,7);g.fill();
+      if(label&&p&&p.why){ g.fillStyle='rgba(255,217,138,.8)';
+        g.fillText(p.why,Math.min(x+5,PAD+IW-60),8); }
     });
   };
   /* the flow repaints with every zoom and pan - tlPaint drives the head,
@@ -12106,12 +12145,13 @@ function wireViewer(){
     let win=null; try{ win=tlWin(); }catch(_){}
     const a=(win&&isFinite(win.a))?win.a:0;
     const len=(win&&win.len>0)?win.len:vd.duration;
-    let t=a+frac*len,best=null;
-    (_hype.peaks||[]).forEach(pt=>{
-      if(best==null||Math.abs(pt-t)<Math.abs(best-t))best=pt;});
-    if(best!=null&&Math.abs(best-t)<len*0.02)t=best;
+    let t=a+frac*len,best=null,why='';
+    (_hype.peaks||[]).forEach(p=>{
+      const pt=(typeof p==='number')?p:(p&&p.t); if(pt==null)return;
+      if(best==null||Math.abs(pt-t)<Math.abs(best-t)){best=pt;why=(p&&p.why)||'';}});
+    if(best!=null&&Math.abs(best-t)<len*0.02)t=best; else why='';
     vd.currentTime=Math.max(0,t-2);
-    whisper('landed on the flow at '+fmtT(Math.round(t)));
+    whisper('landed on the flow at '+fmtT(Math.round(t))+(why?' \u2014 '+why:''));
   });
   let _hypeReq=0;
   const loadHype=async()=>{
@@ -12121,7 +12161,11 @@ function wireViewer(){
     const my=++_hypeReq, want=V.cur.path;
     try{const r=await api.hype(want);
       if(my!==_hypeReq)return;      /* a newer night took the ribbon */
-      if(r&&r.ok){_hype=r;_hypePath=want;}
+      if(r&&r.ok){_hype=r;_hypePath=want;
+        /* 3.31 the ribbon says whose curve it is */
+        hypeCv.title=(r.src==='room')
+          ?'how alive the ROOM was \u2014 the voice chat and your mic, not the game'
+          :'how alive the mix sounded (an older recording \u2014 the game is in it)';}
       else if(r&&r.why)whisper(r.why);
     }catch(_){}
     drawHype();
@@ -12293,6 +12337,7 @@ function wireViewer(){
     /* 3.31 what is copied matches what is shown, and owns up to what it left out */
     const keep=segs.filter(s=>SAID_MEDIA||s.src!=='media');
     const left=segs.length-keep.length;
+    if(!keep.length){whisper('nothing but a video to copy \u2014 press the toggle to include it');return;}
     const txt=keep.map(s=>fmtT((s.a||0)/1000)+'  '+(s.src==='media'?'[a video] ':(s.src==='game'?'[the game] ':''))+(s.t||'').trim()).join('\n');
     whisper((await copyText(txt))?('transcript copied \u2014 '+keep.length+' lines'+(left?' (the video\u2019s '+left+' left out)':''))
       :'could not reach the clipboard');});

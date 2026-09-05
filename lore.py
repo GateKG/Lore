@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.30"
+APP_VERSION = "3.31"
 
 try:
     import psutil
@@ -5865,6 +5865,31 @@ _STT_V = 3          # the reader's sidecar shape (and the qwen3-asr era)
 _STT_ENGINE = "qwen3-asr"
 _HL_V = 2           # gold moments
 _LVL_V = 2          # the loudness curve behind the sound graph
+# 3.31 EXCITEMENT BY SOURCE - three numbers, all MEASURED (qa/sns331time.py
+# over the shelf's 1,316 sound curves, 545 transcripts and 322 hype
+# curves on 2026-09-05; the measure-the-remedy law), none felt:
+#   HL_VOICE_GATE_DB  the room's "somebody is talking" floor (RMS over a
+#       second, dBFS). Two walls: the mic's own floor from below (the
+#       Mix's p5-of-everything bounds it from above: median night -68 dB)
+#       and the talk itself from above. -60 is the lowest five-dB step
+#       eight dB over the median floor; it loses 1.4 % of the median
+#       night's spoken seconds ON THE MIX (fewer on the room, which has
+#       no game bed under it). The specced -50 would have lost 8.5 %,
+#       and 60 % on a quiet-mic night.
+#   HL_SHOUT_RISE_DB  how far the room must rise over its own talking
+#       level for a shout: 90 % of the loud marks that sit on a hot line
+#       (the words' own shouts, n=1,492) clear 6 dB on the Mix, and the
+#       Mix UNDER-reads the room's rise (the game bed lifts the reference,
+#       not the peak); 7 dB kept only 86 %.
+#   HYPE_MIN_RISE  the smallest arousal spread that counts as a rise:
+#       the calm nights' (no laugh, no scream) p75 of p90 - median over
+#       spoken windows is 0.107; 98 % of lively nights (5+ laughs) clear
+#       0.11 by their max - median. Mix curves, so a calm night's spread
+#       is wider than the room's own would be - re-measure on the first
+#       room nights, never lower it by feel.
+HL_VOICE_GATE_DB = -60.0
+HL_SHOUT_RISE_DB = 6.0
+HYPE_MIN_RISE = 0.11
 
 # WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
 # learns to hear something it could not hear before; 2 is the reader
@@ -12865,21 +12890,58 @@ def _read_sidecar(video_path, kind):
                 m["kind"] = ""
     return d
 
+def _hype_bar(vals):
+    """Where the night's own flow counts as HOT, and whether it ever
+    does -> (bar, flat). Night-relative - p90, or three MADs over the
+    median, whichever is higher - with a FLOOR: a calm night whose whole
+    spread is the model's noise gets a bar above its own maximum, so
+    every consumer reads it flat and retones nothing. Fed SPOKEN windows
+    only (the zeros a gated room writes are not readings)."""
+    sv = sorted(float(x) for x in vals)
+    n = len(sv)
+    if n < 8:
+        return 1.0, True
+    med = sv[n // 2]
+    p90 = sv[int(n * 0.9)]
+    mad = sorted(abs(x - med) for x in sv)[n // 2] or 0.005
+    bar = max(p90, med + max(HYPE_MIN_RISE, 3.0 * mad))
+    flat = (sv[-1] - med) < HYPE_MIN_RISE
+    return round(bar, 4), flat
+
+
 def _ins_retone(moments, sns, hl=None):
     """The senses cross-examine the review's feelings. A moment filed
     funny or scary is re-read against the arousal curve at that second
     (scored against the night's own spread) and against whether anyone
     actually laughed or screamed nearby. High arousal with neither is
     EXCITEMENT - the kind he kept asking for by name. Returns how many
-    were retoned; mutates in place, keeps the original under kind0."""
+    were retoned; mutates in place, keeps the original under kind0.
+
+    3.31: a curve fed by the ROOM (hype.src 'room') is judged against
+    _hype_bar over its spoken windows - hot means the room really rose,
+    a flat night retones nothing, and a window nobody spoke in (0) is
+    never hot. A mix-fed curve (every older sidecar) keeps the p85 rule
+    it was audited under: the shelf's reviews carry 186 promotions and
+    308 blanked tones from it (measured), and re-judging them under a
+    rule they were not built with would re-owe every one."""
     try:
         h = (sns or {}).get("hype") or {}
         v = [float(x) for x in (h.get("v") or [])]
         hop = float(h.get("hop") or 3.0)
         if len(v) < 20 or not moments:
             return 0
-        sv = sorted(v)
-        p85 = sv[int(len(sv) * 0.85)]
+        src = str(h.get("src") or "mix")
+        if src == "room":
+            spoken = [x for x in v if x > 0]
+            if len(spoken) < 20:
+                return 0
+            bar, flat = _hype_bar(spoken)
+            if flat:
+                return 0
+            p85 = None
+        else:
+            sv = sorted(v)
+            p85 = sv[int(len(sv) * 0.85)]
         # LAUGHTER LIVES IN THE .hl, NOT THE .sns - the old lookup
         # searched a sidecar that has never carried a laugh, so the
         # stand-test could not pass and only the p85 bypass saved any
@@ -12905,7 +12967,8 @@ def _ins_retone(moments, sns, hl=None):
             m["kind0"] = k
             # hot with no laugh is EXCITEMENT; cold with no laugh is
             # just a moment - a tone word needs its evidence
-            m["kind"] = "excited" if x >= p85 else ""
+            hot = (x > 0 and x >= bar) if p85 is None else (x >= p85)
+            m["kind"] = "excited" if hot else ""
             n += 1
         return n
     except Exception:
@@ -12942,8 +13005,15 @@ def _merge_sns_into_hl(video_path, sns=None):
                 return 0, None
             with open(sp, encoding="utf-8") as fh:
                 sns = json.load(fh) or {}
-        newev = list(sns.get("events") or []) \
-            + [{"t": e2["t"], "kind": e2["kind"], "p": 0.2}
+        # 3.31 WHOSE EARS. A sound event heard on the GAME tap may sit
+        # on a game mark or an old untagged mark, never on a room shout
+        # - it would label his shout "cheer" off the game's crowd. A
+        # mix-fed answer (an older worker, an older night) heard the
+        # room too and sits where it always did; the screen is not a
+        # sound source and names whatever it lands on, as today.
+        csrc = ((sns.get("src") or {}).get("clap")) or "mix"
+        newev = [dict(e2, src=csrc) for e2 in (sns.get("events") or [])] \
+            + [{"t": e2["t"], "kind": e2["kind"], "p": 0.2, "src": "screen"}
                for e2 in (sns.get("ocr") or [])]
         if not newev and not fresh:
             return 0, None
@@ -12972,8 +13042,10 @@ def _merge_sns_into_hl(video_path, sns=None):
                     pruned += 1
         for e2 in newev:
             z2 = round(ceil + 1.0 + float(e2.get("p") or 0.1), 2)
+            esrc = e2.get("src") or csrc
             near = [g for g in gold
-                    if abs((g.get("t") or 0) - e2["t"]) <= 8.0]
+                    if abs((g.get("t") or 0) - e2["t"]) <= 8.0
+                    and not (esrc == "game" and g.get("src") == "room")]
             if not near:
                 # a repick can WALK a kept mark up to 8s per pass; two
                 # passes put it outside the 8s window and this fold then
@@ -12981,7 +13053,8 @@ def _merge_sns_into_hl(video_path, sns=None):
                 # event, moved - never a second one.
                 near = [g for g in gold
                         if g.get("kind") == e2["kind"]
-                        and abs((g.get("t") or 0) - e2["t"]) <= 20.0]
+                        and abs((g.get("t") or 0) - e2["t"]) <= 20.0
+                        and not (esrc == "game" and g.get("src") == "room")]
             if near:
                 # a near mark borrows the kind - that alone is worth
                 # writing back, or the label vanishes on the next redo
@@ -13001,7 +13074,7 @@ def _merge_sns_into_hl(video_path, sns=None):
                         changed = True
             else:
                 gold.append({"t": round(float(e2["t"]), 1),
-                             "z": z2, "kind": e2["kind"]})
+                             "z": z2, "kind": e2["kind"], "src": esrc})
                 added += 1
         if added or changed or pruned:
             gold.sort(key=lambda g: g.get("t") or 0)
@@ -13880,29 +13953,73 @@ def _senses_one(video_path):
         # not in, so the hype curve and the sound tags would be built out
         # of a night he never spoke in.
         names = _audio_track_names(video_path)
-        rc, _o, _e = _ai_run([SETTINGS["ffmpeg_path"], "-y", "-loglevel",
-                              "error", "-i", video_path]
-                             + _mix_audio_args(video_path, names)
-                             + ["-ac", "1", "-ar", "48000",
-                                "-c:a", "pcm_s16le", wav],
-                             1800, flags)
-        if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
-            if _AI["abort"]:
-                return False
-            _AI["soft_fail"] = True
-            return _fail(f"audio extract rc={rc}")
         game = _display_name(_parse_clip_name(name))
         micwav = ""
-        mt = _mic_track(video_path, names)
-        if mt is not None:
-            micwav = wav + ".mic.wav"
-            rc3, _o3, _e3 = _ai_run(
-                [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
-                 "-i", video_path, "-map", f"0:a:{mt}", "-ac", "1",
-                 "-ar", "48000", "-c:a", "pcm_s16le", micwav],
-                1800, flags)
-            if rc3 != 0 or not os.path.isfile(micwav):
-                micwav = ""
+        # 3.31 WHOSE EARS. A file with a room of its own (a Voice track,
+        # or a Mic beside a Game track) feeds the ROOM to the hype curve
+        # and the voices, and the Game track to the sound vocabulary -
+        # hype on the mix is game outcomes, CLAP on the room is nonsense.
+        # One ffmpeg writes every layer (the one resolver; the room lands
+        # at <wav>, the rest beside it). An old night takes today's two
+        # commands verbatim, so its arguments do not move.
+        _rhow = _layer_args(video_path, "room", names)[2]
+        src_name = "room" if _rhow in ("voice+mic", "voice", "mic") \
+            else "mix"
+        gamewav, game_src = "", "mix"
+        if src_name == "room":
+            lay = _extract_layers(video_path, names, wav,
+                                  want=("room", "mic", "game"), rate=48000,
+                                  timeout=1800, flags=flags)
+            rc = lay["rc"]
+            if rc != 0 or not lay["room"].path or not os.path.isfile(wav) \
+                    or _AI["abort"]:
+                if _AI["abort"]:
+                    return False
+                _AI["soft_fail"] = True
+                return _fail(f"audio extract rc={rc}")
+            micwav = lay["mic"].path or ""
+            gamewav = lay["game"].path or ""
+            # with no Game track the 'game' layer is the mix - the sound
+            # vocabulary then hears what it always heard, and says so
+            game_src = "game" if lay["game"].how == "game" else "mix"
+        else:
+            rc, _o, _e = _ai_run([SETTINGS["ffmpeg_path"], "-y", "-loglevel",
+                                  "error", "-i", video_path]
+                                 + _mix_audio_args(video_path, names)
+                                 + ["-ac", "1", "-ar", "48000",
+                                    "-c:a", "pcm_s16le", wav],
+                                 1800, flags)
+            if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
+                if _AI["abort"]:
+                    return False
+                _AI["soft_fail"] = True
+                return _fail(f"audio extract rc={rc}")
+            mt = _mic_track(video_path, names)
+            if mt is not None:
+                micwav = wav + ".mic.wav"
+                rc3, _o3, _e3 = _ai_run(
+                    [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
+                     "-i", video_path, "-map", f"0:a:{mt}", "-ac", "1",
+                     "-ar", "48000", "-c:a", "pcm_s16le", micwav],
+                    1800, flags)
+                if rc3 != 0 or not os.path.isfile(micwav):
+                    micwav = ""
+        # the control file beside the wav - the same beside-the-wav
+        # contract the laughter ear reads: which layer this is, where
+        # the game's is, the mic, the threads. Absent = today's worker.
+        try:
+            with open(wav + ".ctl", "w", encoding="utf-8") as fh:
+                json.dump({"src": src_name, "game_wav": gamewav or None,
+                           "game_src": game_src if gamewav else None,
+                           "mic": micwav or None,
+                           # 0 = the worker's own count: an old night's
+                           # numbers stay the ones the shelf was
+                           # audited under (a different thread count can
+                           # move the model's floats at the last place)
+                           "threads": (_reader_threads()
+                                       if src_name == "room" else 0)}, fh)
+        except Exception:
+            pass
         dur = _AI.get("job_secs") or _probe_duration(video_path) or 0
         to = max(3600, int(dur * 2.5))
         rc, _o, err = _ai_run(
@@ -13915,6 +14032,12 @@ def _senses_one(video_path):
         with open(outj, encoding="utf-8") as fh:
             sns = json.load(fh) or {}
         sns["tries"] = 0
+        if "src" not in sns:
+            # a senses_worker.py on disk that predates 3.31 (a drop-in
+            # mismatch): it heard the mix whatever it was handed
+            sns["src"] = {"clap": "mix", "hype": "mix", "who": "mix"}
+            log(f"senses_worker.py on disk predates 3.31 - {name} was fed "
+                f"the mix throughout.")
         try:
             with open(_ai_sidecar(video_path, "sns"), encoding="utf-8") as fh:
                 _was = json.load(fh) or {}
@@ -14008,7 +14131,11 @@ def _senses_one(video_path):
             # opinion (no music prompt, or the pass fell over); [] means
             # they listened and heard none.
             mus = sns.get("music")
-            if mus is not None:
+            # 3.31: only when this pass was fed the MIX. On a layered
+            # file the reader's own src tags say which lines are a
+            # video's or the game's; stale g flags there are left alone
+            # (mtime-is-lineage - the reader's rewrite clears them).
+            if mus is not None and src_name == "mix":
                 sp2 = _ai_sidecar(video_path, "stt")
                 with open(sp2, encoding="utf-8") as fh:
                     sd2 = json.load(fh) or {}
@@ -14066,17 +14193,22 @@ def _senses_one(video_path):
                         f"unnamed rather than guessed")
         if _how:
             bits.append(_how)
+        _sd = sns.get("src") or {}
         log(f"Senses on {name}: {len(sns.get('events') or [])} sound "
             f"moment(s), {len(sns.get('ocr') or [])} HUD event(s), "
             f"{c.get('speaker_clusters') or 0} voice(s), hype "
             f"{'yes' if sns.get('hype') else 'no'}."
-            + (" " + "; ".join(bits) + "." if bits else ""))
+            + (" " + "; ".join(bits) + "." if bits else "")
+            + f" Fed by {_sd.get('hype') or 'mix'} (hype, voices) and "
+            + (f"{_sd.get('clap')} (sounds)." if _sd.get("clap")
+               else "sounds: none (the game layer could not be read)."))
         return True
     except Exception as e:
         return _fail(e)
     finally:
         _source_busy_done(video_path)
-        for p2 in (wav, outj, wav + ".mic.wav"):
+        for p2 in (wav, outj, wav + ".mic.wav", wav + ".game.wav",
+                   wav + ".ctl"):
             try:
                 if os.path.isfile(p2):
                     os.remove(p2)
@@ -14104,28 +14236,49 @@ def _repick_moments(video_path):
         return False        # nothing was said: the marks cannot improve
     hop_s = dur / float(len(curve))
     es = np.asarray(curve, dtype=float)
+    # 3.31 the room and the game ride beside the mix on the same grid;
+    # without them the re-pick would silently undo the split with
+    # mix-picked marks the next time the reader finished
+    vc = lvl.get("room") or []
+    gc = lvl.get("game") or []
     try:
-        events = _pick_moments(es, hop_s, said, hot_said)
-        # the SAME rule the first pass uses - this is the pass that
-        # actually decides what he sees, because it runs once the words
-        # are known and rewrites the marks
-        events = _thin_moments(events, dur)
+        if len(vc) >= 20:
+            events = _thin_moments(_pick_shouts(np.asarray(vc, dtype=float),
+                                                hop_s, hot_said), dur)
+            loud_src = "room"
+        else:
+            events = _pick_moments(es, hop_s, said, hot_said)
+            # the SAME rule the first pass uses - this is the pass that
+            # actually decides what he sees, because it runs once the
+            # words are known and rewrites the marks
+            events = _thin_moments(events, dur)
+            for ev0 in events:
+                ev0["src"] = "mix"
+            loud_src = "mix"
+        if len(gc) >= 20:
+            events = events + _thin_game(
+                _pick_moments(np.asarray(gc, dtype=float), hop_s), dur,
+                events)
     except Exception as e:
         log(f"Could not re-pick moments for {os.path.basename(video_path)}: {e}")
         return False
-    prior_ev = []
+    prior_ev, prior_hl = [], {}
     try:
         with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
-            prior_ev = (json.load(fh) or {}).get("events") or []
+            prior_hl = json.load(fh) or {}
+        prior_ev = prior_hl.get("events") or []
     except Exception:
         pass
     before = len(prior_ev) if prior_ev else -1
     # THE LAUGHTER SURVIVES THE RE-PICK. The laughs and screams came from a
     # model that heard them, not from this loudness curve - re-choosing the
     # loud moments must not silently delete them (it did, for one build).
-    kinds = [e for e in prior_ev if e.get("kind")]
+    # A game mark is re-derived above, never carried; a laugh from the
+    # room never lands on a game mark's seat (same source or no seat).
+    kinds = [e for e in prior_ev if e.get("kind") and e.get("kind") != "game"]
     for kv in kinds:
-        near = [g for g in events if abs(g["t"] - kv["t"]) <= 8.0]
+        near = [g for g in events if abs(g["t"] - kv["t"]) <= 8.0
+                and (g.get("src") or "mix") == (kv.get("src") or "mix")]
         if near:
             near[0]["kind"] = kv["kind"]
             if kv.get("also"):
@@ -14136,10 +14289,18 @@ def _repick_moments(video_path):
         else:
             events.append(kv)
     events.sort(key=lambda e: e["t"])
+    # today's write dropped every top-level key; src must ride
+    # ONE shape for the src doc, whatever the prior carried
+    _sd = {"laugh": "none", "game": False}
+    _sd.update(prior_hl.get("src") or {})
+    _sd["loud"] = loud_src
     _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                       {"v": _HL_V, "events": events})
+                       {"v": _HL_V, "events": events, "src": _sd})
+    _tail = ""
+    if loud_src == "mix" and os.path.isfile(_ai_sidecar(video_path, "src")):
+        _tail = " (from the mix - the sound pass predates 3.31)"
     log(f"Gold moments for {os.path.basename(video_path)} re-picked with the "
-        f"words: {before if before >= 0 else '?'} -> {len(events)}.")
+        f"words: {before if before >= 0 else '?'} -> {len(events)}{_tail}.")
     return True
 
 
@@ -16170,18 +16331,23 @@ def _window_parts(wpart):
     room = [sg for sg in wpart if _seg_layer(sg) == "room"]
     game = [sg for sg in wpart if _seg_layer(sg) == "game"]
     media = [sg for sg in wpart if _seg_layer(sg) == "media"]
-    if len(room) >= 3:
+
+    def _thin(lines):
+        # the same walk for a video's lines and the game's own: at most
+        # one a minute, eight a window - context, never the room's cost
         kept, last = [], -1e9
-        for sg in media:
+        for sg in lines:
             a = (sg.get("a") or 0) / 1000.0
             if a - last >= 60 and len(kept) < 8:
                 kept.append(sg)
                 last = a
-        out = room + game + kept
+        return kept
+    if len(room) >= 3:
+        out = room + _thin(game) + _thin(media)
         out.sort(key=lambda sg: (sg.get("a") or 0))
         return out, False
     if len(media) >= 3:
-        out = media + game
+        out = media + _thin(game)
         out.sort(key=lambda sg: (sg.get("a") or 0))
         return out, True
     return room + game, False
@@ -16286,7 +16452,8 @@ def _insights_one(video_path, forced=False, fresh=False):
         return _dress_line(sg, i, _sd0)     # module level, liftable (3.31)
 
     _qf = [0]          # quotes blanked/repaired this describe
-    _mdrop = [0]       # moments that pointed at a video's line (3.31)
+    _mdrop = [0]       # moments that pointed at a video's or the game's
+    #                    line (3.31)
 
     def _qnorm(x):
         x = str(x or "").lower()
@@ -16736,8 +16903,14 @@ def _insights_one(video_path, forced=False, fresh=False):
     try:
         with open(_ai_sidecar(video_path, "hl"), encoding="utf-8") as fh:
             for e0 in (json.load(fh) or {}).get("events") or []:
-                _heard.append((float(e0.get("t") or 0),
-                               str(e0.get("kind") or "loud")))
+                kind = str(e0.get("kind") or "loud")
+                # 3.31 a mark says WHICH layer it heard: a game burst
+                # must not be narrated as the room reacting
+                if kind == "game":
+                    kind = "a burst in the game (not the room)"
+                elif kind == "loud" and e0.get("src") == "room":
+                    kind = "a shout in the room"
+                _heard.append((float(e0.get("t") or 0), kind))
     except Exception:
         pass
     _who_names = {}
@@ -17143,10 +17316,11 @@ def _insights_one(video_path, forced=False, fresh=False):
                     why = str(mm.get("why") or "").strip()
                     if m_sg is None or not why:
                         continue
-                    if _seg_layer(m_sg) == "media":
+                    if _seg_layer(m_sg) in ("media", "game"):
                         # a moment is the room laughing or shouting,
-                        # never a video; the schema cannot say so, so
-                        # this post-check does
+                        # never a video and never the game's own voice;
+                        # the schema cannot say so, so this post-check
+                        # does
                         _mdrop[0] += 1
                         continue
                     why = _m_qcheck(mm, why, use)
@@ -17180,8 +17354,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                 f"{len(mapped)} stretch(es), {len(wmoments)} moment(s).")
             if _mdrop[0]:
                 log(f"Describer on {name}: {_mdrop[0]} moment(s) pointed "
-                    f"at a video's line and were dropped - a video is "
-                    f"never the room.")
+                    f"at a video's or the game's line and were dropped - "
+                    f"neither is the room.")
                 _mdrop[0] = 0
             if mapped or got is not None:
                 windows[str(int(lo))] = {"segments": mapped,
@@ -19894,6 +20068,15 @@ def _aud_check(events, src, live, dur):
                     "sighting this mark was standing on is gone",
                     ev, True))
                 continue
+        # 3.31 A SECONDARY MARK ANSWERS TO THE GAME LAYER. The room's
+        # witnesses (words, laughter) cannot vouch for a burst in the
+        # game and must not be asked to - every game mark would else be
+        # struck as "nothing in it" the first night.
+        if kind == "game":
+            keep.append({"t": round(t, 1), "kind": "game",
+                         "agrees": ["game"],
+                         "say": {"sound": "a burst in the game"}})
+            continue
         gone, agrees, det = _aud_condemn(t, src, live, "")
         if gone:
             row = _aud_drop(t, ('a gold mark labelled "' + kind + '"'
@@ -20282,6 +20465,28 @@ def _aud_tone(sns, t):
         if len(v) < 20:
             return ""
         x = float(v[max(0, min(len(v) - 1, int(t / hop)))])
+        if str(h.get("src") or "mix") == "room":
+            # 3.31 the room's own curve: a 0 is a window nobody spoke
+            # in, the spread is over the spoken ones, and a flat night
+            # is calm everywhere - a fanfare in the game is not a peak
+            spoken = [float(y) for y in v if y > 0]
+            if len(spoken) < 20:
+                return ""
+            if x <= 0:
+                return "quiet"
+            bar, flat = _hype_bar(spoken)
+            if flat:
+                return "calm"
+            sv = sorted(spoken)
+            med = sv[len(sv) // 2]
+            p90 = sv[int(len(sv) * 0.9)]
+            if x >= p90 and x >= bar:
+                return "at a peak of excitement"
+            if x >= bar:
+                return "excited"
+            if x >= med:
+                return "lively"
+            return "calm"
         sv = sorted(v)
         med = sv[len(sv) // 2]
         p90 = sv[int(len(sv) * 0.9)]
@@ -23229,8 +23434,40 @@ def _thin_moments(events, dur):
     return chosen
 
 
+def _rms_env_pcm16(read, sr=8000, frame=400, hop=200, chunk_s=30):
+    """The 50 ms RMS envelope in dB of a stream of 16-bit mono pcm -
+    `read(nbytes)` is a pipe's read or a raw file's. Lifted verbatim
+    from the sound pass's inline loop so the pipe, a raw file and a
+    test buffer produce the same numbers to the last bit (the roster
+    holds it to the old loop)."""
+    import numpy as np
+    env, carry = [], np.zeros(0, dtype=np.float32)
+    while True:
+        chunk = read(sr * 2 * chunk_s)
+        if not chunk:
+            break
+        x = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        x = np.concatenate([carry, x])
+        n = (len(x) - frame) // hop
+        if n <= 0:
+            carry = x
+            continue
+        idx = np.arange(n)[:, None] * hop + np.arange(frame)[None, :]
+        pw = (x[idx] ** 2).mean(axis=1)
+        env.append(10.0 * np.log10(pw + 1e-10))
+        carry = x[n * hop:]
+    return np.concatenate(env) if env else np.zeros(0, dtype=np.float32)
+
+
 def _pick_moments(es, hop_s, said=(), hot_said=()):
     """The moments worth a gold mark, from the loudness envelope.
+
+    On a 3.31 layered file this runs on the GAME layer only (secondary
+    marks); the room's shouts are _pick_shouts. Do NOT run it on the
+    room envelope: with digital silence between utterances (a voice
+    app's gate writes true zeros, -100 dB here) every utterance start
+    has fifteen dB of "prominence" and clears the bar below, so it would
+    mark speech, not shouts.
 
     PROMINENCE, not loudness. A peak counts by how far it rises above the
     quietest points on either side of it within a minute - the same measure
@@ -23306,6 +23543,123 @@ def _pick_moments(es, hop_s, said=(), hot_said=()):
     return out
 
 
+def _pick_shouts(ev, hop_s, hot_said=(), gate_db=HL_VOICE_GATE_DB):
+    """Shouts on the ROOM layer: louder than the room was TALKING.
+
+    Prominence (the game rule above) is wrong here - a voice app's gate
+    writes true silence between lines, so every utterance start has
+    fifteen dB of "prominence". The reference is the room's own talking
+    level: a +-60 s rolling median over SPOKEN seconds only (a second
+    is spoken when its level clears HL_VOICE_GATE_DB), and a shout is a
+    rise of HL_SHOUT_RISE_DB over that, held for 0.4 s. A night nobody
+    ever rose in (the whole night's rise under the bar) marks nothing.
+
+    The one-second smoothing is over ENERGY, not over dB: a second half
+    filled with gated zeros averages to -65 dB in dB and to -33 dB as an
+    RMS, and the gate was measured against seconds' RMS (qa/sns331time).
+    Each mark carries src 'room'."""
+    import warnings
+    import numpy as np
+    n = len(ev)
+    if n < int(20 / hop_s):
+        return []
+    w = max(3, int(round(1.0 / hop_s)))
+    pw = np.convolve(10.0 ** (np.asarray(ev, dtype=np.float64) / 10.0),
+                     np.ones(w) / w, mode="same")
+    sm = 10.0 * np.log10(pw + 1e-10)
+    live = sm > gate_db
+    if live.sum() * hop_s < 20.0:
+        return []            # under 20 s of voice all night: nothing to rank
+    per = max(1, int(round(1.0 / hop_s)))
+    secs = n // per
+    if secs < 20:
+        return []
+    # the talking level per spoken second (nan where nobody spoke), then
+    # a +-60 s rolling median over those - five spoken seconds or no
+    # opinion, so the first words after a lull are not "a shout"
+    # (an all-nan second is a second nobody spoke in - numpy's warning
+    # about it is the expected case, not news)
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        m = np.nanmedian(np.where(live, sm, np.nan)[:secs * per]
+                         .reshape(secs, per), axis=1)
+        padm = np.concatenate([np.full(60, np.nan), m, np.full(60, np.nan)])
+        win = np.lib.stride_tricks.sliding_window_view(padm, 121)
+        cnt = np.sum(~np.isnan(win), axis=1)
+        ref = np.where(cnt >= 5, np.nanmedian(win, axis=1), np.nan)
+    reff = np.repeat(ref, per)
+    reff = np.concatenate([reff, np.full(n - len(reff),
+                                         reff[-1] if len(reff) else np.nan)])
+    rise = np.where(live & ~np.isnan(reff), sm - reff, -np.inf)
+    lr = rise[np.isfinite(rise)]
+    # a flat night: nobody EVER rose above how they talked. The max, not
+    # a percentile - three shouts in two hours are 0.17 % of the talking
+    # and a p99 over the spoken frames never reaches them; the 0.4 s
+    # hold below is what tells a shout from a click.
+    if not len(lr) or float(lr.max()) < HL_SHOUT_RISE_DB:
+        return []
+    span = max(1, int(round(2.0 / hop_s)))          # peaks 2 s apart at most
+    out, i = [], span
+    while i < n - span:
+        r = rise[i]
+        if r >= HL_SHOUT_RISE_DB and r >= rise[i - span:i + span + 1].max():
+            half = reff[i] + r / 2.0
+            j = i
+            while j > 0 and sm[j] > half:
+                j -= 1
+            k2 = i
+            while k2 < n - 1 and sm[k2] > half:
+                k2 += 1
+            held = (k2 - j) * hop_s
+            if held >= 0.4:
+                t = i * hop_s
+                # no plain "said" bonus: on the room layer every
+                # candidate IS speech; a HOT line still counts double
+                score = float(r) + min(held, 4.0) * 0.6 \
+                    + (6.0 if any(abs(t - q) <= 4.0 for q in hot_said)
+                       else 0.0)
+                out.append({"t": round(max(0.0, t - 0.4), 2),
+                            "z": round(score, 2), "p": round(float(r), 1),
+                            "src": "room"})
+            i += span
+        else:
+            i += 1
+    return out
+
+
+def _thin_game(gev, dur, room_events):
+    """The game's bursts as SECONDARY marks: half the room's budget,
+    never inside 8 s of a room mark, their own kind ('game', src
+    'game') so every consumer can tell them from the room."""
+    keep = _thin_moments(gev, dur)
+    cap = max(4, int(min(60, max(8, round(dur / 150.0)))) // 2)
+    keep = sorted(keep, key=lambda e: -(e.get("z") or 0))[:cap]
+    vt = [float(e["t"]) for e in room_events]
+    out = []
+    for e in keep:
+        if any(abs(float(e["t"]) - t) <= 8.0 for t in vt):
+            continue                    # the room already owns that second
+        e = dict(e)
+        e["kind"] = "game"
+        e["src"] = "game"
+        out.append(e)
+    return sorted(out, key=lambda e: e["t"])
+
+
+def _lvl_curve(es, pts):
+    """The sound curve as the sidecar stores it: the PEAK of each bucket
+    on a pts grid (averaging flattens exactly the spikes worth seeing).
+    Lifted from the sound pass so the room and game curves share the
+    mix's grid to the sample."""
+    import numpy as np
+    n = len(es)
+    if not n:
+        return []
+    idx = np.linspace(0, n, pts + 1).astype(int)
+    buckets = [es[idx[i]:max(idx[i] + 1, idx[i + 1])] for i in range(pts)]
+    return [int(round(float(b.max()))) for b in buckets if len(b)]
+
+
 def _highlights_one(video_path):
     """Loudness-burst highlight pass -> .hl.json sidecar. 8kHz mono PCM is
     streamed straight out of ffmpeg (no temp file), a 50ms RMS envelope is
@@ -23328,13 +23682,43 @@ def _highlights_one(video_path):
     if lw is not None:
         law = os.path.join(_work_dir(),
                            f"laugh_{os.getpid()}_{threading.get_ident()}.wav")
+    # 3.31 THE ROOM AND THE GAME, APART. The pipe stays the unmapped
+    # default pick (the Mix on every tome file) so the drawn sound curve
+    # and every old night's arguments do not move; a file that carries a
+    # room of its own (a Voice track, or a Mic beside a Game track) has
+    # the same ffmpeg write the room summed at parity as an 8 kHz raw -
+    # the shout picker's input, and the laughter ear's wav when it runs
+    # - and the Game track as another. One disk read, as before.
+    names = _audio_track_names(video_path)
+    _rpre, _rmaps, _rhow = _layer_args(video_path, "room", names,
+                                       fan=2 if law else 1)
+    has_room = _rhow in ("voice+mic", "voice", "mic")
+    gt = _game_track(video_path, names)
+    room8 = game8 = None
+    if has_room:
+        room8 = os.path.join(_work_dir(),
+                             f"hl_{os.getpid()}_{threading.get_ident()}"
+                             f".room8.raw")
+    if gt is not None:
+        game8 = os.path.join(_work_dir(),
+                             f"hl_{os.getpid()}_{threading.get_ident()}"
+                             f".game8.raw")
     try:
         cmd = [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
                "-i", video_path,
                "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
-        if law:
+        if has_room:
+            cmd += _rpre + _rmaps[0] + ["-ac", "1", "-ar", str(SR),
+                                        "-f", "s16le", room8]
+            if law:
+                cmd += ["-vn"] + _rmaps[1] + ["-ac", "1", "-ar", "32000",
+                                             "-c:a", "pcm_s16le", law]
+        elif law:
             cmd += ["-vn", "-ac", "1", "-ar", "32000",
                     "-c:a", "pcm_s16le", law]
+        if game8:
+            cmd += ["-vn", "-map", "0:a:%d" % gt, "-ac", "1", "-ar", str(SR),
+                    "-f", "s16le", game8]
         errt = bytearray()
         proc = _popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -23355,27 +23739,12 @@ def _highlights_one(video_path):
             except Exception:
                 pass
             return False
-        env = []
-        carry = np.zeros(0, dtype=np.float32)
-        while True:
-            chunk = proc.stdout.read(SR * 2 * 30)      # 30s per read
-            if not chunk:
-                break
-            x = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-            x = np.concatenate([carry, x])
-            n = (len(x) - FRAME) // HOP
-            if n <= 0:
-                carry = x
-                continue
-            idx = np.arange(n)[:, None] * HOP + np.arange(FRAME)[None, :]
-            pw = (x[idx] ** 2).mean(axis=1)
-            env.append(10.0 * np.log10(pw + 1e-10))
-            carry = x[n * HOP:]
+        e = _rms_env_pcm16(proc.stdout.read, SR, FRAME, HOP)
         proc.wait(timeout=30)
         _AI["proc"] = None
         if _AI["abort"]:
             return False
-        if not env:
+        if not len(e):
             # died before ANY pipe data. The classic cause is the laugh
             # wav's second output failing to open (scratch full, permissions,
             # a vanished drive) - transient, so it must not poison this video
@@ -23394,7 +23763,6 @@ def _highlights_one(video_path):
             log(f"Sound pass on {os.path.basename(video_path)}: ffmpeg "
                 f"exited {proc.returncode} - nothing was written.")
             return False
-        e = np.concatenate(env)
         got_s = len(e) * HOP / float(SR)
         pd = _probe_duration(video_path) or 0
         if pd > 60 and got_s < pd * 0.9:
@@ -23426,15 +23794,72 @@ def _highlights_one(video_path):
             return True
         k = np.ones(20, dtype=np.float32) / 20.0
         es = np.convolve(e, k, mode="same")
+        dur = len(es) * HOP / float(SR)
+        nm = os.path.basename(video_path)
+
+        def _raw_env(p2):
+            # a layer's raw the same ffmpeg wrote; unread when it is
+            # missing or short of the mix by a tenth (a corrupt track)
+            try:
+                with open(p2, "rb") as fh:
+                    e2 = _rms_env_pcm16(fh.read, SR, FRAME, HOP)
+            except Exception:
+                return None, 0.0
+            got2 = len(e2) * HOP / float(SR)
+            if len(e2) < 0.9 * len(e):
+                return None, got2
+            return np.convolve(e2, k, mode="same"), got2
+        esv = esg = None
+        if room8:
+            esv, _g2 = _raw_env(room8)
+            if esv is None:
+                log(f"Sound pass on {nm}: the Voice layer could not be read "
+                    f"({_g2:.0f}s of {dur:.0f}s) - the gold marks came from "
+                    f"the mix this time.")
+        if game8:
+            esg, _g3 = _raw_env(game8)
+            if esg is None:
+                log(f"Sound pass on {nm}: the Game layer could not be read "
+                    f"- no game marks this time.")
         said, hot_said = _speech_times(video_path)
-        events = _pick_moments(es, HOP / float(SR), said, hot_said)
         # A REEL, NOT A BARCODE. Every burst 8s apart used to survive (up to
         # 200 of them), which on a 2h session painted the whole seek bar gold
         # and marked nothing in particular. Keep only the strongest moments,
         # spaced out in proportion to the video's length: the loudest first,
         # each at least MINGAP from one already kept.
-        dur = len(es) * HOP / float(SR)
-        events = _thin_moments(events, dur)
+        if esv is not None:
+            # the room's shouts: louder than the room was TALKING, never
+            # louder than the game (each mark already carries src room)
+            events = _thin_moments(_pick_shouts(esv, HOP / float(SR),
+                                                hot_said), dur)
+            loud_src = "room"
+            if not events:
+                live_s = float(np.count_nonzero(esv > HL_VOICE_GATE_DB)) \
+                    * HOP / float(SR)
+                _room_why = ("the room was silent (under 20 s of voice)"
+                             if live_s < 20.0 else
+                             "the room never rose above its own talking "
+                             "level")
+            else:
+                _room_why = ""
+        else:
+            events = _pick_moments(es, HOP / float(SR), said, hot_said)
+            events = _thin_moments(events, dur)
+            for ev0 in events:
+                ev0["src"] = "mix"
+            loud_src = "mix"
+            _room_why = ""
+        game_events = []
+        if esg is not None:
+            game_events = _thin_game(_pick_moments(esg, HOP / float(SR)),
+                                     dur, events)
+        if _room_why:
+            log(f"Sound pass on {nm}: {_room_why} - no loud marks; "
+                f"{len(game_events)} game mark(s) stand alone.")
+        events = sorted(events + game_events, key=lambda e2: e2["t"])
+        src_doc = {"loud": loud_src, "laugh": "none",
+                   "game": esg is not None}
+        lsrc = "room" if has_room else "mix"
 
         # THE EAR FOR LAUGHTER. The loudness contest happens above; this is
         # a different question - "did somebody LAUGH or SCREAM" - answered
@@ -23469,16 +23894,21 @@ def _highlights_one(video_path):
                     # must sit ABOVE this session's own gold ceiling or the
                     # viewer's top-30 cut silently deletes every quiet laugh
                     ceil = max([g.get("z") or 0 for g in events] + [10.0])
+                    src_doc["laugh"] = lsrc
                     for ev in lev:
                         z2 = round(ceil + 1.0 + float(ev["p"]), 2)
+                        # a laugh never takes a game mark's seat and
+                        # never re-labels it (3.31)
                         near = [g for g in events
-                                if abs(g["t"] - ev["t"]) <= 8.0]
+                                if g.get("src") != "game"
+                                and abs(g["t"] - ev["t"]) <= 8.0]
                         if near:
                             near[0]["kind"] = ev["kind"]
                             near[0]["z"] = max(near[0].get("z") or 0, z2)
                         else:
                             events.append({"t": round(float(ev["t"]), 1),
-                                           "z": z2, "kind": ev["kind"]})
+                                           "z": z2, "kind": ev["kind"],
+                                           "src": lsrc})
                             added += 1
                     events.sort(key=lambda e: e["t"])
                     if lev:
@@ -23510,7 +23940,7 @@ def _highlights_one(video_path):
                     exist_ok=True)
         _bank_sidecar(video_path, "hl")    # a redo keeps the one it replaces
         _atomic_write_json(_ai_sidecar(video_path, "hl"),
-                           {"v": _HL_V, "events": events})
+                           {"v": _HL_V, "events": events, "src": src_doc})
         # THE LOUDNESS CURVE, free: the envelope is already in hand from the
         # pass above, so drawing it costs one more sidecar and no more work.
         #
@@ -23525,19 +23955,24 @@ def _highlights_one(video_path):
         # instead of 1,800 - one every 0.6s rather than every 14s.
         # The PEAK of each bucket is kept, never the average: averaging flattens
         # exactly the spikes worth seeing.
+        # 3.31: "db" stays the Mix, what the player plays; the room and
+        # the game ride beside it on the SAME grid, so the words-known
+        # re-pick reproduces the split without decoding.
         try:
             pts = int(max(1800, min(40000, (dur or 0) * 8)))
             n = len(es)
             if n:
-                idx = np.linspace(0, n, pts + 1).astype(int)
-                buckets = [es[idx[i]:max(idx[i] + 1, idx[i + 1])]
-                           for i in range(pts)]
-                curve = [int(round(float(b.max()))) for b in buckets if len(b)]
-                _atomic_write_json(_ai_sidecar(video_path, "lvl"),
-                                   {"v": 2, "dur": round(dur, 2),
-                                    "floor": int(round(float(np.percentile(es, 5)))),
-                                    "peak": int(round(float(es.max()))),
-                                    "db": curve})
+                curve = _lvl_curve(es, pts)
+                ldoc = {"v": 2, "dur": round(dur, 2),
+                        "floor": int(round(float(np.percentile(es, 5)))),
+                        "peak": int(round(float(es.max()))),
+                        "db": curve}
+                if esv is not None:
+                    ldoc["room"] = _lvl_curve(esv, pts)
+                if esg is not None:
+                    ldoc["game"] = _lvl_curve(esg, pts)
+                ldoc["src"] = {"db": "mix"}
+                _atomic_write_json(_ai_sidecar(video_path, "lvl"), ldoc)
         except Exception as e2:
             # the editor draws no sound shape without this file, and a fresh
             # hl above made the sweep call the whole pass done forever
@@ -23568,7 +24003,9 @@ def _highlights_one(video_path):
             if _a4:
                 log(f"Re-folded {_a4} sighting(s) into the fresh gold.")
         log(f"Highlights for {os.path.basename(video_path)}: "
-            f"{len(events)} moment(s).")
+            f"{len(events)} moment(s) - loud marks from the {loud_src}"
+            + (f", {len(game_events)} game mark(s)" if game_events else "")
+            + ".")
         return True
     except Exception as e:
         log(f"Highlight pass failed for {os.path.basename(video_path)}: {e}")
@@ -23585,11 +24022,12 @@ def _highlights_one(video_path):
         # the 32k wav is consumed and removed on the happy path; every
         # OTHER path (short audio, abort, crash) must not leave 400 MB
         # of it on the scratch drive per video
-        try:
-            if law and os.path.isfile(law):
-                os.remove(law)
-        except OSError:
-            pass
+        for p3 in (law, room8, game8):
+            try:
+                if p3 and os.path.isfile(p3):
+                    os.remove(p3)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -28115,7 +28553,8 @@ class _JsApi:
             return {"hype": d.get("hype"), "speakers": d.get("speakers") or [],
                     "names": d.get("names") or {},
                     "events": d.get("events") or [],
-                    "ocr": d.get("ocr") or [], "inp": inp}
+                    "ocr": d.get("ocr") or [], "inp": inp,
+                    "src": d.get("src")}
         except Exception:
             return None
 
@@ -28373,6 +28812,9 @@ class _JsApi:
             return {"ok": False, "why": "too short to have a flow"}
         step = max(1, len(v) // 1600)
         vd = [round(max(v[i:i + step]), 3) for i in range(0, len(v), step)]
+        src = str(h.get("src") or "mix")
+        if src == "room":
+            return self._hype_room(p, v, hop, step, vd)
         sv = sorted(v)
         p90 = sv[int(len(sv) * 0.9)]
         # THE STRONGEST PEAKS SURVIVE. First-40-chronological kept
@@ -28393,7 +28835,71 @@ class _JsApi:
         peaks = sorted(t for _, t in keep)
         return {"ok": True, "hop": hop * step, "v": vd,
                 "peaks": peaks,
-                "median": round(sv[len(sv) // 2], 3), "p90": round(p90, 3)}
+                "median": round(sv[len(sv) // 2], 3), "p90": round(p90, 3),
+                "src": "mix", "bar": round(p90, 3), "flat": False,
+                "quiet": 0}
+
+    def _hype_room(self, p, v, hop, step, vd):
+        """3.31 the ROOM's flow: spread over the windows somebody spoke
+        in (a 0 is a gated window, not a reading), a bar with a floor so
+        a calm night lies flat, and the deviation from calm - 0 quiet, 1
+        at the bar - drawn instead of a per-night rescale that stood
+        every night's chatter up the same. The peaks are the rises that
+        have a CAUSE the ears can name (laughter, a scream, a shout in
+        the room) - no quota, no dots for a rise nothing explains."""
+        spoken = [x for x in v if x > 0]
+        if len(spoken) < 8:
+            return {"ok": False, "why": "nobody spoke long enough to have "
+                                        "a flow"}
+        bar, flat = _hype_bar(spoken)
+        sv = sorted(spoken)
+        med = sv[len(sv) // 2]
+        p90 = sv[int(len(sv) * 0.9)]
+        span = max(1e-6, bar - med)
+        if flat:
+            dev = [0.0] * len(vd)
+        else:
+            dev = [round(max(0.0, (x - med) / span), 3) if x > 0 else 0.0
+                   for x in vd]
+        causes = []
+        try:
+            with open(_ai_sidecar(p, "hl"), encoding="utf-8") as fh:
+                for e in (json.load(fh) or {}).get("events") or []:
+                    k = str(e.get("kind") or "")
+                    if k == "laugh":
+                        w = "laughter"
+                    elif k == "scream":
+                        w = "a scream"
+                    elif k in ("", "loud") and e.get("src") == "room":
+                        w = "a shout in the room"
+                    else:
+                        continue
+                    causes.append((float(e.get("t") or 0), w))
+        except Exception:
+            pass
+        peaks = []
+        if not flat:
+            cand = sorted(((v[i], round(i * hop, 1))
+                           for i in range(2, len(v) - 2)
+                           if v[i] >= bar and v[i] == max(v[i - 2:i + 3])),
+                          reverse=True)
+            keep = []
+            for sc, t in cand:
+                why = None
+                for ct, w in causes:
+                    if abs(ct - t) <= 10.0:
+                        why = w
+                        break
+                if why is None:
+                    continue
+                if all(abs(t - t2) > 45 for _, t2, _w in keep):
+                    keep.append((sc, t, why))
+            peaks = [{"t": t, "why": w} for _, t, w in
+                     sorted(keep, key=lambda k3: k3[1])]
+        return {"ok": True, "hop": hop * step, "v": vd, "dev": dev,
+                "peaks": peaks, "median": round(med, 3),
+                "p90": round(p90, 3), "src": "room", "bar": bar,
+                "flat": flat, "quiet": round(1 - len(spoken) / len(v), 2)}
 
     def sns_rename(self, path, who, name):
         """Give a clustered voice its real name - stored in the sidecar's
@@ -28489,7 +28995,11 @@ class _JsApi:
             return {"ok": False, "why": "no gold moments yet"}
         if not evs:
             return {"ok": False, "why": "no gold moments yet"}
-        top = sorted(evs, key=lambda e: -(e.get("z") or 0))[:8]
+        # 3.31 a game burst is a side focus by his word - never the reel
+        top = sorted([e for e in evs if e.get("kind") != "game"],
+                     key=lambda e: -(e.get("z") or 0))[:8]
+        if not top:
+            return {"ok": False, "why": "no gold moments yet"}
         segs = sorted([[max(0.0, float(e.get("t") or 0) - 8),
                         float(e.get("t") or 0) + 8] for e in top])
         merged = []

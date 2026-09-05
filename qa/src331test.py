@@ -48,8 +48,14 @@ WSRC = io.open(WPATH, encoding="utf-8").read()
 LSRC = io.open(LPATH, encoding="utf-8").read()
 
 
+# THE FILE BEFORE THIS READER is stage B (a7a461f), not whatever HEAD
+# happens to be: once the reader was committed HEAD carried it too and
+# the parity fixture would have compared the reader with itself.
+PRE = "a7a461f"
+
+
 def git_show(rel):
-    return subprocess.run(["git", "-C", ROOT, "show", "HEAD:" + rel],
+    return subprocess.run(["git", "-C", ROOT, "show", PRE + ":" + rel],
                           capture_output=True, text=True,
                           encoding="utf-8").stdout
 
@@ -1142,6 +1148,28 @@ check("...and the note is the honesty line",
 check("...the guards line in lore.py appends the stand-down",
       "the Voice layer was not trusted - media detection " in LSRC
       and '"stood down)" if cnt.get("media_off") else ""' in LSRC)
+
+# 3.31 stage D: a Voice layer the app NAMED but that would not load
+# (a corrupt .voice.wav) on a Voice+Game night - media detection stands
+# down, the mix is the room, nobody is filed as "a video"
+p_bad = os.path.join(NIGHT, "corrupt.voice.wav")
+io.open(p_bad, "wb").write(b"RIFF" + bytes(4) + b"garbage-not-a-wav")
+rc, doc, raw, prog = run_worker(W_NEW, {"LORE_ASR_VOICE": p_bad,
+                                        "LORE_ASR_GAME": p_game})
+check("a corrupt Voice layer beside a Game tap: media detection stood down",
+      rc == 0 and doc["sources"]["media"] is False
+      and doc["sources"]["voice"] is False and doc["sources"]["game"] is True
+      and any(n == "the Voice layer could not be loaded - media detection "
+                   "stood down" for n in doc["notes"])
+      and any(n.startswith("voice layer skipped: ") for n in doc["notes"]))
+check("...the mix is the room, as on an old night: the friend's line, the "
+      "video AND the game's announcer are the room, his line off the mic - "
+      "nobody is filed as a video; the game tap has nothing the room (the "
+      "mix) does not cover",
+      [s.get("src", "") for s in doc["segments"]] == ["", "you", "", ""]
+      and doc["counters"]["media_lines"] == 0
+      and doc["counters"]["game_lines"] == 0
+      and doc["sources"]["game_s"] == 0.0)
 
 # THE OLD-FILE PATH, byte-identical to the HEAD worker
 p_out_h = os.path.join(NIGHT, "head.json")

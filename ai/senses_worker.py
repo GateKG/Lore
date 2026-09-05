@@ -3,7 +3,15 @@
 
 Called as a subprocess, exactly like the reader and the laughter ear:
 
-    senses_worker.py <input.wav (48kHz mono)> <output.json> [game-name]
+    senses_worker.py <input.wav (48kHz mono)> <output.json> [game-name] [mic]
+
+3.31 BY SOURCE: a control file beside the wav, <input.wav>.ctl =
+{src: 'room'|'mix', game_wav, game_src, mic, threads}, says WHICH layer
+the wav is. On 'room' (the voice app's tap + the mic, or the mic alone)
+the hype curve and the voices are read off the room, windows nobody
+spoke in skip the model, and the sound vocabulary listens to game_wav
+(the Game tap, or the mix when there was none). No .ctl, or src 'mix':
+today's worker to the bit - one wav, every pass over it, un-gated.
 
 Three passes over one decode, all CPU (torch is CPU-only on this machine and
 the GPU belongs to games):
@@ -36,6 +44,12 @@ CHUNK_S = 10               # CLAP window
 HOP_S = 5                  # CLAP hop
 HYPE_WIN = 6.0             # arousal window
 HYPE_HOP = 3.0
+# 3.31 a hype window under this RMS (dBFS) on the ROOM is nobody
+# talking: no model call, a 0 in the curve. The same number as lore.py's
+# HL_VOICE_GATE_DB, measured in qa/sns331time.py (the lowest five-dB
+# step eight dB over the median night's floor; loses 1.4 % of the
+# median night's spoken seconds on the Mix, fewer on the room).
+HYPE_GATE_DB = -60.0
 
 # the default sound vocabulary; a per-game pack (ai/packs/<game>.txt, one
 # prompt per line as  kind: prompt text) replaces or extends it
@@ -222,24 +236,82 @@ def decimate(np, x, factor):
     return x[:n].reshape(-1, factor).mean(axis=1)
 
 
-def main(src, dst, game="", mic=None):
-    import numpy as np
-    import soundfile as sf
-    import torch
-    torch.set_num_threads(_threads())
+def _read_ctl(src):
+    """The beside-the-wav control file (the laughter ear reads the same
+    shape): {src, game_wav, game_src, mic, threads}; {} when absent or
+    unreadable, which is exactly the pre-3.31 worker."""
+    try:
+        with open(src + ".ctl", encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
 
-    base = os.path.dirname(os.path.abspath(__file__))
-    mdir = os.path.join(base, "models")
-    a, sr = sf.read(src, dtype="float32")
+
+def _hype_prep(np, a16, src_name, gate_db=HYPE_GATE_DB):
+    """The hype windows, prepared the way the model expects. Pure, so a
+    test can lift it without torch. Yields (pos, segment-or-None).
+
+    room: a window under gate_db RMS yields None (no model call - a
+    voice app's gate writes true zeros and normalising those is noise
+    amplified into a reading); the rest are zero-mean / unit-variance,
+    which is exactly Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm
+    (models/hype/preprocessor_config.json do_normalize=true).
+    mix (old files): every window, untouched - today's numbers."""
+    hop, win = int(HYPE_HOP * 16000), int(HYPE_WIN * 16000)
+    pos = 0
+    while pos + 16000 <= len(a16):
+        seg = np.ascontiguousarray(a16[pos:pos + win]).astype(np.float32)
+        if src_name == "room":
+            rms_db = 20.0 * np.log10(float(np.sqrt(np.mean(seg * seg)))
+                                     + 1e-9)
+            if rms_db < gate_db:
+                yield pos, None
+            else:
+                yield pos, (seg - seg.mean()) / np.sqrt(seg.var() + 1e-7)
+        else:
+            yield pos, seg
+        pos += hop
+
+
+def load_mono(sf, np, path):
+    """One 48 k mono float32 array off a wav - the room wav and the
+    game wav come through the same door."""
+    a, sr = sf.read(path, dtype="float32")
     if a.ndim > 1:
         a = a.mean(axis=1)
     if sr != SR:
         raise SystemExit(f"expected {SR} Hz, got {sr}")
+    return a
+
+
+def main(src, dst, game="", mic=None):
+    import numpy as np
+    import soundfile as sf
+    import torch
+    ctl = _read_ctl(src)
+    mic = mic or ctl.get("mic")
+    game_wav = ctl.get("game_wav") or None
+    src_name = str(ctl.get("src") or "mix")
+    try:
+        _thr = int(ctl.get("threads") or 0)
+    except (TypeError, ValueError):
+        _thr = 0
+    torch.set_num_threads(max(1, min(_thr, os.cpu_count() or _thr))
+                          if _thr > 0 else _threads())
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    mdir = os.path.join(base, "models")
+    a = load_mono(sf, np, src)
     dur = len(a) / float(SR)
     total_work = dur * 3.0             # three passes, roughly equal footing
     done_work = 0.0
     out = {"v": 1, "events": [], "hype": None, "speakers": [],
-           "emb": [], "counters": {}}
+           "emb": [], "counters": {},
+           # 3.31 whose ears: which layer fed each pass
+           "src": {"clap": (str(ctl.get("game_src") or "game")
+                            if game_wav else "mix"),
+                   "hype": src_name, "who": src_name}}
 
     def _feat(x):
         # transformers 4.x returned tensors from get_*_features; 5.x wraps
@@ -256,7 +328,17 @@ def main(src, dst, game="", mic=None):
         raise RuntimeError("no embeddings in model output")
 
     # ---------------- CLAP: the sound vocabulary -------------------------
+    # 3.31: over the GAME wav when the control file names one (boss
+    # music lives there, not in the room); a game wav that will not
+    # read fails this pass alone - never a fall-back to the room
+    ca = a
     try:
+        if game_wav:
+            try:
+                ca = load_mono(sf, np, game_wav)
+            except Exception as e4:
+                out["src"]["clap"] = None
+                raise RuntimeError("game wav unreadable: " + str(e4)[:80])
         cdir = os.path.join(mdir, "clap")
         if not os.path.isdir(cdir):
             raise RuntimeError("clap model missing")
@@ -273,8 +355,8 @@ def main(src, dst, game="", mic=None):
         hops, sims, aembs = [], [], []
         pos = 0
         step, win = int(HOP_S * SR), int(CHUNK_S * SR)
-        while pos + SR <= len(a):
-            seg = a[pos:pos + win]
+        while pos + SR <= len(ca):
+            seg = ca[pos:pos + win]
             with torch.no_grad():
                 ai = proc(audio=[seg], sampling_rate=SR, return_tensors="pt")
                 em = _feat(model.get_audio_features(**ai))
@@ -330,6 +412,7 @@ def main(src, dst, game="", mic=None):
         del model, proc
     except Exception as e:
         out["counters"]["clap_failed"] = str(e)[:120]
+    del ca                    # the game array goes before the room's 16 k
     done_work = dur
     say_prog(dst, done_work, total_work)
 
@@ -362,19 +445,25 @@ def main(src, dst, game="", mic=None):
                               if k.startswith("classifier.")}, strict=True)
         head.eval()
         a16 = decimate(np, a, 3)
-        hop, win = int(HYPE_HOP * 16000), int(HYPE_WIN * 16000)
-        vals, pos = [], 0
+        vals, quiet = [], 0
         with torch.no_grad():
-            while pos + 16000 <= len(a16):
-                seg = torch.from_numpy(
-                    np.ascontiguousarray(a16[pos:pos + win]))[None, :]
-                h = body(seg).last_hidden_state.mean(dim=1)
-                ar = float(head(h)[0][0])          # arousal, roughly 0..1
-                vals.append(round(max(0.0, min(1.0, ar)), 3))
-                pos += hop
-                say_prog(dst, dur + min(dur, pos / 16000), total_work)
+            for pos, seg in _hype_prep(np, a16, src_name):
+                if seg is None:
+                    vals.append(0.0)       # nobody spoke: no reading
+                    quiet += 1
+                else:
+                    h = body(torch.from_numpy(seg)[None, :]) \
+                        .last_hidden_state.mean(dim=1)
+                    ar = float(head(h)[0][0])      # arousal, roughly 0..1
+                    vals.append(round(max(0.0, min(1.0, ar)), 3))
+                say_prog(dst, dur + min(dur, (pos + int(HYPE_HOP * 16000))
+                                        / 16000), total_work)
         if vals:
-            out["hype"] = {"hop": HYPE_HOP, "v": vals}
+            out["hype"] = {"hop": HYPE_HOP, "v": vals, "src": src_name,
+                           "norm": 1 if src_name == "room" else 0,
+                           "gate_db": (HYPE_GATE_DB if src_name == "room"
+                                       else None),
+                           "quiet": quiet, "windows": len(vals)}
             out["counters"]["hype_windows"] = len(vals)
         del body, head
     except Exception as e:
@@ -557,7 +646,7 @@ def main(src, dst, game="", mic=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("usage: senses_worker.py <in.wav> <out.json> [game]",
+        print("usage: senses_worker.py <in.wav> <out.json> [game] [mic]",
               file=sys.stderr)
         sys.exit(2)
     try:

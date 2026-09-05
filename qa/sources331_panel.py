@@ -228,6 +228,67 @@ check("the old 'S.showMedia' / 'lore.showmedia' design never landed (one toggle)
       "S.showMedia" not in U and "lore.showmedia" not in U
       and "vsaidmed" not in U)
 
+print("\n--- 3.31 stage D: the copy button on an all-video panel, the Game "
+      "chip, the marks, the ribbon ---")
+i_cp = U.index("$('#vsaidcopy').addEventListener('click'")
+cp = U[i_cp:U.index("$('#vsqm').addEventListener('click'")]
+check("nothing but a video shown: a whisper, no clipboard write",
+      "if(!keep.length){whisper('nothing but a video to copy \\u2014 press "
+      "the toggle to include it');return;}" in cp
+      and cp.index("if(!keep.length)") < cp.index("const txt=keep.map("))
+check("the Game chip sits after Scream, on by default, with a tip",
+      '<button data-m="game" class="on" title="Bursts in the game itself' in U
+      and U.index('data-m="scream"') < U.index('data-m="game"')
+      < U.index('data-m="told"'))
+check("MARKS carries game (default true), the save list and gsig know it",
+      "told:true, sense:true, game:true};" in U
+      and "['gold','red','loud','laugh','scream','told','sense','game'].forEach"
+      in U
+      and "const gsig=['loud','laugh','scream','told','sense','game']" in U
+      and "sense:'sense',game:'game'};" in U)
+check("stamp: a game mark hears 'a burst in the game', a room shout "
+      "'a shout in the room', an old mark 'a loud moment'",
+      ":ev.kind==='game'?'a burst in the game'" in U
+      and ":(ev.src==='room'?'a shout in the room':'a loud moment');" in U
+      and ":ev.kind==='game'?'game'" in U
+      and "k==='game'?'game':(SNSK[k]?'sense':'loud')" in U)
+check("the game tick's CSS: short, dull, taller when told",
+      '.hlmark[data-fk="game"]{background:#b7a37c;opacity:.5;height:4px;top:0}'
+      in U and '.hlmark[data-fk="game"].told' not in U)   # a told mark wears data-fk 'told' - that rule was dead
+check("both tip maps name the kind",
+      U.count("game:'a burst in the game'") == 2)
+i_dh = U.index("const drawHype=()=>{")
+dh = U[i_dh:U.index("window.__hypePaint=")]
+check("drawHype: a room curve draws its deviation, a flat night a baseline "
+      "and a word, an old mix curve exactly as before",
+      "const room=(_hype.src==='room');" in dh
+      and "const dev=(room&&_hype.dev&&_hype.dev.length===n)?_hype.dev:null;"
+      in dh
+      and "if(room&&_hype.flat){" in dh
+      and "'a calm night \\u2014 the room never rose'" in dh
+      and "const lo=_hype.median||0,hi=Math.max(_hype._max||1,lo+0.05);" in dh
+      and "Math.pow(Math.max(0,Math.min(1,(x-lo)/(hi-lo))),2.6)" in dh)
+check("...peaks may be numbers or {t, why}; the cause is written when sparse",
+      "const t=(typeof p==='number')?p:p.t;" in dh
+      and "if(label&&p&&p.why){" in dh)
+check("the click lands on a peak of either shape and says its cause",
+      "const pt=(typeof p==='number')?p:(p&&p.t); if(pt==null)return;" in U
+      and "whisper('landed on the flow at '+fmtT(Math.round(t))"
+          "+(why?' \\u2014 '+why:''));" in U)
+check("the ribbon's title names its source after a load",
+      "hypeCv.title=(r.src==='room')" in U
+      and "'how alive the ROOM was \\u2014 the voice chat and your mic, "
+          "not the game'" in U
+      and "'how alive the mix sounded (an older recording \\u2014 the game "
+          "is in it)'" in U)
+check("drawLevels' teal thread breaks across gated windows on a room curve "
+      "only",
+      "const gated=(_sns.hype.src==='room');" in U
+      and "if(gated&&hv[i]<=0){started=false;continue;}" in U)
+check("every new read is guarded (src compared, never dereferenced bare)",
+      "_hype.src===" in U and "_sns.hype.src===" in U
+      and "r.src===" in U and ".dev.length" in U)
+
 print("\n--- checkui over the patched file ---")
 r = subprocess.run(["node", os.path.join(ROOT, "qa", "checkui.js"), UI],
                    capture_output=True, text=True, encoding="utf-8")

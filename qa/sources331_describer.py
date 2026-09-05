@@ -30,7 +30,9 @@ import textwrap
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = io.open(os.path.join(ROOT, "lore.py"), encoding="utf-8").read()
-HEAD = subprocess.run(["git", "-C", ROOT, "show", "HEAD:lore.py"],
+# the 3.30 nested _line lives in the file BEFORE the reader (stage B,
+# a7a461f) - HEAD carries the reader itself once it is committed
+HEAD = subprocess.run(["git", "-C", ROOT, "show", "a7a461f:lore.py"],
                       capture_output=True, text=True,
                       encoding="utf-8").stdout
 
@@ -193,13 +195,14 @@ lns = {"_seg_layer": _seg_layer, "use": use, "wmoments": [],
                            {"line": 2, "why": "the announcer", "kind": "big"},
                            {"line": 3, "why": "a shout", "kind": "big"}]}}
 exec(compile(block, "<moments>", "exec"), lns)
-check("a moment on a video's line is dropped and counted",
-      lns["_mdrop"][0] == 1
+check("a moment on a video's line OR the game's is dropped and counted "
+      "(3.31 stage D: the game's own voice is never the room either)",
+      lns["_mdrop"][0] == 2
       and [m["why"] for m in lns["wmoments"]]
-      == ["everyone laughs", "the announcer", "a shout"])
+      == ["everyone laughs", "a shout"])
 check("...the kept moments sit on their lines' clocks",
       all(abs(m["t"] - t0) < 0.06 for m, t0 in
-          zip(lns["wmoments"], (10.45, 30.45, 40.45))))
+          zip(lns["wmoments"], (10.45, 40.45))))
 
 print("\n--- the wiring ---")
 check("_line is the one-line wrapper over _dress_line",
@@ -226,10 +229,31 @@ check("...and the game's-own-voice rule",
 check("...before the final 'Write Arabic' rule",
       rules.index("(the game's own voice)")
       < rules.index("- Write Arabic in Arabic letters"))
-check("the dropped-moments log line",
+check("the dropped-moments log line names both",
       "moment(s) pointed " in SRC
-      and "at a video's line and were dropped - a video is " in SRC
-      and 'never the room.")' in SRC)
+      and "at a video's or the game's line and were dropped - " in SRC
+      and 'neither is the room.")' in SRC)
+
+print("\n--- (i) 3.31 stage D: the game's lines are thinned like a video's ---")
+room3 = [mk(5, None, "one"), mk(6, None, "two"), mk(7, None, "three")]
+gl = [mk(10 + 10 * i, "game", "line %d" % i) for i in range(100)]
+part, mo = _window_parts(room3 + gl)
+gk = [sg for sg in part if _seg_layer(sg) == "game"]
+check("with three room lines, 100 game lines 10 s apart thin to 8, >= 60 s "
+      "apart, the room untouched",
+      not mo and len(gk) == 8
+      and all(b["a"] - a["a"] >= 60000 for a, b in zip(gk, gk[1:]))
+      and [sg for sg in part if _seg_layer(sg) == "room"] == room3
+      and [sg["a"] for sg in part] == sorted(sg["a"] for sg in part))
+ml = [mk(11 + 10 * i, "media", "video %d" % i) for i in range(5)]
+part, mo = _window_parts(ml + gl)
+check("a room-silent window keeps every media line and thins the game's",
+      mo and len([sg for sg in part if _seg_layer(sg) == "media"]) == 5
+      and len([sg for sg in part if _seg_layer(sg) == "game"]) == 8)
+part, mo = _window_parts(gl[:2] + [mk(3, None, "hi")])
+check("under three lines of either kind the game's lines pass through "
+      "unthinned (the caller files the window silent)",
+      not mo and len(part) == 3)
 check("the describer generation was NOT bumped for this (no re-owed reviews)",
       re.search(r"^_INS_GEN\s*=\s*(\d+)", SRC, re.M).group(1)
       == re.search(r"^_INS_GEN\s*=\s*(\d+)", HEAD, re.M).group(1)

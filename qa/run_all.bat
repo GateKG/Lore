@@ -38,7 +38,8 @@ for %%t in (codex327test codex326test codex325test codex324test codex323test asr
             tracks331test src331settingstest src331dumptest
             src331taptest src331watchtest src331runtest src331walktest
             src331test sources331_describer sources331_panel
-            sources331_shelf) do (
+            sources331_shelf hl331test hype331test hlsplit331test
+            sns331test) do (
   echo ===== %%t =====
   python "%%t.py"
   if errorlevel 1 set FAILED=!FAILED! %%t

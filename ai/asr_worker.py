@@ -1210,6 +1210,16 @@ def main(src, dst, mic=None):
     ga = _load_layer(game, sr, sf, np, notes, "game", len(a))
     has_voice = va is not None
     has_game = ga is not None
+    voice_lost = bool(voice) and not has_voice
+    if voice_lost and media_on:
+        # THE APP NAMED A VOICE LAYER AND IT WOULD NOT LOAD. With a Game
+        # tap beside it the room would be the mic alone and every friend
+        # in the Mix would be filed as "a video" and folded away - the
+        # honesty rule again: no room, no media verdict, and the mix is
+        # the room (the reader-hears-the-mix rung), exactly as before.
+        media_on = False
+        notes.append("the Voice layer could not be loaded - media "
+                     "detection stood down")
     voice_db, voice_s = -120.0, 0.0
     if has_voice:
         _vr = _rms(va, 0, len(va))
@@ -1223,7 +1233,7 @@ def main(src, dst, mic=None):
             np.clip(va, -1.0, 1.0, out=va)
         a = va
         del va
-    elif has_game and ma is not None:
+    elif has_game and ma is not None and not voice_lost:
         a = ma                        # the room is his mic alone tonight
 
     _mix_spans_first = True
