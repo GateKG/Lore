@@ -565,6 +565,8 @@ body.intro #dragpill,body.vfull #dragpill{display:none}
 .grow .gname{flex:1;min-width:0;font-size:14.5px;font-weight:600;color:var(--ink);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .grow .gcount{font-size:11px;color:var(--ink-soft);font-style:italic;white-space:nowrap}
+/* 3.31: what the game-sources ledger knows - a quiet chip in the shelf's own type */
+.grow .gvoice{font:italic 10px var(--serif);color:var(--ink-faint);padding:1px 6px;border:1px solid rgba(200,160,95,.35);border-radius:8px;margin-left:4px;white-space:nowrap;flex:0 0 auto}
 .grow .garrow{color:var(--ink-faint);font-size:14px;transition:transform .18s}
 .grow:hover .garrow{transform:translateX(3px);color:var(--acc,var(--ink-soft))}
 
@@ -834,6 +836,14 @@ body.reduced .proj-glare::after{animation:none}
 /* a voice's name in the transcript - click to give it a real one */
 .sline.gml{opacity:.5}
 .sline.gml span{font-style:italic}
+/* 3.31: a line a VIDEO said - a stream, a song, a tab - kept apart from the
+   room. Dimmer than the game's own audio, cooler in colour, never nameable. */
+.sline.media{opacity:.42}
+.sline.media span{font-style:italic}
+.sline.media .swho{color:#9a8ea8;cursor:default}
+.sline.gl2 .swho{color:#8a9490;cursor:default}
+#vsaid .vsrch #vsqm.on{color:#f2e4c8;background:rgba(232,181,99,.22)}
+#vsaid .vsrch #vsqm .n{font:600 8.5px var(--ui);margin-left:3px;opacity:.85}
 .sline .swho{font:600 9.5px var(--ui);color:#8fb4a0;text-decoration:none;
   margin:0 6px 0 2px;cursor:pointer;flex:0 0 auto}
 .sline .swho:hover{color:#c1e8d2}
@@ -2395,6 +2405,7 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
       <input id="vsq" type="text" placeholder="find a word…">
       <button id="vsqw" class="on" title="Search — find these exact words in this recording">⌕</button>
       <button id="vsqa" title="Ask — a question about this recording">✧</button>
+      <button id="vsqm" title="the video’s lines" style="display:none">▭</button>
     </div>
     <div class="vsaidbody"></div>
   </div>
@@ -2860,6 +2871,8 @@ function makeMock(){
     return {key,name:n,display:n,
       sessions:Array.from({length:ns},(_,i)=>mk('session',i)),
       clips:Array.from({length:nc},(_,i)=>mk('clip',i)),
+      /* 3.31: a badge, a no-badge, and a never-by-source game */
+      voices:(gi%3===2)?null:{chat:gi%2?3:0,lines:gi%3===0?2:0,nights:3},
       count:ns+nc,latest:now-gi*86400};}),out_dir:'C:/mock'};
   let st={status:'watching',t0:0};
   return {
@@ -2936,7 +2949,11 @@ function makeMock(){
     transcript:async()=>[{a:4000,b:7000,t:'Right, we are going in.'},
       {a:9000,b:12000,t:'Watch the left side, someone is rotating.'},
       {a:15500,b:18000,t:'That was a clean one.'},
+      /* 3.31: a video's line and the game's own voice, in time order, so
+         the harness renders both kinds without a real recording */
+      {a:21000,b:24000,t:'and that is why the Quilboar build is dead',src:'media',why:'mix>voice'},
       {a:22000,b:26000,t:'I keep leaving the goal wide open, honestly.'},
+      {a:26000,b:28000,t:'The enemy has slain your ally.',src:'game'},
       {a:31000,b:34000,t:'Okay, last play — go for it.'}],
     ai_status:async()=>{
       const st=window.__mockAI||{};
@@ -4709,6 +4726,30 @@ function recMenu(v,ev,row,sync){
   m.style.top=(Math.max(8,Math.min(ev.clientY,
     innerHeight-w2.height-8))/_z)+'px';
 }
+/* 3.31 what the game-sources ledger says about a chapter, in words and as
+   chips. g.voices is null (or absent, under an older lore.py) for a game
+   never heard by source - then nothing prints, exactly as today. */
+function voiceText(g){
+  const v=g&&g.voices; if(!v||!v.nights)return '';
+  const bits=[];
+  if(v.chat)bits.push('voice chat in '+v.chat+' of '+v.nights+' night'+(v.nights===1?'':'s'));
+  if(v.lines)bits.push('the game talks');
+  return bits.join(' \u00b7 ');
+}
+function voiceBadges(g){
+  const v=g&&g.voices; if(!v||!v.nights)return null;
+  const w=document.createDocumentFragment(); let any=false;
+  if(v.chat){const c=el('span','gvoice','voice chat');
+    c.title='your friends were on voice chat here in '+v.chat+' of '+v.nights+' night'+(v.nights===1?'':'s')+' the tome heard by source';
+    w.append(c);any=true;}
+  if(v.lines){const c=el('span','gvoice','voice lines');
+    c.title='the game itself talks \u2014 characters, casters or cutscenes were heard in '+v.lines+' of '+v.nights+' night'+(v.nights===1?'':'s');
+    w.append(c);any=true;}
+  if(!any&&v.nights>=2){const c=el('span','gvoice','quiet');
+    c.title='heard by source '+v.nights+' nights: no voice chat, no voice lines';
+    w.append(c);any=true;}
+  return any?w:null;
+}
 function renderContents(cL,cR,spreadIdx){
   const _cm=_loreCMode();   /* B7: what the left leaf shows is the reader's choice */
   ptitle(cL,'the tome remembers',
@@ -4861,7 +4902,8 @@ function renderContents(cL,cR,spreadIdx){
       qrow.innerHTML='“'+String(g[0].h.text).split(new RegExp('('+qq+')','ig'))
         .map((seg,i)=>i%2?'<b>'+esc(seg)+'</b>':esc(seg)).join('')+'”';
       mn.append(qrow);
-      mn.append(el('div','sresw',esc(v.gname)+' · '+fmtT(t0)+' · '+esc(fmtWhen(v.mtime))));
+      mn.append(el('div','sresw',esc(v.gname)+' · '+fmtT(t0)+' · '+esc(fmtWhen(v.mtime))
+        +(g[0].h.src==='media'?' · a video said this, not the room':(g[0].h.src==='game'?' · the game said this':''))));
       if(g.length>1){const ch=el('div','stchips');
         g.forEach(e2=>{const t=Math.max(0,e2.h.t_ms/1000);
           const c=el('span','stchip',fmtT(t));
@@ -5140,6 +5182,7 @@ function renderContents(cL,cR,spreadIdx){
     const r=el('div','grow'+(has?'':' muted'));r.style.setProperty('--acc',hue.c);
     const sg=el('div','gsigil');sg.innerHTML=sigilSVG(g.key,hue,false);r.append(sg);
     r.append(el('div','gname',esc(g.display)));
+    const vb=voiceBadges(g); if(vb)r.append(vb);   /* 3.31 */
     const cparts=[];
     if(g.sessions.length)cparts.push(`${g.sessions.length} session${g.sessions.length>1?'s':''}`);
     if(g.clips.length)cparts.push(`${g.clips.length} clip${g.clips.length>1?'s':''}`);
@@ -5204,6 +5247,7 @@ function renderChapter(cL,cR,sp,spreadIdx){
     if(g.clips.length)stats.push(`<b>${g.clips.length}</b> clip${g.clips.length>1?'s':''}`);
     const total=(g.sessions.concat(g.clips)).reduce((a,v)=>a+(v.size||0),0);
     stats.push(`<b>${esc(fmtSize(total))}</b>`);
+    const vt=voiceText(g); if(vt)stats.push(esc(vt));   /* 3.31 */
     addRenameBtn(ptitle(cL,`chapter ${roman(sp.gi+1)} — ${lbl(sp.lItems)}`,g.display,hue,
            stats.join(' &nbsp;·&nbsp; '),g.key),g.display);
   }else{
@@ -7771,6 +7815,7 @@ function lightFace(idx,side){
         if(g.sessions.length)stats.push(`<b>${g.sessions.length}</b> session${g.sessions.length>1?'s':''}`);
         if(g.clips.length)stats.push(`<b>${g.clips.length}</b> clip${g.clips.length>1?'s':''}`);
         const total=(g.sessions.concat(g.clips)).reduce((a,v)=>a+(v.size||0),0);stats.push(`<b>${esc(fmtSize(total))}</b>`);
+        const vt=voiceText(g); if(vt)stats.push(esc(vt));   /* 3.31 */
         ptitle(n,`chapter ${roman(sp.gi+1)} — ${_flightLabel(sp.lItems)}`,g.display,hue,stats.join(' &nbsp;·&nbsp; '),g.key);
       }else ptitle(n,`chapter ${roman(sp.gi+1)} — ${_flightLabel(sp.lItems)}${suffix}`,
                    g.display,hue,
@@ -9346,22 +9391,33 @@ function saidRender(center){
       r.title='the auditor struck this line \u2014 two ears heard no '
         +'readable words'+(ln.was?'. It first wrote: '+ln.was:'');}
     else p.textContent=ln.text;
-    if(ln.g){ r.classList.add('gml');
+    /* 3.31 by source: a video's line and the game's own voice are told
+       apart from the room, never attributed to a person, never nameable
+       (the media check runs first: a line that is both media and g is media) */
+    const isMedia=ln.src==='media', isGame=ln.src==='game';
+    if(isMedia){ r.classList.add('media');
+      r.title='a video, a stream or a song playing on your screen \u2014 not you, not your friends. The tome keeps it apart from the room: it never counts as the room talking and never makes a gold mark.'
+        +(ln.why==='mix>voice'?' (no game tap this night: could also be the game)':''); }
+    else if(isGame){ r.classList.add('gml','gl2');
+      r.title='the game\u2019s own voice \u2014 a character, a caster, a cutscene'; }
+    else if(ln.g){ r.classList.add('gml');
       if(!ln.nn)r.title='probably the game\u2019s own audio (music/cutscene), not the room'; }
     /* the mic layer is ground truth: a line with HIS mic's energy is
        his, and no borrowed nearest-cluster guess may overrule it */
-    const who=ln.g?null:(ln.src==='you'?'you':snsWhoAt(ln.t));
+    const who=(ln.g||isMedia||isGame)?null:(ln.src==='you'?'you':snsWhoAt(ln.t));
     /* only a chip with a real cluster behind it opens the naming input.
        The old one opened for anything and threw the typed name away,
        which is worse than not offering it. */
-    const wn=ln.g?null:snsWhoNumAt(ln.t);
-    if(who){ const w=el('u',wn?'swho':'swho unk',who);
-      w.title=wn?'click to name this voice'
+    const wn=(ln.g||isMedia||isGame)?null:snsWhoNumAt(ln.t);
+    const lab=isMedia?'a video':(isGame?'the game':who);
+    if(lab){ const w=el('u',(wn&&!isMedia&&!isGame)?'swho':'swho unk',lab);
+      w.title=(isMedia||isGame)?r.title
+             :(wn?'click to name this voice'
                :(wn===0?'people talking over each other - when voices '
                         +'overlap, the ears cannot honestly say whose '
                         +'line this is, so it is not guessed'
-                       :'your own mic track says this one is you');
-      if(wn)w.dataset.t=String(ln.t);
+                       :'your own mic track says this one is you'));
+      if(wn&&!isMedia&&!isGame)w.dataset.t=String(ln.t);
       r.append(b,w,p); }
     else r.append(b,p);
     _said.els[di]=r; frag.append(r);
@@ -9380,22 +9436,51 @@ function saidRender(center){
     }
   }
 }
+/* 3.31 which lines the panel shows: the query as before, and a VIDEO's
+   lines only when asked for - they stay in lines[] (the count, the copy
+   button) but drop out of vis so the follower never scrolls to them.
+   Pure, so the roster can lift it. */
+function saidVisible(lines,low,q,showMedia){
+  const t=String(q||'').trim().toLowerCase();
+  const n=lines.length, vis=[], pos=new Array(n).fill(-1);
+  for(let i=0;i<n;i++){
+    const l=lines[i];
+    if(!showMedia&&l.src==='media')continue;
+    if(!t||(low[i]||'').indexOf(t)>=0||(l.when||'').indexOf(t)>=0){pos[i]=vis.length;vis.push(i);}
+  }
+  return {vis,pos};
+}
+/* the toggle beside Search/Ask: hidden for a night with no video lines (no
+   control for a thing that cannot happen), a count while they are folded */
+function saidMediaPaint(){
+  const b=$('#vsqm'); if(!b)return;
+  const n=_said.nMedia||0;
+  b.style.display=n?'':'none';
+  b.classList.toggle('on',SAID_MEDIA);
+  b.innerHTML='\u25AD'+(n&&!SAID_MEDIA?'<span class="n">'+n+'</span>':'');
+  b.title=SAID_MEDIA
+    ?'the video\u2019s lines are shown \u2014 what a video, a stream or a song was saying while you played. Not you, not your friends. Press to fold them away again.'
+    :('the video\u2019s lines \u2014 '+n+' line'+(n===1?'':'s')+' a video or a song said while you played, folded away. Not you, not your friends. Press to read them.');
+}
 function saidFilter(q){
   const t=String(q||'').trim().toLowerCase();
   const n=_said.lines.length;
-  const vis=[], pos=new Array(n).fill(-1), low=_said.low||[];
-  for(let i=0;i<n;i++){
-    if(!t||low[i].indexOf(t)>=0||(_said.lines[i].when||'').indexOf(t)>=0){
-      pos[i]=vis.length; vis.push(i);
-    }
-  }
+  const {vis,pos}=saidVisible(_said.lines,_said.low||[],q,SAID_MEDIA);
   _said.vis=vis;_said.pos=pos;
   if(n)saidRender(0);
+  /* a filter must announce itself: a transcript that is ALL video must not
+     look unread */
+  const body=$('#vsaid .vsaidbody');
+  if(body&&n&&!vis.length&&!t&&(_said.nMedia||0)===n){
+    body.innerHTML='';
+    body.append(el('div','vempty','Nobody in the room spoke here \u2014 a video was playing. Press \u25AD to read what it said.'));
+  }
   return vis.length;
 }
 async function loadSaid(v,req){
   const body=$('#vsaid .vsaidbody');
   _said={lines:[],path:v.path,at:-1};
+  saidMediaPaint();   /* 3.31: no lines yet = no toggle (it repaints below) */
   body.innerHTML='';
   body.append(el('div','vempty','listening back…'));
   let segs=[];try{segs=await api.transcript(v.path)||[];}catch(e){}
@@ -9412,9 +9497,11 @@ async function loadSaid(v,req){
     const t=(s.a||0)/1000;
     const mm=Math.floor(t/60),ss=String(Math.floor(t%60)).padStart(2,'0');
     return {t,when:mm+':'+ss,text:s.t||'',g:s.g?1:0,src:s.src||'',
-      nn:s.nn?1:0,was:s.was||''};
+      why:s.why||'',nn:s.nn?1:0,was:s.was||''};
   });
   _said.low=_said.lines.map(l=>l.text.toLowerCase());
+  _said.nMedia=_said.lines.filter(l=>l.src==='media').length;   /* 3.31 */
+  saidMediaPaint();
   saidWire(body);
   saidFilter(($('#vsq')&&$('#vsq').value)||'');   /* honour a query already typed */
 }
@@ -10584,6 +10671,7 @@ async function lullCompute(vid,req){
   const my=(LULL.busy=(LULL.busy||0)+1);
   let segs=[],lv=null;
   try{ segs=await api.transcript(vid.path)||[]; }catch(_){ segs=[]; }
+  segs=segs.filter(s=>s.src!=='media');   /* a lull is "nobody talked" - a video is not the room */
   try{ lv=await api.levels(vid.path); }catch(_){ lv=null; }
   if(my!==LULL.busy)return;              /* a newer compute owns the state */
   if(req!==_viewerReq||!V.cur||V.cur.path!==vid.path)return;
@@ -10694,6 +10782,10 @@ try{ const m=JSON.parse(localStorage.getItem('lore.marks')||'{}');
        MARKS.loud=MARKS.laugh=MARKS.scream=MARKS.told=false;
      MARKS.gold=true;   /* legacy master - the chips rule now */
 }catch(e){}
+/* 3.31 the video's lines: folded away unless he asks, remembered per
+   viewer like the mark chips (a private window simply forgets) */
+let SAID_MEDIA=false;
+try{ SAID_MEDIA=localStorage.getItem('lore.said.media')==='1'; }catch(e){}
 /* bring the stretch that owns this second into view, and light it */
 function chapterInView(t){
   const box=$('#vchaps .vchapbody'); if(!box)return;
@@ -11065,6 +11157,7 @@ function markTipShow(m){
     _tipTx={path:p,segs:null,busy:true};
     (async()=>{ let segs=[];
       try{ if(api.transcript)segs=await api.transcript(p)||[]; }catch(e){}
+      segs=segs.filter(s=>s.src!=='media');   /* "what was said here" - a video is not the room */
       if(_tipTx.path===p){ _tipTx.segs=segs; _tipTx.busy=false;
         if(wrap._tipRe&&tip.classList.contains('on'))wrap._tipRe(); }
     })();
@@ -12197,9 +12290,18 @@ function wireViewer(){
     if(!V.cur)return;
     let segs=[];try{segs=await api.transcript(V.cur.path)||[];}catch(_){}
     if(!segs.length){whisper('nothing transcribed to copy yet');return;}
-    const txt=segs.map(s=>fmtT((s.a||0)/1000)+'  '+(s.t||'').trim()).join('\n');
-    whisper((await copyText(txt))?('transcript copied \u2014 '+segs.length+' lines')
+    /* 3.31 what is copied matches what is shown, and owns up to what it left out */
+    const keep=segs.filter(s=>SAID_MEDIA||s.src!=='media');
+    const left=segs.length-keep.length;
+    const txt=keep.map(s=>fmtT((s.a||0)/1000)+'  '+(s.src==='media'?'[a video] ':(s.src==='game'?'[the game] ':''))+(s.t||'').trim()).join('\n');
+    whisper((await copyText(txt))?('transcript copied \u2014 '+keep.length+' lines'+(left?' (the video\u2019s '+left+' left out)':''))
       :'could not reach the clipboard');});
+  /* 3.31 the video's lines, folded or shown - remembered per viewer */
+  $('#vsqm').addEventListener('click',e=>{e.stopPropagation();
+    SAID_MEDIA=!SAID_MEDIA;
+    try{localStorage.setItem('lore.said.media',SAID_MEDIA?'1':'0');}catch(_){}
+    saidMediaPaint(); saidFilter(($('#vsq')&&$('#vsq').value)||'');
+    whisper(SAID_MEDIA?'the video\u2019s lines are shown \u2014 dimmed, and never the room':'the video\u2019s lines are folded away');});
   $('#vchapcopy').addEventListener('click',async e=>{e.stopPropagation();
     const ins=_ins;
     if(!ins||(!(ins.chapters||[]).length&&!(ins.moments||[]).length)){

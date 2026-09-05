@@ -151,5 +151,37 @@ check("the physics counter ships in stats", '"physics": 0' in SRC)
 check("the boot note still never re-reads behind his back",
       "never read again on its own" in LSRC)
 
+print("\n--- T5: 3.31 - the old path stays the old path ---")
+# reader 6 hears the Voice and Game layers ONLY when the app names them
+# in the environment; with neither, every new step is a no-op and the
+# transcript is reader 5's word for word (qa/src331test.py T9 proves it
+# against the HEAD worker; these are the laws it rests on, by index)
+check("the layers come by environment, argv is unchanged",
+      'voice = os.environ.get("LORE_ASR_VOICE") or ""' in SRC
+      and 'game = os.environ.get("LORE_ASR_GAME") or ""' in SRC
+      and "def main(src, dst, mic=None):" in SRC
+      and "sys.argv[3] if len(sys.argv) > 3 else None" in SRC)
+check("without a Voice layer the mix stays the room (a is not rebound)",
+      "mixa = a " in SRC and "    if has_voice:\n" in SRC
+      and "        a = va\n" in SRC)
+check("the split hands an old file's spans back untouched",
+      "returns the spans it was given, untouched" in SRC
+      and "if (has_voice or has_game) and media_on:" in SRC)
+check("the mic-extra cut is ONE subtraction, shared with the new passes",
+      SRC.count("_subtract(") >= 4 and "def _subtract(spans, cover, sr" in SRC)
+check("lore.py names the layers only when the file carries the titles",
+      "if voicewav or gamewav:" in LSRC
+      and 'env["LORE_ASR_VOICE"] = voicewav' in LSRC
+      and LSRC.index("if voicewav or gamewav:")
+      < LSRC.index('env["LORE_ASR_VOICE"] = voicewav'))
+check("...and asks the resolver for mix + mic alone on an old night",
+      'want = (("mix", "mic", "voice", "game") if layered\n'
+      '                else ("mix", "mic"))' in LSRC)
+check("READER 6 is the first generation whose new hearing needs a track "
+      "(the sweep skips old nights)",
+      re.search(r"^_STT_READER_TRACKS = 5", LSRC, re.M) is not None
+      and "if rd >= _STT_READER_TRACKS and not _stt_has_layers(video_path):"
+      in LSRC)
+
 print("\n%d ok, %d failed" % (ok, bad))
 sys.exit(1 if bad else 0)

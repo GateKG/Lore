@@ -5869,8 +5869,17 @@ _LVL_V = 2          # the loudness curve behind the sound graph
 # WHICH READER WROTE A TRANSCRIPT. Bump this whenever ai/asr_worker.py
 # learns to hear something it could not hear before; 2 is the reader
 # whose transliteration wall faces both ways; 5 closes the six-word
-# echo band the prompt was slipping through.
-_STT_READER = 5
+# echo band the prompt was slipping through; 6 reads the room off the
+# Voice tap and files media/game lines by source. SHIPS WITH THE WORKER
+# (READER in ai/asr_worker.py) - the 3.24 lesson.
+_STT_READER = 6
+# THE FIRST READER WHOSE ONLY NEW HEARING NEEDS A TRACK. From reader 5
+# on, what a newer reader would say differently about a night lives on
+# the Voice / Game tracks - a Mix/System/Mic file read by reader 5 comes
+# back word for word under reader 6. _stt_stale_reader uses this so the
+# sweep never re-reads ~400 identical old nights; a future reader that
+# changes its hearing on EVERY file must raise this to its own number.
+_STT_READER_TRACKS = 5
 
 _STT_RD_CACHE = {}
 
@@ -5913,10 +5922,42 @@ def _stt_reader_of(video_path):
     return rd
 
 
+_STT_TRK_CACHE = {}
+
+
+def _stt_has_layers(video_path):
+    """Does this recording carry a Voice or Game title? ONE ffprobe per
+    file per process life (it is a process spawn, and the sweep asks per
+    file per beat), keyed on the file's mtime like the reader cache."""
+    try:
+        mt = os.path.getmtime(video_path)
+    except OSError:
+        return False
+    key = os.path.normcase(video_path)
+    hit = _STT_TRK_CACHE.get(key)
+    if hit and hit[0] == mt:
+        return hit[1]
+    try:
+        names = _audio_track_names(video_path) or []
+        got = ("voice" in names) or ("game" in names)
+    except Exception:
+        got = False
+    _STT_TRK_CACHE[key] = (mt, got)
+    return got
+
+
 def _stt_stale_reader(video_path):
-    """A transcript exists but an older reader wrote it."""
+    """A transcript exists, an older reader wrote it, AND re-reading
+    would say something new. Reader 6's new hearing is the Voice and
+    Game tracks; on a file without them it would write reader 5's words
+    again - so those nights are not stale, and reread_old cannot spend
+    days re-reading them for identical text."""
     rd = _stt_reader_of(video_path)
-    return rd >= 0 and rd < _STT_READER
+    if rd < 0 or rd >= _STT_READER:
+        return False
+    if rd >= _STT_READER_TRACKS and not _stt_has_layers(video_path):
+        return False
+    return True
 
 
 def _worker_reader_gen():
@@ -11650,6 +11691,246 @@ def _thumb_dir(out):
 
 
 # ---------------------------------------------------------------------------
+#  3.31 THE PER-GAME SOURCES LEDGER. Does this game carry voice chat? Does
+#  the game itself talk? One file, %LOCALAPPDATA%\Lore\game_sources.json,
+#  keyed exactly as scan_library keys a chapter (the display name, lower
+#  case, off the video's basename) so the shelf's badges join without a
+#  second lookup. It is REBUILT from the shelf - the sidecars' 'sources'
+#  blocks, head-read - never incremented: a redo of a night cannot count
+#  it twice, and only videos still on disk vote. A transcribe schedules
+#  one debounced rebuild; a daily tick catches the rest.
+# ---------------------------------------------------------------------------
+_GS_VOICE_S = 120.0     # a night with this much speech on the Voice tap = voice chat
+_GS_GAME_S = 60.0       # this much of the game's own speech = the game talks
+_GS_MEDIA_S = 60.0      # this much of a video's speech = a video played (reported)
+_GS_QUIET_NIGHTS = 3    # this many honest quiet nights = false, not unknown
+_GS_DEBOUNCE_S = 30.0   # a transcribe waits this long before the rebuild
+_GS_OK_VOICE = ("live", "gone")   # a Voice tap that was honest all night
+_GS = {"timer": None, "lock": threading.Lock(), "daily_at": 0.0}
+
+
+def _game_sources_path():
+    return os.path.join(_data_dir(), "game_sources.json")
+
+
+def _game_sources_lib():
+    return os.path.normcase(os.path.abspath(
+        SETTINGS.get("output_dir", "") or "."))
+
+
+def _game_sources_empty():
+    return {"v": 1, "lib": "", "at": 0, "games": {}}
+
+
+def _game_sources_load():
+    """The ledger, or the empty shape - also when it was built for a
+    different library (a moved output_dir must not wear another shelf's
+    verdicts) or cannot be read."""
+    try:
+        with open(_game_sources_path(), encoding="utf-8") as fh:
+            got = json.load(fh) or {}
+    except Exception:
+        return _game_sources_empty()
+    if not isinstance(got, dict) or not isinstance(got.get("games"), dict):
+        return _game_sources_empty()
+    if str(got.get("lib") or "") != _game_sources_lib():
+        return _game_sources_empty()
+    return got
+
+
+def _game_sources_row():
+    return {"nights": 0, "voice_seen": 0, "voice_nights": 0,
+            "game_seen": 0, "game_nights": 0, "media_nights": 0,
+            "voice_s": 0.0, "game_s": 0.0, "media_s": 0.0, "last": 0,
+            "voice_chat": None, "voice_lines": None}
+
+
+def _game_sources_add(row, sources, when=0):
+    """One night's 'sources' block into a row - the increments, in ONE
+    place. A night 'saw' a layer when its track existed; it counts as a
+    voice / game / media night when that layer carried the threshold."""
+    row["nights"] += 1
+    if sources.get("voice"):
+        row["voice_seen"] += 1
+        vs = float(sources.get("voice_s") or 0.0)
+        row["voice_s"] = round(row["voice_s"] + vs, 1)
+        if vs >= _GS_VOICE_S:
+            row["voice_nights"] += 1
+    if sources.get("game"):
+        row["game_seen"] += 1
+        gs = float(sources.get("game_s") or 0.0)
+        row["game_s"] = round(row["game_s"] + gs, 1)
+        if gs >= _GS_GAME_S:
+            row["game_nights"] += 1
+    ms = float(sources.get("media_s") or 0.0)
+    row["media_s"] = round(row["media_s"] + ms, 1)
+    if ms >= _GS_MEDIA_S:
+        row["media_nights"] += 1
+    row["last"] = max(int(row.get("last") or 0), int(when or 0))
+
+
+def _game_sources_verdicts(row):
+    """THE VERDICTS, from the thresholds above and nowhere else (retuning
+    = edit the numbers + rebuild). voice_chat: True after ONE night with
+    voice-chat speech on the tap; False after three nights that carried
+    a Voice track and nobody spoke on it; None until then. voice_lines
+    likewise on the Game track. Media is reported (media_nights), never
+    judged. Mutates the row."""
+    row["voice_chat"] = (True if row["voice_nights"] >= 1 else
+                         (False if (row["voice_seen"] >= _GS_QUIET_NIGHTS
+                                    and row["voice_nights"] == 0)
+                          else None))
+    row["voice_lines"] = (True if row["game_nights"] >= 1 else
+                          (False if (row["game_seen"] >= _GS_QUIET_NIGHTS
+                                     and row["game_nights"] == 0)
+                           else None))
+
+
+def _game_sources_key(file_name):
+    """scan_library's chapter key for a video, off its basename."""
+    return _display_name(_parse_clip_name(file_name)).lower()
+
+
+def _game_sources_night_ok(tdir, base, sources):
+    """May this night vote? Not when the reader stood media detection
+    down (the Voice tap was not trusted), and not when the recorder's
+    .src.json says the tap died or failed - three such nights would flip
+    a game to 'no voice chat' for a fault of the tap."""
+    try:
+        if int(sources.get("media_off") or 0):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if not sources.get("voice"):
+        return True
+    try:
+        with open(os.path.join(tdir, base + ".src.json"),
+                  encoding="utf-8") as fh:
+            doc = json.load(fh) or {}
+    except Exception:
+        return True
+    for r in (doc.get("runs") or []):
+        v = ((r.get("sources") or {}).get("voice") or {}) \
+            if isinstance(r, dict) else {}
+        if isinstance(v, dict) and v.get("state") is not None \
+                and str(v.get("state") or "") not in _GS_OK_VOICE:
+            return False
+    return True
+
+
+def _game_sources_rebuild():
+    """Rebuild the ledger from the shelf: every transcript whose video is
+    still on a shelf and whose 'sources' block says the night was heard
+    by source. ~400 x 16 KB head-reads - under a second, on a daemon
+    thread. Returns the ledger it wrote."""
+    out = SETTINGS.get("output_dir", "")
+    led = {"v": 1, "lib": _game_sources_lib(), "at": time.time(),
+           "games": {}}
+    base2key = {}
+    for d, kind in _library_dirs(out):
+        for v in _scan_dir_mp4s(d, kind):
+            try:
+                base2key[os.path.splitext(v["file"])[0]] = \
+                    _game_sources_key(v["file"])
+            except Exception:
+                continue
+    tdir = _thumb_dir(out)
+    try:
+        names = os.listdir(tdir)
+    except OSError:
+        names = []
+    for fn in names:
+        if not fn.endswith(".stt.json"):
+            continue
+        base = fn[:-len(".stt.json")]
+        key = base2key.get(base)
+        if not key:
+            continue                 # not on any shelf: no vote
+        try:
+            with open(os.path.join(tdir, fn), encoding="utf-8",
+                      errors="ignore") as fh:
+                head = fh.read(16384)
+        except OSError:
+            continue
+        # 'sources' is written before 'segments' (see the sidecar write)
+        # - 16 KB covers v/model/engine/counters/reader/run/sources
+        m = re.search(r'"sources"\s*:\s*(\{[^{}]*\})', head)
+        if not m:
+            continue                 # an old transcript: no vote
+        try:
+            sources = json.loads(m.group(1))
+        except Exception:
+            continue
+        if not isinstance(sources, dict) \
+                or not (sources.get("voice") or sources.get("game")):
+            continue                 # a Mix-only night was not heard by source
+        if not _game_sources_night_ok(tdir, base, sources):
+            continue
+        mw = re.search(r'"when"\s*:\s*(\d+)', head)
+        try:
+            when = int(mw.group(1)) if mw else int(
+                os.path.getmtime(os.path.join(tdir, fn)))
+        except Exception:
+            when = 0
+        _game_sources_add(led["games"].setdefault(key, _game_sources_row()),
+                          sources, when)
+    for row in led["games"].values():
+        _game_sources_verdicts(row)
+    try:
+        _atomic_write_json(_game_sources_path(), led)
+    except Exception as e:
+        log(f"Could not write game_sources.json: {e}")
+    return led
+
+
+def _game_sources_rebuild_safe():
+    try:
+        _game_sources_rebuild()
+    except Exception as e:
+        log(f"The game-sources ledger could not be rebuilt: {e}")
+
+
+def _game_sources_note(video_path, sources):
+    """AFTER A TRANSCRIBE heard by source: schedule ONE rebuild, debounced
+    (a catch-up sweep reads nights back to back; one walk after the last
+    of them is enough). Never increments - a redo cannot double-count. A
+    Mix-only night schedules nothing, so a game's badge never says
+    'quiet' because the taps did not open."""
+    if not isinstance(sources, dict) \
+            or not (sources.get("voice") or sources.get("game")):
+        return
+    with _GS["lock"]:
+        t = _GS.get("timer")
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        t = threading.Timer(_GS_DEBOUNCE_S, _game_sources_rebuild_safe)
+        t.daemon = True
+        t.name = "game-sources"
+        t.start()
+        _GS["timer"] = t
+
+
+def _game_sources_daily():
+    """Once a day, off the recorder's thread: rebuild when the ledger is
+    absent, older than a day, or stamped for another library. The day is
+    claimed BEFORE the thread runs, so two beats cannot walk twice."""
+    try:
+        led = _game_sources_load()
+        if led.get("at") and time.time() - float(led.get("at") or 0) < 86400:
+            return
+        if time.time() - float(_GS.get("daily_at") or 0.0) < 3600:
+            return
+        _GS["daily_at"] = time.time()
+        threading.Thread(target=_game_sources_rebuild_safe, daemon=True,
+                         name="game-sources").start()
+    except Exception as e:
+        log(f"The game-sources ledger could not be scheduled: {e}")
+
+
+# ---------------------------------------------------------------------------
 #  The tome's intelligence (Lore 2.0) - all LOCAL, all idle-time:
 #    * Qwen3-ASR transcribes every recording (CPU, BELOW_NORMAL,
 #      realtime on this machine) -> the library is searchable by what was
@@ -13733,6 +14014,13 @@ def _senses_one(video_path):
                     sd2 = json.load(fh) or {}
                 on = off = 0
                 for sg in sd2.get("segments") or []:
+                    if sg.get("src") in ("media", "game"):
+                        # 3.31: those lines already carry their source;
+                        # stamping g on a media line would make the player
+                        # call a video "probably the game's own audio", and
+                        # the toggle below would churn the sidecar's mtime
+                        # (mtime-is-lineage) for lines nobody displays
+                        continue
                     mid = ((sg.get("a") or 0) + (sg.get("b")
                                                  or (sg.get("a") or 0))) \
                         / 2000.0
@@ -13881,6 +14169,65 @@ def _asr_context_for(video_path):
               "often switching within one sentence.")
 
 
+def _asr_context_media():
+    """The biasing context for the MEDIA pass (3.31): a video, a stream
+    or a song in the background. Built here, not in the worker, for the
+    same reason as the room's: one place, so any future echo migration
+    compares against the string that was actually sent."""
+    return ("Narration or dialogue from a video, stream or song playing "
+            "in the background - not the people in the room.")
+
+
+def _asr_context_game(video_path):
+    """The biasing context for the GAME pass (3.31): the game's own
+    voices, named by its shelf when the shelf knows the name."""
+    try:
+        pp = os.path.dirname(video_path)
+        gname = (os.path.basename(os.path.dirname(pp))
+                 if os.path.basename(pp).lower() in ("videos", "clips")
+                 else "")
+        if not gname:
+            gname = _display_name(_parse_clip_name(video_path))
+            if gname == "Recording":
+                gname = ""
+    except Exception:
+        gname = ""
+    return ("In-game dialogue, announcer and voice lines from "
+            + (gname if gname else "the game itself") + ".")
+
+
+def _src_media_possible(video_path, run_s):
+    """Could media detection be honest tonight? Reads the recorder's
+    .src.json: no loopback layer means nothing to find a video in, and a
+    voice tap that DIED or was lost for more than a tenth of the night
+    would have friends heard only in the Mix filed as 'a video' and
+    hidden. No sidecar (the file carries the titles but the recorder
+    wrote no note) = possible."""
+    try:
+        with open(_ai_sidecar(video_path, "src"), encoding="utf-8") as fh:
+            doc = json.load(fh) or {}
+    except Exception:
+        return True
+    try:
+        if isinstance(doc.get("layers"), dict) \
+                and doc["layers"].get("media") is False:
+            return False
+        gap = 0.0
+        for r in (doc.get("runs") or []):
+            v = ((r.get("sources") or {}).get("voice") or {}) \
+                if isinstance(r, dict) else {}
+            if not isinstance(v, dict):
+                continue
+            if str(v.get("state") or "") == "dead":
+                return False
+            gap += float(v.get("gap_s") or 0.0)
+        if run_s and run_s > 0 and gap > 0.10 * float(run_s):
+            return False
+    except Exception:
+        return True
+    return True
+
+
 def _transcribe_one(video_path):
     """Qwen3-ASR over one recording -> .stt.json sidecar.
 
@@ -13929,12 +14276,32 @@ def _transcribe_one(video_path):
         # below - probing twice lets the two disagree when one of them
         # times out on a cold file.
         names = _audio_track_names(video_path)
-        rc, _o, _e = _ai_run([SETTINGS["ffmpeg_path"], "-y", "-loglevel",
-                              "error", "-i", video_path]
-                             + _mix_audio_args(video_path, names)
-                             + ["-ac", "1", "-ar", "16000",
-                                "-c:a", "pcm_s16le", wav],
-                             1800, flags)
+        # 3.31 ONE READ OF THE FILE writes every layer the reader needs
+        # (the one resolver, _extract_layers): the Mix lands at `wav`
+        # itself - the .ctl/.prog contract and the coverage check below
+        # are keyed on it - with the Mic, Voice and Game layers beside
+        # it. An old Mix/System/Mic night asks for mix + mic only, so its
+        # command carries exactly today's arguments (the roster holds it
+        # to the 3.30 fixture); the two extra layers are asked for only
+        # when the file carries a Voice or Game TITLE, and are handed to
+        # the worker only when they really came from those tracks.
+        layered = (_voice_track(video_path, names) is not None
+                   or _game_track(video_path, names) is not None)
+        want = (("mix", "mic", "voice", "game") if layered
+                else ("mix", "mic"))
+        lay = _extract_layers(video_path, names, wav, want, 16000, 1800,
+                              flags)
+        rc = lay["rc"]
+        if rc != 0 and layered and not _AI["abort"]:
+            # the failure ladder: one retry on the plain road before
+            # today's soft-fail - a night is never lost to a layer
+            log(f"The Voice layer of {os.path.basename(video_path)} would "
+                f"not extract (ffmpeg rc={rc}); the reader hears the mix "
+                f"instead.")
+            layered = False
+            lay = _extract_layers(video_path, names, wav, ("mix", "mic"),
+                                  16000, 1800, flags)
+            rc = lay["rc"]
         if rc != 0 or not os.path.isfile(wav) or _AI["abort"]:
             if not _AI["abort"]:
                 log(f"Could not extract audio from "
@@ -13959,18 +14326,26 @@ def _transcribe_one(video_path):
             _AI["soft_fail"] = True
             return False
         # THE MIC LAYER (2.81+): extracted beside the mix so the worker
-        # can say which lines are HIS voice - not the game's, not a tab's
-        micwav = ""
-        mt = _mic_track(video_path, names)
-        if mt is not None:
-            micwav = wav + ".mic.wav"
-            rc2, _o2, _e2 = _ai_run(
-                [SETTINGS["ffmpeg_path"], "-y", "-loglevel", "error",
-                 "-i", video_path, "-map", f"0:a:{mt}", "-ac", "1",
-                 "-ar", "16000", "-c:a", "pcm_s16le", micwav],
-                1800, flags)
-            if rc2 != 0 or not os.path.isfile(micwav):
-                micwav = ""
+        # can say which lines are HIS voice - not the game's, not a tab's.
+        # 3.31: the Voice tap and the Game tap ride beside it, each only
+        # when the resolver really fed it from that track (an old file's
+        # 'game' would fall to System, and a tap night's to the mix -
+        # neither is a Game layer).
+        micwav = lay["mic"].path if lay["mic"].how == "mic" else ""
+        voicewav = gamewav = ""
+        if layered:
+            if lay["voice"].how == "voice":
+                voicewav = lay["voice"].path
+                if not voicewav:
+                    log(f"The reader on {os.path.basename(video_path)}: "
+                        f"the Voice layer could not be extracted (ffmpeg "
+                        f"rc={rc}) - reading the mix as the room, as before.")
+            if lay["game"].how == "game":
+                gamewav = lay["game"].path
+                if not gamewav:
+                    log(f"The reader on {os.path.basename(video_path)}: "
+                        f"the Game layer could not be extracted (ffmpeg "
+                        f"rc={rc}) - game lines will not be filed this time.")
         env = dict(os.environ)
         env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         env.setdefault("HF_HOME", _models_dir())
@@ -13980,6 +14355,27 @@ def _transcribe_one(video_path):
         # ONE builder (the echo migration asks the same question of the
         # transcripts written before the reader could ask it itself).
         env["LORE_ASR_CONTEXT"] = _asr_context_for(video_path)
+        if voicewav or gamewav:
+            # 3.31 BY SOURCE. The worker reads the room off the Voice tap
+            # + mic, the game off its tap, and files what the Mix heard
+            # that neither explains as a video. An old night sets none of
+            # these and takes the byte-identical 3.1x path.
+            if voicewav:
+                env["LORE_ASR_VOICE"] = voicewav
+            if gamewav:
+                env["LORE_ASR_GAME"] = gamewav
+            env["LORE_ASR_CONTEXT_MEDIA"] = _asr_context_media()
+            env["LORE_ASR_CONTEXT_GAME"] = _asr_context_game(video_path)
+            env["LORE_ASR_GAME_LINES"] = (
+                "1" if SETTINGS.get("read_game_lines", True) else "0")
+            if not _src_media_possible(video_path, _vd):
+                # NOBODY TURNS MEDIA DETECTION OFF WHEN IT IS IMPOSSIBLE
+                # - except this. Friends heard only in the Mix must never
+                # be filed as a video and folded away.
+                env["LORE_ASR_MEDIA"] = "0"
+                log(f"The reader on {os.path.basename(video_path)}: media "
+                    f"detection stood down (no loopback layer / the voice "
+                    f"tap was lost mid-night).")
         # LEAVE THE GAME ITS CORES - BUT ONLY WHILE HE IS PLAYING ONE.
         # This used to ask find_active_game(), i.e. "is a game running", and
         # then freeze the answer for the whole job. Measured on his machine:
@@ -14088,6 +14484,16 @@ def _transcribe_one(video_path):
                                     "reader": int(data.get("reader")
                                                   or 0),
                                     "when": int(time.time())},
+                            # 3.31 WHAT THE NIGHT CARRIED BY SOURCE -
+                            # ahead of the segments so the 8 KB head-read
+                            # and the per-game ledger can read it; a
+                            # stale worker still yields a shape they can
+                            # read (all-false flags).
+                            "sources": (data.get("sources")
+                                        if isinstance(data.get("sources"),
+                                                      dict)
+                                        else {"voice": False, "game": False,
+                                              "media": False}),
                             "segments": segs})
         _AI["index"] = None
         # THE GOLD MOMENTS WERE PICKED WITHOUT THESE WORDS. Sound runs first on
@@ -14113,14 +14519,30 @@ def _transcribe_one(video_path):
                 f"{cnt.get('enwall', 0)} English-in-Arabic re-ask(s) "
                 f"({cnt.get('enwall_won', 0)} kept), "
                 f"{cnt.get('laugh', 0)} unreadable-word re-ask(s) "
-                f"({cnt.get('laugh_won', 0)} kept).")
+                f"({cnt.get('laugh_won', 0)} kept), "
+                f"{cnt.get('media_lines', 0)} line(s) filed to a video, "
+                f"{cnt.get('game_lines', 0)} to the game"
+                + (" (the Voice layer was not trusted - media detection "
+                   "stood down)" if cnt.get("media_off") else "")
+                + ".")
         # WHAT THE READER HAS TO SAY. It used to say it on stderr, which
         # this function only ever reads when the job FAILS - so a mic
         # layer that skipped itself was invisible on every good run.
         for note in (data.get("notes") or [])[:4]:
             log(f"The reader on {os.path.basename(video_path)}: "
                 f"{str(note)[:160]}")
-        log(f"Transcribed {os.path.basename(video_path)}: {len(segs)} lines.")
+        # "N lines" MEANS THE ROOM, or a night of YouTube reads as a
+        # talkative night in the log he reads
+        _room = sum(1 for s in segs if s.get("src") not in ("media", "game"))
+        _med = sum(1 for s in segs if s.get("src") == "media")
+        _gm = sum(1 for s in segs if s.get("src") == "game")
+        log(f"Transcribed {os.path.basename(video_path)}: {_room} lines"
+            + (f", {_med} from a video" if _med else "")
+            + (f", {_gm} from the game" if _gm else "") + ".")
+        try:
+            _game_sources_note(video_path, data.get("sources") or {})
+        except Exception:
+            pass
         return True
     except Exception as e:
         log(f"Transcribe failed for {os.path.basename(video_path)}: {e}")
@@ -14130,7 +14552,7 @@ def _transcribe_one(video_path):
             asrv.stop()               # moment the job ends, every path out
         _source_busy_done(video_path)
         for p in (wav, outj, wav + ".ctl", wav + ".prog", wav + ".prog.tmp",
-                  wav + ".mic.wav"):
+                  wav + ".mic.wav", wav + ".voice.wav", wav + ".game.wav"):
             try:
                 os.remove(p)
             except OSError:
@@ -14616,6 +15038,13 @@ RULES:
   EVERY moment must be a DIFFERENT event - never two entries for the same
   line or the same shout described twice.
 - "quote" must be copied from a line inside that stretch.
+- A line marked "(a video playing in the background, not the room)" is what a
+  video, a stream or a song was SAYING on his screen - not the people. Use it
+  only to say what was being watched ("while a video about X plays"); never
+  quote it as a person's words, never build a moment on it, and never treat
+  what happens in it as happening to the players.
+- A line marked "(the game's own voice)" is a character, a caster or a
+  cutscene. It says what was fought or where; it is never who laughed.
 - Write Arabic in Arabic letters and English in English letters, as spoken."""
 
 # the same shape as a GRAMMAR, handed to llama-server's sampler so a
@@ -15674,6 +16103,90 @@ def _insights_wanted():
     return bool(SETTINGS.get("insights_auto"))
 
 
+# 3.31 WHICH LAYER A TRANSCRIPT LINE BELONGS TO, and how the describer
+# dresses it. Module level, so the roster can lift the dressing and hold
+# it to a verbatim copy of the 3.30 body on an old night (no review may
+# be re-owed by this).
+def _seg_layer(sg):
+    """'media' (a video, a stream, a song the loopback heard), 'game'
+    (the game's own tap), else 'room' - you, a friend, an old recording,
+    a g-flagged line (dressed as today)."""
+    src = str((sg or {}).get("src") or "").lower()
+    if src == "media":
+        return "media"
+    if src == "game":
+        return "game"
+    return "room"
+
+
+def _room_words(segs):
+    """Words the ROOM said - what the 'nothing was said' verdict counts."""
+    return sum(len((sg.get("t") or "").split()) for sg in (segs or [])
+               if _seg_layer(sg) == "room")
+
+
+def _dress_line(sg, i, sns):
+    """One transcript line as the model sees it. A media line is told
+    plainly what it is BEFORE the text (the model copies the dressing,
+    see _q_check), a game line likewise; a room line is today's body
+    verbatim - YOU: / a named voice / the g-flag tail."""
+    t = int((sg.get("a") or 0) / 1000)
+    layer = _seg_layer(sg)
+    txt = (sg.get("t") or "").strip()
+    if layer == "media":
+        return (f"[#{i} {t // 60}:{t % 60:02d}] (a video playing in the "
+                f"background, not the room) {txt}")
+    if layer == "game":
+        return f"[#{i} {t // 60}:{t % 60:02d}] (the game's own voice) {txt}"
+    gl = " (probably the game's own audio)" if sg.get("g") else ""
+    yv = "YOU: " if sg.get("src") == "you" else ""
+    # WHO SPOKE, when a named voice overlaps the line. The prompt
+    # has said "use the names" for weeks while the lines carried
+    # none - an invitation to guess. _aud_voice is overlap-only by
+    # design (a nameless quote is worth more than a wrong one), so
+    # nameless nights and game audio stay bare.
+    if not yv and not sg.get("g"):
+        try:
+            _w = _aud_voice(sns, (sg.get("a") or 0) / 1000.0,
+                            (sg.get("b") or 0) / 1000.0)
+            if _w:
+                yv = ("YOU: " if str(_w).strip().lower() == "you"
+                      else str(_w).strip()[:24] + ": ")
+        except Exception:
+            pass
+    return f"[#{i} {t // 60}:{t % 60:02d}] {yv}{txt}{gl}"
+
+
+def _window_parts(wpart):
+    """The lines one window shows the model, in time order, and whether
+    the room was silent in it -> (part, media_only). Room lines are
+    NEVER thinned (the law below stands); media lines are context, so
+    with three or more room lines they are thinned to at most one per
+    minute and eight per window - they must not spend the context the
+    room's words need. With fewer than three room lines and three or
+    more media lines the window is 'what was being watched': every
+    media line, media_only=True. Fewer than three lines of either: the
+    caller files the window silent."""
+    room = [sg for sg in wpart if _seg_layer(sg) == "room"]
+    game = [sg for sg in wpart if _seg_layer(sg) == "game"]
+    media = [sg for sg in wpart if _seg_layer(sg) == "media"]
+    if len(room) >= 3:
+        kept, last = [], -1e9
+        for sg in media:
+            a = (sg.get("a") or 0) / 1000.0
+            if a - last >= 60 and len(kept) < 8:
+                kept.append(sg)
+                last = a
+        out = room + game + kept
+        out.sort(key=lambda sg: (sg.get("a") or 0))
+        return out, False
+    if len(media) >= 3:
+        out = media + game
+        out.sort(key=lambda sg: (sg.get("a") or 0))
+        return out, True
+    return room + game, False
+
+
 def _insights_one(video_path, forced=False, fresh=False):
     """What this recording actually was -> .ins.json sidecar. All local.
 
@@ -15704,8 +16217,13 @@ def _insights_one(video_path, forced=False, fresh=False):
                 f"attempted. Ask again in a moment.")
             _AI["soft_fail"] = True     # a slow disk is not a bad recording
             return False
-    words = sum(len((sg.get("t") or "").split()) for sg in segs)
-    if words < 12:
+    words = _room_words(segs)            # the room only
+    # a night where only a video talked must not be stamped 'honestly
+    # nothing was said' forever - the window rule below turns it into
+    # 'what was being watched'; but a video never counts as the room
+    mwords = sum(len((sg.get("t") or "").split()) for sg in segs
+                 if _seg_layer(sg) == "media")
+    if words < 12 and mwords < 12:
         if not _ai_sidecar_fresh(video_path, "stt"):
             # no transcript EXISTS yet - describing now would stamp a
             # 2-hour Discord night as 'honestly nothing was said', forever
@@ -15765,26 +16283,10 @@ def _insights_one(video_path, forced=False, fresh=False):
         game = "an unknown game"
 
     def _line(sg, i):
-        t = int((sg.get("a") or 0) / 1000)
-        gl = " (probably the game's own audio)" if sg.get("g") else ""
-        yv = "YOU: " if sg.get("src") == "you" else ""
-        # WHO SPOKE, when a named voice overlaps the line. The prompt
-        # has said "use the names" for weeks while the lines carried
-        # none - an invitation to guess. _aud_voice is overlap-only by
-        # design (a nameless quote is worth more than a wrong one), so
-        # nameless nights and game audio stay bare.
-        if not yv and not sg.get("g"):
-            try:
-                _w = _aud_voice(_sd0, (sg.get("a") or 0) / 1000.0,
-                                (sg.get("b") or 0) / 1000.0)
-                if _w:
-                    yv = ("YOU: " if str(_w).strip().lower() == "you"
-                          else str(_w).strip()[:24] + ": ")
-            except Exception:
-                pass
-        return f"[#{i} {t // 60}:{t % 60:02d}] {yv}{(sg.get('t') or '').strip()}{gl}"
+        return _dress_line(sg, i, _sd0)     # module level, liftable (3.31)
 
     _qf = [0]          # quotes blanked/repaired this describe
+    _mdrop = [0]       # moments that pointed at a video's line (3.31)
 
     def _qnorm(x):
         x = str(x or "").lower()
@@ -16375,8 +16877,11 @@ def _insights_one(video_path, forced=False, fresh=False):
                             if str(int(l2)) in windows),
                 "total": len(edges), "tail": False,
                 "at": time.time()}
-            part = [sg for sg in segs
-                    if lo <= (sg.get("a") or 0) / 1000.0 < hi]
+            wpart = [sg for sg in segs
+                     if lo <= (sg.get("a") or 0) / 1000.0 < hi]
+            # 3.31: the room's lines plus a video's as thinned context -
+            # or, when nobody in the room spoke, what was being watched
+            part, media_only = _window_parts(wpart)
             if len(part) < 3:
                 windows[str(int(lo))] = []      # a silent half hour is done,
                 progress = True                  # not owing
@@ -16548,7 +17053,14 @@ def _insights_one(video_path, forced=False, fresh=False):
                 want = max(3, min(12, -(-len(use) // 12)))
                 out_cap = min(1500, 900 + 100 * max(0, want - 5))
                 _first = (asked == 0)
-                head = (f"The game being played is {game}. This window "
+                head = (("NOBODY IN THE ROOM SPOKE in this window. Every "
+                         "line is what a video, a stream or a song was "
+                         "saying on his screen while he played. Write one "
+                         "or two stretches saying WHAT WAS BEING WATCHED, "
+                         "in the form 'watching a video about X while "
+                         "playing', and return NO moments. "
+                         if media_only else "")
+                        + f"The game being played is {game}. This window "
                         f"of the recording runs from minute "
                         f"{int(lo // 60)} to minute {int(hi // 60)}. "
                         + (f"{see}{ears}{eyes}{so_far}" if _first
@@ -16631,6 +17143,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                     why = str(mm.get("why") or "").strip()
                     if m_sg is None or not why:
                         continue
+                    if _seg_layer(m_sg) == "media":
+                        # a moment is the room laughing or shouting,
+                        # never a video; the schema cannot say so, so
+                        # this post-check does
+                        _mdrop[0] += 1
+                        continue
                     why = _m_qcheck(mm, why, use)
                     wmoments.append(
                         {"t": round(((m_sg.get("a") or 0)
@@ -16660,6 +17178,11 @@ def _insights_one(video_path, forced=False, fresh=False):
                     break
             log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} min -> "
                 f"{len(mapped)} stretch(es), {len(wmoments)} moment(s).")
+            if _mdrop[0]:
+                log(f"Describer on {name}: {_mdrop[0]} moment(s) pointed "
+                    f"at a video's line and were dropped - a video is "
+                    f"never the room.")
+                _mdrop[0] = 0
             if mapped or got is not None:
                 windows[str(int(lo))] = {"segments": mapped,
                                          "moments": wmoments,
@@ -18655,6 +19178,11 @@ def _aud_vocab():
                 except Exception:
                     continue
                 for sg in (doc.get("segments") or []):
+                    if isinstance(sg, dict) \
+                            and sg.get("src") in ("media", "game"):
+                        continue       # 3.31: what THIS house says is the
+                        #                authority; a video's essay would
+                        #                teach the gate words nobody here uses
                     if isinstance(sg, dict) and sg.get("nn"):
                         continue       # struck noise feeds nothing
                     if isinstance(sg, dict) and sg.get("pn"):
@@ -18971,6 +19499,11 @@ def _aud_garble(stt, freq):
             continue              # he put it back himself - settled
         if sg.get("nn") or sg.get("pn"):
             continue              # struck (whole or split) - settled
+        if sg.get("src") in ("media", "game"):
+            # 3.31: a Japanese video or an NPC is itself - the shortlist
+            # is for the reader hallucinating alphabets into HIS voice,
+            # and the corrector's ear must not be spent re-listening to it
+            continue
         # A CORRECTED LINE IS JUDGED BY ITS ORIGINAL. The corrected text
         # is Arabic script with no Latin tokens, so it slipped past this
         # detector entirely - which meant a bad correction could never be
@@ -19129,8 +19662,11 @@ def _aud_says(t, src):
         if a > t + _AUD_WORDS:
             break                     # the transcript is in time order
         txt = str(sg.get("t") or "").strip()
-        if len(txt.split()) < 2 or sg.get("g"):
-            continue                  # the game's own audio is not a voice
+        if len(txt.split()) < 2 or sg.get("g") \
+                or sg.get("src") in ("media", "game"):
+            continue                  # only the room is a witness (3.31:
+            #                           a video's sentence or an NPC line
+            #                           is not a witness to the room)
         # THE LINE THAT COVERS THE SECOND WINS. Taking the first row
         # in the window and stopping handed the thinker a sentence
         # from a different moment 45.7% of the time, and in 813 of
@@ -19930,6 +20466,7 @@ def _aud_dossier(g, src, ins):
     model given a keyhole can only transliterate."""
     t = float(g.get("t") or 0)
     outl = []
+    _vid_near = False
     for sg in (src.get("stt") or []):
         try:
             a = float(sg.get("a") or 0) / 1000.0
@@ -19941,6 +20478,12 @@ def _aud_dossier(g, src, ins):
             break
         txt = str(sg.get("t") or "").strip()
         if not txt:
+            continue
+        if sg.get("src") in ("media", "game"):
+            # 3.31: a doubtful line judged beside a video's transcript
+            # would be 'corrected' toward the video's words; the dossier
+            # says a video was on, and no more
+            _vid_near = _vid_near or sg.get("src") == "media"
             continue
         mark = ">>> " if abs(a - t) < 1.0 else "    "
         # THE TAG IS THE MODEL'S GUESS; THE SCRIPT IS WHAT IT WROTE.
@@ -19961,6 +20504,8 @@ def _aud_dossier(g, src, ins):
         outl.append(mark + lang + " " + txt[:110])
         if len(outl) >= 14:
             break
+    if _vid_near:
+        outl.append("    (a video was playing in the background here)")
     bits = []
     tone = _aud_tone(src.get("sns"), t)
     if tone:
@@ -23358,6 +23903,7 @@ def _ai_tick(ctl):
     except Exception:
         pass
     _self_check_daily()
+    _game_sources_daily()          # 3.31: the per-game ledger, once a day
     out = SETTINGS.get("output_dir", "")
     if not out or not os.path.isdir(out):
         return
@@ -24416,11 +24962,24 @@ def scan_library():
                 "dur": (round(dur, 1) if dur is not None else None),
                 "badge": ({"text": badge[0], "phase": badge[1]} if badge else None)}
         (g["sessions"] if v["kind"] == "session" else g["clips"]).append(item)
+    # 3.31: what the game-sources ledger knows about each chapter - the
+    # same key, so the badges join; None when never heard by source
+    try:
+        gv = _game_sources_load().get("games") or {}
+    except Exception:
+        gv = {}
     for g in groups.values():
         g["sessions"].sort(key=lambda x: x["mtime"], reverse=True)
         g["clips"].sort(key=lambda x: x["mtime"], reverse=True)
         g["count"] = len(g["sessions"]) + len(g["clips"])
         g["latest"] = max([x["mtime"] for x in g["sessions"] + g["clips"]] or [0])
+        row = gv.get(g["key"]) if isinstance(gv, dict) else None
+        g["voices"] = ({"chat": int(row.get("voice_nights") or 0),
+                        "lines": int(row.get("game_nights") or 0),
+                        "nights": int(row.get("nights") or 0),
+                        "voice_chat": row.get("voice_chat"),
+                        "voice_lines": row.get("voice_lines")}
+                       if isinstance(row, dict) else None)
     ordered = sorted(groups.values(), key=lambda g: (-g["count"], -g["latest"]))
     return {"games": ordered, "out_dir": out}
 
@@ -24436,6 +24995,13 @@ def _library_signature():
             b = _finish_badge(v["path"])
             sig.append(f"{v['file']}|{int(v['mtime'])}|{v['size']}|{b[1] if b else ''}")
     sig.sort()
+    # 3.31: a badge that changes without the signature moving never
+    # repaints - the ledger's clock rides along (0 when absent)
+    try:
+        sig.append("game_sources|%d" % int(os.path.getmtime(
+            _game_sources_path())))
+    except OSError:
+        sig.append("game_sources|0")
     import hashlib
     return hashlib.md5("\n".join(sig).encode("utf-8", "ignore")).hexdigest()
 
@@ -25570,8 +26136,12 @@ class _JsApi:
         rows_all = []
         for i, sg in enumerate(segs):
             t = int(sg.get("a") or 0) // 1000
+            # 3.31: the Ask must be able to say 'you were watching a
+            # video about X' without attributing the video to a friend
+            pre = ("(video) " if sg.get("src") == "media"
+                   else ("(game) " if sg.get("src") == "game" else ""))
             rows_all.append((i, f"[{t // 60}:{t % 60:02d}] "
-                                f"{sg.get('t') or ''}"))
+                                f"{pre}{sg.get('t') or ''}"))
         picked = [r for i, r in rows_all if i in keep_idx]
         rest = [r for i, r in rows_all if i not in keep_idx]
         step = max(1, len(rest) // max(1, 260 - len(picked)))
@@ -27384,6 +27954,16 @@ class _JsApi:
         except Exception:
             pass
         return []
+
+    def game_sources(self):
+        """3.31 the per-game sources ledger: {v, lib, at, games: {key:
+        {nights, voice_seen, voice_nights, game_seen, game_nights,
+        media_nights, voice_s, game_s, media_s, last, voice_chat,
+        voice_lines}}} - the raw counts, so he can judge the thresholds."""
+        try:
+            return _game_sources_load()
+        except Exception:
+            return _game_sources_empty()
 
     def transcript(self, path):
         """This video's transcript segments: [{a, b, t}] (ms)."""
@@ -30657,6 +31237,7 @@ def lore_app(show_window=True):
     log("Recorder is up; opening the tome window…")
     _names_daily()          # a quick name check, at most once every 24 hours
     _self_check_daily()     # one health line a day in the log
+    _game_sources_daily()   # 3.31: the per-game sources ledger, once a day
     _free_now_so_turn_it_on()  # describing costs nothing now
     _clean_slate_if_needed()   # once: forget everything the old reader wrote
     _ins_slate_if_needed()  # once per generation: re-anchor every review

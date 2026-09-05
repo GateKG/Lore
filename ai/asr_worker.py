@@ -4,7 +4,12 @@
 Called as a subprocess, exactly like ffmpeg and whisper-cli are, so nothing
 heavy has to live inside the app itself:
 
-    asr_worker.py <input.wav> <output.json>
+    asr_worker.py <mix.wav> <output.json> [mic.wav]
+
+3.31 READS BY SOURCE. The app names the Voice tap and the Game tap in the
+environment (LORE_ASR_VOICE / LORE_ASR_GAME); the room is then the tap
+plus his mic, the game is read off its own layer, and the Mix (still
+argv[1]) becomes the MEDIA detector - see the block above main().
 
 WHY THIS EXISTS. whisper has to choose ONE language for a stretch of audio and
 then write everything in that language's alphabet. In a house where English and
@@ -45,6 +50,7 @@ hehe.", which is زامي) - see _laughing_alone.
 import base64
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -345,7 +351,8 @@ def _arabizi(t):
 # read yesterday - and nothing on disk said which reader had written a
 # transcript, so there was no way even to ask. Every transcript carries
 # this number now; the app counts them and says the number out loud.
-READER = 5      # 5: the six-word echo band (see _ctx_echo)
+READER = 6      # 5: the six-word echo band (see _ctx_echo); 6: the room
+#                 off the Voice tap, media and game lines by source
 
 # HOW MANY EXTRA REQUESTS THE TWO NEW WALLS MAY SPEND, the same
 # reasoning as TRANSLIT_MAX: not a budget, a stop, so a night that goes
@@ -354,6 +361,35 @@ READER = 5      # 5: the six-word echo band (see _ctx_echo)
 # candidate for each wall. These are eight and six times that.
 ENWALL_MAX = 8
 LAUGH_MAX = 6
+
+# 3.31 THE OTHER SOURCES. A 3.31 recording carries the room on its own
+# tracks - the voice app's tap (Voice) and his mic - and the game on its
+# own (Game); the device loopback (the Mix, still argv[1]) hears all of
+# it plus whatever else the speakers played. Stops, not budgets, sized
+# the way every other wall in this file is sized: a night that goes
+# wrong in some new way cannot spend an hour reading a video.
+MEDIA_SECS_MAX = 1800   # seconds of a video's speech one job may read
+GAME_GROUPS_MAX = 120   # game utterances one job may read
+# A source EXPLAINS a Mix span when it carries at least this much of the
+# Mix's energy (1/4 amplitude = -12 dB). The process taps and the
+# loopback share the same WASAPI mix gain (the probe measured a tone tap
+# at -11 dBFS while its siblings sat silent), so a source that really
+# carries a span sits within a few dB of the mix; 12 dB leaves 6+ dB of
+# margin over ducking and normalisation and is far above a silent tap's
+# floor. Reasoned, not yet measured on a real Discord+YouTube night.
+MEDIA_RATIO = 0.25
+MEDIA_FLOOR = 10 ** (-45 / 20.0)   # quieter than -45 dBFS is not speech worth attributing
+# A Voice track this quiet over the WHOLE night, while the Mix carries a
+# minute or more of speech nothing explains, was granted but hears
+# nothing (Discord moved its audio process, a wrong root pid). It is not
+# trusted: media detection stands down and those spans are read as the
+# room, because friends must never be hidden as "a video".
+DEAD_VOICE_DB = -60.0
+MEDIA_CTX_DEFAULT = ("Narration or dialogue from a video, stream or song "
+                     "playing in the background - not the people in the "
+                     "room.")
+GAME_CTX_DEFAULT = ("In-game dialogue, announcer and voice lines from the "
+                    "game itself.")
 
 # SOUNDING A WORD OUT. Each script folds to the same small alphabet of
 # consonant classes and the vowels are thrown away, because vowels are
@@ -786,6 +822,251 @@ def _foreign(t):
     return ok / len(letters) < 0.5
 
 
+# ===================================================================
+#  3.31: THE ROOM, THE GAME, AND WHAT WAS PLAYING
+# ===================================================================
+# MEDIA IS DEFINED BY SUBTRACTION, never by content. The room's own
+# speech spans (the Voice tap + the mic) and the game's are cut away from
+# what the Mix heard FIRST; only a span that neither source carries any
+# energy for is a video, a stream or a song. So a friend talking under a
+# loud video stays the room, and a video is never quoted as a person.
+
+def _load_layer(path, sr, sf, np, notes, name, n=None):
+    """One extra layer (the Voice tap or the Game tap) as float32 mono at
+    the mix's rate, or None with a note saying why it was skipped. With
+    `n` (the mix's length in samples) the layer is trimmed or padded to
+    it: every wav is ffmpeg's decode of the same mp4, so they agree to a
+    frame, and more than half a second of drift is said out loud because
+    lines past a short layer's end are then read from the mix and may
+    include a video."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        x, xsr = sf.read(path, dtype="float32")
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+    except Exception as e:
+        notes.append(name + " layer skipped: " + str(e)[:80])
+        return None
+    if xsr != sr:
+        notes.append(name + " layer skipped: rates differ (%d vs %d)"
+                     % (xsr, sr))
+        return None
+    x = np.ascontiguousarray(x)
+    if n is not None and len(x) != n:
+        d = len(x) - n
+        if abs(d) > 0.5 * sr:
+            notes.append("the %s layer is %.1fs %s than the mix - the tail "
+                         "is read from the mix"
+                         % (name, abs(d) / float(sr),
+                            "longer" if d > 0 else "shorter"))
+        x = x[:n] if d > 0 else np.pad(x, (0, -d))
+    return x
+
+
+def _rms(arr, s0, e0):
+    """Root-mean-square of one slice; 0.0 for an empty one."""
+    seg = arr[s0:e0]
+    if len(seg) == 0:
+        return 0.0
+    return float(math.sqrt(float((seg * seg).mean())))
+
+
+def _subtract(spans, cover, sr, min_s=0.4, max_s=CHUNK_S):
+    """Cut every `cover` interval away from every span; drop the pieces
+    too short to be speech; split the ones longer than one request.
+    Samples in, sorted (start, end) tuples out. This is the mic-extra
+    cut lifted out of main() so the game and the media passes subtract
+    the SAME way the mic always has (one subtraction, three callers)."""
+    out = []
+    cover = sorted(cover)
+    for _x, _y in sorted(spans):
+        if _x >= _y:
+            continue
+        _cuts = [(_x, _y)]
+        for _mx, _my in cover:
+            if _my <= _x or _mx >= _y:
+                continue
+            _nxt = []
+            for _a2, _b2 in _cuts:
+                if _mx > _a2:
+                    _nxt.append((_a2, min(_b2, _mx)))
+                if _my < _b2:
+                    _nxt.append((max(_a2, _my), _b2))
+            _cuts = [(p2, q2) for p2, q2 in _nxt if q2 - p2 > 0]
+        for _a2, _b2 in _cuts:
+            if _b2 - _a2 < min_s * sr:
+                continue                  # too short to be speech
+            while _b2 - _a2 > max_s * sr:
+                out.append((_a2, _a2 + int(max_s * sr)))
+                _a2 += int(max_s * sr)
+            if _b2 - _a2 >= min_s * sr:
+                out.append((_a2, _b2))
+    return sorted(out)
+
+
+def _media_spans(mixa, ra, ga, unexplained, sr):
+    """Which of the Mix's unexplained speech spans are a VIDEO: the ones
+    where neither the room nor the game carries MEDIA_RATIO of the Mix's
+    energy, and the Mix itself stands over MEDIA_FLOOR. Returns (spans,
+    why) - why names what was consulted, because without a Game track a
+    span could as well be the game as a video."""
+    out = []
+    for s0, e0 in unexplained:
+        m = _rms(mixa, s0, e0)
+        if m < MEDIA_FLOOR:
+            continue                      # quieter than -45 dBFS
+        r = _rms(ra, s0, e0) if ra is not None else 0.0
+        g = _rms(ga, s0, e0) if ga is not None else 0.0
+        if r >= MEDIA_RATIO * m:
+            continue                      # the room explains it
+        if g >= MEDIA_RATIO * m:
+            continue                      # the game explains it
+        out.append((s0, e0))
+    why = "mix>voice,game" if ga is not None else "mix>voice"
+    return out, why
+
+
+def _cap_seconds(spans, sr, max_s):
+    """Keep the LONGEST spans up to max_s seconds of speech (the wall of
+    MIC_EXTRA_MAX, by seconds instead of count) -> (kept sorted by start,
+    dropped count, dropped seconds)."""
+    kept, total = [], 0
+    for s in sorted(spans, key=lambda s3: s3[1] - s3[0], reverse=True):
+        n = s[1] - s[0]
+        if total + n > max_s * sr:
+            break
+        kept.append(s)
+        total += n
+    whole = sum(e - s for s, e in spans)
+    return sorted(kept), len(spans) - len(kept), (whole - total) / float(sr)
+
+
+def _cap_count(spans, n_max):
+    """Keep the n_max longest spans -> (kept sorted by start, dropped
+    count, dropped seconds in samples/sr terms left to the caller)."""
+    order = sorted(spans, key=lambda s3: s3[1] - s3[0], reverse=True)
+    kept = sorted(order[:n_max])
+    dropped = order[n_max:]
+    return kept, len(dropped), sum(e - s for s, e in dropped)
+
+
+def _sources_block(has_voice, has_game, media_ran, voice_s, mic_s, room_s,
+                   game_s, media_s, media_read_s, game_read_s, stats):
+    """The sidecar's 'sources' block: what this night carried by source,
+    in seconds of Silero speech. Written AHEAD of the segments so the
+    app's 8 KB head-read and the per-game ledger can read it cheaply.
+    game_s is None when the night had no Game track (no vote, not zero)."""
+    return {"v": 1, "voice": bool(has_voice), "game": bool(has_game),
+            "media": bool(media_ran),
+            "voice_s": round(float(voice_s), 1),
+            "mic_s": round(float(mic_s), 1),
+            "room_s": round(float(room_s), 1),
+            "game_s": (round(float(game_s), 1) if has_game else None),
+            "media_s": round(float(media_s), 1),
+            "media_read_s": round(float(media_read_s), 1),
+            "game_read_s": round(float(game_read_s), 1),
+            "media_dropped": int(stats.get("media_dropped", 0)),
+            "game_dropped": int(stats.get("game_dropped", 0)),
+            "media_off": int(stats.get("media_off", 0))}
+
+
+def _plan_sources(a, mixa, ga, spans, sr, vad, stats, notes, has_voice,
+                  voice_db, media_on, game_lines_on):
+    """THE SPLIT. `spans` are the room's speech spans as the VAD wrote
+    them (dicts; the mic's extras already merged) over `a`, which is the
+    room on a 3.31 night and the Mix itself on an old one. Decides what
+    else the night carries - game speech the room does not cover, and
+    the Mix speech that neither explains, a video - and returns
+    (spans, media, game, meta): the room spans (with the dead-Voice
+    guard's hand-backs, routed to the Mix by their 'mix' key), the media
+    spans to read, the game spans to read, and the seconds of each for
+    the sources block. `vad(arr)` -> [(start, end)] in samples. On an
+    old file (no layers) it returns the spans it was given, untouched.
+    Module level so the roster can drive it with a hand-made VAD."""
+    room_spans = sorted((s["start"], s["end"]) for s in spans)
+    room_s = sum(e - s for s, e in room_spans) / float(sr)
+    has_game = ga is not None
+    game_spans, game_s = [], 0.0
+    if has_game:
+        game_spans = _subtract(vad(ga), room_spans, sr)
+        game_s = sum(e - s for s, e in game_spans) / float(sr)
+    media, media_s, media_read_s, why = [], 0.0, 0.0, ""
+    media_ran = False
+    if (has_voice or has_game) and media_on:
+        unexplained = _subtract(vad(mixa), room_spans + game_spans, sr)
+        un_s = sum(e - s for s, e in unexplained) / float(sr)
+        if has_voice and voice_db < DEAD_VOICE_DB and un_s >= 60:
+            # THE HONESTY RULE: a tap that was granted but hears nothing
+            # must not turn every friend into "a video" and hide them
+            stats["media_off"] = 1
+            notes.append("the Voice layer is silent for the whole night "
+                         "while the mix carries %ds of speech - not "
+                         "trusting it; those spans are read as the room"
+                         % int(un_s))
+            spans = sorted(list(spans) + [{"start": s, "end": e, "mix": 1}
+                                          for s, e in unexplained],
+                           key=lambda s3: s3["start"])
+        else:
+            media_ran = True
+            media, why = _media_spans(mixa, a, ga, unexplained, sr)
+            media_s = sum(e - s for s, e in media) / float(sr)
+            if media:
+                kept, dn, ds = _cap_seconds(media, sr, MEDIA_SECS_MAX)
+                stats["media_dropped"] = dn
+                media_read_s = sum(e - s for s, e in kept) / float(sr)
+                notes.append("the video layer found %d span(s), %ds of "
+                             "speech" % (len(media), int(media_s))
+                             + ((" - the wall keeps the longest %ds, %ds "
+                                 "went unread" % (MEDIA_SECS_MAX, int(ds)))
+                                if dn else ""))
+                media = kept
+    game_read, game_read_s = [], 0.0
+    if has_game and game_spans:
+        if game_lines_on:
+            game_read, dn, dsm = _cap_count(game_spans, GAME_GROUPS_MAX)
+            stats["game_dropped"] = dn
+            game_read_s = sum(e - s for s, e in game_read) / float(sr)
+            notes.append("the game spoke for %ds in %d span(s)"
+                         % (int(game_s), len(game_spans))
+                         + ((" - the wall keeps the %d longest, %d went "
+                             "unread" % (GAME_GROUPS_MAX, dn)) if dn else ""))
+        else:
+            notes.append("the game spoke for %ds in %d span(s) - counted, "
+                         "not read" % (int(game_s), len(game_spans)))
+    meta = {"room_s": room_s, "game_s": game_s, "media_s": media_s,
+            "media_read_s": media_read_s, "game_read_s": game_read_s,
+            "why": why, "media_ran": media_ran}
+    return spans, media, game_read, meta
+
+
+def _group_spans(span_list, arr_of, sr, kind):
+    """Neighbouring speech into requests, remembering the REAL times so
+    the transcript still lines up with the video. The 3.1x grouping
+    loop, lifted out so one routine serves three sources: `arr_of(span)`
+    -> (audio slice, mic samples) is how a span's audio is fetched (the
+    clean mic or the room for room spans, the Mix for media, a COPY of
+    the game layer for game spans so the layer can be released)."""
+    groups, cur = [], None
+    for s in span_list:
+        piece, micn = arr_of(s)
+        if cur and (s["start"] - cur["end"]) / sr <= GROUP_GAP_S \
+                and (cur["len"] + s["end"] - s["start"]) <= sr * CHUNK_S:
+            cur["parts"].append(piece)
+            cur["len"] += s["end"] - s["start"]
+            cur["mic"] += micn
+            cur["end"] = s["end"]
+        else:
+            if cur:
+                groups.append(cur)
+            cur = {"parts": [piece, ], "start": s["start"],
+                   "end": s["end"], "len": s["end"] - s["start"],
+                   "mic": micn, "kind": kind}
+    if cur:
+        groups.append(cur)
+    return groups
+
+
 def main(src, dst, mic=None):
     import numpy as np
     import soundfile as sf
@@ -829,6 +1110,7 @@ def main(src, dst, mic=None):
     # this pipe with communicate(), which returns only once the process has
     # exited, so not one of those lines was ever seen while it mattered.
     prog_path = src + ".prog"
+    _room_s = [0.0]       # seconds of the ROOM's speech, once it is known
 
     def say_progress(done, total, secs_done, secs_total):
         try:
@@ -837,6 +1119,7 @@ def main(src, dst, mic=None):
                 json.dump({"done": done, "total": total,
                            "audio_done": round(secs_done, 1),
                            "audio_total": round(secs_total, 1),
+                           "room_s": round(_room_s[0], 1),
                            "threads": have_threads[0]}, fh)
             os.replace(tmp, prog_path)
         except Exception:
@@ -855,31 +1138,29 @@ def main(src, dst, mic=None):
              "translit_won": 0, "mic_lines": 0, "enwall": 0,
              "enwall_won": 0, "laugh": 0, "laugh_won": 0,
              "physics": 0, "leash_kept": 0, "mic_only": 0,
-             "mic_dropped": 0}
+             "mic_dropped": 0,
+             # 3.31 by source: lines filed to a video / the game, what the
+             # walls left unread, and whether the dead-Voice guard fired
+             "media_lines": 0, "game_lines": 0, "media_dropped": 0,
+             "game_dropped": 0, "media_off": 0}
     # AND WHAT ELSE HAPPENED, in words. These used to go to stderr, which
     # the app only reads when the job FAILS - so a mic layer that quietly
     # skipped itself left no trace anywhere on a successful run.
     notes = []
+    # 3.31 THE OTHER LAYERS COME BY ENVIRONMENT. argv[1] stays the Mix -
+    # the .ctl and .prog files are keyed on it - and the app names the
+    # Voice tap and the Game tap beside it. Absent, this is exactly the
+    # 3.1x reader: the mix is the room and nothing below runs.
+    voice = os.environ.get("LORE_ASR_VOICE") or ""
+    game = os.environ.get("LORE_ASR_GAME") or ""
+    ctx_media = ((os.environ.get("LORE_ASR_CONTEXT_MEDIA") or "").strip()
+                 or MEDIA_CTX_DEFAULT)
+    ctx_game = ((os.environ.get("LORE_ASR_CONTEXT_GAME") or "").strip()
+                or GAME_CTX_DEFAULT)
+    media_on = (os.environ.get("LORE_ASR_MEDIA") or "1") != "0"
+    game_lines_on = (os.environ.get("LORE_ASR_GAME_LINES") or "1") != "0"
 
     say_progress(0, 0, 0.0, len(a) / float(sr))    # "started, finding speech"
-    _mix_spans_first = True
-    spans = get_speech_timestamps(torch.from_numpy(a), load_silero_vad(),
-                                  sampling_rate=sr,
-                                  min_silence_duration_ms=300,
-                                  max_speech_duration_s=CHUNK_S,
-                                  speech_pad_ms=200)
-    # A SILENT MIX IS NOT A SILENT NIGHT. This used to end the job
-    # here - before the microphone was ever opened, four lines below -
-    # so a night where the game was quiet and he was the only one
-    # talking transcribed to nothing at all. 225 recordings on the
-    # shelf logged "0 lines". The mic gets its say before anything is
-    # given up on; if it has nothing either, the answer is the same.
-    if not spans and not (mic and os.path.isfile(mic)):
-        json.dump({"segments": [], "model": MODEL, "engine": engine,
-                   "reader": READER, "counters": stats},
-                  open(dst, "w", encoding="utf-8"))
-        say_progress(0, 0, 0.0, 0.0)
-        return 0
 
     # HIS VOICE COMES OFF HIS OWN MICROPHONE. The clean Mic track has
     # ridden beside the mix since 2.81 and was only ever used to TAG
@@ -887,7 +1168,8 @@ def main(src, dst, mic=None):
     # speech span it claims is sliced from the clean audio instead of
     # the mix - same number of model calls, the noise floor gone from
     # his half of the night. Friends and the game stay on the mix,
-    # which is the only place they exist.
+    # which is the only place they exist. (3.31: opened before the room
+    # is built, because the room is the Voice tap PLUS this.)
     ma, mm = None, []
     if mic and os.path.isfile(mic):
         try:
@@ -908,9 +1190,74 @@ def main(src, dst, mic=None):
             notes.append("mic routing skipped: " + str(e2)[:80])
             ma = None
 
-    def _span_audio(s0, e0):
+    def _vad_tuples(arr):
+        """The mix VAD's exact call over another layer -> [(s, e)]."""
+        return [(s3["start"], s3["end"]) for s3 in get_speech_timestamps(
+            torch.from_numpy(np.ascontiguousarray(arr)), load_silero_vad(),
+            sampling_rate=sr, min_silence_duration_ms=300,
+            max_speech_duration_s=CHUNK_S, speech_pad_ms=200)]
+
+    # 3.31 THE ROOM. VOICE = the voice app's tap + his mic: the tap does
+    # not carry his own voice, so a shared span sliced from the tap alone
+    # would erase his half - summing the mic in keeps today's behaviour
+    # for overlaps (the 0.9 rule below still routes his solo spans to
+    # the clean mic). Sample alignment holds because every wav is
+    # ffmpeg's 16 kHz decode of the same mp4. With a Game tap but no
+    # Voice (a by-source night with the voice app closed) the room is
+    # his mic alone; with neither, the mix is the room, as it always was.
+    mixa = a                          # the device loopback, kept by name
+    va = _load_layer(voice, sr, sf, np, notes, "voice", len(a))
+    ga = _load_layer(game, sr, sf, np, notes, "game", len(a))
+    has_voice = va is not None
+    has_game = ga is not None
+    voice_db, voice_s = -120.0, 0.0
+    if has_voice:
+        _vr = _rms(va, 0, len(va))
+        voice_db = 20.0 * math.log10(_vr) if _vr > 0 else -120.0
+        # seconds of speech on the Voice tap ALONE - the ledger's
+        # "does this game carry voice chat" reads this number
+        voice_s = sum(e - s for s, e in _vad_tuples(va)) / float(sr)
+        if ma is not None:
+            _n = min(len(va), len(ma))
+            va[:_n] += ma[:_n]
+            np.clip(va, -1.0, 1.0, out=va)
+        a = va
+        del va
+    elif has_game and ma is not None:
+        a = ma                        # the room is his mic alone tonight
+
+    _mix_spans_first = True
+    spans = get_speech_timestamps(torch.from_numpy(a), load_silero_vad(),
+                                  sampling_rate=sr,
+                                  min_silence_duration_ms=300,
+                                  max_speech_duration_s=CHUNK_S,
+                                  speech_pad_ms=200)
+    # A SILENT MIX IS NOT A SILENT NIGHT. This used to end the job
+    # here - before the microphone was ever opened, four lines below -
+    # so a night where the game was quiet and he was the only one
+    # talking transcribed to nothing at all. 225 recordings on the
+    # shelf logged "0 lines". The mic gets its say before anything is
+    # given up on; if it has nothing either, the answer is the same.
+    # (3.31: nor is a silent ROOM - the mix may still carry a video,
+    # and the game tap its lines; the ledger wants the block regardless.)
+    if not spans and not (mic and os.path.isfile(mic)) \
+            and not ((has_voice or has_game) and media_on) \
+            and not has_game:
+        json.dump({"sources": _sources_block(
+                       has_voice, has_game, False, voice_s, 0.0, 0.0,
+                       0.0, 0.0, 0.0, 0.0, stats),
+                   "segments": [], "model": MODEL, "engine": engine,
+                   "reader": READER, "counters": stats},
+                  open(dst, "w", encoding="utf-8"))
+        say_progress(0, 0, 0.0, 0.0)
+        return 0
+
+    def _span_audio(s):
         """(slice, mic-samples): the clean mic when its own detector
-        says these samples carry his voice, the mix otherwise."""
+        says these samples carry his voice, the room (or mix) otherwise."""
+        s0, e0 = s["start"], s["end"]
+        if s.get("mix"):
+            return mixa[s0:e0], 0     # handed back by the dead-Voice guard
         if ma is not None and e0 <= len(ma):
             ov = 0
             for x, y in mm:
@@ -932,10 +1279,11 @@ def main(src, dst, mic=None):
     # friends at once - was never a candidate at all, however clean
     # the mic had it. Its spans join the mix's here: subtracted first
     # so nothing is decoded twice, fragments too short to be speech
-    # dropped, anything longer than one request split.
+    # dropped, anything longer than one request split (_subtract - the
+    # one cut the game and media passes share).
     if ma is not None and mm:
         _mix = sorted((s3["start"], s3["end"]) for s3 in spans)
-        _extra = []
+        _mm = []
         for _x, _y in sorted(mm):
             # never past the end of EITHER track: a mic recording that
             # outruns the mix would otherwise put a line past the end
@@ -943,26 +1291,9 @@ def main(src, dst, mic=None):
             _y = min(_y, len(ma), len(a))
             if _x >= _y:
                 continue
-            _cuts = [(_x, _y)]
-            for _mx, _my in _mix:
-                if _my <= _x or _mx >= _y:
-                    continue
-                _nxt = []
-                for _a2, _b2 in _cuts:
-                    if _mx > _a2:
-                        _nxt.append((_a2, min(_b2, _mx)))
-                    if _my < _b2:
-                        _nxt.append((max(_a2, _my), _b2))
-                _cuts = [(p2, q2) for p2, q2 in _nxt if q2 - p2 > 0]
-            for _a2, _b2 in _cuts:
-                if _b2 - _a2 < 0.4 * sr:
-                    continue                  # too short to be speech
-                while _b2 - _a2 > CHUNK_S * sr:
-                    _extra.append({"start": _a2,
-                                   "end": _a2 + int(CHUNK_S * sr)})
-                    _a2 += int(CHUNK_S * sr)
-                if _b2 - _a2 >= 0.4 * sr:
-                    _extra.append({"start": _a2, "end": _b2})
+            _mm.append((_x, _y))
+        _extra = [{"start": _a2, "end": _b2}
+                  for _a2, _b2 in _subtract(_mm, _mix, sr)]
         # A STOP, NOT A BUDGET - the same rule the other three walls
         # in this file carry, and this one adds whole model requests
         # rather than cheap re-asks. The longest spans are kept: those
@@ -989,31 +1320,37 @@ def main(src, dst, mic=None):
             spans = sorted(list(spans) + _extra,
                            key=lambda s3: s3["start"])
 
+    # 3.31 THE SPLIT: what else this night carries (nothing, on an old
+    # file - the spans come back untouched)
+    mic_s = sum(y - x for x, y in mm) / float(sr)
+    spans, media_spans, game_spans, smeta = _plan_sources(
+        a, mixa, ga, spans, sr, _vad_tuples, stats, notes, has_voice,
+        voice_db, media_on, game_lines_on)
+    _room_s[0] = smeta["room_s"]
+
     # group neighbouring speech into requests, remembering the REAL times so
-    # the transcript still lines up with the video
-    groups, cur = [], None
-    for s in spans:
-        piece, micn = _span_audio(s["start"], s["end"])
-        if cur and (s["start"] - cur["end"]) / sr <= GROUP_GAP_S \
-                and (cur["len"] + s["end"] - s["start"]) <= sr * CHUNK_S:
-            cur["parts"].append(piece)
-            cur["len"] += s["end"] - s["start"]
-            cur["mic"] += micn
-            cur["end"] = s["end"]
-        else:
-            if cur:
-                groups.append(cur)
-            cur = {"parts": [piece, ], "start": s["start"],
-                   "end": s["end"], "len": s["end"] - s["start"],
-                   "mic": micn}
-    if cur:
-        groups.append(cur)
+    # the transcript still lines up with the video - one routine, three
+    # sources; the game slices are COPIES so the layer can be released
+    # (120 x 28 s x 64 KB = 215 MB at most against a fourth full array)
+    groups = _group_spans(spans, _span_audio, sr, "room")
+    groups_media = _group_spans(
+        [{"start": s3, "end": e3} for s3, e3 in media_spans],
+        lambda s: (mixa[s["start"]:s["end"]], 0), sr, "media")
+    groups_game = _group_spans(
+        [{"start": s3, "end": e3} for s3, e3 in game_spans],
+        lambda s: (np.array(ga[s["start"]:s["end"]]), 0), sr, "game")
+    del ga
 
     # WHAT THIS AUDIO IS. Qwen3-ASR takes a free-text biasing context - the
     # app passes the game's name and the register of the room (friends on
     # Discord, Emirati Arabic and English mid-sentence). Without it the model
     # transcribes each utterance as if it fell out of the sky.
     ctx = (os.environ.get("LORE_ASR_CONTEXT") or "").strip() or None
+    # 3.31: the media and game passes bias with their OWN context (a
+    # video is not "friends on Discord"), and _ctx_echo must compare
+    # against the context that was actually sent - so ask() reads it
+    # through this one cell instead of the name above
+    cur_ctx = [ctx]
 
     if USE_GGUF:
         # ---- the GPU: llama-server (llama.cpp mtmd) ---------------------
@@ -1027,8 +1364,8 @@ def main(src, dst, mic=None):
             sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
             msgs = []
-            if ctx and use_ctx:
-                msgs.append({"role": "system", "content": ctx})
+            if cur_ctx[0] and use_ctx:
+                msgs.append({"role": "system", "content": cur_ctx[0]})
             msgs.append({"role": "user", "content": [
                 {"type": "input_audio",
                  "input_audio": {"data": b64, "format": "wav"}}]})
@@ -1108,7 +1445,7 @@ def main(src, dst, mic=None):
         def ask(audio, language, use_ctx=True):
             inp = proc.apply_transcription_request(
                 audio=audio, language=language,
-                prompt=(ctx if use_ctx else None), sampling_rate=sr,
+                prompt=(cur_ctx[0] if use_ctx else None), sampling_rate=sr,
                 return_tensors="pt")
             with torch.no_grad():
                 ids = mdl.generate(**inp, max_new_tokens=440,
@@ -1143,7 +1480,10 @@ def main(src, dst, mic=None):
 
     # _CTX_STOP, _ctx_echo, _impossible and _foreign live at module
     # level now - THE FABRICATION GATES, above main()
-    speech_total = sum(g["len"] for g in groups) / float(sr)
+    speech_total = (sum(g["len"] for g in groups)
+                    + sum(g["len"] for g in groups_media)
+                    + sum(g["len"] for g in groups_game)) / float(sr)
+    n_all = len(groups) + len(groups_media) + len(groups_game)
     speech_done = 0.0
     out, last = [], "english"
     # WHICH UTTERANCE EACH LINE CAME FROM. The laughter wall below can
@@ -1154,14 +1494,20 @@ def main(src, dst, mic=None):
     # its parts are views into the same array, so this costs a list of
     # integers and nothing else.
     gidx = []
-    slow_n = 0
-    for i, g in enumerate(groups):
-        apply_threads()          # he alt-tabbed; take the machine back (or give it up)
-        audio = np.concatenate(g["parts"])
-        if len(audio) < sr * 0.4:
-            speech_done += g["len"] / float(sr)
-            say_progress(i + 1, len(groups), speech_done, speech_total)
-            continue    # skipped, but the bar must not stall on it
+    slow_n = [0]
+
+    def _read(audio, walls, secs):
+        """One utterance through the model and every fabrication gate
+        -> (txt, lang, lost). The leash, the foreign-alphabet test, the
+        echo test and the physics test always run; the HOUSE walls -
+        Arabizi (inside ask), Arabic-in-Latin, English-in-Arabic - only
+        with walls=True, because they exist for Emirati speech and would
+        spend their stops on a video or a game's announcer. `last`
+        learns from every line that ships; the passes that must not
+        teach it a video's language save and restore it around the
+        call."""
+        nonlocal last
+        ctx = cur_ctx[0]         # the context THIS pass is sending
         t_ask = time.time()
         lost = None
         txt, lang = ask(audio, None)
@@ -1235,8 +1581,8 @@ def main(src, dst, mic=None):
             if t2 and _foreign(t2):
                 t2, l2 = "", None
             txt, lang = (t2 or ""), (l2 or lang)
-        if txt and lang != "arabic" and stats["translit"] < TRANSLIT_MAX \
-                and _arabizi(txt):
+        if walls and txt and lang != "arabic" \
+                and stats["translit"] < TRANSLIT_MAX and _arabizi(txt):
             # ARABIC WRITTEN IN LATIN LETTERS. The guard inside ask()
             # only fires when the model SAYS arabic; this one catches the
             # lines it tagged english, of which "The Nefq?" (the tunnel)
@@ -1256,7 +1602,7 @@ def main(src, dst, mic=None):
                     and 0.4 <= len(t2) / float(len(txt)) <= 2.5:
                 stats["translit_won"] += 1
                 txt, lang = t2, (l2 or "arabic")
-        if txt and stats["enwall"] < ENWALL_MAX \
+        if walls and txt and stats["enwall"] < ENWALL_MAX \
                 and _arabic_frac(txt) >= 0.5:
             hd = _english_head(txt)
             if hd:
@@ -1321,8 +1667,8 @@ def main(src, dst, mic=None):
                 elif sum(1 for ch in _sf_letters
                          if ch.isascii()) / float(len(_sf_letters)) > 0.5:
                     lang = "english"
-        slow_n = slow_n + 1 if time.time() - t_ask > 150 else 0
-        if slow_n >= 3:
+        slow_n[0] = slow_n[0] + 1 if time.time() - t_ask > 150 else 0
+        if slow_n[0] >= 3:
             raise SystemExit(
                 "three utterances in a row took over 150s each - the server "
                 "is crawling; giving up rather than pinning the job for "
@@ -1333,6 +1679,16 @@ def main(src, dst, mic=None):
         # learns only from lines that ship.
         if txt and lang in KEEP:
             last = lang
+        return txt, lang, lost
+
+    for i, g in enumerate(groups):
+        apply_threads()          # he alt-tabbed; take the machine back (or give it up)
+        audio = np.concatenate(g["parts"])
+        if len(audio) < sr * 0.4:
+            speech_done += g["len"] / float(sr)
+            say_progress(i + 1, n_all, speech_done, speech_total)
+            continue    # skipped, but the bar must not stall on it
+        txt, lang, lost = _read(audio, True, len(audio) / float(sr))
         if txt:
             if lost:
                 # the answer that did not win is kept beside the one
@@ -1360,7 +1716,7 @@ def main(src, dst, mic=None):
         # BY SPEECH, not by utterance count: utterances are wildly uneven, so
         # "40 of 300" says much less about the time left than "12 of 96
         # minutes of talking".
-        say_progress(i + 1, len(groups), speech_done, speech_total)
+        say_progress(i + 1, n_all, speech_done, speech_total)
 
     # THE SECOND READING (2.85). Some lines can only be judged once the
     # whole night is on the page, because what gives them away is what
@@ -1389,6 +1745,41 @@ def main(src, dst, mic=None):
             stats["laugh_won"] += 1
             sg["t"], sg["lang"] = t2, (l2 or "arabic")
 
+    # 3.31 THE SECOND AND THIRD PASSES: what a video said, and what the
+    # game said, read by the same model through the same fabrication
+    # gates but with their OWN context and WITHOUT the house walls, and
+    # filed by source so nothing downstream can mistake them for the
+    # room. `last` is saved and put back: a video must not teach the
+    # leash its language and pin it onto the room.
+    _last_room = last
+    done_n = len(groups)
+    for kind, glist, cctx, why in (("media", groups_media, ctx_media,
+                                    smeta["why"]),
+                                   ("game", groups_game, ctx_game,
+                                    "game tap")):
+        if not glist:
+            continue
+        cur_ctx[0] = cctx
+        for g in glist:
+            apply_threads()
+            audio = np.concatenate(g["parts"])
+            done_n += 1
+            if len(audio) < sr * 0.4:
+                speech_done += g["len"] / float(sr)
+                say_progress(done_n, n_all, speech_done, speech_total)
+                continue
+            txt, lang, _lost = _read(audio, False, len(audio) / float(sr))
+            if txt:
+                out.append({"a": int(g["start"] / sr * 1000),
+                            "b": int(g["end"] / sr * 1000), "t": txt,
+                            "lang": lang or last, "src": kind, "why": why})
+                stats[kind + "_lines"] += 1
+            speech_done += g["len"] / float(sr)
+            say_progress(done_n, n_all, speech_done, speech_total)
+    cur_ctx[0] = ctx
+    last = _last_room
+    out.sort(key=lambda s3: s3["a"])
+
     # THE MIC LAYER (2.81+): the mic track's own speech spans say which
     # lines are HIS voice - a cutscene or a background tab has no mic
     # energy, a spoken line does. TAGGED, NEVER FILTERED, and nothing is
@@ -1405,7 +1796,10 @@ def main(src, dst, mic=None):
     # voice detector already found every part of his speech but 0.7
     # seconds of it.
     if ma is not None:
-        notes.append(str(stats["mic_lines"]) + " of " + str(len(out))
+        # "of the ROOM's lines" - a video's or the game's are not his
+        _n_room = sum(1 for sg in out
+                      if sg.get("src") not in ("media", "game"))
+        notes.append(str(stats["mic_lines"]) + " of " + str(_n_room)
                      + " line(s) read from the clean mic itself")
     if mic and os.path.isfile(mic) and ma is None:
         try:
@@ -1418,6 +1812,8 @@ def main(src, dst, mic=None):
                 min_silence_duration_ms=300, speech_pad_ms=120)
             mm = [(s2["start"] / msr, s2["end"] / msr) for s2 in mspans]
             for sg in out:
+                if sg.get("src") in ("media", "game"):
+                    continue      # never his voice, whatever the mic did
                 a2, b2 = (sg["a"] or 0) / 1000.0, (sg["b"] or 0) / 1000.0
                 ov = sum(max(0.0, min(b2, y) - max(a2, x)) for x, y in mm)
                 if ov >= 0.4 * max(0.3, b2 - a2):
@@ -1434,7 +1830,16 @@ def main(src, dst, mic=None):
     # tmp + replace: a crash mid-dump must never leave torn JSON under the
     # final name for the app to misread as a finished transcript
     with open(dst + ".tmp", "w", encoding="utf-8") as fh:
-        json.dump({"segments": out, "model": MODEL, "engine": engine,
+        # 'sources' BEFORE 'segments': the app's 8 KB head-read and the
+        # per-game ledger rely on the small keys sitting ahead of the
+        # lines (json.dump keeps insertion order)
+        json.dump({"sources": _sources_block(
+                       has_voice, has_game,
+                       smeta["media_ran"] and not stats["media_off"],
+                       voice_s, mic_s, smeta["room_s"], smeta["game_s"],
+                       smeta["media_s"], smeta["media_read_s"],
+                       smeta["game_read_s"], stats),
+                   "segments": out, "model": MODEL, "engine": engine,
                    "reader": READER, "counters": stats, "notes": notes},
                   fh, ensure_ascii=False)
     os.replace(dst + ".tmp", dst)
@@ -1444,8 +1849,12 @@ def main(src, dst, mic=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("usage: asr_worker.py <in.wav> <out.json> [mic.wav]",
-              file=sys.stderr)
+        print("usage: asr_worker.py <mix.wav> <out.json> [mic.wav]\n"
+              "  env: LORE_ASR_VOICE / LORE_ASR_GAME (16 kHz mono wavs of "
+              "the Voice and Game taps), LORE_ASR_CONTEXT_MEDIA / "
+              "LORE_ASR_CONTEXT_GAME, LORE_ASR_MEDIA=0 (no media "
+              "detection), LORE_ASR_GAME_LINES=0 (count game speech, do "
+              "not read it)", file=sys.stderr)
         sys.exit(2)
     try:
         sys.exit(main(sys.argv[1], sys.argv[2],

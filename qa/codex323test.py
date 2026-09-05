@@ -139,9 +139,12 @@ check("laundering by chapter names is logged, never blocking",
       "laundering watch" in SRC)
 
 print("\n--- A3: the lines carry their voice ---")
-_ln = SRC.split("def _line(sg, i):")[1][:2200]
+# 3.31: the dressing moved out of the nested _line into the module-level
+# _dress_line (liftable); _line is a one-line wrapper handing it _sd0
+_ln = SRC.split("def _dress_line(sg, i, sns):")[1][:2200]
 check("_line asks the overlap-only voice, never the nearest guess",
-      "_aud_voice(_sd0" in _ln)
+      "_aud_voice(sns" in _ln
+      and "return _dress_line(sg, i, _sd0)" in SRC)
 check("game audio is never given a voice",
       'not sg.get("g")' in _ln)
 check("there is NO 'speaker N:' arm",
