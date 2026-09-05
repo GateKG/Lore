@@ -41,8 +41,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = io.open(os.path.join(ROOT, "lore.py"), encoding="utf-8").read()
 USRC = io.open(os.path.join(ROOT, "ui.html"), encoding="utf-8").read()
 TREE = ast.parse(SRC)
+# THE FILE BEFORE DROPS C/D is drop B (2b59d37), not whatever HEAD
+# happens to be: once 3.32 was committed HEAD carried them too and the
+# parity block below compared the drops with themselves (red from the
+# 3.32 commit on; pinned 2026-09-06 with the 3.33 refresh)
 try:
-    HSRC = subprocess.run(["git", "show", "HEAD:lore.py"], cwd=ROOT,
+    HSRC = subprocess.run(["git", "show", "2b59d37:lore.py"], cwd=ROOT,
                           capture_output=True, timeout=60).stdout \
         .decode("utf-8", "replace").replace("\r\n", "\n")
 except Exception:
@@ -1002,10 +1006,14 @@ if HSRC:
           and SRC.count('_AI["index"] = None') == 9
           and len(re.findall(r'^([ \t]*)_AI\["index"\] = None[^\n]*\n'
                              r'\1_AI\["shelf"\] = None$', SRC, re.M)) == 9)
-    check("state() is HEAD's plus the one flag",
+    check("state() is HEAD's plus the one flag (and 3.33's pair)",
           msrc(HSRC, "_JsApi", "state", HTREE).replace(
               '                "version": APP_VERSION}',
               '                "librarian_ready": _emb_ready(),\n'
+              '                "second_ear": bool(SETTINGS.get("second_ear", '
+              'True)),\n'
+              '                "room_names": str(SETTINGS.get("room_names") '
+              'or ""),\n'
               '                "version": APP_VERSION}')
           == msrc(SRC, "_JsApi", "state", TREE))
 else:
@@ -1071,14 +1079,15 @@ check("_EmbServer.start refuses without the model (no spawn, no port sweep)",
 
 # =========================================================================
 print("\n--- the UI, read from its source ---")
-check("the stamps: 3.32 in both mocks, lore.py APP_VERSION 3.32, no 3.31 "
-      "version left", USRC.count("version:'3.32'") == 2
-      and "version:'3.31'" not in USRC and 'APP_VERSION = "3.32"' in SRC)
+check("the stamps: 3.33 in both mocks, lore.py APP_VERSION 3.33, no 3.32 "
+      "version left", USRC.count("version:'3.33'") == 2
+      and "version:'3.32'" not in USRC and 'APP_VERSION = "3.33"' in SRC)
 check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "librarian_ready, so the harness box is never dead",
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
-      and "librarian_ready:true,version:'3.32'" in USRC)
+      and "librarian_ready:true,second_ear:true,room_names:'',"
+          "version:'3.33'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "

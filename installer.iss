@@ -13,8 +13,8 @@
 [Setup]
 AppId={{7C1A44D9-63BF-4A0E-9E7D-2F4B8C5A930E}
 AppName=Lore
-AppVersion=3.32
-VersionInfoVersion=3.32.0
+AppVersion=3.33
+VersionInfoVersion=3.33.0
 ; A 64-bit app should live in the real Program Files (v1 landed in x86;
 ; upgrades reuse whichever folder is already installed, so nothing breaks).
 ArchitecturesAllowed=x64compatible
@@ -65,6 +65,8 @@ Filename: "{app}\Lore.exe"; Description: "Open LORE now"; Flags: postinstall now
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM Lore.exe"; Flags: runhidden; RunOnceId: "StopRecorder"
 ; A transcription job may still hold whisper files open after Lore.exe dies.
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM whisper-cli.exe"; Flags: runhidden; RunOnceId: "StopWhisper"
+; ...and the second ear (3.33, ai\whisper\whisper-server.exe) its dlls.
+Filename: "{cmd}"; Parameters: "/C taskkill /F /IM whisper-server.exe"; Flags: runhidden; RunOnceId: "StopWhisperServer"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\__pycache__"
@@ -102,5 +104,9 @@ begin
     { An orphaned transcription child would keep whisper\ files locked. }
     Exec(ExpandConstant('{cmd}'),
          '/C taskkill /F /IM whisper-cli.exe',
+         '', SW_HIDE, ewWaitUntilTerminated, rc);
+    { ...and the second ear (3.33) would keep ai\whisper\*.dll locked. }
+    Exec(ExpandConstant('{cmd}'),
+         '/C taskkill /F /IM whisper-server.exe',
          '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;

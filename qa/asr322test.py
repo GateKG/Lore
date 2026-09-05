@@ -130,7 +130,8 @@ check("the guard summary counts the physics wall",
 print("\n--- T3: the tag yields to the script ---")
 i_gate = SRC.index('stats["physics"] += 1')
 i_lang = SRC.index("THE TAG IS THE MODEL'S GUESS")
-i_last = SRC.index("if txt and lang in KEEP:\n            last = lang")
+# 3.33: the body sits one level deeper, inside _read's try/finally
+i_last = SRC.index("if txt and lang in KEEP:\n                last = lang")
 check("the physics gate runs before the accept", i_gate < i_last)
 check("...and the script-derivation sits between it and `last`",
       i_gate < i_lang < i_last)
@@ -145,8 +146,13 @@ import re as _re2
 _wr = _re2.search(r"^READER = (\d+)", SRC, _re2.M)
 _ar = _re2.search(r"^_STT_READER = (\d+)", LSRC, _re2.M)
 check("the worker stamps a reader generation", bool(_wr))
-check("the app expects exactly what the worker writes - a mismatch is how a stale worker ran a whole redo undetected",
-      bool(_ar) and _wr.group(1) == _ar.group(1))
+# 3.33: the worker may run AHEAD of _STT_READER (reader 7 over an app
+# that expects 6 - the second ear re-owes nothing on disk, by law); it
+# must never run behind it, which is how a stale worker ran a whole
+# redo undetected
+check("the worker is never older than the app expects (worker >= "
+      "_STT_READER); a stale worker is how a whole redo ran undetected",
+      bool(_ar) and int(_wr.group(1)) >= int(_ar.group(1)))
 check("the physics counter ships in stats", '"physics": 0' in SRC)
 check("the boot note still never re-reads behind his back",
       "never read again on its own" in LSRC)
@@ -177,9 +183,9 @@ check("lore.py names the layers only when the file carries the titles",
 check("...and asks the resolver for mix + mic alone on an old night",
       'want = (("mix", "mic", "voice", "game") if layered\n'
       '                else ("mix", "mic"))' in LSRC)
-check("READER 6 is the first generation whose new hearing needs a track "
-      "(the sweep skips old nights)",
-      re.search(r"^_STT_READER_TRACKS = 5", LSRC, re.M) is not None
+check("the track generation rides with the reader (5 under 3.31; 7 under 3.33, "
+      "when the second ear changed every night's hearing)",
+      re.search(r"^_STT_READER_TRACKS = 7", LSRC, re.M) is not None
       and "if rd >= _STT_READER_TRACKS and not _stt_has_layers(video_path):"
       in LSRC)
 

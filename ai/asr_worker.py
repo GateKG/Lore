@@ -54,10 +54,47 @@ import math
 import os
 import re
 import sys
+import socket
+import threading
 import time
 import urllib.request
 
 MODEL = os.environ.get("LORE_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B-hf")
+# 3.33 THE SECOND EAR: a whisper-server on the CPU, handed by the app
+# (LORE_ASR_WHISPER=http://127.0.0.1:port). Unset = this file is the
+# 3.32 reader byte for byte: _draft is never called.
+DRAFT_SERVER = os.environ.get("LORE_ASR_WHISPER") or ""
+DRAFT_PROMPT = os.environ.get("LORE_ASR_DRAFT_PROMPT") or ""
+# WHISPER'S COST IS PER WINDOW, NOT PER SECOND. Measured on his box
+# 2026-09-06 (turbo q5_0, CPU): 1 s of silence 24.7 s, a 3 s slice
+# 29.6 s, a whole 24.5 s piece 30 s - at ten threads; ~60 s each at
+# four. So a night of 407 short room lines drafted one by one was
+# ~3 hours in the reader's lane for a job the card finished in 4.5
+# minutes. Utterances are PACKED into windows of at most this many
+# seconds, one POST per window (last night packs into 65, ~1x the
+# room's talk), and the app tells us its thread count so the timeout
+# can be honest about it.
+DRAFT_THREADS = int(os.environ.get("LORE_ASR_WHISPER_THREADS") or 0)
+DRAFT_WINDOW_S = 30.0
+DRAFT_PAD_S = 0.5     # silence between packed utterances: a segment
+#                       ends where a mouth did, so the split is clean
+DRAFT_LOGPROB = -0.8  # a segment under this is dropped from the draft:
+#                       shaped noise measured -0.98, "*BOOM*" -1.5,
+#                       real speech -0.2..-0.6 (2026-09-06, his room)
+DRAFT_DEAD = 2        # timed-out windows in a row: the ear is gone for
+#                       the night, the reader goes on with one
+# what Whisper writes over silence and music ("Thank you." on 45
+# pieces of his room, measured 2026-09-06; "Thank you. Thank you.",
+# "Subtitles by the Amara.org community" on noise): never a hint
+_DRAFT_JUNK = re.compile(
+    r"^\W*(thank(s| you)( (so|very) much)?( for watching)?\W*)+$"
+    r"|^\W*(you|bye|goodbye|okay|subscribe.*|please subscribe.*)\W*$"
+    r"|^.*(subtitles? by|amara\.org|transcri(bed|ption) by|captions? by|"
+    r"www\.|\.com\b)", re.I)
+# sound tags Whisper writes between words - "*BOOM*", "[Music]",
+# "(laughs)" - are not a hint about what was said
+_DRAFT_TAG = re.compile(r"\*[^*\n]{1,40}\*|\[[^\]\n]{1,40}\]"
+                        r"|\((?:[^()\s]+\s?){1,3}\)")
 MIC_EXTRA_MAX = 60    # a stop on mic-only spans, not a budget
 CHUNK_S = 28          # at most this much SPEECH per request
 GROUP_GAP_S = 0.8     # speech separated by less than this is one utterance
@@ -351,8 +388,10 @@ def _arabizi(t):
 # read yesterday - and nothing on disk said which reader had written a
 # transcript, so there was no way even to ask. Every transcript carries
 # this number now; the app counts them and says the number out loud.
-READER = 6      # 5: the six-word echo band (see _ctx_echo); 6: the room
-#                 off the Voice tap, media and game lines by source
+READER = 7      # 5: the six-word echo band (see _ctx_echo); 6: the room
+#                 off the Voice tap, media and game lines by source;
+#                 7: the second ear (3.33) - Whisper's English draft
+#                 of each room line in the context, filed as "d"
 
 # HOW MANY EXTRA REQUESTS THE TWO NEW WALLS MAY SPEND, the same
 # reasoning as TRANSLIT_MAX: not a budget, a stop, so a night that goes
@@ -823,6 +862,288 @@ def _foreign(t):
 
 
 # ===================================================================
+#  3.33: THE SECOND EAR
+# ===================================================================
+# Measured on his own room (45 pieces, eight ears, sheet e733b623): the
+# reader keeps the Arabic and the mid-sentence switching but mishears
+# the English game words ("Doors Health Zone" for duos Hearthstone
+# match); Whisper large-v3-turbo gets those words, drops the Arabic and
+# writes "Thank you." on silence. The reader WITH Whisper's English
+# reading of the same utterance appended to its context kept both (his
+# ticks: two-pass 8, Whisper 5, the reader alone 2, of 19). So the draft
+# is a HINT IN THE PROMPT, never a line: it rides beside the line as
+# "d" and nothing downstream reads it as speech. CPU only, ~1x realtime
+# on the room's ~20 minutes of talk per hour - the card is never touched.
+
+def _draft_timeout():
+    """Seconds one window may take: three times its measured cost at
+    the ear's thread count plus a margin (ten threads -> 102 s, four
+    -> 210, three -> 270). The flat 60 s of the first cut timed out
+    every window at three threads and the server kept computing the
+    abandoned request, so the next one queued behind it."""
+    return int(30 + 720.0 / max(1, DRAFT_THREADS or 4))
+
+
+def _is_timeout(e):
+    return isinstance(e, (socket.timeout, TimeoutError)) or isinstance(
+        getattr(e, "reason", None), (socket.timeout, TimeoutError))
+
+
+def _echo_base(c):
+    """The context WITHOUT the room's names, for the echo tests: every
+    alias rides in the reader's context (3.33) and counted as a context
+    word, a six-word callout that was mostly names read as the prompt
+    talking - which cost a no-context re-ask that also lost the names."""
+    return c.split(" Names in the room:", 1)[0] if c else c
+
+
+def _draft_echo(txt, prompt):
+    """Whisper reading its own initial prompt back. The prompt is its
+    'previous text' and over noise it simply continues it: measured
+    2026-09-06, the prompt verbatim came back as a draft and passed
+    every other gate. Most of the line's 4-letter word prefixes in the
+    prompt (three words up), or _ctx_echo's own verdict."""
+    if not prompt or not txt:
+        return False
+    if _ctx_echo(txt, prompt):
+        return True
+
+    def toks(x):
+        return [w for w in re.findall(r"[a-z0-9'\-]+", x.lower())
+                if len(w) >= 3 and w not in _CTX_STOP]
+    tw = toks(txt)
+    if len(tw) < 3:
+        return False
+    cp = {w[:4] for w in toks(prompt)}
+    return sum(1 for w in tw if w[:4] in cp) / float(len(tw)) >= 0.6
+
+
+def _draft_judge(segs, lang, prompt):
+    """One utterance's segments of a window -> the hint or "". Junk: a
+    language nobody in this house speaks, a silence phrase, a mean word
+    probability under 0.35, a looping 3-gram ("I got wild gun" x3), a
+    foreign alphabet, the prompt read back. A segment under the
+    logprob floor is dropped on its own (the "*BOOM*" between two real
+    shouts), the rest of the utterance still counts."""
+    if lang not in ("english", "en", "arabic", "ar"):
+        return ""
+    keep = []
+    for sg in segs:
+        lp = sg.get("avg_logprob")
+        try:
+            if lp is not None and float(lp) < DRAFT_LOGPROB:
+                continue
+        except (TypeError, ValueError):
+            pass
+        keep.append(sg)
+    txt = " ".join(str(sg.get("text") or "") for sg in keep)
+    txt = re.sub(r"\s+", " ", _DRAFT_TAG.sub(" ", txt)).strip()
+    if not txt or _DRAFT_JUNK.match(txt) is not None:
+        return ""
+    probs = [float(w.get("probability")) for sg in keep
+             for w in (sg.get("words") or [])
+             if isinstance(w, dict) and w.get("probability") is not None]
+    if probs and sum(probs) / float(len(probs)) < 0.35:
+        return ""
+    words = re.findall(r"\S+", txt.lower())
+    grams = {}
+    for i in range(len(words) - 2):
+        g = " ".join(words[i:i + 3])
+        grams[g] = grams.get(g, 0) + 1
+    if grams and max(grams.values()) >= 3:
+        return ""
+    if _foreign(txt) or _draft_echo(txt, prompt):
+        return ""
+    return txt[:400]
+
+
+def _draft_post(wav, prompt, timeout):
+    """One POST to whisper-server's /inference, the verified contract:
+    multipart, verbose_json, temperature 0, language auto, the initial
+    prompt. Raises; the callers never do."""
+    bnd = "----lore-draft-%d" % int(time.time() * 1000)
+    parts = []
+    for k, v in (("temperature", "0"),
+                 ("response_format", "verbose_json"),
+                 ("language", "auto"), ("prompt", prompt or "")):
+        parts.append(("--" + bnd + "\r\nContent-Disposition: form-data; "
+                      "name=\"" + k + "\"\r\n\r\n" + v + "\r\n")
+                     .encode("utf-8"))
+    parts.append(("--" + bnd + "\r\nContent-Disposition: form-data; "
+                  "name=\"file\"; filename=\"u.wav\"\r\n"
+                  "Content-Type: audio/wav\r\n\r\n").encode("utf-8")
+                 + wav + b"\r\n")
+    parts.append(("--" + bnd + "--\r\n").encode("utf-8"))
+    req = urllib.request.Request(
+        DRAFT_SERVER + "/inference", b"".join(parts),
+        {"Content-Type": "multipart/form-data; boundary=" + bnd})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def _draft_many(auds, sr, prompt, stats=None):
+    """ONE window for a run of utterances -> a draft per utterance ("" =
+    no hint). The utterances are laid end to end with DRAFT_PAD_S of
+    silence between, posted once, and the reply's segments are handed
+    back by their start/end to the utterance they overlap most. NEVER
+    raises: any error is a window of "" (a timeout counted as one)."""
+    n = len(auds)
+    res = [""] * n
+    if stats is not None:
+        stats["draft_ask"] = stats.get("draft_ask", 0) + n
+        stats["draft_win"] = stats.get("draft_win", 0) + 1
+    try:
+        import numpy as np
+        import soundfile as sf
+        pad = np.zeros(int(sr * DRAFT_PAD_S), dtype=np.float32)
+        spans, pieces, pos = [], [], 0
+        for a in auds:
+            if pieces:
+                pieces.append(pad)
+                pos += len(pad)
+            spans.append((pos / float(sr), (pos + len(a)) / float(sr)))
+            pieces.append(np.asarray(a, dtype=np.float32))
+            pos += len(a)
+        buf = io.BytesIO()
+        sf.write(buf, np.concatenate(pieces), sr, format="WAV",
+                 subtype="PCM_16")
+        j = _draft_post(buf.getvalue(), prompt, _draft_timeout())
+        lang = str(j.get("language") or "").strip().lower()
+        segs = [sg for sg in (j.get("segments") or [])
+                if isinstance(sg, dict)]
+        if not segs and j.get("text"):
+            segs = [{"text": str(j.get("text"))}]
+        per = [[] for _ in auds]
+        for sg in segs:
+            k = -1
+            try:
+                s0, s1 = float(sg["start"]), float(sg["end"])
+                best = 0.0
+                for m, (u0, u1) in enumerate(spans):
+                    ov = min(s1, u1) - max(s0, u0)
+                    if ov > best:
+                        best, k = ov, m
+            except (KeyError, TypeError, ValueError):
+                pass
+            if k < 0 and n == 1:
+                k = 0          # no times, one utterance: it is its own
+            if k >= 0:
+                per[k].append(sg)
+        for k in range(n):
+            d = _draft_judge(per[k], lang, prompt)
+            if d:
+                res[k] = d
+                if stats is not None:
+                    stats["draft_ok"] = stats.get("draft_ok", 0) + 1
+            elif stats is not None:
+                stats["draft_junk"] = stats.get("draft_junk", 0) + 1
+    except Exception as e:
+        if stats is not None and _is_timeout(e):
+            stats["draft_timeout"] = stats.get("draft_timeout", 0) + 1
+    return res
+
+
+def _draft(audio, sr, prompt, stats=None):
+    """Whisper's reading of ONE utterance, in English, or "" - the
+    single-utterance shape of _draft_many, kept for what lifts it."""
+    return _draft_many([audio], sr, prompt, stats)[0]
+
+
+def _draft_pack(lens, sr):
+    """Consecutive utterances into windows of at most DRAFT_WINDOW_S
+    seconds, pads counted -> lists of utterance indices. An utterance
+    the reader skips (under 0.4 s) is left out, so the two agree."""
+    bufs, cur, tot = [], [], 0.0
+    for i, n in enumerate(lens):
+        secs = n / float(sr)
+        if secs < 0.4:
+            continue
+        if cur and tot + DRAFT_PAD_S + secs > DRAFT_WINDOW_S:
+            bufs.append(cur)
+            cur, tot = [], 0.0
+        tot += secs + (DRAFT_PAD_S if cur else 0.0)
+        cur.append(i)
+    if cur:
+        bufs.append(cur)
+    return bufs
+
+
+class _Drafter:
+    """The second ear's own lane. Packs the room's utterances into
+    windows and drafts them on a thread AHEAD of the reader when the
+    reader is on the card (the two share nothing, so the night costs
+    the longer of the two, not the sum); on the CPU road only the
+    window the reader is about to need, so the two never fight for
+    the cores. `may_draft()` is the app's word (the .ctl budget it
+    rewrites every four seconds): while a game has the machine a
+    window the reader reaches is SKIPPED, not waited for - the reader
+    goes on with one ear and the game keeps its cores, and drafting
+    resumes with the next window once he is out. DRAFT_DEAD timed-out
+    windows in a row end the night's drafting: a server that is not
+    answering must not cost a timeout per window for hours."""
+
+    def __init__(self, audio_of, lens, sr, prompt, stats, may_draft,
+                 ahead, notes=None):
+        self.audio_of, self.sr, self.prompt = audio_of, sr, prompt
+        self.stats, self.may_draft, self.ahead = stats, may_draft, ahead
+        self.notes = notes if notes is not None else []
+        self.bufs = _draft_pack(lens, sr)
+        self.buf_of = {i: b for b, idx in enumerate(self.bufs) for i in idx}
+        self.ready = [threading.Event() for _ in self.bufs]
+        self.want = [threading.Event() for _ in self.bufs]
+        self.drafts = {}
+        self.dead = False
+        self.th = threading.Thread(target=self._run, daemon=True)
+        self.th.start()
+
+    def get(self, i):
+        """The draft for utterance i, waiting for its window if the
+        thread is still on it - never longer than one window's timeout."""
+        b = self.buf_of.get(i)
+        if b is None:
+            return ""
+        self.want[b].set()
+        self.ready[b].wait(_draft_timeout() + 60)
+        return self.drafts.get(i, "")
+
+    def _run(self):
+        strikes = 0
+        try:
+            for b, idx in enumerate(self.bufs):
+                try:
+                    if not self.dead and (not self.ahead
+                                          or not self.may_draft()):
+                        self.want[b].wait()
+                    if self.dead or not self.may_draft():
+                        self.stats["draft_skip"] = (
+                            self.stats.get("draft_skip", 0) + len(idx))
+                        continue
+                    before = self.stats.get("draft_timeout", 0)
+                    res = _draft_many([self.audio_of(i) for i in idx],
+                                      self.sr, self.prompt, self.stats)
+                    for i, d in zip(idx, res):
+                        if d:
+                            self.drafts[i] = d
+                    if self.stats.get("draft_timeout", 0) > before:
+                        strikes += 1
+                        if strikes >= DRAFT_DEAD and not self.dead:
+                            self.dead = True
+                            self.notes.append(
+                                "the second ear went quiet after %d "
+                                "timed-out window(s) - the rest of the "
+                                "night was read with one ear" % strikes)
+                    else:
+                        strikes = 0
+                except Exception:
+                    pass
+                finally:
+                    self.ready[b].set()
+        finally:
+            for ev in self.ready:
+                ev.set()
+
+
+# ===================================================================
 #  3.31: THE ROOM, THE GAME, AND WHAT WAS PLAYING
 # ===================================================================
 # MEDIA IS DEFINED BY SUBTRACTION, never by content. The room's own
@@ -968,7 +1289,11 @@ def _sources_block(has_voice, has_game, media_ran, voice_s, mic_s, room_s,
             "game_read_s": round(float(game_read_s), 1),
             "media_dropped": int(stats.get("media_dropped", 0)),
             "game_dropped": int(stats.get("game_dropped", 0)),
-            "media_off": int(stats.get("media_off", 0))}
+            "media_off": int(stats.get("media_off", 0)),
+            "draft_ok": int(stats.get("draft_ok", 0)),
+            "draft_junk": int(stats.get("draft_junk", 0)),
+            "draft_skip": int(stats.get("draft_skip", 0)),
+            "draft_timeout": int(stats.get("draft_timeout", 0))}
 
 
 def _plan_sources(a, mixa, ga, spans, sr, vad, stats, notes, has_voice,
@@ -1095,6 +1420,21 @@ def main(src, dst, mic=None):
         except ValueError:
             return default_threads
 
+    def wanted_ear2():
+        """May the second ear draft RIGHT NOW? The app writes "ear2"
+        beside the thread budget (0 while a game has the machine). An
+        older .ctl without it: the budget itself tells - a quarter of
+        the machine is the playing count. No .ctl at all = yes."""
+        try:
+            with open(ctl_path, encoding="utf-8") as fh:
+                j = json.load(fh)
+            if j.get("ear2") is not None:
+                return bool(j.get("ear2"))
+            n = int(j.get("threads") or 0)
+            return n <= 0 or n > max(2, (os.cpu_count() or 8) // 4)
+        except Exception:
+            return True
+
     have_threads = [0]
 
     def apply_threads():
@@ -1142,7 +1482,12 @@ def main(src, dst, mic=None):
              # 3.31 by source: lines filed to a video / the game, what the
              # walls left unread, and whether the dead-Voice guard fired
              "media_lines": 0, "game_lines": 0, "media_dropped": 0,
-             "game_dropped": 0, "media_off": 0}
+             "game_dropped": 0, "media_off": 0,
+             # 3.33 the second ear: asked, junked, leaned on; the
+             # windows posted, the utterances not asked while a game
+             # had the machine, the windows that timed out
+             "draft_ask": 0, "draft_junk": 0, "draft_ok": 0,
+             "draft_win": 0, "draft_skip": 0, "draft_timeout": 0}
     # AND WHAT ELSE HAPPENED, in words. These used to go to stderr, which
     # the app only reads when the job FAILS - so a mic layer that quietly
     # skipped itself left no trace anywhere on a successful run.
@@ -1505,6 +1850,19 @@ def main(src, dst, mic=None):
     # integers and nothing else.
     gidx = []
     slow_n = [0]
+    # 3.33 the second ear's draft for the utterance _read is on: set
+    # at every entry, read by the room writer right after the call.
+    # A cell, not a fourth return value - three callers unpack three.
+    last_draft = [""]
+    # ...and the one the room loop hands in BEFORE the call, fetched by
+    # utterance index from the drafter's windows (never asked inside
+    # _read: one POST per utterance was the 3-hour night)
+    next_draft = [""]
+    drafter = None
+    if DRAFT_SERVER and groups:
+        drafter = _Drafter(lambda k: np.concatenate(groups[k]["parts"]),
+                           [g["len"] for g in groups], sr, DRAFT_PROMPT,
+                           stats, wanted_ear2, bool(USE_GGUF), notes)
 
     def _read(audio, walls, secs):
         """One utterance through the model and every fabrication gate
@@ -1517,179 +1875,198 @@ def main(src, dst, mic=None):
         teach it a video's language save and restore it around the
         call."""
         nonlocal last
-        ctx = cur_ctx[0]         # the context THIS pass is sending
-        t_ask = time.time()
-        lost = None
-        txt, lang = ask(audio, None)
-        if lang and lang not in KEEP:
-            stats["leash"] += 1
-            if not out:
-                # the FIRST utterance has no history to hold it to: pin by
-                # the SCRIPT of what it actually wrote - an Arabic night
-                # opened by one wandering guess used to get pinned English
-                letters = sum(1 for c in txt if c.isalpha())
-                arab = sum(1 for c in txt if "\u0600" <= c <= "\u06ff")
-                last = ("arabic" if letters and arab / float(letters) > 0.3
-                        else "english")
-            # THE RETRY HAS TO EARN IT. This used to be an
-            # unconditional overwrite on the strength of a tag - the
-            # one guard here that never looked at what it was
-            # keeping. Every test below is already written in this
-            # file; they are simply pointed at the retry, at no extra
-            # cost, because this is the call that already happened.
-            t2, l2 = ask(audio, last)
-            secs0 = len(audio) / float(sr)
-            worse = (not (t2 or "").strip()          # nothing came back
-                     or _foreign(t2)                 # an unread alphabet
-                     or _impossible(t2, secs0)       # no mouth is that fast
-                     or (ctx and _ctx_echo(t2, ctx)))  # the prompt talking
-            # PINNING FORCES THE SCRIPT - the arabizi guard leans on
-            # that deliberately - so an answer written in the script
-            # the pin was pushing is not evidence about what was
-            # said. It is only the PIN that has to be doubted, and
-            # only when it pointed away from the first answer:
-            # guarding one direction unconditionally made Arabic win
-            # every argument and latch there.
-            _af1, _af2 = _arabic_frac(txt), _arabic_frac(t2)
-            if not worse and ((last == "english"
-                               and _af1 >= 0.5 and _af2 < 0.5)
-                              or (last == "arabic"
-                                  and _af1 < 0.5 and _af2 >= 0.5)):
-                worse = True
-            if worse and txt and not _foreign(txt) \
-                    and not _impossible(txt, secs0):
-                stats["leash_kept"] += 1
-                lang = None          # the script fix below decides it
-                if t2 and t2.strip() != txt.strip():
-                    lost = t2.strip()[:300]
-            else:
-                txt, lang = t2, l2
-        if txt and _foreign(txt):
-            # a foreign ALPHABET slipped past the language leash: one
-            # pinned retry, then the utterance is dropped - silence beats
-            # a language nobody in the room speaks
-            t2, l2 = ask(audio, last)
-            if t2 and not _foreign(t2):
-                txt, lang = t2, (l2 or last)
-            else:
-                txt = ""
-        if txt and ctx and _ctx_echo(txt, ctx):
-            # THE PROMPT LEAKED. Ask once more with no context at all and
-            # trust that answer: words genuinely spoken survive on their
-            # own; an echo comes back as nothing (or as what the noise
-            # actually was). Never drop the retry - a real sentence that
-            # happens to mention the game and Discord is still real.
-            # Pin the CURRENT line's accepted language, not the previous
-            # line's - pinning stale 'arabic' onto an English line forces
-            # Arabic-script output (the Arabizi guard uses that exact
-            # trick on purpose). And the retry answers in the
-            # hallucination-heaviest regime, so it faces the same
-            # alphabet wall every other answer does.
-            stats["echo"] += 1
-            pin = lang if lang in KEEP else last
-            t2, l2 = ask(audio, pin, use_ctx=False)
-            if t2 and _foreign(t2):
-                t2, l2 = "", None
-            txt, lang = (t2 or ""), (l2 or lang)
-        if walls and txt and lang != "arabic" \
-                and stats["translit"] < TRANSLIT_MAX and _arabizi(txt):
-            # ARABIC WRITTEN IN LATIN LETTERS. The guard inside ask()
-            # only fires when the model SAYS arabic; this one catches the
-            # lines it tagged english, of which "The Nefq?" (the tunnel)
-            # became two chapter titles of lore that never happened.
-            #
-            # Ask once more pinned to Arabic and keep that answer only if
-            # it comes back mostly in Arabic script at roughly the same
-            # length. THE LENGTH BAND IS THE SAFETY, not the script test:
-            # pinning forces Arabic script whatever was said, so the
-            # script tells us nothing about whether the answer is right -
-            # everything that decides that lives in _arabizi. The band is
-            # only here to catch the runaway repetition this whole worker
-            # exists to prevent.
-            stats["translit"] += 1
-            t2, l2 = ask(audio, "arabic")
-            if t2 and _arabic_frac(t2) >= 0.5 \
-                    and 0.4 <= len(t2) / float(len(txt)) <= 2.5:
-                stats["translit_won"] += 1
-                txt, lang = t2, (l2 or "arabic")
-        if walls and txt and stats["enwall"] < ENWALL_MAX \
-                and _arabic_frac(txt) >= 0.5:
-            hd = _english_head(txt)
-            if hd:
-                # ENGLISH WRITTEN IN ARABIC LETTERS - the wall above,
-                # the other way round. "قولي الشط الصوت خراب!" is
-                # "holy shit" and then real Arabic, and on 2.84 the
-                # whole line went to the auditor as Arabic speech.
+        base = cur_ctx[0]        # the context THIS pass is sending
+        ectx = _echo_base(base)  # ...minus the room's names, for the echo tests
+        # 3.33 THE SECOND EAR. Whisper's English reading of this same
+        # utterance rides in the context as a hint; the echo tests below
+        # compare against `base`, never the widened prompt - a correct
+        # line that AGREES with the draft is not the prompt talking. The
+        # room only (walls): a video or the game earns no second hearing.
+        # Restored in the finally, so a raise cannot leak the draft into
+        # the next utterance. Unset server = this block is dormant.
+        d = ""
+        last_draft[0] = ""
+        if walls and DRAFT_SERVER:
+            d, next_draft[0] = next_draft[0], ""
+            if d:
+                cur_ctx[0] = ((base or "") + ' A first pass by another ear '
+                              'heard, in English: "' + d + '"')
+                last_draft[0] = d
+        try:
+            t_ask = time.time()
+            lost = None
+            txt, lang = ask(audio, None)
+            if lang and lang not in KEEP:
+                stats["leash"] += 1
+                if not out:
+                    # the FIRST utterance has no history to hold it to: pin by
+                    # the SCRIPT of what it actually wrote - an Arabic night
+                    # opened by one wandering guess used to get pinned English
+                    letters = sum(1 for c in txt if c.isalpha())
+                    arab = sum(1 for c in txt if "\u0600" <= c <= "\u06ff")
+                    last = ("arabic" if letters and arab / float(letters) > 0.3
+                            else "english")
+                # THE RETRY HAS TO EARN IT. This used to be an
+                # unconditional overwrite on the strength of a tag - the
+                # one guard here that never looked at what it was
+                # keeping. Every test below is already written in this
+                # file; they are simply pointed at the retry, at no extra
+                # cost, because this is the call that already happened.
+                t2, l2 = ask(audio, last)
+                secs0 = len(audio) / float(sr)
+                worse = (not (t2 or "").strip()          # nothing came back
+                         or _foreign(t2)                 # an unread alphabet
+                         or _impossible(t2, secs0)       # no mouth is that fast
+                         or (ectx and _ctx_echo(t2, ectx)))  # the prompt talking
+                # PINNING FORCES THE SCRIPT - the arabizi guard leans on
+                # that deliberately - so an answer written in the script
+                # the pin was pushing is not evidence about what was
+                # said. It is only the PIN that has to be doubted, and
+                # only when it pointed away from the first answer:
+                # guarding one direction unconditionally made Arabic win
+                # every argument and latch there.
+                _af1, _af2 = _arabic_frac(txt), _arabic_frac(t2)
+                if not worse and ((last == "english"
+                                   and _af1 >= 0.5 and _af2 < 0.5)
+                                  or (last == "arabic"
+                                      and _af1 < 0.5 and _af2 >= 0.5)):
+                    worse = True
+                if worse and txt and not _foreign(txt) \
+                        and not _impossible(txt, secs0):
+                    stats["leash_kept"] += 1
+                    lang = None          # the script fix below decides it
+                    if t2 and t2.strip() != txt.strip():
+                        lost = t2.strip()[:300]
+                else:
+                    txt, lang = t2, l2
+            if txt and _foreign(txt):
+                # a foreign ALPHABET slipped past the language leash: one
+                # pinned retry, then the utterance is dropped - silence beats
+                # a language nobody in the room speaks
+                t2, l2 = ask(audio, last)
+                if t2 and not _foreign(t2):
+                    txt, lang = t2, (l2 or last)
+                else:
+                    txt = ""
+            if txt and ectx and _ctx_echo(txt, ectx):
+                # THE PROMPT LEAKED. Ask once more with no context at all and
+                # trust that answer: words genuinely spoken survive on their
+                # own; an echo comes back as nothing (or as what the noise
+                # actually was). Never drop the retry - a real sentence that
+                # happens to mention the game and Discord is still real.
+                # Pin the CURRENT line's accepted language, not the previous
+                # line's - pinning stale 'arabic' onto an English line forces
+                # Arabic-script output (the Arabizi guard uses that exact
+                # trick on purpose). And the retry answers in the
+                # hallucination-heaviest regime, so it faces the same
+                # alphabet wall every other answer does.
+                stats["echo"] += 1
+                pin = lang if lang in KEEP else last
+                t2, l2 = ask(audio, pin, use_ctx=False)
+                if t2 and _foreign(t2):
+                    t2, l2 = "", None
+                txt, lang = (t2 or ""), (l2 or lang)
+            if walls and txt and lang != "arabic" \
+                    and stats["translit"] < TRANSLIT_MAX and _arabizi(txt):
+                # ARABIC WRITTEN IN LATIN LETTERS. The guard inside ask()
+                # only fires when the model SAYS arabic; this one catches the
+                # lines it tagged english, of which "The Nefq?" (the tunnel)
+                # became two chapter titles of lore that never happened.
                 #
-                # Ask once more pinned to English and keep NOTHING of
-                # that answer but a yes or a no: if it says the phrase
-                # back, splice OUR phrase over the exact span that
-                # sounded it out. Pinning forces Latin letters, so
-                # trusting the answer's text would translate his Arabic
-                # for him - this way a wrong yes cannot reach one
-                # character past the words that were suspect.
-                #
-                # THE SPLICE KEEPS BOTH SIDES. Rebuilding the line as
-                # "phrase + the tail" silently deleted whatever stood
-                # in front of the run - a leading "يا" carries no
-                # consonant, so the head can start at word two.
-                stats["enwall"] += 1
-                try:
-                    t2, _l2 = ask(audio, "english")
-                except Exception as e0:
-                    t2 = ""
-                    notes.append("the English-in-Arabic wall gave up: "
-                                 + str(e0)[:80])
-                if t2 and _says(t2, hd[2]):
-                    stats["enwall_won"] += 1
-                    txt = (txt[:hd[0]] + hd[2][0].upper() + hd[2][1:]
-                           + txt[hd[1]:])
-                    if _arabic_frac(txt) < 0.5:
+                # Ask once more pinned to Arabic and keep that answer only if
+                # it comes back mostly in Arabic script at roughly the same
+                # length. THE LENGTH BAND IS THE SAFETY, not the script test:
+                # pinning forces Arabic script whatever was said, so the
+                # script tells us nothing about whether the answer is right -
+                # everything that decides that lives in _arabizi. The band is
+                # only here to catch the runaway repetition this whole worker
+                # exists to prevent.
+                stats["translit"] += 1
+                t2, l2 = ask(audio, "arabic")
+                if t2 and _arabic_frac(t2) >= 0.5 \
+                        and 0.4 <= len(t2) / float(len(txt)) <= 2.5:
+                    stats["translit_won"] += 1
+                    txt, lang = t2, (l2 or "arabic")
+            if walls and txt and stats["enwall"] < ENWALL_MAX \
+                    and _arabic_frac(txt) >= 0.5:
+                hd = _english_head(txt)
+                if hd:
+                    # ENGLISH WRITTEN IN ARABIC LETTERS - the wall above,
+                    # the other way round. "قولي الشط الصوت خراب!" is
+                    # "holy shit" and then real Arabic, and on 2.84 the
+                    # whole line went to the auditor as Arabic speech.
+                    #
+                    # Ask once more pinned to English and keep NOTHING of
+                    # that answer but a yes or a no: if it says the phrase
+                    # back, splice OUR phrase over the exact span that
+                    # sounded it out. Pinning forces Latin letters, so
+                    # trusting the answer's text would translate his Arabic
+                    # for him - this way a wrong yes cannot reach one
+                    # character past the words that were suspect.
+                    #
+                    # THE SPLICE KEEPS BOTH SIDES. Rebuilding the line as
+                    # "phrase + the tail" silently deleted whatever stood
+                    # in front of the run - a leading "يا" carries no
+                    # consonant, so the head can start at word two.
+                    stats["enwall"] += 1
+                    try:
+                        t2, _l2 = ask(audio, "english")
+                    except Exception as e0:
+                        t2 = ""
+                        notes.append("the English-in-Arabic wall gave up: "
+                                     + str(e0)[:80])
+                    if t2 and _says(t2, hd[2]):
+                        stats["enwall_won"] += 1
+                        txt = (txt[:hd[0]] + hd[2][0].upper() + hd[2][1:]
+                               + txt[hd[1]:])
+                        if _arabic_frac(txt) < 0.5:
+                            lang = "english"
+            if txt and _impossible(txt, len(audio) / float(sr)):
+                # A MOUTH CANNOT SAY THIS. The paraphrase leak lands here:
+                # prompt-flavoured sentences stamped on sub-second spans of
+                # music, byte-identical across nights because temperature
+                # is 0. One retry with the context stripped - words
+                # genuinely spoken survive on their own; a fabrication has
+                # nothing to come back as. The retry faces this same test,
+                # so it cannot smuggle the line back in.
+                stats["physics"] += 1
+                pin = lang if lang in KEEP else last
+                t2, l2 = ask(audio, pin, use_ctx=False)
+                if t2 and (_foreign(t2)
+                           or _impossible(t2, len(audio) / float(sr))):
+                    t2, l2 = "", None
+                txt, lang = (t2 or ""), (l2 or lang)
+            # THE TAG IS THE MODEL'S GUESS; THE SCRIPT IS WHAT IT WROTE.
+            # 4,178 Arabic-script lines in this library are tagged
+            # "english" - 44% of all Arabic lines - and `last` then learns
+            # the lie, so the leash pins English onto an Arabic night and
+            # forces Latin output on the re-ask. The characters decide now,
+            # BEFORE `last` learns anything.
+            if txt:
+                _sf_letters = [ch for ch in txt if ch.isalpha()]
+                if _sf_letters:
+                    _sf_ar = sum(1 for ch in _sf_letters
+                                 if "\u0600" <= ch <= "\u06ff")
+                    if _sf_ar / float(len(_sf_letters)) > 0.5:
+                        lang = "arabic"
+                    elif sum(1 for ch in _sf_letters
+                             if ch.isascii()) / float(len(_sf_letters)) > 0.5:
                         lang = "english"
-        if txt and _impossible(txt, len(audio) / float(sr)):
-            # A MOUTH CANNOT SAY THIS. The paraphrase leak lands here:
-            # prompt-flavoured sentences stamped on sub-second spans of
-            # music, byte-identical across nights because temperature
-            # is 0. One retry with the context stripped - words
-            # genuinely spoken survive on their own; a fabrication has
-            # nothing to come back as. The retry faces this same test,
-            # so it cannot smuggle the line back in.
-            stats["physics"] += 1
-            pin = lang if lang in KEEP else last
-            t2, l2 = ask(audio, pin, use_ctx=False)
-            if t2 and (_foreign(t2)
-                       or _impossible(t2, len(audio) / float(sr))):
-                t2, l2 = "", None
-            txt, lang = (t2 or ""), (l2 or lang)
-        # THE TAG IS THE MODEL'S GUESS; THE SCRIPT IS WHAT IT WROTE.
-        # 4,178 Arabic-script lines in this library are tagged
-        # "english" - 44% of all Arabic lines - and `last` then learns
-        # the lie, so the leash pins English onto an Arabic night and
-        # forces Latin output on the re-ask. The characters decide now,
-        # BEFORE `last` learns anything.
-        if txt:
-            _sf_letters = [ch for ch in txt if ch.isalpha()]
-            if _sf_letters:
-                _sf_ar = sum(1 for ch in _sf_letters
-                             if "\u0600" <= ch <= "\u06ff")
-                if _sf_ar / float(len(_sf_letters)) > 0.5:
-                    lang = "arabic"
-                elif sum(1 for ch in _sf_letters
-                         if ch.isascii()) / float(len(_sf_letters)) > 0.5:
-                    lang = "english"
-        slow_n[0] = slow_n[0] + 1 if time.time() - t_ask > 150 else 0
-        if slow_n[0] >= 3:
-            raise SystemExit(
-                "three utterances in a row took over 150s each - the server "
-                "is crawling; giving up rather than pinning the job for "
-                "hours")
-        # A BLANKED LINE TEACHES NOTHING. The walls above blank a
-        # condemned line but leave its tag - and the tags of exactly
-        # those lines are the least trustworthy in the file. `last`
-        # learns only from lines that ship.
-        if txt and lang in KEEP:
-            last = lang
-        return txt, lang, lost
+            slow_n[0] = slow_n[0] + 1 if time.time() - t_ask > 150 else 0
+            if slow_n[0] >= 3:
+                raise SystemExit(
+                    "three utterances in a row took over 150s each - the server "
+                    "is crawling; giving up rather than pinning the job for "
+                    "hours")
+            # A BLANKED LINE TEACHES NOTHING. The walls above blank a
+            # condemned line but leave its tag - and the tags of exactly
+            # those lines are the least trustworthy in the file. `last`
+            # learns only from lines that ship.
+            if txt and lang in KEEP:
+                last = lang
+            return txt, lang, lost
+        finally:
+            cur_ctx[0] = base
 
     for i, g in enumerate(groups):
         apply_threads()          # he alt-tabbed; take the machine back (or give it up)
@@ -1698,6 +2075,8 @@ def main(src, dst, mic=None):
             speech_done += g["len"] / float(sr)
             say_progress(i + 1, n_all, speech_done, speech_total)
             continue    # skipped, but the bar must not stall on it
+        if drafter is not None:
+            next_draft[0] = drafter.get(i)   # waits for its window, once
         txt, lang, lost = _read(audio, True, len(audio) / float(sr))
         if txt:
             if lost:
@@ -1720,6 +2099,10 @@ def main(src, dst, mic=None):
                 sg_new["micp"] = round(mfrac, 2)
             if sg_new_alt:
                 sg_new["alt"] = sg_new_alt
+            if last_draft[0]:
+                # 3.33 what the second ear heard, beside the line -
+                # for the reconciler to come, never as speech
+                sg_new["d"] = last_draft[0][:300]
             out.append(sg_new)
             gidx.append(i)   # out[k] came from groups[gidx[k]]
         speech_done += g["len"] / float(sr)
@@ -1837,6 +2220,15 @@ def main(src, dst, mic=None):
             # that succeeded - the app reads the notes and journals them
             notes.append("mic layer skipped: " + str(e2)[:90])
 
+    if DRAFT_SERVER:
+        # 3.33 said once per night through the notes road the app
+        # already prints; silent when the second ear never woke
+        notes.append("the second ear drafted %d of %d room utterance(s) "
+                     "(%d junk; %d window(s), %d timed out; %d not asked "
+                     "while a game had the machine)"
+                     % (stats["draft_ok"], stats["draft_ask"],
+                        stats["draft_junk"], stats["draft_win"],
+                        stats["draft_timeout"], stats["draft_skip"]))
     # tmp + replace: a crash mid-dump must never leave torn JSON under the
     # final name for the app to misread as a finished transcript
     with open(dst + ".tmp", "w", encoding="utf-8") as fh:
@@ -1864,7 +2256,9 @@ if __name__ == "__main__":
               "the Voice and Game taps), LORE_ASR_CONTEXT_MEDIA / "
               "LORE_ASR_CONTEXT_GAME, LORE_ASR_MEDIA=0 (no media "
               "detection), LORE_ASR_GAME_LINES=0 (count game speech, do "
-              "not read it)", file=sys.stderr)
+              "not read it), LORE_ASR_WHISPER=<url> (the second ear) / "
+              "LORE_ASR_DRAFT_PROMPT / LORE_ASR_WHISPER_THREADS",
+              file=sys.stderr)
         sys.exit(2)
     try:
         sys.exit(main(sys.argv[1], sys.argv[2],

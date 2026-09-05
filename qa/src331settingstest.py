@@ -59,6 +59,7 @@ SAID = []
 ns = {"os": os, "log": SAID.append, "time": time,
       "_default_output_dir": lambda: r"C:\mock\Records"}
 DEFAULTS = lift_assign("DEFAULTS", ns)
+extract("_room_names_clamp", ns)     # 3.33: the clamp the sanitizer calls
 sanitize = extract("_sanitize_settings", ns)
 
 print("--- DEFAULTS ---")

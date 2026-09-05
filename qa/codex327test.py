@@ -628,6 +628,8 @@ def leash(first, first_lang, retry, retry_lang, ctx="", pin="english"):
     ns = dict(NS)
     ns.update({"lang": first_lang, "txt": first, "out": [1],
                "audio": [0.0] * 16000, "ctx": ctx, "last": pin,
+               "base": ctx,     # 3.33: the block reads the context as `base`
+               "ectx": ctx,     # ...and its echo test as `ectx` (no names here)
                "lost": None, "np": None,
                "stats": {"leash": 0, "leash_kept": 0},
                "ask": lambda a, p, use_ctx=True: (retry, retry_lang)})

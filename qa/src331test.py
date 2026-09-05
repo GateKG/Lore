@@ -301,8 +301,10 @@ check("'sources' precedes 'segments' in the final dump",
       src_i < seg_i)
 _wr = re.search(r"^READER = (\d+)", WSRC, re.M)
 _ar = re.search(r"^_STT_READER = (\d+)", LSRC, re.M)
-check("READER == 6 in the worker and _STT_READER == 6 in lore.py",
-      _wr and _ar and _wr.group(1) == "6" and _ar.group(1) == "6")
+# 3.33: the second ear is reader 7 in the worker; _STT_READER stays 6
+# on purpose - a transcript on disk is never re-owed by that drop
+check("READER == 7 in the worker and _STT_READER == 6 in lore.py",
+      _wr and _ar and _wr.group(1) == "7" and _ar.group(1) == "6")
 check("ask() reads the context through the cell, never the name",
       'if cur_ctx[0] and use_ctx:' in WSRC
       and 'prompt=(cur_ctx[0] if use_ctx else None)' in WSRC
@@ -475,7 +477,8 @@ check("the sources block: game_s is None without a Game track, keys whole",
       and list(blk) == ["v", "voice", "game", "media", "voice_s", "mic_s",
                         "room_s", "game_s", "media_s", "media_read_s",
                         "game_read_s", "media_dropped", "game_dropped",
-                        "media_off"])
+                        "media_off", "draft_ok", "draft_junk",
+                        "draft_skip", "draft_timeout"])
 
 # =========================================================================
 print("\n--- T8: the lore.py side ---")
@@ -1014,8 +1017,8 @@ W_NEW = load_worker(WPATH, "asr331_new")
 HEADW = os.path.join(TMP, "asr_worker_head.py")
 io.open(HEADW, "w", encoding="utf-8", newline="").write(HEAD_W)
 W_OLD = load_worker(HEADW, "asr331_head")
-check("the HEAD worker is reader 5, the working one reader 6",
-      W_OLD.READER == 5 and W_NEW.READER == 6)
+check("the HEAD worker is reader 5, the working one reader 7 (3.33)",
+      W_OLD.READER == 5 and W_NEW.READER == 7)
 
 NIGHT = os.path.join(TMP, "night")
 os.makedirs(NIGHT)
@@ -1095,7 +1098,7 @@ check(".prog carries room_s and audio_total = room + media + game",
       abs(prog["room_s"] - src["room_s"]) < 0.05
       and abs(prog["audio_total"] - (src["room_s"] + src["media_read_s"]
                                      + src["game_read_s"])) < 0.2)
-check("the reader stamp is 6", doc["reader"] == 6)
+check("the reader stamp is 7", doc["reader"] == 7)
 check("four asks, none re-asked (no wall fired on a video)",
       len(ASKED) == 4 and doc["counters"]["echo"] == 0
       and doc["counters"]["leash"] == 0)
@@ -1179,21 +1182,25 @@ rc_n, doc_n, raw_n, prog_n = run_worker(W_NEW, {}, out=p_out_n)
 check("an old night (no env): the HEAD worker and this one write the "
       "same lines", rc_h == rc_n == 0 and doc_h["segments"] == doc_n["segments"]
       and len(doc_n["segments"]) == 4)
-check("...the same notes and the same counters but the five new zeros",
+# 3.33 adds the second ear's six counters, zero without a server
+check("...the same notes and the same counters but the eleven new zeros",
       doc_h["notes"] == doc_n["notes"]
       and {k: v for k, v in doc_n["counters"].items()
            if k not in ("media_lines", "game_lines", "media_dropped",
-                        "game_dropped", "media_off")} == doc_h["counters"]
+                        "game_dropped", "media_off", "draft_ask",
+                        "draft_junk", "draft_ok", "draft_win",
+                        "draft_skip", "draft_timeout")} == doc_h["counters"]
       and all(doc_n["counters"][k] == 0 for k in
               ("media_lines", "game_lines", "media_dropped", "game_dropped",
-               "media_off")))
+               "media_off", "draft_ask", "draft_junk", "draft_ok",
+               "draft_win", "draft_skip", "draft_timeout")))
 check("...the only new top-level key is 'sources', all flags false",
       set(doc_n) - set(doc_h) == {"sources"}
       and doc_n["sources"]["voice"] is False
       and doc_n["sources"]["game"] is False
       and doc_n["sources"]["media"] is False
       and doc_n["sources"]["game_s"] is None
-      and doc_n["reader"] == 6 and doc_h["reader"] == 5)
+      and doc_n["reader"] == 7 and doc_h["reader"] == 5)
 check("...the same audio_total in .prog (room_s beside it)",
       prog_h["audio_total"] == prog_n["audio_total"]
       and "room_s" in prog_n and "room_s" not in prog_h)

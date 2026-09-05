@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.32"
+APP_VERSION = "3.33"
 
 try:
     import psutil
@@ -170,6 +170,17 @@ DEFAULTS = {
     # ("[CLUB] Name" or just "Name"). Empty means the tome reports that a
     # match ended and says "won?" - it never guesses whose win it was.
     "handle":            "",
+    # THE SECOND EAR (3.33). Whisper turbo on the CPU reads every room
+    # line too, and the reader leans on that English draft for game
+    # words and names (measured on his own room: two-pass 8 ticks of
+    # 19, the reader alone 2). About 20 minutes of CPU per hour of
+    # talk; never the card. Off = one ear, exactly as 3.32.
+    "second_ear":        True,
+    # THE ROOM'S NAMES (3.33): people by comma, other spellings by
+    # slash ("A, B / Bee, C / CC"). What no ear can guess. His own
+    # data - seeded once from room_names.txt beside the settings,
+    # never written into code.
+    "room_names":        "",
     # What the recorder captures: the whole watched screen (proven path) or,
     # experimentally, only the game's own window - the SAME GPU capture cropped
     # at the source to the window's client rect, tracked as the window moves
@@ -734,6 +745,9 @@ def _sanitize_settings(d):
                                       DEFAULTS["read_game_lines"]))
     d["black_guard"] = bool(d.get("black_guard", DEFAULTS["black_guard"]))
     d["handle"] = str(d.get("handle", DEFAULTS["handle"]) or "")[:40].strip()
+    d["second_ear"] = bool(d.get("second_ear", DEFAULTS["second_ear"]))
+    d["room_names"] = _room_names_clamp(
+        d.get("room_names", DEFAULTS["room_names"]))
 
 
 def load_settings():
@@ -6220,14 +6234,14 @@ HYPE_MIN_RISE = 0.11
 # echo band the prompt was slipping through; 6 reads the room off the
 # Voice tap and files media/game lines by source. SHIPS WITH THE WORKER
 # (READER in ai/asr_worker.py) - the 3.24 lesson.
-_STT_READER = 6
+_STT_READER = 7          # 3.33: the second ear changes every night's hearing
 # THE FIRST READER WHOSE ONLY NEW HEARING NEEDS A TRACK. From reader 5
 # on, what a newer reader would say differently about a night lives on
 # the Voice / Game tracks - a Mix/System/Mic file read by reader 5 comes
 # back word for word under reader 6. _stt_stale_reader uses this so the
 # sweep never re-reads ~400 identical old nights; a future reader that
 # changes its hearing on EVERY file must raise this to its own number.
-_STT_READER_TRACKS = 5
+_STT_READER_TRACKS = 7   # 3.33: raised with the reader - both ears hear EVERY file anew
 
 _STT_RD_CACHE = {}
 
@@ -12599,33 +12613,45 @@ def _game_has_focus():
         return False
 
 
-def _reader_threads():
+def _reader_playing():
+    """Does a game have the machine right now - a recording running, or
+    a game in front of him? One question, so the thread budget and the
+    second ear's gate (3.33) can never disagree about it."""
+    try:
+        ctl = _AI.get("ctl")
+        if ctl is not None and ctl.session is not None:
+            return True
+    except Exception:
+        pass
+    return bool(_game_has_focus())
+
+
+def _reader_threads(playing=None):
     """How much of the machine the reader may take, RIGHT NOW.
 
     A quarter of it while he is actually playing - a stuttering game is
     noticed instantly and slow reading is invisible. Otherwise nearly all of
-    it, because nothing is competing for it."""
+    it, because nothing is competing for it. `playing` may be handed in
+    (False = the idle count, what the second ear is sized to)."""
     n = os.cpu_count() or 8
-    playing = False
-    try:
-        ctl = _AI.get("ctl")
-        playing = bool(ctl is not None and ctl.session is not None)
-    except Exception:
-        pass
-    if not playing:
-        playing = _game_has_focus()
+    if playing is None:
+        playing = _reader_playing()
     return max(2, n // 4) if playing else max(2, n - 4)
 
 
 def _write_reader_budget(ctl_path):
     """Tell a running reader what it may use. It re-reads this between
     utterances, so alt-tabbing out of a game speeds it up within seconds
-    instead of at the next job."""
+    instead of at the next job. "ear2" (3.33) is the second ear's gate:
+    0 while a game has the machine, and the worker skips the windows it
+    reaches until it is 1 again - its thread count is fixed at spawn, so
+    this is the only way it can leave a game its cores."""
     try:
-        n = _reader_threads()
+        playing = _reader_playing()
+        n = _reader_threads(playing)
         tmp = ctl_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"threads": n}, fh)
+            json.dump({"threads": n, "ear2": 0 if playing else 1}, fh)
         os.replace(tmp, ctl_path)
         return n
     except Exception:
@@ -13833,6 +13859,18 @@ _MODEL_SETS = [
          ("mmproj-Qwen3-ASR-1.7B-bf16.gguf",
           _HF % ("ggml-org/Qwen3-ASR-1.7B-GGUF",
                  "mmproj-Qwen3-ASR-1.7B-bf16.gguf"), 641773984),
+     ]},
+    # 3.33 the binaries (ai\whisper\whisper-server.exe + dlls) ship
+    # with the drop-in; only the model is fetched
+    {"key": "ear2", "tier": "reader",
+     "title": "The second ear",
+     "what": "a second hearing of every line - the English draft the "
+             "reader leans on for game words and names",
+     "dir": "whisper",
+     "files": [
+         ("ggml-large-v3-turbo-q5_0.bin",
+          _HF % ("ggerganov/whisper.cpp", "ggml-large-v3-turbo-q5_0.bin"),
+          574041195),
      ]},
     {"key": "senses", "tier": "reader",
      "title": "The senses",
@@ -16053,10 +16091,125 @@ def _asr_context_for(video_path):
                 gname = ""      # that is the app's word for "no idea"
     except Exception:
         gname = ""
+    try:
+        names = [a for p in _room_names() for a in p]
+    except Exception:
+        names = []
     return (("Gaming session of " + gname + ". " if gname else "")
             + "Friends on Discord playing together; casual gaming chat, "
               "callouts, jokes. They speak Emirati Gulf Arabic and English, "
-              "often switching within one sentence.")
+              "often switching within one sentence."
+            # 3.33 the room's names: free text the reader can lean on
+            # for exactly what it cannot guess. Empty = the 3.32 string.
+            + ((" Names in the room: " + ", ".join(names) + ".")
+               if names else ""))
+
+
+def _room_names_clamp(raw):
+    """The setting's 600 characters, cut at a PERSON's boundary: a list
+    longer than that loses whole people off its end, never half a name
+    (slicing before the strip cut mid-name and said nothing)."""
+    t = str(raw or "").strip()
+    if len(t) <= 600:
+        return t
+    cut = max(t.rfind(",", 0, 600), t.rfind("\u060c", 0, 600))
+    return t[:cut if cut > 0 else 600].strip()
+
+
+def _room_names():
+    """The room's people as lists of spellings (3.33): "A, B / Bee" ->
+    [["A"], ["B", "Bee"]]. People by comma (or the Arabic one, or a
+    line), other spellings by slash. Empty setting = []."""
+    raw = str(SETTINGS.get("room_names") or "")[:600]
+    out = []
+    for person in re.split("[,\u060c\n]", raw):
+        al = [a.strip() for a in person.split("/") if a.strip()]
+        if al:
+            out.append(al)
+    return out
+
+
+def _room_aliases_of(name):
+    """The room's OTHER spellings of this person, or []. Never raises -
+    the auditor asks it about every name a title claims."""
+    try:
+        key = str(name or "").strip().lower()
+        if not key:
+            return []
+        for p in _room_names():
+            if key in [a.lower() for a in p]:
+                return [a for a in p if a.lower() != key]
+    except Exception:
+        pass
+    return []
+
+
+def _seed_room_names():
+    """Boot (3.33): an EMPTY room_names setting is filled once from
+    room_names.txt beside the settings - his own list, one person per line,
+    other spellings after " / ", a comma between people as the setting
+    itself reads it - and saved, so the file is read once
+    and the settings page is the truth from then on. A filled setting
+    is never touched; no file, nothing happens. The names are his data
+    and live only there - never in code, comments or tests."""
+    try:
+        if str(SETTINGS.get("room_names") or "").strip():
+            return False
+        p = os.path.join(_data_dir(), "room_names.txt")
+        if not os.path.isfile(p):
+            return False
+        with open(p, encoding="utf-8-sig") as fh:
+            rows = [ln.strip() for ln in fh.read().splitlines()]
+        people = []
+        for ln in rows:
+            if not ln or ln.startswith("#"):
+                continue
+            for part in re.split("[,\u060c]", ln):
+                al = [a.strip() for a in part.split("/") if a.strip()]
+                if al:
+                    people.append(" / ".join(al))
+        if not people:
+            return False
+        SETTINGS["room_names"] = _room_names_clamp(", ".join(people))
+        save_settings(SETTINGS)
+        log("The room's names were read from room_names.txt: %d people."
+            % len(people))
+        return True
+    except Exception as e:
+        log("The room's names could not be read from room_names.txt: "
+            + str(e)[:100])
+        return False
+
+
+def _asr_game_name(video_path):
+    """The game a recording belongs to, off its shelf or its filename -
+    the same answer _asr_context_for gives, for the second ear's prompt."""
+    try:
+        pp = os.path.dirname(video_path)
+        gname = (os.path.basename(os.path.dirname(pp))
+                 if os.path.basename(pp).lower() in ("videos", "clips")
+                 else "")
+        if not gname:
+            gname = _display_name(_parse_clip_name(video_path))
+            if gname == "Recording":
+                gname = ""
+    except Exception:
+        gname = ""
+    return gname
+
+
+def _draft_prompt_for(video_path):
+    """Whisper's initial prompt for the second ear (3.33): the game, the
+    room's people (first spelling each) and the words it mishears most
+    on his nights. Whisper caps the prompt near 224 tokens, so short."""
+    try:
+        firsts = [p[0] for p in _room_names() if p]
+    except Exception:
+        firsts = []
+    gname = _asr_game_name(video_path)
+    return ((gname + ". ") if gname else "") + "Friends on Discord" \
+        + ((": " + ", ".join(firsts)) if firsts else "") \
+        + ". Alt-F4, MMR, duos, tavern, triple, GG."
 
 
 def _asr_context_media():
@@ -16155,6 +16308,7 @@ def _transcribe_one(video_path):
                        f"stt_{os.getpid()}_{threading.get_ident()}.wav")
     outj = wav + ".json"
     asrv = None                       # the GPU server, if one comes up
+    wsrv = None                       # the second ear (3.33), if it wakes
     _t_run0 = time.time()
     _vd = _ad = 0.0
     _source_busy_add(video_path)
@@ -16294,6 +16448,57 @@ def _transcribe_one(video_path):
                 asrv = None
                 log(f"The GPU reader would not start for "
                     f"{os.path.basename(video_path)} - taking the CPU road.")
+        # THE SECOND EAR (3.33). Whisper turbo on the CPU beside the
+        # reader, for the room's English game words and names - the
+        # reader keeps its own thread budget and the two share the
+        # machine (half of it here). It never touches the card, never
+        # takes the job slot, and a server that will not wake means one
+        # ear, exactly as before. The worker's note line prints through
+        # the notes road below.
+        if SETTINGS.get("second_ear", True) and not _AI["abort"]:
+            try:
+                _wp = _whisper_paths()
+            except Exception:
+                _wp = None
+            if _wp is None:
+                # said ONCE per launch, never per job: a night that
+                # reads with one ear because ai\whisper is not there
+                # is otherwise indistinguishable from the toggle off
+                if not _AI.get("ear2_missing_said"):
+                    _AI["ear2_missing_said"] = True
+                    log("The second ear is not installed (ai\\whisper) - "
+                        "reading with one ear.")
+            else:
+                try:
+                    # THE IDLE HALF, not this moment's. The count is fixed
+                    # at spawn and the worker only drafts while no game
+                    # has the machine (the .ctl's ear2), so a job that
+                    # starts mid-game must not hand it three threads for
+                    # the whole night (75-90 s a window, past the timeout)
+                    _wt = max(2, _reader_threads(False) // 2)
+                    wsrv = _WhisperServer()
+                    if wsrv.start(_wt):
+                        env["LORE_ASR_WHISPER"] = \
+                            f"http://127.0.0.1:{wsrv.port}"
+                        env["LORE_ASR_DRAFT_PROMPT"] = \
+                            _draft_prompt_for(video_path)
+                        env["LORE_ASR_WHISPER_THREADS"] = str(_wt)
+                        log(f"The second ear is up: whisper turbo on the "
+                            f"CPU, {_wt} threads.")
+                    else:
+                        wsrv.stop()
+                        wsrv = None
+                        log("The second ear would not wake - reading "
+                            "with one ear.")
+                except Exception:
+                    try:
+                        if wsrv is not None:
+                            wsrv.stop()
+                    except Exception:
+                        pass
+                    wsrv = None
+                    log("The second ear would not wake - reading with "
+                        "one ear.")
         _AI["prog_file"] = prog_file
         _AI["prog_t0"] = None
         stop_budget = threading.Event()
@@ -16441,6 +16646,8 @@ def _transcribe_one(video_path):
     finally:
         if asrv is not None:          # the 4.7 GB comes off the card the
             asrv.stop()               # moment the job ends, every path out
+        if wsrv is not None:          # and the second ear with it (3.33)
+            wsrv.stop()
         _source_busy_done(video_path)
         for p in (wav, outj, wav + ".ctl", wav + ".prog", wav + ".prog.tmp",
                   wav + ".mic.wav", wav + ".voice.wav", wav + ".game.wav"):
@@ -17742,6 +17949,76 @@ class _AsrServer(_DescServer):
             if attempt == 0:
                 time.sleep(3)
         self.pr = None
+        return False
+
+
+_WHISPER_PORT = 8911
+
+
+def _whisper_paths():
+    """(whisper-server.exe, the turbo model) for the second ear (3.33),
+    or None. The binaries ship beside the app (ai/whisper, by the
+    drop-in - never fetched); the model lives under the models dir.
+    Either absent = one ear, byte for byte the 3.32 reader."""
+    exe = os.path.join(_here(), "ai", "whisper", "whisper-server.exe")
+    mdl = _model_file("whisper", "ggml-large-v3-turbo-q5_0.bin")
+    if os.path.isfile(exe) and os.path.isfile(mdl):
+        return exe, mdl
+    return None
+
+
+class _WhisperServer(_DescServer):
+    """whisper-server (whisper.cpp) for the length of ONE transcription
+    job, on the CPU beside the reader. It shares stop() with its parent
+    and nothing else: no card, no -ngl, and NEVER the job slot
+    _AI['proc'] - the abort path kills the reader, and the finally that
+    stops the GPU reader stops this one too."""
+
+    def __init__(self, port=None):
+        self.pr = None
+        self.port = int(port or _WHISPER_PORT)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def start(self, threads=4, budget=60):
+        """Bring it up with N threads. Alive = GET / answers with ANY
+        HTTP status (the root is a 200 once the model is loaded; ~2 s
+        for the 574 MB q5_0 turbo). Sixty seconds is generous."""
+        import urllib.error
+        import urllib.request
+        wp = _whisper_paths()
+        if wp is None:
+            return False
+        exe, mdl = wp
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if os.name == "nt":
+            flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        _free_port(self.port)
+        try:
+            pr = _popen(
+                [exe, "-m", mdl, "--host", "127.0.0.1",
+                 "--port", str(self.port), "-t", str(int(threads)),
+                 "-l", "auto"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags)
+        except Exception as e:
+            log(f"The second ear could not be spawned: {str(e)[:120]}")
+            return False
+        self.pr = pr
+        t0 = time.time()
+        while time.time() - t0 < budget:
+            if _AI["abort"]:
+                self.stop()
+                return False
+            if pr.poll() is not None:
+                break
+            try:
+                urllib.request.urlopen(self.base + "/", timeout=2).read()
+                return True
+            except urllib.error.HTTPError:
+                return True         # any status at all: it is listening
+            except Exception:
+                time.sleep(0.5)
+        self.stop()
         return False
 
 
@@ -21445,9 +21722,28 @@ def _aud_names(video_path, ins, stt, low):
                 continue
             seen.add(nm)
             verdict, how, spelling = _aud_grounded(nm, words, skels, spoken)
+            alias = ""
+            if verdict != "said":
+                # 3.33 THE ROOM'S NAMES FOLD. "Bee" in the title and "B"
+                # in the night are one person when the settings say so:
+                # the other spellings are asked the same question, and a
+                # yes under any of them is a yes.
+                try:
+                    others = _room_aliases_of(nm)
+                except Exception:
+                    others = []
+                for al in others:
+                    v2, _h2, sp2 = _aud_grounded(al, words, skels, spoken)
+                    if v2 == "said":
+                        verdict, alias = "said", al
+                        how = "said as " + al + ", one of the room's names"
+                        spelling = sp2 or al
+                        break
             rows.append({"name": nm, "where": where,
                          "verdict": verdict or "unsaid",
                          "how": how, "said": spelling})
+            if alias:
+                rows[-1]["alias"] = alias
     for r in rows:
         if r["verdict"] == "unsaid":
             warn.append("the " + r["where"] + " names " + r["name"]
@@ -24994,6 +25290,14 @@ def _audit_one(video_path, redo=False):
             names, nwarn = _aud_names(video_path, ins, stt, _low)
         except Exception:
             names, nwarn = [], []
+        # 3.33 the room's names fold like the eye's places do: a name
+        # grounded under another of its spellings joins the merged, so
+        # "N name(s) folded" counts it and the sidecar says which
+        for _r in names:
+            if isinstance(_r, dict) and _r.get("alias"):
+                merged.append({"kept": str(_r.get("name") or "")[:70],
+                               "folded": [str(_r["alias"])[:70]],
+                               "why": "the room's names"})
         # THE SCREEN'S VERDICT AGAINST THE STORY'S (3.32): a chapter
         # that claims a win the screen never showed is questioned,
         # never struck - a row beside the unsaid names.
@@ -28874,6 +29178,8 @@ class _JsApi:
                 "free_gb": free_gb, "size_mb": size_mb,
                 "webhook": bool(SETTINGS.get("discord_webhook", "").strip()),
                 "librarian_ready": _emb_ready(),
+                "second_ear": bool(SETTINGS.get("second_ear", True)),
+                "room_names": str(SETTINGS.get("room_names") or ""),
                 "version": APP_VERSION}
 
     def signature(self):
@@ -34274,6 +34580,7 @@ def lore_app(show_window=True):
         _signal_show()   # another copy is running: ask it to open its tome
         return
     load_settings()
+    _seed_room_names()            # 3.33 once, from room_names.txt, if empty
     _hide_console()
     log(f"LORE v{APP_VERSION} is waking; the recorder starts first, "
         "then the tome opens.")

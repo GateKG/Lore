@@ -125,7 +125,10 @@ if not exist ai\asr_worker.py (
   REM tome's mind panel in Settings.
   if not exist "%APP%\ai" mkdir "%APP%\ai"
   copy /y ai\*.py "%APP%\ai\" >nul
-  for %%D in (packs torchlibrosa vendor_ocr vendor_sb) do (
+  REM ai\whisper (3.33) is the second ear's whisper-server.exe and
+  REM its ggml dlls, ~9 MB - the binaries travel, the 574 MB model
+  REM is fetched like the others.
+  for %%D in (packs torchlibrosa vendor_ocr vendor_sb whisper) do (
     if exist "ai\%%D" xcopy /e /i /y /d "ai\%%D" "%APP%\ai\%%D" >nul
   )
   REM THE WORKERS' PYTHON ENVIRONMENT still travels ^(~1.1 GB^). The

@@ -2924,7 +2924,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,version:'3.32'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',version:'3.33'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3105,6 +3105,7 @@ function makeMock(){
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,handle:'',
+      second_ear:true,room_names:'',
       popup_style:'slide',popup_size:'large',sfx_volume:25,
       hotkey_record:'ctrl+alt+f7',hotkey_replay:'ctrl+alt+f9',
       hotkey_pause:'ctrl+alt+f10',hotkey_clip_discord:'ctrl+alt+f8',clip_hotkey_seconds:60,
@@ -3112,7 +3113,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.32'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.33'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -7199,6 +7200,22 @@ function renderSet(cL,cR,app,spreadIdx){
           +'says whose it was. With this empty it still counts the matches and '
           +'says \u201cwon?\u201d, honestly, rather than guess. A wrong name '
           +'would flip every verdict, so copy it exactly.');
+    /* 3.33 the second ear and the room's names: what the reader
+       cannot hear or guess on its own */
+    divider(R,'The room');
+    row(R,'The second ear',ctlToggle('second_ear'),
+        'a second hearing of every line for game words and names - about a minute of CPU for every minute of talk, never the card');
+    hint(R,'Whisper reads every line of the room too, in English, and the reader '
+          +'leans on that draft for the game words it mishears on its own \u2014 '
+          +'MMR, Alt-F4, the match type \u2014 while keeping the Arabic. Measured '
+          +'on this room: the two ears together were right four times as often as '
+          +'the reader alone. Off means one ear, exactly as before.');
+    row(R,'The room\u2019s names',ctlText('room_names',true,'A, B / Bee, C / CC \u2014 people by comma, other spellings by slash'),
+        'people by comma, other spellings by slash');
+    hint(R,'The people who are usually in the call, so both ears spell them '
+          +'right and the auditor knows that two spellings are one person. '
+          +'A room_names.txt beside the settings (one person per line) is read '
+          +'once, the first time this is empty.');
     divider(R,'Compatibility');
     row(R,'Compatibility capture',ctlToggle('safe_capture'));
     hint(R,'Turn on if recording fails to start or stops right away (helps some AMD / 4K setups). LORE also switches this on by itself if needed.');
