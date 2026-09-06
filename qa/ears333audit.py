@@ -78,14 +78,22 @@ def lift_assign(src, tree, name, ns):
     return ns[name]
 
 
+# THE PARITY BASE IS A COMMIT, NOT HEAD. The moment drop F was committed,
+# "HEAD" became the patched file and its lifted _aud_dossier called
+# _aud_ear_note into a namespace that never had it (6 Sep, the roster
+# went red on the very commit that shipped). ac63a55 = drop E, the last
+# lore.py before the auditor weighed the two ears.
+PARITY_BASE = "ac63a55"
+
+
 def head_of(rel):
-    return subprocess.run(["git", "show", "HEAD:" + rel], cwd=ROOT,
+    return subprocess.run(["git", "show", PARITY_BASE + ":" + rel], cwd=ROOT,
                           capture_output=True).stdout.decode("utf-8")
 
 
 HSRC = head_of("lore.py")
 HTREE = ast.parse(HSRC)
-check("HEAD's lore.py could be read for the parity checks",
+check("the parity base's lore.py could be read for the parity checks",
       len(HSRC) > 100000)
 
 LOGS = []
