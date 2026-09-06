@@ -9316,8 +9316,13 @@ async function renderHlMarks(vid,req){
       const said=(_ins&&_ins.moments||[]).reduce((best,q)=>{
         const dd=Math.abs(q.t-ev.t);
         return (dd<=8&&(!best||dd<best.d))?{d:dd,why:q.why}:best;},null);
-      m._said=said;   /* the CARD may still quote the tome's words for this
-                         second - but 'told' is no longer a gold tint (J) */
+      /* 3.34: NOT words to speak - a CLAIM on this second. The gold
+         mark used to print the moment's why, so hovering the gold
+         tick and the red mark one second apart said the identical
+         sentence (his screenshots, 4:54 and 4:55). Gold says what
+         the EAR heard; the moment is the red row's to tell. */
+      m._said=null;
+      m._claimed=!!(said&&said.d<=3);
       /* the mark says WHAT it heard: the ear's verdict when it has one,
          the loudness contest's honest default when it does not. A sighting
          was never heard at all - it says who was on screen. */
@@ -9361,6 +9366,12 @@ async function renderHlMarks(vid,req){
       place._px=new Map();
       nodes.forEach(m=>{
         const old=m.querySelector('.mkn'); if(old)old.remove();
+        /* 3.34: ONE EVENT, ONE MARK. The describer plants its moments
+           on the loud seconds it quotes, so the red mark and this
+           gold tick were the same event twice over. The red carries
+           the words; this one steps aside (its verbs live on the red
+           row too). The screen's own verdict never steps aside. */
+        if(m._claimed&&MARKS.told!==false&&(m._ev||{}).kind!=='outcome'){m.style.display='none';return;}
         if(m.style.display==='none')return;   /* window-culled this pass */
         const key=Math.round((parseFloat(m.style.left)||0)/7);
         const near=place._px.get(key);
@@ -11560,7 +11571,6 @@ function markCardShow(m){
         card.classList.remove('on');
     },true); }
   const ev=m._ev||{}, t=ev.t; if(t==null)return;
-  const said=m._said;
   const SN={cheer:'cheering',groan:'a frustrated groan',
             music:'battle music swells',scare:'a scare',
             victory:'VICTORY on screen',defeat:'defeat on screen',
@@ -11577,9 +11587,8 @@ function markCardShow(m){
      mark is stamped the moment the bar is drawn, often before api.visions
      has come back, so a name baked in at stamp time is usually missing. */
   card.append(el('b',null,fmtT(t)+'  \u00b7  '
-    +esc(said?('\u2726 '+said.why)
-         :ev.kind==='creature'?visLabel(t)
-         :(SN[ev.kind]||'a loud moment'))));
+    +esc(ev.kind==='creature'?visLabel(t)
+         :(SN[ev.kind]||m._heard||'a loud moment'))));
   const w=tipWordsAt(t);
   if(w)card.append(el('i',null,'\u201c'+esc(w)+'\u201d'));
   if(!(V.ed&&V.ed.on)){
@@ -11654,7 +11663,6 @@ function markTipShow(m){
               boss:'a boss felled',hud:'the game said so on screen',
               game:'a burst in the game'};
     why=ev.kind==='outcome'?('\u2694 the screen: '+(ev.text||'decided'))
-        :m._said?('\u2726 '+m._said.why)
         :ev.kind==='creature'?visLabel(ev.t)
         :(SN[ev.kind]||m._heard||'a loud moment');
     /* and whatever else happened in the same second - a WINNER under

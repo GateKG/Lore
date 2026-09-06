@@ -251,5 +251,21 @@ console.log('\n--- what an older save may still switch off ---');
     src.indexOf('JSON.stringify(Object.assign({v:2},MARKS))') > 0);
 }
 
+console.log('\n--- one event, one mark (his 4:54 gold vs 4:55 red) ---');
+{
+  check('gold never speaks the describer\'s moment',
+    src.indexOf("m._said=null;") > 0 &&
+    src.indexOf("'\\u2726 '+m._said.why") < 0 &&
+    src.indexOf("esc(said?('\\u2726 '+said.why)") < 0);
+  check('a loud second a moment already claims draws once',
+    src.indexOf('m._claimed=!!(said&&said.d<=3);') > 0 &&
+    /if\(m\._claimed&&MARKS\.told!==false&&\(m\._ev\|\|\{\}\)\.kind!=='outcome'\)/
+      .test(src));
+  check('...but the screen\'s own verdict never steps aside',
+    src.indexOf("kind!=='outcome'") > 0);
+  check('...and putting the moments away brings it back',
+    src.indexOf('MARKS.told!==false') > 0);
+}
+
 console.log('\n' + ok + ' ok, ' + bad + ' failed');
 process.exit(bad ? 1 : 0);
