@@ -369,6 +369,13 @@ check("the added head opens with base = cur_ctx[0] and ends at try:",
 new_core = new[:i_nl + 1] + new[i_try + 1:-2]
 old_core = [ln for ln in old
             if ln != "ctx = cur_ctx[0]         # the context THIS pass is sending"]
+if "nonlocal last" in old and old[old.index("nonlocal last") + 1] \
+        .startswith("base = cur_ctx[0]"):
+    # drop E is COMMITTED: HEAD carries the added head and the finally
+    # too, so the same block is stripped from both sides (3.33 F)
+    o_nl = old.index("nonlocal last")
+    o_try = old.index("try:", o_nl)
+    old_core = old[:o_nl + 1] + old[o_try + 1:-2]
 old_core = [ln.replace("or (ctx and _ctx_echo(t2, ctx)))",
                        "or (ectx and _ctx_echo(t2, ectx)))")
             .replace("if txt and ctx and _ctx_echo(txt, ctx):",

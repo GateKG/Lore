@@ -301,10 +301,11 @@ check("'sources' precedes 'segments' in the final dump",
       src_i < seg_i)
 _wr = re.search(r"^READER = (\d+)", WSRC, re.M)
 _ar = re.search(r"^_STT_READER = (\d+)", LSRC, re.M)
-# 3.33: the second ear is reader 7 in the worker; _STT_READER stays 6
-# on purpose - a transcript on disk is never re-owed by that drop
-check("READER == 7 in the worker and _STT_READER == 6 in lore.py",
-      _wr and _ar and _wr.group(1) == "7" and _ar.group(1) == "6")
+# 3.33: the second ear is reader 7 in the worker AND in lore.py - his
+# word on 6 Sep (archive and start from the beginning) re-reads the
+# shelf; ears333test pins the same 7 with _STT_READER_TRACKS
+check("READER == 7 in the worker and _STT_READER == 7 in lore.py",
+      _wr and _ar and _wr.group(1) == "7" and _ar.group(1) == "7")
 check("ask() reads the context through the cell, never the name",
       'if cur_ctx[0] and use_ctx:' in WSRC
       and 'prompt=(cur_ctx[0] if use_ctx else None)' in WSRC
@@ -503,6 +504,7 @@ lns = {"os": os, "json": json, "re": re, "time": time, "log": LOGS.append,
 for nm in ("_AUD_WORDS", "_AUD_SOUND", "_AUD_EYE", "_AUD_LAYERS"):
     lift_assign(LSRC, nm, lns)
 for nm in ("_aud_voice", "_aud_says", "_aud_garble", "_aud_dossier",
+           "_aud_ear_note",      # 3.33 F: the dossier's witness (empty here)
            "_speech_times", "_src_media_possible", "_asr_context_media",
            "_asr_context_game", "_seg_layer"):
     extract(LSRC, nm, lns)
@@ -604,11 +606,15 @@ NAMES[os.path.basename(old_v)] = ["mix", "system", "mic"]
 io.open(side(old_v, "stt"), "w", encoding="utf-8").write(
     '{"v": 3, "model": "m", "engine": "qwen3-asr", "counters": {}, '
     '"reader": 5, "segments": []}')
-check("a reader-5 transcript of a Mix/System/Mic night is NOT stale",
-      sns_["_stt_stale_reader"](old_v) is False and len(PROBES) == 1)
+# 3.33: _STT_READER_TRACKS rose to 7 with the reader (both ears hear
+# EVERY file anew), so a reader-5 transcript sits under the tracks line
+# and is stale on any night - the track probe is never even asked
+check("a reader-5 transcript of a Mix/System/Mic night IS stale under "
+      "reader 7 (below the tracks line - no probe asked)",
+      sns_["_stt_stale_reader"](old_v) is True and len(PROBES) == 0)
 sns_["_stt_stale_reader"](old_v)
-check("...and the probe ran once (cached on the file's clock)",
-      len(PROBES) == 1)
+check("...and still no probe on the second ask",
+      len(PROBES) == 0)
 NAMES[os.path.basename(old_v)] = ["mix", "voice", "game", "mic"]
 sns_["_STT_TRK_CACHE"].clear()
 check("the same transcript of a Voice/Game night IS stale",

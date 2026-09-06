@@ -16144,6 +16144,22 @@ def _room_aliases_of(name):
     return []
 
 
+def _room_first_of(name):
+    """The room's FIRST spelling of this person - the one his settings
+    lead with - when the name is any of that person's spellings, else
+    "". Never raises."""
+    try:
+        key = str(name or "").strip().lower()
+        if not key:
+            return ""
+        for p in _room_names():
+            if p and key in [a.lower() for a in p]:
+                return str(p[0])
+    except Exception:
+        pass
+    return ""
+
+
 def _seed_room_names():
     """Boot (3.33): an EMPTY room_names setting is filled once from
     room_names.txt beside the settings - his own list, one person per line,
@@ -21739,6 +21755,24 @@ def _aud_names(video_path, ins, stt, low):
                         how = "said as " + al + ", one of the room's names"
                         spelling = sp2 or al
                         break
+            # 3.33 F THE ROOM'S FIRST SPELLING WINS. A person his
+            # settings list under several spellings is written the way
+            # the FIRST spelling has him, wherever the night supports
+            # him at all: a title's OTHER spelling folds to the first, and a
+            # title already spelt the room's way is not respelt toward
+            # the night's variant. The setting alone never puts anyone
+            # in the room - an unsaid name stays unsaid.
+            try:
+                _first = (_room_first_of(nm)
+                          if verdict in ("said", "spelt") else "")
+            except Exception:
+                _first = ""
+            if _first and _first.lower() != nm.lower():
+                verdict, spelling = "spelt", _first
+                how = "the room's names spell this person " + _first
+            elif _first and verdict == "spelt":
+                verdict, spelling = "said", ""
+                how = "said, and spelt the way the room spells it"
             rows.append({"name": nm, "where": where,
                          "verdict": verdict or "unsaid",
                          "how": how, "said": spelling})
@@ -22006,9 +22040,15 @@ def _aud_clip(s, n=600):
     return cut.rstrip(" ,;:-") + "\u2026"
 
 
-def _aud_sense(heard, freq):
+def _aud_sense(heard, freq, extra=None):
     """Does this proposed correction read as language the library has
     ever heard? Returns (ok, the words that fail).
+
+    3.33 `extra`: a set of lowercase Latin tokens that count as seen -
+    the second ear's own draft, the room's names, the game's words -
+    for a fix that weighs the two ears (a name the library never met
+    is the motivating case). None, the default, is every older call
+    byte for byte.
 
     "نافو" and "ترونوم" are not Arabic - they are English noises wearing
     Arabic letters, and they shipped into his transcript because nothing
@@ -22032,6 +22072,8 @@ def _aud_sense(heard, freq):
                        freq.get("\u0627\u0644" + w, 0))
         else:
             seen = freq.get(w.lower(), 0)
+            if not seen and extra and w.lower() in extra:
+                seen = 1          # the second ear / the room / the game
         if not seen:
             bad.append(w)
     ok = not (len(bad) >= 2 and len(bad) / float(len(toks)) > 0.5)
@@ -22063,7 +22105,16 @@ def _aud_revert_nonsense(video_path, freq):
             continue     # a struck line is not a correction to re-judge
         if not sg.get("fx") or sg.get("was") is None:
             continue
-        ok, bad = _aud_sense(sg.get("t"), freq)
+        # 3.33 F THE SAME EVIDENCE THAT ADMITTED A FIX KEEPS IT. A fix
+        # that weighed the two ears passed the gate on its own d, the
+        # room's names and the game's words - and the vocabulary never
+        # counts a corrected line, so judged bare here the next audit
+        # took every such fix back, the line re-entered the ear-gap
+        # shortlist, and it was asked and fixed again each night. The
+        # segment carries its d; one without hands None and the
+        # decision is the old one, byte for byte.
+        ok, bad = _aud_sense(sg.get("t"), freq,
+                             _aud_ear_extra(sg, video_path))
         if ok:
             continue
         sg["t"] = sg.get("was")
@@ -22173,6 +22224,186 @@ def _aud_garble(stt, freq):
     # foreign-script strikes ride OUTSIDE the cap - they cost no model
     # time and dropping one would leave Chinese standing in a transcript
     return foreign + out[:10]
+
+
+# THE TWO EARS (3.33 F). The reader hears the room bilingually; drop E
+# gave every room line a second reading `d` - an English-only ear that
+# knows the game's words and the room's names but no Arabic. Where the
+# two disagree on an English line, neither is right alone often enough
+# that he corrected four such lines by hand on one sheet. The
+# disagreement is a WITNESS: the line joins the doubtful shortlist, the
+# dossier shows both hearings, and the thinker weighs them. A night
+# whose stt carries no `d` (reader 6 and older) never produces a row
+# here - the count-undoing law, kept by construction.
+_AUD_EAR_STOP = _AUD_STOP | frozenset({
+    "the", "you", "are", "was", "were", "for", "they", "our", "your",
+    "this", "that", "but", "not", "yes", "yeah", "okay", "have", "get",
+    "got", "dont", "don't", "gonna", "wanna", "can", "cant", "can't"})
+_AUD_EAR_TOK = re.compile(r"[A-Za-z']{3,}")
+_AUD_EAR_CAP = 40       # rows per night the witness may put on the table
+_AUD_EAR_ASK = 12       # ...of which this many reach the model in one ask
+_AUD_ASK_CHARS = 32000  # the ask body's budget - the thinker's window is
+#                         16k tokens with the answer reserved, and a full
+#                         shortlist measured at 56k characters overflowed
+#                         it, answered nothing, and burned a try
+
+
+def _aud_ear_toks(t, stop=True):
+    """Latin content tokens: three letters or more, lower case, minus
+    the stop words. Arabic never counts - the second ear has none."""
+    out = []
+    for w in _AUD_EAR_TOK.findall(str(t or "")):
+        w = w.strip("'").lower()
+        if len(w) < 3 or (stop and w in _AUD_EAR_STOP):
+            continue
+        out.append(w)
+    return out
+
+
+def _aud_overlap(a, b):
+    """How much two hearings agree, 0..1: Jaccard over their Latin
+    content tokens. Two hearings with nothing Latin in either share
+    nothing measurable and score 0."""
+    sa, sb = set(_aud_ear_toks(a)), set(_aud_ear_toks(b))
+    if not sa and not sb:
+        return 0.0
+    return len(sa & sb) / float(len(sa | sb))
+
+
+def _aud_ear_gap(stt):
+    """The room lines the two ears heard DIFFERENTLY: {n, t, b, text,
+    was, d, gap, odd, kind} rows shaped for the shortlist. A candidate
+    is a room segment (no src, or his mic) that is not pinned, struck
+    or already fixed, carries a non-empty `d`, has three or more Latin
+    content tokens, is under thirty percent Arabic script, and agrees
+    with `d` on fewer than half its words. Sorted most-different first,
+    capped. NOTHING without `d` is ever a row."""
+    out = []
+    for i, sg in enumerate(stt or []):
+        if not isinstance(sg, dict):
+            continue
+        if sg.get("src") not in (None, "", "you"):
+            continue
+        if sg.get("pin") or sg.get("nn") or sg.get("pn") or sg.get("fx"):
+            continue
+        d = str(sg.get("d") or "").strip()
+        if not d:
+            continue
+        txt = str(sg.get("t") or "").strip()
+        if len(_aud_ear_toks(txt)) < 3:
+            continue
+        letters = [c for c in txt if c.isalpha()]
+        arab = sum(1 for c in letters if "\u0600" <= c <= "\u06ff")
+        if letters and arab / float(len(letters)) >= 0.3:
+            continue
+        ov = _aud_overlap(txt, d)
+        if ov >= 0.5:
+            continue
+        try:
+            t = float(sg.get("a") or 0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        try:
+            b_s = float(sg.get("b") or 0) / 1000.0
+        except (TypeError, ValueError):
+            b_s = t + 6.0
+        out.append({"n": i, "t": round(t, 1),
+                    "b": round(max(b_s, t + 0.5), 1),
+                    "text": txt[:200], "was": txt[:200], "d": d[:300],
+                    "gap": round(1.0 - ov, 2), "odd": [],
+                    "kind": "ears"})
+    out.sort(key=lambda r: (-r["gap"], r["t"]))
+    return out[:_AUD_EAR_CAP]
+
+
+def _aud_ear_union(garble, ears):
+    """The ear-gap rows join the garble shortlist, one row per second:
+    a line that is both keeps its garble row (its odd words, its
+    standing guess, a foreign-script strike) and gains the second
+    ear's hearing. No ears, the shortlist is returned untouched."""
+    if not ears:
+        return garble
+    out = list(garble or [])
+    for e in ears:
+        hit = None
+        for g in out:
+            try:
+                if abs(float(g.get("t") or 0) - float(e.get("t") or 0)) \
+                        <= 0.15:
+                    hit = g
+                    break
+            except (TypeError, ValueError):
+                continue
+        if hit is None:
+            out.append(e)
+        elif not hit.get("d"):
+            hit["d"] = e["d"]
+            hit["gap"] = e["gap"]
+    return out
+
+
+def _aud_ear_note(g):
+    """The witness, as the dossier prints it after the conversation:
+    what the second ear heard, and who is in the room. Empty for a row
+    without `d` - the dossier is byte for byte the old one then."""
+    d = str((g or {}).get("d") or "").strip()
+    if not d:
+        return ""
+    note = '\n    the second ear (English only) heard: "' + d[:300] + '"'
+    try:
+        names = [a for p in _room_names() for a in p]
+    except Exception:
+        names = []
+    if names:
+        note += "\n    people in the room: " + ", ".join(names)
+    return note
+
+
+def _aud_ear_extra(g, video_path=None):
+    """What counts as a seen word when a fix weighs the two ears: the
+    second ear's own tokens, the room's names, the game's words off the
+    filename. None for a row without `d` - the sense gate runs exactly
+    as it always did."""
+    if not isinstance(g, dict) or not g.get("d"):
+        return None
+    ex = set(_aud_ear_toks(g.get("d"), stop=False))
+    try:
+        for p in _room_names():
+            for a in p:
+                ex.update(_aud_ear_toks(a, stop=False))
+    except Exception:
+        pass
+    if video_path:
+        try:
+            ex.update(w for w in _aud_gamewords(video_path) if len(w) >= 3)
+        except Exception:
+            pass
+    return ex
+
+
+def _aud_ear_budget(video_path, anchors, drops, game, dur, src, places,
+                    crs, garble, body):
+    """The ask, cut to the thinker's window. While the body runs past
+    _AUD_ASK_CHARS and the last row on the table is a pure ear-gap row,
+    that row steps off (the union keeps them most-different first, so
+    the tail is the row the two ears disagreed on least) and the ask
+    is rebuilt. `garble` is trimmed IN PLACE so the caller's list, the
+    fix indices and the verdicts all name the same rows the model saw.
+    Returns the body. A night with no ear-gap row on the table - every
+    night without d - returns the body it was handed, untouched."""
+    rows = garble if isinstance(garble, list) else []
+    cut = 0
+    while len(body) > _AUD_ASK_CHARS and rows \
+            and rows[-1].get("kind") == "ears":
+        rows.pop()
+        cut += 1
+        body = _aud_body(anchors, drops, game, dur, src, places, crs,
+                         rows)
+    if cut:
+        log("The auditor left " + str(cut) + " ear-gap row(s) off the ask "
+            "on " + os.path.basename(video_path or "") + " - the ask ran "
+            "past its budget; they wait, unsettled, for the next audit.")
+    return body
 
 
 def _aud_places(vis):
@@ -22801,6 +23032,15 @@ STEP 1b - TRUST THE SECOND EAR. Some lines carry "listening again to
   that is EVIDENCE OF NOISE - two ears failing the same span usually
   means there was nothing there to hear.
 
+STEP 1c - WEIGH THE TWO EARS. Some lines come with what a SECOND EAR
+  heard - an English-only model that knows the game's words and the
+  room's names but no Arabic. When the two disagree, weigh both
+  against the conversation, the game and the names: keep every Arabic
+  word the first ear wrote, take the second ear's spelling of game
+  words and names when the sounds agree, and write ONE line that a
+  person in that room would have said. Never merge two different
+  sentences into one; when you cannot tell, leave the line alone.
+
 STEP 2 - CHECK THE STORY. What are they doing? What was said before
   and after? Is the room calm or screaming? Did anyone laugh - a
   strange word under laughter can be a joke, and a joke said is a joke
@@ -23216,7 +23456,11 @@ def _aud_dossier(g, src, ins):
             + (("(the sounds may already spell: "
               + "; ".join(hints[:5]) + ")\n") if hints else "")
             + (("(" + "; ".join(bits) + ")\n") if bits else "")
-            + "\n".join(outl))
+            + "\n".join(outl)
+            # 3.33 F the second ear's hearing and the room's names, after
+            # the conversation - the pack builder keeps this tail past
+            # its knife
+            + _aud_ear_note(g))
 
 
 def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
@@ -23303,8 +23547,15 @@ def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
                        + '" - judge that guess by STEP 1 like anything '
                        'else. If the sounds spell something different, '
                        'your fix replaces it.')
-            packs.append(ph + "\n" + _aud_dossier(g, src, src.get("ins"))
-                         [:900])
+            _doss = _aud_dossier(g, src, src.get("ins"))
+            _wit = _aud_ear_note(g)
+            if _wit and _doss.endswith(_wit):
+                # the witness sits after the conversation; the knife
+                # cuts the conversation, never the witness
+                _doss = _doss[:len(_doss) - len(_wit)][:900] + _wit
+            else:
+                _doss = _doss[:900]
+            packs.append(ph + "\n" + _doss)
         doubt = ("\n\nTHE DOUBTFUL LINES - the whole of your job. Each "
                  "comes with the conversation around it (>>> marks the "
                  "line), the tone of the room, and what was heard and "
@@ -23315,7 +23566,7 @@ def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
             + "\n\nReturn only fixes.")
 
 
-def _aud_parse(got, garble):
+def _aud_parse(got, garble, video_path=None):
     """One parser for whichever thinker answered - the fixes with the
     sense gate, and the INVESTIGATION VERDICTS: a line the model checked
     and found already right (Torvello cheesecake - a real shop, said
@@ -23347,6 +23598,17 @@ def _aud_parse(got, garble):
             # audio's evidence - the line is PRESERVED automatically
             # (unclear strikes nothing). Hands-off means the machine
             # decides; here it decides to keep what was heard.
+            # 3.33 F THE WITNESS ASKED FOR A WEIGHING, NEVER A STRIKE.
+            # A pure ear-gap row is readable English by construction
+            # (three Latin content words, under thirty percent Arabic)
+            # and sits past the relisten's first eight, so no ear ever
+            # reaches the veto below - a "noise" on it would strike a
+            # sentence he can read. It weighs as unclear instead; a
+            # merged row keeps its odd words and stays strikeable.
+            if v == "noise" and row.get("kind") == "ears" \
+                    and not row.get("odd"):
+                v = "unclear"
+                row["wit_kept"] = True
             if v == "noise":
                 # THE VETO MUST DEMAND MORE THAN THE EAR'S OWN
                 # WRITE-GATE. An ear only exists because it already
@@ -23395,7 +23657,12 @@ def _aud_parse(got, garble):
             (garble or [])[i]["vwhy"] = \
                 _aud_clip(str(f.get("why") or "").strip())
             continue
-        okS, badW = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}))
+        # 3.33 F a fix that weighs the two ears may use the second
+        # ear's words, the room's names and the game's words; a row
+        # without `d` hands None and the gate is the old gate
+        okS, badW = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}),
+                               _aud_ear_extra((garble or [])[i],
+                                              video_path))
         if not okS:
             # TWO LISTENERS BEAT THE DICTIONARY here exactly as they
             # do in the noise veto: a fix that adopts a non-junk
@@ -23676,6 +23943,11 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
     if _aud_llm_paths() is not None:
         body = _aud_body(anchors, drops, game, dur, src, places, crs,
                          garble)
+        # 3.33 F the last guard on the window: a tail of ear-gap rows
+        # steps off until the ask fits; the garble rows and the most-
+        # different ear rows always stay (the list is cut in place)
+        body = _aud_ear_budget(video_path, anchors, drops, game, dur, src,
+                               places, crs, garble, body)
         asrv = _AUD_KEEP.get("srv")
         if asrv is not None and (asrv.pr is None
                                  or asrv.pr.poll() is not None):
@@ -23727,7 +23999,7 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
                 except Exception:
                     pass
                 if got is not None:
-                    return _aud_parse(got, garble)
+                    return _aud_parse(got, garble, video_path)
             _aud_keep_drop()           # answered nothing - gemma may try
     # ===== the describer path, exactly as it always was. ===============
     if _describer_paths() is None:
@@ -23762,6 +24034,10 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
                 bool(_AI["abort"]), []
         body = _aud_body(anchors, drops, game, dur, src, places, crs,
                          garble)
+        # 3.33 F the same guard as the thinker's - the describer's
+        # window is the smaller of the two
+        body = _aud_ear_budget(video_path, anchors, drops, game, dur, src,
+                               places, crs, garble, body)
         # the doubtful lines want a little more room to come back in.
         # NO GRAMMAR on this ask, on purpose and by measurement: the
         # schema fence costs 2.4x on gemma's 262k vocabulary (59s vs 24s
@@ -23777,7 +24053,7 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
             got = json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
         except Exception:
             return [], "", "the answer would not parse", True, False, []
-        return _aud_parse(got, garble)
+        return _aud_parse(got, garble, video_path)
     except Exception as e:
         return [], "", str(e)[:140], True, False, []
     finally:
@@ -25325,6 +25601,14 @@ def _audit_one(video_path, redo=False):
                 src["stt"] = stt
             _beat("shortlisting doubtful lines", 0.16)
             garble = _aud_garble(stt, _freq)
+            # 3.33 F THE DISAGREEMENT IS A WITNESS: the room lines the
+            # two ears heard differently join the shortlist. A night
+            # whose stt carries no `d` adds nothing - same rows, same
+            # bytes, same verdicts as before.
+            try:
+                garble = _aud_ear_union(garble, _aud_ear_gap(stt))
+            except Exception:
+                pass
             for _g in garble:
                 try:
                     _g["hints"] = _aud_hints(_g, _freq)
@@ -25351,6 +25635,23 @@ def _audit_one(video_path, redo=False):
         warn.extend(nwarn[:4])
         warn.extend(owarn[:4])
         ask_rows = [g for g in (garble or []) if not g.get("carried")]
+        # 3.33 F THE WITNESS IS BUDGETED. Forty ear-gap rows may sit on
+        # the shortlist, but each pack is ~1,300 characters (the
+        # conversation, then the witness kept past the knife) and the
+        # thinker's window holds a dozen of them beside the garble rows,
+        # not forty. The union keeps them most-different first; the
+        # rest stay on the shortlist unasked and unsettled - never
+        # carried as anything - and a night without d loses no row.
+        _ears_n = 0
+        _kept = []
+        for _g in ask_rows:
+            if _g.get("kind") == "ears":
+                _ears_n += 1
+                if _ears_n > _AUD_EAR_ASK:
+                    continue
+            _kept.append(_g)
+        ask_rows = _kept
+        _eared = len([g for g in ask_rows if g.get("d")])
         if ask_rows:
             _beat("re-listening with an Arabic ear", 0.20)
             try:
@@ -25371,6 +25672,8 @@ def _audit_one(video_path, redo=False):
             # every doubtful line already holds a settled verdict -
             # this audit is pure arithmetic, no model, seconds
             beats, gist, why, retry, held, fixes = [], "", "", False,                 False, []
+        # recounted: the character guard may have cut the tail in place
+        _eared = len([g for g in ask_rows if g.get("d")])
         if ask_rows and not held and not why:
             # the measured cost of THIS ask feeds the next estimate
             _took = time.time() - _ask_t0
@@ -25506,6 +25809,8 @@ def _audit_one(video_path, redo=False):
                + str(struck) + " struck as unintelligible, "
                + str(len(corrected)) + " standing"
                if garble or corrected else "")
+            + (", weighed the two ears on " + str(_eared) + " line(s)"
+               if _eared else "")
             + (", " + str(len(names_fixed)) + " name(s) respelt"
                if names_fixed else "")
             + (", a thread of " + str(len(beats)) + " beat(s)." if beats
