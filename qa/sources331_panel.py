@@ -243,8 +243,12 @@ check("the Game chip sits after Scream, on by default, with a tip",
 check("MARKS carries game (default true), the save list and gsig know it",
       # 3.32 appends the outcome chip to every one of these lists
       "told:true, sense:true, game:true, outcome:true};" in U
-      and "['gold','red','loud','laugh','scream','told','sense','game',"
+      # 3.34 J: 'told' is NOT in the blind restore list any more - it
+      # stopped meaning a gold tint and started meaning the red
+      # moments row, so only a save stamped v:2 may switch it
+      and "['gold','red','loud','laugh','scream','sense','game',"
           "'outcome'].forEach" in U
+      and "m.v>=2&&typeof m.told==='boolean'" in U
       and "const gsig=['loud','laugh','scream','told','sense','game',"
           "'outcome']" in U
       and "sense:'sense',game:'game',outcome:'outcome'};" in U)

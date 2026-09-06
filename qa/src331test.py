@@ -533,6 +533,11 @@ check("_aud_garble: a Chinese-alphabet MEDIA line is not struck",
       not any(abs(float(x.get("t") or 0) - 1.0) < 0.5 for x in g_out))
 check("...and one without src still is",
       any(abs(float(x.get("t") or 0) - 5.0) < 0.5 for x in g_out))
+# 3.34 K: the dossier labels who is talking, so it reaches for the
+# setting and the labeller - lifted from lore.py like everything else
+lns.setdefault("SETTINGS", {})
+for _nm in ("_my_name", "_aud_who"):
+    extract(LSRC, _nm, lns)
 dos = lns["_aud_dossier"]({"t": 10.0}, {"stt": STT, "sns": {}}, {})
 check("_aud_dossier: the video's line is left out and a note stands in",
       "video talking" not in dos and "a video was playing in the "

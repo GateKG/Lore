@@ -126,6 +126,11 @@ def build(src, tree, ns=None):
                "_room_names", "_room_aliases_of", "_aud_carry",
                "_aud_hints", "_aud_skel_index"):
         extract(src, tree, nm, ns)
+    # 3.34 K: only the patched source labels the dossier's
+    # conversation lines, so the parity base has neither of these
+    if "def _aud_who(" in src:
+        for nm in ("_my_name", "_aud_who"):
+            extract(src, tree, nm, ns)
     return ns
 
 
@@ -254,6 +259,26 @@ G1 = dict(G0, d="we're about to lose our freak", kind="ears", gap=0.6)
 dh = HN["_aud_dossier"](G0, SRC, SRC["ins"])
 dt = NS["_aud_dossier"](G0, SRC, SRC["ins"])
 check("without d the dossier is byte-identical to HEAD's", dh == dt)
+# 3.34 K THE LABELS, and the parity gate on them: no name and no
+# tap and the conversation is bare, exactly as it always was.
+CONV_W = [dict(CONV[20], src="you"), dict(CONV[21])]
+SRC_W = dict(SRC, stt=CONV_W, sources={"voice": True})
+GW = {"t": 20.0, "b": 20.9, "text": CONV[20]["t"], "odd": [],
+      "hints": []}
+NS["SETTINGS"]["my_name"] = "Wanderer"
+dw = NS["_aud_dossier"](GW, SRC_W, SRC["ins"])
+check("on a tap night the dossier says who is talking - his name "
+      "on his mic, Discord on a friend's line",
+      ">>> [en] Wanderer: Line number 20" in dw
+      and "[en] Discord: Line number 21" in dw)
+NS["SETTINGS"]["my_name"] = ""
+check("a tap night with no typed name still labels both, so the "
+      "law the prompt teaches names a mark the dossier writes",
+      ">>> [en] YOU: Line number 20"
+      in NS["_aud_dossier"](GW, SRC_W, SRC["ins"]))
+check("no name and no tap: byte-identical to the parity base",
+      NS["_aud_dossier"](GW, dict(SRC, stt=CONV_W), SRC["ins"])
+      == HN["_aud_dossier"](GW, dict(SRC, stt=CONV_W), SRC["ins"]))
 d1 = NS["_aud_dossier"](G1, SRC, SRC["ins"])
 WIT = '    the second ear (English only) heard: "we\'re about to lose our freak"'
 check("with d the witness line appears exactly once, after the conversation",
@@ -430,8 +455,23 @@ check("the auditor still writes only its own sidecars: no new "
       LSRC.count("_atomic_write_json(") == HSRC.count("_atomic_write_json(") + 1
       and seg(LSRC, LTREE, "_thin_strike_migration").count(
           "_atomic_write_json(") == 1)
-check("_aud_dossier differs from HEAD's ONLY by the appended witness",
-      seg(LSRC, LTREE, "_aud_dossier").replace(
+# 3.34 K: and by ONE more thing - the speaker label. The auditor's
+# prompt is given the law that reads '<name>:' and 'Discord:', so
+# its own dossier has to write them or the law names a mark the
+# thinker never sees. Undo both to compare with the parity base.
+WHO_NEW = ('        # THE TAG WAS JUDGED ABOVE, FROM THE RAW TEXT, AND THAT\n'
+           '        # ORDER IS THE POINT: a Latin "Discord: " prefix flips a\n'
+           '        # short Arabic line to [en], and the script detection that\n'
+           '        # heals 4,178 mislabelled lines was hard-won. The label\n'
+           '        # goes on after it, never before.\n'
+           '        outl.append(mark + lang + " " + _aud_who(sg, src) + txt[:110])')
+WHO_OLD = '        outl.append(mark + lang + " " + txt[:110])'
+check("the dossier's label is judged AFTER the script tag, never "
+      "before it - a Latin prefix would flip a short Arabic line",
+      seg(LSRC, LTREE, "_aud_dossier").count(WHO_NEW) == 1)
+check("_aud_dossier differs from HEAD's ONLY by the appended witness "
+      "and the speaker label",
+      seg(LSRC, LTREE, "_aud_dossier").replace(WHO_NEW, WHO_OLD).replace(
           '\n            + "\\n".join(outl)\n'
           '            # 3.33 F the second ear\'s hearing and the room\'s '
           'names, after\n'

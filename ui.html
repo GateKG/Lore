@@ -1717,6 +1717,9 @@ body.clipping #vseekwrap{cursor:crosshair}
 .mompill .wbtn:hover{background:rgba(232,181,99,.32);color:#fff3d8}
 .hlmark.picked{background:#ffd98c;opacity:1;height:10px;top:-5px;
   box-shadow:0 0 7px rgba(255,215,140,.9)}
+/* 3.34 J: the moments are red now, and a picked one has to say so too */
+.insmark.picked{background:#ffd9cf;opacity:1;height:10px;bottom:-4px;
+  box-shadow:0 0 7px rgba(201,88,74,.9)}
 /* where an edit came from - under the details line, above the toolbar */
 #vlineage{order:2;display:none;margin-bottom:8px;font:600 11px var(--ui);
   color:#bda87c;letter-spacing:.03em;max-width:88vw;overflow:hidden;
@@ -1891,9 +1894,10 @@ body.vfull #vover{height:12px}
    looped for as long as you held still on it. A transform is painted, not
    laid out, so the hit area stays exactly where your mouse found it. */
 /* THE SECOND SET. Gold is what the room SOUNDED like; red is what the tome
-   worked out was being TALKED about. Different questions, so different marks,
-   and either can be put away - they sit on opposite sides of the bar so a
-   loud moment inside a chapter never hides behind its marker. */
+   says HAPPENED - one mark per described moment; and the bar's own sections
+   are the story's shape. Three questions, three answers, and each can be put
+   away - the gold and the red sit on opposite sides of the bar so a loud
+   second inside a moment never hides behind it. */
 .insmark{position:absolute;bottom:-2px;width:2px;height:6px;border-radius:1px;
   background:#c9584a;opacity:.85;cursor:pointer;z-index:8;box-sizing:border-box;
   transform-origin:50% 0;
@@ -1920,14 +1924,28 @@ body.vfull #vover{height:12px}
   box-shadow:0 0 8px 2px rgba(253,246,227,.55)}
 .usrmark.hid{display:none}
 body.editing .usrmark{pointer-events:none}
-/* G4: the bar divides at chapter boundaries - a band per chapter over the
-   track, the current one standing brighter */
+/* 3.34 J: THE TIMELINE IS THE CHAPTERS. The bar itself is divided the way a
+   video site divides its scrubber - neighbouring sections in two tints of
+   the bar's own gold-leather with a 2px gap between them, so the track reads
+   as sections at a glance and needs no second white line above it. The layer
+   never takes the pointer: scrubbing and the editor's drag are sacred. */
 #vchapsegs{position:absolute;left:0;right:0;top:0;bottom:0;pointer-events:none;z-index:1}
 .chseg{position:absolute;top:50%;height:5px;transform:translateY(-50%);
-  border-radius:2px;background:rgba(232,181,99,.16);
+  border-radius:2px;background:rgba(232,181,99,.10);
   transition:background .18s ease,height .18s ease}
+.chseg.alt{background:rgba(232,181,99,.22)}
 .chseg.now{background:rgba(232,181,99,.48);height:7px;
   box-shadow:0 0 6px rgba(232,181,99,.35)}
+/* the chapter's own handle. The sections cannot be clicked (they are under
+   the track), so the START of each one gets a small red notch ABOVE it -
+   6x6, the chapter red - that hovers its tip and seeks to the chapter. */
+.chnotch{position:absolute;top:-9px;width:6px;height:6px;z-index:7;
+  border-radius:2px;background:#c9584a;opacity:.9;cursor:pointer;
+  box-sizing:border-box;pointer-events:auto;
+  transition:transform .12s ease,box-shadow .12s ease,opacity .12s ease}
+.chnotch:hover,.chnotch.hot{opacity:1;transform:scale(1.35);
+  box-shadow:0 0 9px 2px rgba(201,88,74,.8),0 0 3px #fff}
+.chnotch.hid{display:none}
 /* N5: the mark's own tip - its signal, and the words heard at that second */
 #vmoments{display:none !important}  /* removed by request - the marks ARE
                                        the moments; one surface, not two */
@@ -1982,7 +2000,7 @@ body.vfull #vmoments{display:none}
 #vmarkpick{flex-wrap:wrap;justify-content:flex-end}
 /* G5: the panel head buttons sit together */
 .vhbtns{display:flex;align-items:center;gap:2px}
-body.editing .insmark,body.editing .hlmark{pointer-events:none}
+body.editing .insmark,body.editing .hlmark,body.editing .chnotch{pointer-events:none}
 /* the row you just jumped to, so the eye finds it without hunting */
 #vchaps .crow.flash{animation:chapflash .7s ease-out}
 @keyframes chapflash{
@@ -2005,12 +2023,9 @@ body.editing .insmark,body.editing .hlmark{pointer-events:none}
 .hlmark:hover,.hlmark.hot{background:#fff1cf;opacity:1;
   transform:scale(2,2.1);
   box-shadow:0 0 10px 2px var(--gold),0 0 3px #fff}
-/* a mark Claude could describe stands a little taller - it has something
-   to say when you hover it */
-.hlmark.told{height:9px;top:-4px;background:#ffe9b8}
-/* ...and the screen's verdict keeps its own gold when told: the
-   outcome rule above ties .told on specificity and would lose to it */
-.hlmark[data-fk="outcome"].told{background:var(--gold-hi)}
+/* 3.34 J: the .told tint is gone. A described second is a RED mark under
+   the bar now, so tinting the gold for it said the same thing twice and
+   made the gold stop meaning "this is what the room sounded like". */
 .hlmark:active{background:#fff;transform:scale(2.2,2.3);
   box-shadow:0 0 14px 3px var(--gold-hi)}
 /* ONE LINE. The field and the two marks share a row, and the marks sit
@@ -2557,7 +2572,7 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
           <button data-m="laugh" class="on">Laugh</button>
           <button data-m="scream" class="on">Scream</button>
           <button data-m="game" class="on" title="Bursts in the game itself (3.31, a night recorded by source) - a side focus, never the room">Game</button>
-          <button data-m="told" class="on">Told</button>
+          <button data-m="told" class="on" title="The moments the tome described - the red marks under the bar">Moments</button>
           <button data-m="sense" class="on">Senses</button>
           <button data-m="outcome" class="on" title="What the screen decided (3.32): WINNER and the colour, a placement - the game's own verdict, read off the frames">Outcome</button>
           <button data-m="red" class="on">Chapters</button>
@@ -2930,7 +2945,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,second_ear:true,room_names:'',version:'3.34'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',version:'3.34'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3111,7 +3126,7 @@ function makeMock(){
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,handle:'',
-      second_ear:true,room_names:'',
+      second_ear:true,room_names:'',my_name:'',
       popup_style:'slide',popup_size:'large',sfx_volume:25,
       hotkey_record:'ctrl+alt+f7',hotkey_replay:'ctrl+alt+f9',
       hotkey_pause:'ctrl+alt+f10',hotkey_clip_discord:'ctrl+alt+f8',clip_hotkey_seconds:60,
@@ -5590,7 +5605,9 @@ function clipNeedsWebhook(){
 
 function wireMarks(){
   const box=$('#vmarkpick'); if(!box)return;
-  const NAME={red:'chapter',loud:'loud',laugh:'laughter',scream:'scream',told:'told',sense:'sense',game:'game',outcome:'outcome'};
+  /* 3.34 J: 'red' is the bar's sections and their notches; 'told' is the
+     red moment row under it - the names say which switch is which */
+  const NAME={red:'chapter',loud:'loud',laugh:'laughter',scream:'scream',told:'moments',sense:'sense',game:'game',outcome:'outcome'};
   /* SAY WHAT THE CHIPS ARE EATING. "44 marks" in the versions panel and a
      dozen on the bar is not a mystery, it is a filter - an old save's
      single Sound switch could leave four kinds off without a word. The
@@ -5598,7 +5615,7 @@ function wireMarks(){
   const updLab=()=>{
     const lab=$('#vmarklab'); if(!lab)return;
     let n=document.querySelectorAll('.hlmark.hid').length;
-    if(MARKS.red===false)n+=document.querySelectorAll('.insmark').length;
+    if(MARKS.told===false)n+=document.querySelectorAll('.insmark').length;
     lab.textContent=n?('Marks · '+n+' hidden'):'Marks';
     lab.style.color=n?'#d8a85c':'';
   };
@@ -5610,9 +5627,13 @@ function wireMarks(){
       b.style.color=(MARKS[k]!==false)?(k==='red'?'#e0705f':'var(--gold-hi)'):'#7a6647'; };
     b.addEventListener('click',e=>{e.stopPropagation();
       MARKS[k]=!MARKS[k];
-      try{localStorage.setItem('lore.marks',JSON.stringify(MARKS));}catch(_){}
+      /* v:2 - 'told' stopped meaning the gold tint and started
+         meaning the whole red moments row (3.34 J), so a switch
+         saved against the old meaning must not govern the new one */
+      try{localStorage.setItem('lore.marks',
+        JSON.stringify(Object.assign({v:2},MARKS)));}catch(_){}
       paint();
-      insMarksPlace();
+      momMarksPlace(); chapSegsPaint();
       if(typeof _hlPlace==='function'&&_hlPlace)_hlPlace();
       updLab();
       whisper((NAME[k]||k)+' marks '+(MARKS[k]?'shown':'hidden'));});
@@ -7216,6 +7237,10 @@ function renderSet(cL,cR,app,spreadIdx){
           +'MMR, Alt-F4, the match type \u2014 while keeping the Arabic. Measured '
           +'on this room: the two ears together were right four times as often as '
           +'the reader alone. Off means one ear, exactly as before.');
+    /* 3.34 K: the tome has always called his own lines "you". It is his
+       tome - it may as well call him by name. Empty keeps "you". */
+    row(R,'Your name',ctlText('my_name',false,'the name the tome calls you'),
+        'your own lines are labelled this instead of \u201cyou\u201d');
     row(R,'The room\u2019s names',ctlText('room_names',true,'A, B / Bee, C / CC \u2014 people by comma, other spellings by slash'),
         'people by comma, other spellings by slash');
     hint(R,'The people who are usually in the call, so both ears spell them '
@@ -8933,10 +8958,27 @@ function snsWhoNumAt(t){
     return +ks[0];
   return null;
 }
+/* 3.34 K: what the tome calls HIS lines - Settings > The room > Your name
+   when he has typed one, "you" while it is empty. */
+function myName(){
+  const st=(S.settings&&S.settings.settings)||{};
+  return String(st.my_name||'').trim()||'you';
+}
+/* 3.34 K: does THIS night's transcript carry a voice tap? A room line that
+   is not his own mic came in through Discord's own stream - so an unnamed
+   cluster is not "Voice 2" to him, it is Discord. */
+function saidVoiceTap(){
+  return !!(_said&&(_said.lines||[]).some(l=>l&&l.src==='room'));
+}
 function snsWhoAt(t){
   const n=snsWhoNumAt(t); if(n==null)return null;
+  const named=n?((_sns.names||{})[String(n)]||''):'';
+  if(named)return named;             /* a typed name always wins */
+  /* the number is not lost - it lives on in the chip's title, so naming
+     a voice still works exactly as it did */
+  if(saidVoiceTap())return 'Discord';
   if(!n)return 'a voice';            /* honest beats a wrong name */
-  return ((_sns.names||{})[String(n)])||('Voice '+n);
+  return 'Voice '+n;
 }
 function snsWireWho(){
   const body=$('#vsaid .vsaidbody'); if(!body||body._whoWired)return;
@@ -9232,14 +9274,11 @@ async function renderHlMarks(vid,req){
       if(near.kind&&near.kind!=='outcome')near.also=[near.kind].concat(near.also||[]);
       near.kind='outcome'; near.text=text;
     }else evs.push({t:o.t,z:1e6,kind:'outcome',text:text});});
-  /* THE REVIEW'S OWN MOMENTS ARE MARKS TOO. A funny line is not always a
-     loud one - "she's sprinting towards you guys" can be said almost
-     quietly. A described moment with no loud peak within 8s becomes its
-     own gold mark, ranked above every peak so the cut to 30 never drops
-     it; the told-stamp then finds its words at distance zero. */
-  ((_ins&&_ins.moments)||[]).forEach(q=>{
-    if(q&&q.t>0&&!evs.some(ev=>Math.abs(ev.t-q.t)<=8))
-      evs.push({t:q.t,z:1e6});});
+  /* 3.34 J: THE REVIEW'S MOMENTS ARE NOT GOLD. They used to be planted
+     here as gold marks with no peak behind them, which made the gold say
+     "the room sounded like this" about seconds the room was quiet for -
+     and drew the same fact twice once the red row became the moments.
+     Gold is the ear's, red is the tome's; the two no longer borrow. */
   if(req!==_viewerReq||!evs.length)return;
   const vd=$('#vvideo'),wrap=$('#vseekwrap');
   let nodes=null;                 /* built once, then only ever MOVED */
@@ -9272,8 +9311,8 @@ async function renderHlMarks(vid,req){
       const said=(_ins&&_ins.moments||[]).reduce((best,q)=>{
         const dd=Math.abs(q.t-ev.t);
         return (dd<=8&&(!best||dd<best.d))?{d:dd,why:q.why}:best;},null);
-      m._said=said;
-      m.classList.toggle('told',!!said);
+      m._said=said;   /* the CARD may still quote the tome's words for this
+                         second - but 'told' is no longer a gold tint (J) */
       /* the mark says WHAT it heard: the ear's verdict when it has one,
          the loudness contest's honest default when it does not. A sighting
          was never heard at all - it says who was on screen. */
@@ -9294,7 +9333,7 @@ async function renderHlMarks(vid,req){
       /* 3.32 the screen's verdict outranks even told: the planted
          outcome moment IS this second, and the tick must read as the
          game's own word, not as one more described line */
-      const fk=ev.kind==='outcome'?'outcome':said?'told':(ev.kind==='laugh'?'laugh'
+      const fk=ev.kind==='outcome'?'outcome':(ev.kind==='laugh'?'laugh'
               :ev.kind==='scream'?'scream'
               :ev.kind==='game'?'game'
               :SNSK[ev.kind]?'sense':'loud');
@@ -9683,7 +9722,7 @@ function saidRender(center){
       if(!ln.nn)r.title='probably the game\u2019s own audio (music/cutscene), not the room'; }
     /* the mic layer is ground truth: a line with HIS mic's energy is
        his, and no borrowed nearest-cluster guess may overrule it */
-    const who=(ln.g||isMedia||isGame)?null:(ln.src==='you'?'you':snsWhoAt(ln.t));
+    const who=(ln.g||isMedia||isGame)?null:(ln.src==='you'?myName():snsWhoAt(ln.t));
     /* only a chip with a real cluster behind it opens the naming input.
        The old one opened for anything and threw the typed name away,
        which is worse than not offering it. */
@@ -9691,7 +9730,9 @@ function saidRender(center){
     const lab=isMedia?'a video':(isGame?'the game':who);
     if(lab){ const w=el('u',(wn&&!isMedia&&!isGame)?'swho':'swho unk',lab);
       w.title=(isMedia||isGame)?r.title
-             :(wn?'click to name this voice'
+             :(wn?(lab==='Discord'
+                   ? 'Discord \u00b7 voice '+wn+' \u2014 click to name'
+                   : 'click to name this voice')
                :(wn===0?'people talking over each other - when voices '
                         +'overlap, the ears cannot honestly say whose '
                         +'line this is, so it is not guessed'
@@ -9911,10 +9952,12 @@ function clearIdleHide(){
 }
 function closeViewer(){
   if(REEL)reelStop(true);   /* 2.76 N6: closing the player ends the reel */
-  /* the red marks belong to the recording, not the bar */
+  /* the red marks and the sections belong to the recording, not the bar */
   {const w=$('#vseekwrap');
    if(w){(w._insNodes||[]).forEach(n=>n.remove());w._insNodes=null;
+         (w._chNodes||[]).forEach(n=>n.remove());w._chNodes=null;
          w.querySelectorAll('.insmark').forEach(n=>n.remove());
+         w.querySelectorAll('.chnotch').forEach(n=>n.remove());
          w.querySelectorAll('.usrmark').forEach(n=>n.remove());w._usrNodes=null;
          if(w._chlay){w._chlay.innerHTML='';w._chlay._sig='';w._chlay._segs=[];}
          if(w._tip)w._tip.classList.remove('on');}}
@@ -11140,11 +11183,19 @@ function tlWin(){
 let MARKS = {gold:true, red:true, loud:true, laugh:true, scream:true, told:true, sense:true, game:true, outcome:true};
 try{ const m=JSON.parse(localStorage.getItem('lore.marks')||'{}');
      /* 3.31 game, 3.32 outcome: an old save without the key keeps it on */
-     ['gold','red','loud','laugh','scream','told','sense','game','outcome'].forEach(k=>{
+     ['gold','red','loud','laugh','scream','sense','game','outcome'].forEach(k=>{
        if(typeof m[k]==='boolean')MARKS[k]=m[k];});
+     /* 3.34 J: 'told' is NOT restored from an older save. It used to
+        be a tint on some gold marks; it is the whole red moments row
+        now, and a Told=off saved months ago would open 3.34 with the
+        tome's own moments gone and no way to guess why. Only a save
+        stamped v:2 - written since the meaning changed - has a say. */
+     if(m.v>=2&&typeof m.told==='boolean')MARKS.told=m.told;
      /* an old save's single Sound switch fans out into the four kind chips */
      if(m.gold===false&&m.loud===undefined)
-       MARKS.loud=MARKS.laugh=MARKS.scream=MARKS.told=false;
+       /* 3.34 J: not told - it is the MOMENTS' chip now, and an old
+          Sound switch never had a say over the tome's own marks */
+       MARKS.loud=MARKS.laugh=MARKS.scream=false;
      MARKS.gold=true;   /* legacy master - the chips rule now */
 }catch(e){}
 /* 3.31 the video's lines: folded away unless he asks, remembered per
@@ -11183,39 +11234,52 @@ function chapterInView(t){
   light(); setTimeout(light,0);
 }
 
-function insMarksPlace(){
+/* ---- 3.34 J: THE MOMENTS ARE THE RED MARKS ----
+   Gate, 6 Sep: "moments should be the red markers below". The red row used
+   to be the chapter starts, which overlapped the gold almost second for
+   second; the bar itself is divided into chapters now (chapSegsPaint), so
+   the red under it is the describer's own moments - one mark each. The
+   PLANTED outcome moment is skipped: the screen's bright gold tick above
+   already is that second, and two marks for one fact lies about the count. */
+function momMarksPlace(){
   const wrap=$('#vseekwrap'); if(!wrap)return;
-  const all=((_ins&&_ins.chapters)||[]).slice().sort((a,b)=>a.t-b.t);
-  /* EVERY CHAPTER DRAWS. This sampled a 7-hour night down to 25 evenly
-     spaced marks, so his Big Walk - 116 chapters in the sidecar - showed
-     about ten on the bar and read as broken. The cap is gone; chapters
-     that crowd the same few pixels are folded into the one that draws,
-     and hovering it says how many are hiding there. Zooming separates
-     them, exactly as it does for the gold. */
+  const all=((_ins&&_ins.moments)||[])
+    .filter(m=>m&&m.t>0&&String(m.kind||'')!=='outcome')
+    .slice().sort((a,b)=>a.t-b.t);
+  /* EVERY MOMENT DRAWS, exactly as every chapter used to: no cap, and the
+     ones crowding the same few pixels fold into the one that draws, whose
+     hover says how many are hiding there. Zooming separates them. */
   const wsel=tlWin();
-  const ch=wsel.full?all:all.filter(c=>c.t>=wsel.a-0.01&&c.t<=wsel.b+0.01);
+  const ch=wsel.full?all:all.filter(q=>q.t>=wsel.a-0.01&&q.t<=wsel.b+0.01);
   let nodes=wrap._insNodes||[...wrap.querySelectorAll('.insmark')];
   if(nodes.length!==ch.length){
     nodes.forEach(n=>n.remove()); nodes=[];
     ch.forEach(()=>{
       const m=document.createElement('div'); m.className='insmark';
-      /* THE CHAPTER LIVES ON THE NODE, re-stamped every place() - reusing a
+      /* THE MOMENT LIVES ON THE NODE, re-stamped every place() - reusing a
          node by index with its closure from the PREVIOUS recording sent
-         clicks to another video's chapter times. The gold marks had this
-         exact bug once; same cure. */
-      m.addEventListener('click',e=>{e.stopPropagation();
-        const c=m._c; if(!c)return;
-        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
-        try{$('#vvideo').currentTime=c.t;}catch(_){}
-        chapterInView(c.t);
-        whisper(fmtT(c.t)+'  \u00b7  '+(c.label||'chapter'));
+         clicks to another video's times. The gold marks had this exact bug
+         once; same cure, and the player is read LIVE at press time. */
+      m.addEventListener('pointerdown',e=>{
+        /* pointerdown, not click: the bar underneath is a range input and
+           the editor binds its own drag to this surface - either would
+           swallow a click before it reached the mark. */
+        e.preventDefault(); e.stopPropagation();
+        const q=m._m; if(!q)return;
+        if(e.ctrlKey){ momTogglePick(m); return; }   /* Ctrl+click picks */
+        const to=Math.max(0,q.t-2);   /* land BEFORE it happens - the gold's law */
+        V.userSeekReq=_viewerReq;     /* 3.34 his seek outranks the resume */
+        try{ $('#vvideo').currentTime=to; V.tlPin=true; tlPaint(); }catch(_){}
+        m.classList.add('hot'); setTimeout(()=>m.classList.remove('hot'),260);
+        markCardShow(m);              /* the verbs live on THIS - it stays put */
       });
+      m.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();});
       wrap.append(m); nodes.push(m);
     });
   }
   wrap._insNodes=nodes;
   /* NOT AGAINST A BAR THAT HAS NOT LAID OUT YET. With a zero-width wrap
-     tlPx returns the same 7px for every second, so every chapter mark lands
+     tlPx returns the same 7px for every second, so every moment mark lands
      on top of the first one and stays there until something else repaints -
      which looks exactly like "all the red marks are bunched at the left".
      The gold marks have had this guard all along; that is why they were
@@ -11224,15 +11288,23 @@ function insMarksPlace(){
   const win=tlWin();
   const seen=new Map();          /* pixel bucket -> the mark that draws it */
   nodes.forEach((m,i)=>{
-    const c=ch[i]; if(!c)return;
-    if(m._c!==c){ m._c=c; m.removeAttribute('title'); }  /* markTipShow names it now */
+    const q=ch[i]; if(!q)return;
+    /* kind:'moment' - the card falls back to ev.kind when the moment
+       carries no why, and 'a loud moment' is the exact claim this drop
+       took off the red row (the describer, not the ear, put it here) */
+    if(m._m!==q){ m._m=q; m._ev={t:q.t,kind:'moment'};   /* markCardShow and momTogglePick
+                                                 read _ev; the card quotes _said */
+      m._said=q.why?{why:q.why}:null;
+      m.removeAttribute('title'); }           /* markTipShow speaks on hover */
+    m.classList.toggle('picked',_momPick.has(q.t));   /* picks survive a re-place */
     m._kn=1;
-    const off=(!MARKS.red||c.t<win.a-0.01||c.t>win.b+0.01);
+    /* the Told chip is the moments' switch now - the label says 'moments' */
+    const off=(MARKS.told===false||q.t<win.a-0.01||q.t>win.b+0.01);
     m.classList.toggle('hid',off);
-    if(!off)m.style.left=Math.round(tlPx(c.t)-1)+'px';
+    if(!off)m.style.left=Math.round(tlPx(q.t)-1)+'px';
   });
   /* NOW THAT THEY ALL DRAW, fold the ones sharing a few pixels into the
-     first of them - no badge, because a chapter mark hangs off the BOTTOM
+     first of them - no badge, because a moment mark hangs off the BOTTOM
      of the bar and a count under it would sit on the seek track itself.
      The hover says how many are hiding instead. */
   nodes.forEach(m=>{
@@ -11243,6 +11315,9 @@ function insMarksPlace(){
     else seen.set(key,m);
   });
   /* the kind chips cost a sweep only when one CHANGES */
+  /* 3.34 J: 'told' stays in this list though no gold mark answers to it any
+     more - it is the MOMENTS' chip now, and the sweep it triggers is a
+     no-op. Cheaper than a list that disagrees with the chips. */
   const gsig=['loud','laugh','scream','told','sense','game','outcome'].map(k=>MARKS[k]?'1':'0').join('');
   if(wrap._goldShown!==gsig){
     wrap._goldShown=gsig;
@@ -11316,46 +11391,124 @@ function usrToggle(){
   usrPlace(); usrSave();
 }
 
-/* ---- G4: the bar divides at chapter boundaries, YouTube-fashion ----
-   A tinted band per chapter over the seek track, the current one standing
-   brighter; hovering the bar names the chapter in the peek label. Same
-   tlPx as every mark, so nothing drifts. */
-function chapName(t){
-  let hit=null;
-  (((_ins&&_ins.chapters)||[])).forEach(c=>{ if(c.t<=t&&(!hit||c.t>hit.t))hit=c; });
-  return hit?(hit.label||''):'';
+/* ---- 3.34 J: THE TIMELINE IS THE CHAPTERS ----
+   Gate, 6 Sep: "just divide the actual time line post chapter generation!"
+   A section per chapter drawn INTO the bar, two tints alternating with a
+   2px gap between neighbours - the way a video site divides its scrubber,
+   in the tome's own gold. The layer never takes the pointer, so scrubbing
+   and the editor's drag are untouched; the START of each chapter gets a
+   notch above the track, and THAT is what you press to go there. Same tlPx
+   as every mark, so nothing can drift from the gold or the head. */
+function chapList(){
+  return ((_ins&&_ins.chapters)||[])
+    .filter(c=>c&&c.t!=null&&isFinite(c.t)).slice().sort((a,b)=>a.t-b.t);
 }
+/* which section owns this second - the tip the whole track answers with */
+function chapAt(t){
+  let hit=null;
+  chapList().forEach(c=>{ if(c.t<=t+0.01&&(!hit||c.t>hit.t))hit=c; });
+  return hit;
+}
+function chapName(t){ const c=chapAt(t); return c?(c.label||''):''; }
 function chapSegsPaint(){
   const wrap=$('#vseekwrap'); if(!wrap)return;
   let lay=wrap._chlay;
-  const ch=((_ins&&_ins.chapters)||[]).slice().sort((a,b)=>a.t-b.t);
+  const ch=chapList();
   const d=tlDur();
-  if(!ch.length||!d){ if(lay){lay.innerHTML='';lay._sig='';lay._segs=[];} return; }
+  /* the 'chapter' chip owns the sections AND their notches: off means the
+     bar is a plain track again, not a dimmed one */
+  if(!ch.length||!d||MARKS.red===false){
+    if(lay){lay.innerHTML='';lay._sig='';lay._segs=[];}
+    chapNotchPlace([]); return; }
   if(!lay){ lay=document.createElement('div'); lay.id='vchapsegs';
     wrap.insertBefore(lay,wrap.firstChild); wrap._chlay=lay; }
   const W=(_tlG?_tlG.width:wrap.getBoundingClientRect().width);
   if(W<20)return;
   const win=tlWin();
-  /* boundaries: the start, every chapter start, the end */
-  const bs=[0]; ch.forEach(c=>{ if(c.t>0&&c.t<d)bs.push(c.t); }); bs.push(d);
-  const sig=bs.map(b=>b.toFixed(1)).join(',')
+  /* ONE SECTION PER CHAPTER: [c.t, next.t), the last running to the end.
+     A first chapter that starts after 0:00 leaves the opening stretch its
+     own unnamed section, so the bar is divided all the way across. */
+  const bs=[]; if(ch[0].t>0.01)bs.push({t:0,c:null});
+  ch.forEach(c=>{ if(c.t<d)bs.push({t:c.t,c:c}); });
+  const sig=bs.map(b=>b.t.toFixed(1)).join(',')
     +'|'+win.a.toFixed(2)+'|'+win.len.toFixed(2)+'|'+Math.round(W);
   if(lay._sig!==sig){
     lay._sig=sig; lay.innerHTML=''; lay._segs=[];
-    for(let i=0;i+1<bs.length;i++){
-      const a=bs[i], b=bs[i+1];
-      if(b<win.a||a>win.b)continue;
-      const x0=tlPx(Math.max(a,win.a)), x1=tlPx(Math.min(b,win.b));
-      if(x1-x0<3)continue;               /* too thin to read as a band */
-      const s=document.createElement('div'); s.className='chseg';
-      s.style.left=Math.round(x0+1)+'px';
-      s.style.width=Math.max(2,Math.round(x1-x0-2))+'px';
-      s._a=a; s._b=b;
+    bs.forEach((b,i)=>{
+      const a=b.t, z=(i+1<bs.length)?bs[i+1].t:d;
+      if(z<win.a||a>win.b)return;
+      /* WHOLE PIXELS FIRST, then the gap - rounding the left edge and the
+         width separately left neighbours 1px apart as often as 2px, and a
+         gap that flickers between sections is not a divider. */
+      const x0=Math.round(tlPx(Math.max(a,win.a))),
+            x1=Math.round(tlPx(Math.min(z,win.b)));
+      if(x1-x0<3)return;               /* too thin to read as a band */
+      /* the two tints alternate by POSITION in the night, not by what is
+         on screen - a section keeps its shade while you pan */
+      const s=document.createElement('div');
+      s.className='chseg'+((i%2)?' alt':'');
+      s.style.left=(x0+1)+'px';
+      s.style.width=Math.max(2,x1-x0-2)+'px';
+      s._a=a; s._b=z; s._c=b.c;
       lay.append(s); lay._segs.push(s);
-    }
+    });
   }
   const now=(($('#vvideo')||{}).currentTime)||0;
   (lay._segs||[]).forEach(s=>s.classList.toggle('now',now>=s._a&&now<s._b));
+  chapNotchPlace(ch);
+}
+/* the notch is the chapter's handle. A plain press on the track still
+   seeks to the second you pressed - scrubbing is sacred - so 'go to the
+   START of this chapter' needs a target of its own. */
+function chapNotchPlace(ch){
+  const wrap=$('#vseekwrap'); if(!wrap)return;
+  let nodes=wrap._chNodes||[];
+  if(nodes.length!==ch.length){
+    nodes.forEach(n=>n.remove()); nodes=[];
+    ch.forEach(()=>{
+      const m=document.createElement('div'); m.className='chnotch';
+      /* no role, no tabindex: the gold marks have never carried either, and
+         the notch and the moment mark mirror them exactly rather than
+         inventing a focus story for one third of the bar. */
+      /* THE CHAPTER LIVES ON THE NODE, re-stamped every place() - a node
+         reused by index still holding the PREVIOUS recording's closure sent
+         clicks to another video's chapter times. Same cure as the gold: the
+         fact is read off the node, and the player is read live. */
+      m.addEventListener('pointerdown',e=>{
+        e.preventDefault(); e.stopPropagation();
+        const c=m._c; if(!c)return;
+        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
+        try{ $('#vvideo').currentTime=c.t; V.tlPin=true; tlPaint(); }catch(_){}
+        chapterInView(c.t);
+        m.classList.add('hot'); setTimeout(()=>m.classList.remove('hot'),260);
+        whisper(fmtT(c.t)+'  \u00b7  '+(c.label||'chapter'));
+      });
+      m.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();});
+      wrap.append(m); nodes.push(m);
+    });
+  }
+  wrap._chNodes=nodes;
+  if((_tlG?_tlG.width:wrap.getBoundingClientRect().width)<20)return;
+  const win=tlWin();
+  nodes.forEach((m,i)=>{
+    const c=ch[i]; if(!c)return;
+    m._c=c; m._kn=1;
+    const off=(c.t<win.a-0.01||c.t>win.b+0.01);
+    m.classList.toggle('hid',off);
+    if(!off)m.style.left=Math.round(tlPx(c.t)-3)+'px';
+  });
+  /* his Big Walk has 116 chapters: at 'whole' they share pixels, and 116
+     six-pixel notches on top of each other is a smear, not a handle. The
+     crowded ones fold into the first, whose hover says how many are
+     hiding there - the red marks' old law, kept. */
+  const seen=new Map();
+  nodes.forEach(m=>{
+    if(m.classList.contains('hid'))return;
+    const key=Math.round((parseFloat(m.style.left)||0)/7);
+    const first=seen.get(key);
+    if(first&&first!==m){ m.classList.add('hid'); first._kn=(first._kn||1)+1; }
+    else seen.set(key,m);
+  });
 }
 
 /* ---- G6: the moments as a row of chips under the bar ----
@@ -11419,7 +11572,8 @@ function markCardShow(m){
             victory:'VICTORY on screen',defeat:'defeat on screen',
             kill:'a kill streak on screen',level:'a level-up on screen',
             boss:'a boss felled',hud:'the game said so on screen',
-            laugh:'laughter',scream:'a scream',game:'a burst in the game'};
+            laugh:'laughter',scream:'a scream',game:'a burst in the game',
+            moment:'a described moment'};
   card.innerHTML='';
   const x0=el('span','mcx','\u00d7');
   x0.addEventListener('pointerdown',e0=>{e0.preventDefault();e0.stopPropagation();
@@ -11481,15 +11635,22 @@ function markCardShow(m){
   card.style.left=Math.max(4,Math.min(W-(card.offsetWidth||240)-4,
     x-(card.offsetWidth||240)/2))+'px';
 }
-function markTipShow(m){
-  const wrap=$('#vseekwrap'); if(!wrap)return;
-  clearTimeout(_tipHideT); _tipHideT=null;
+/* ONE tip node for all three sets - the gold, the red and the sections -
+   so a hover can never leave two of them open over each other. */
+function markTipNode(){
+  const wrap=$('#vseekwrap'); if(!wrap)return null;
   let tip=wrap._tip;
   if(!tip){ tip=document.createElement('div'); tip.id='marktip';
     tip.addEventListener('mouseenter',()=>{clearTimeout(_tipHideT);_tipHideT=null;});
     tip.addEventListener('mouseleave',markTipArmHide);
     wrap.append(tip); wrap._tip=tip; }
-  let t=null, why='';
+  return tip;
+}
+function markTipShow(m){
+  const wrap=$('#vseekwrap'); if(!wrap)return;
+  clearTimeout(_tipHideT); _tipHideT=null;
+  const tip=markTipNode(); if(!tip)return;
+  let t=null, why='', sub='';
   if(m.classList.contains('hlmark')){
     const ev=m._ev||{}; t=ev.t;
     const SN={cheer:'cheering',groan:'a frustrated groan',
@@ -11507,17 +11668,24 @@ function markTipShow(m){
     if(ev.also&&ev.also.length)
       why+=' + '+ev.also.map(k=>SN[k]||k).join(', ');
   }else if(m.classList.contains('insmark')){
-    const c=m._c||{}; t=c.t; why='chapter \u2014 '+(c.label||'');
-    /* every chapter draws now, so a long night stacks several on one
-       pixel - say so rather than letting them look like one */
+    /* 3.34 J: the red is a MOMENT now - the tome's own words for why this
+       second is worth watching, with the line spoken at it underneath */
+    const q=m._m||{}; t=q.t; why='\u2726 '+(q.why||'a moment');
+    /* every moment draws, so a long night stacks several on one pixel -
+       say so rather than letting them look like one */
+    if((m._kn||1)>1)why+='   (+'+(m._kn-1)+' more here \u2014 zoom in)';
+  }else if(m.classList.contains('chnotch')){
+    const c=m._c||{}; t=c.t; why=c.label||'chapter';
+    sub=(c.what&&c.what!==c.label)?c.what:'';
     if((m._kn||1)>1)why+='   (+'+(m._kn-1)+' more here \u2014 zoom in)';
   }else{ t=m._t; why='your mark'; }
   if(t==null)return;
   const render=()=>{
-    tip.innerHTML='';
+    tip.innerHTML=''; tip._c=null;   /* not a section's tip any more */
     tip.append(el('b',null,fmtT(t)+'  \u00b7  '+esc(why)));
-    const w=tipWordsAt(t);
-    if(w)tip.append(el('i',null,'\u201c'+esc(w)+'\u201d'));
+    /* a section says what it WAS; everything else quotes what was SAID */
+    const w=sub||tipWordsAt(t);
+    if(w)tip.append(el('i',null,sub?esc(w):'\u201c'+esc(w)+'\u201d'));
     tip.classList.add('on');
     const W=wrap.getBoundingClientRect().width;
     const x=parseFloat(m.style.left)||tlPx(t);
@@ -11538,11 +11706,39 @@ function markTipShow(m){
     })();
   }
 }
+/* 3.34 J: THE TRACK ITSELF IS HOVERABLE. Anywhere over the bar names the
+   SECTION under the pointer - the same tip the notch shows - so the shape
+   of the night can be read by sweeping across it, without hunting a mark.
+   Rebuilt only when the section under the pointer CHANGES: this rides
+   mousemove, and rebuilding a tip sixty times a second is a stutter. */
+function chapTipShow(c,x){
+  const wrap=$('#vseekwrap'), tip=markTipNode();
+  if(!wrap||!tip||!c)return;
+  clearTimeout(_tipHideT); _tipHideT=null;
+  wrap._tipRe=null;                /* nothing async to re-render here */
+  if(tip._c!==c||!tip.classList.contains('on')){
+    tip._c=c; tip.innerHTML='';
+    tip.append(el('b',null,fmtT(c.t||0)+'  \u00b7  '+esc(c.label||'chapter')));
+    if(c.what&&c.what!==c.label)tip.append(el('i',null,esc(c.what)));
+    tip.classList.add('on');
+  }
+  const W=wrap.getBoundingClientRect().width;
+  tip.style.left=Math.max(4,Math.min(W-(tip.offsetWidth||120)-4,
+    (x==null?tlPx(c.t||0):x)-(tip.offsetWidth||120)/2))+'px';
+}
+function chapTipAtX(clientX){
+  const wrap=$('#vseekwrap'); if(!wrap||!tlDur())return;
+  /* the chip that hides the sections hides what they say, too */
+  if(MARKS.red===false){ markTipHide(); return; }
+  const c=chapAt(tlTimeAt(clientX));
+  if(!c){ markTipHide(); return; }
+  chapTipShow(c,clientX-wrap.getBoundingClientRect().left);
+}
 let _tipHideT=null;
 function markTipHide(){
   clearTimeout(_tipHideT); _tipHideT=null;
   const wrap=$('#vseekwrap'), tip=wrap&&wrap._tip;
-  if(tip)tip.classList.remove('on');
+  if(tip){tip.classList.remove('on'); tip._c=null;}
   if(wrap)wrap._tipRe=null;
 }
 function markTipArmHide(){
@@ -11748,7 +11944,8 @@ function tlPaint(){
   headPx();          /* the head is placed by tlPx, like every mark */
   try{if(typeof clipPaint==='function'&&CLIP.on)clipPaint();}catch(e){}
   try{vloopPaint();}catch(e){}     /* 2.76: the loop band rides every paint */
-  insMarksPlace();   /* and so are the chapters */
+  momMarksPlace();   /* the tome's moments, in red under the bar */
+  chapSegsPaint();   /* and the chapters, as the bar's own sections */
   const vd=$('#vvideo'), d=tlDur(), win=tlWin();
   const ov=$('#vover'), wb=$('#voverwin'), hd=$('#voverhead');
   if(ov){
@@ -11769,7 +11966,6 @@ function tlPaint(){
   document.body.classList.toggle('tlzoom',!win.full);
   drawRuler();
   try{ if(window.__hypePaint)window.__hypePaint(); }catch(e){}
-  if(typeof chapSegsPaint==='function')chapSegsPaint();
   if(typeof paintChapters==='function')paintChapters();
   if(typeof paintSeen==='function')paintSeen();
   /* the working rides the same paint - WRAPPED, because a throw in a
@@ -13026,19 +13222,20 @@ function wireViewer(){
          right on top of it */
       const _mc2=document.getElementById('markcard');
       if(_mc2&&_mc2.classList.contains('on')){peekHide();return;}
-      if(e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark,#marktip,#markcard')){peekHide();return;}
+      if(e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark,.chnotch,#marktip,#markcard')){peekHide();return;}
       const r=swrap.getBoundingClientRect();
       peekShow(e.clientX,tlTimeAt(e.clientX),r.top);
+      chapTipAtX(e.clientX);      /* 3.34 J: and the section it is in */
     });
     swrap.addEventListener('mouseleave',()=>{peekHide();markTipHide();});
     /* N5: every mark explains itself - the signal that made it, and the
        words heard at that second */
     swrap.addEventListener('mouseover',e=>{
-      const m=e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark');
+      const m=e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark,.chnotch');
       if(m)markTipShow(m);
     });
     swrap.addEventListener('mouseout',e=>{
-      const m=e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark');
+      const m=e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark,.chnotch');
       if(!m)return;
       const to=e.relatedTarget;
       if(to&&(m.contains(to)||(to.closest&&to.closest('#marktip'))))return;

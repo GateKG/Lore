@@ -36,7 +36,7 @@ for %%t in (codex327test codex326test codex325test codex324test codex323test asr
             mictest audiotest midchange fetchtest
             hud330test echo330test title330test owing330test black332test outcome332test ask332test stall332test askstate332test
             picture332test ears333test ears333audit describer333test
-            hotfix334test
+            hotfix334test eye334test
             tracks331test src331settingstest src331dumptest
             src331taptest src331watchtest src331runtest src331walktest
             src331test sources331_describer sources331_panel
@@ -55,6 +55,9 @@ if errorlevel 1 set FAILED=!FAILED! cliptest
 echo ===== paneltest =====
 node "paneltest.js"
 if errorlevel 1 set FAILED=!FAILED! paneltest
+echo ===== chaptest =====
+node "chaptest.js"
+if errorlevel 1 set FAILED=!FAILED! chaptest
 echo ===== checkui =====
 node "checkui.js" "..\ui.html"
 if errorlevel 1 set FAILED=!FAILED! checkui

@@ -1083,6 +1083,7 @@ if HSRC:
               'True)),\n'
               '                "room_names": str(SETTINGS.get("room_names") '
               'or ""),\n'
+              '                "my_name": _my_name(),\n'
               '                "version": APP_VERSION}')
           == msrc(SRC, "_JsApi", "state", TREE))
 else:
@@ -1156,7 +1157,7 @@ check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
       and "librarian_ready:true,second_ear:true,room_names:'',"
-          "version:'3.34'" in USRC)
+          "my_name:'',version:'3.34'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "

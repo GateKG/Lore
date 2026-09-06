@@ -906,12 +906,13 @@ ans = {"re": re, "os": os, "json": json}
 for c in ("_AUD_V", "_AUD_WORDS", "_AUD_SOUND", "_AUD_EYE", "_AUD_REVIEW",
           "_AUD_CHAPTER", "_AUD_LAUGH", "_AUD_SCREEN", "_AUD_OUT_WIN",
           "_AUD_LIVE", "_AUD_LAYERS", "_AUD_SAY", "_AUD_SILENT",
-          "_AUD_OUT_WORDS"):
+          "_AUD_OUT_WORDS", "_AUD_STOP", "_AUD_EYE_FAM"):
     assign(SRC, c, ans, TREE)
 ans["_aud_voice"] = lambda sns, a, b: ""
 ans["_outcome_line"] = _outcome_line
 ans["_ordinal"] = ns["_ordinal"]
-for f in ("_aud_says", "_aud_live", "_aud_silence", "_aud_out_match",
+for f in ("_aud_eye_agrees", "_aud_says", "_aud_live", "_aud_silence",
+          "_aud_out_match",
           "_aud_out_seat", "_aud_out_opposite", "_aud_outcomes",
           "_aud_public"):
     extract(SRC, f, ans, TREE)
@@ -960,9 +961,22 @@ if HSRC:
                "ins": {"moments": [{"t": 1118.2, "why": "a save"}],
                        "chapters": [{"t": 1110, "label": "The save"}]},
                "laughs": [(1119.0, "laugh")]}
-    check("OLD-NIGHT PARITY: a night with no outcomes and no banner read "
-          "answers exactly as HEAD's auditor did",
-          ans["_aud_says"](1118.0, old_src) == h_says(1118.0, old_src)
+    # 3.34 I MOVED THIS ANSWER ON PURPOSE, so the pin follows the
+    # CONTRACT and not the code: on this fixture the only look is a
+    # bare place name ("the pitch") against a mark that says "what a
+    # save", and a witness that agrees with anything is no witness.
+    # Everything else about the second must still be HEAD's.
+    hl, hd = h_says(1118.0, old_src)
+    nl, nd = ans["_aud_says"](1118.0, old_src)
+    check("OLD-NIGHT CONTRACT: the vacuous look no longer votes - the eye "
+          "is out of the agreeing witnesses, and eye_near says it was "
+          "looking anyway",
+          "eye" in hl and "eye" not in nl
+          and nd.get("eye_near") is True
+          and nl == [k for k in hl if k != "eye"])
+    check("...and NOTHING else moved: every other layer, and the quoted "
+          "words of all of them, answer exactly as HEAD's auditor did",
+          {k: v for k, v in nd.items() if k != "eye_near"} == hd
           and ans["_aud_says"](50.0, old_src) == h_says(50.0, old_src))
 
 print("\n--- the auditor: what the story claims ---")
@@ -1176,17 +1190,26 @@ check("the OUTCOMES block, the plant, the tally and the witness are all "
 print("\n--- the UI, read from its source ---")
 rhm = USRC[USRC.index("async function renderHlMarks"):]
 rhm = rhm[:rhm.index("const clusterPass=")]
-check("the bar folds _sns.outcomes FIRST, before the review's moments, "
-      "z 1e6, kind 'outcome', the text on the tick",
+# 3.34 J took the review's moments OUT of the gold - they are the red
+# row under the bar now - so the old ordering pin has nothing left to
+# order against. The contract it was defending survives: the screen's
+# verdict is the only thing this pass plants.
+check("the bar folds _sns.outcomes into the gold - z 1e6, kind "
+      "'outcome', the text on the tick - and the moments are NOT "
+      "planted as gold beside them any more",
       "((_sns&&_sns.outcomes)||[]).forEach(o=>{" in rhm
-      and rhm.index("_sns.outcomes") < rhm.index("((_ins&&_ins.moments)||[])")
+      and "((_ins&&_ins.moments)||[])" not in rhm
       and "evs.push({t:o.t,z:1e6,kind:'outcome',text:text})" in rhm)
 check("...and a mark within 8 s is retagged so the win WINS the seat, "
       "keeping its own kind in also",
       "near.also=[near.kind].concat(near.also||[])" in rhm
       and "near.kind='outcome'; near.text=text;" in rhm)
-check("stamp(): outcome is tested BEFORE said; heard = the text",
-      "const fk=ev.kind==='outcome'?'outcome':said?'told'" in rhm
+check("stamp(): the outcome still outranks every kind and heard is "
+      "its text - but 3.34 J made data-fk the EAR's kind only, so "
+      "'told' is no longer a gold tint",
+      "const fk=ev.kind==='outcome'?'outcome':(ev.kind==='laugh'"
+      "?'laugh'" in rhm
+      and "said?'told'" not in rhm
       and "const heard=ev.kind==='outcome'?(ev.text||'the screen decided')" in rhm
       and "k==='outcome'?'outcome'" in rhm)
 check("the chip 'outcome' joins MARKS, the saved keys, gsig and NAME",
@@ -1196,11 +1219,10 @@ check("the chip 'outcome' joins MARKS, the saved keys, gsig and NAME",
       and 'data-m="outcome"' in USRC)
 check("the tick wears the brightest gold, outlined",
       '.hlmark[data-fk="outcome"]{background:var(--gold-hi);' in USRC)
-check("...and keeps it when told: the outcome+told rule sits BELOW .told, "
-      "which ties it on specificity",
-      '.hlmark[data-fk="outcome"].told{background:var(--gold-hi)}' in USRC
-      and USRC.index(".hlmark.told{") < USRC.index(
-          '.hlmark[data-fk="outcome"].told{'))
+check("...and nothing can dull it: 3.34 J deleted the .told tint, so "
+      "no rule ties or beats the tick on specificity any more",
+      ".hlmark.told{" not in USRC
+      and '.hlmark[data-fk="outcome"].told{' not in USRC)
 check("the api.audit contract comment names the six layers, screen among "
       "them", "sound / words / eye / screen /" in USRC
       and "laugh / review (THR_LAYERS, in that order)" in USRC

@@ -536,7 +536,7 @@ check("review fix: the said row, the Eye row, the chapter mark, your mark, "
       "stamp V.userSeekReq before they seek (8)",
       USRC.count(STAMP) == 8
       and "    const vd=$('#vvideo');\n    " + STAMP + "\n    try{vd.currentTime=ln.t;}catch(e2){}" in USRC
-      and "        const c=m._c; if(!c)return;\n        " + STAMP + "\n        try{$('#vvideo').currentTime=c.t;}catch(_){}" in USRC)
+      and "        const c=m._c; if(!c)return;\n        " + STAMP + "\n        try{ $('#vvideo').currentTime=c.t; V.tlPin=true; tlPaint(); }catch(_){}" in USRC)
 tw = USRC[USRC.index("function tipWordsAt(t){"):USRC.index("function markCardShow(m){")]
 check("tipWordsAt skips a struck line - the next nearest unstruck line, "
       "else none", "if(s.nn)continue;" in tw

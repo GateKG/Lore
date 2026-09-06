@@ -181,6 +181,10 @@ DEFAULTS = {
     # data - seeded once from room_names.txt beside the settings,
     # never written into code.
     "room_names":        "",
+    # HIS NAME FOR THE TOME (3.34 K): what the story calls him instead
+    # of "the player" - seeded once from my_name.txt beside the
+    # settings, never written into code. Empty = "YOU", as 3.33.
+    "my_name":           "",
     # What the recorder captures: the whole watched screen (proven path) or,
     # experimentally, only the game's own window - the SAME GPU capture cropped
     # at the source to the window's client rect, tracked as the window moves
@@ -748,6 +752,8 @@ def _sanitize_settings(d):
     d["second_ear"] = bool(d.get("second_ear", DEFAULTS["second_ear"]))
     d["room_names"] = _room_names_clamp(
         d.get("room_names", DEFAULTS["room_names"]))
+    d["my_name"] = str(d.get("my_name", DEFAULTS["my_name"])
+                       or "").strip()[:40].strip()
 
 
 def load_settings():
@@ -16205,6 +16211,50 @@ def _seed_room_names():
         return False
 
 
+def _my_name():
+    """His name for the tome, or "". The setting is the only truth -
+    the clamp already cut it to forty characters, and this never
+    raises, because every prompt built at ask time asks it."""
+    try:
+        return str(SETTINGS.get("my_name") or "").strip()[:40]
+    except Exception:
+        return ""
+
+
+def _seed_my_name():
+    """Boot (3.34 K): an EMPTY my_name setting is filled once from
+    my_name.txt beside the settings - one line, the name he wants the
+    story to use - and saved, so the file is read once and the
+    settings page is the truth from then on. A filled setting is
+    never touched; no file, nothing happens. The name is his data and
+    lives only there - never in code, comments or tests, and never in
+    the log line that says it was read."""
+    try:
+        if str(SETTINGS.get("my_name") or "").strip():
+            return False
+        p = os.path.join(_data_dir(), "my_name.txt")
+        if not os.path.isfile(p):
+            return False
+        nm = ""
+        with open(p, encoding="utf-8-sig") as fh:
+            for ln in fh.read().splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    nm = ln
+                    break
+        nm = nm.strip()[:40].strip()
+        if not nm:
+            return False
+        SETTINGS["my_name"] = nm
+        save_settings(SETTINGS)
+        log("Your name for the tome was read from my_name.txt.")
+        return True
+    except Exception as e:
+        log("Your name could not be read from my_name.txt: "
+            + str(e)[:100])
+        return False
+
+
 def _asr_game_name(video_path):
     """The game a recording belongs to, off its shelf or its filename -
     the same answer _asr_context_for gives, for the second ear's prompt."""
@@ -17089,6 +17139,45 @@ def _describer_paths():
     return None
 
 
+def _who_law(voice=False, name=None):
+    """WHO IS TALKING, BY NAME (3.34 K): the one law appended to the
+    describer's, the title's and the auditor's prompt at ask time.
+
+    A prompt that never learns his name can only write "the player",
+    and the transcript's own labels are the evidence for a better
+    word. The 'Discord:' half is a law about a LABEL, not a name:
+    his friends are people, so the prose must never call one of them
+    Discord (his words, 6 Sep: "in the description don't literally
+    call them Discord, but some identifier that they're my friend").
+
+    With no name and no voice tap there is nothing to teach and this
+    is "" - the ask is then HEAD's to the byte, so every title and
+    every chapter already baked stays comparable.
+
+    A TAP NIGHT WITH NO NAME STILL GETS THE LAW, deliberately:
+    this is a law about a LABEL, and _dress_line writes
+    'Discord:' into that night's transcript whether or not he
+    has typed a name. A prompt that never explains a label the
+    transcript carries is worse than one that changed. The price
+    is stated plainly: from 3.34 on, titles baked from a 3.31+
+    tap night are no longer byte-comparable with the ones before
+    it - nights with neither a name nor a tap still are."""
+    nm = _my_name() if name is None else str(name or "").strip()[:40]
+    if not nm and not voice:
+        return ""
+    me = nm or "the person recording"
+    law = ("\n- The recording belongs to " + me + " (lines marked '"
+           + (nm or "YOU") + ":' are theirs).")
+    if voice:
+        law += (" Lines marked 'Discord:' are " + me + "'s friends "
+                "on the voice call - in chapters, titles, summaries "
+                "and moments NEVER write 'Discord' as if it were a "
+                "person's name: say 'a friend on the call', 'his "
+                "friend', 'the friends', 'the boys on the call', or "
+                "the name a line carries.")
+    return law + " Never 'the player' or 'the players'."
+
+
 _DESC_SYSTEM = """You are given part of the transcript of one recorded gaming session.
 The people speak Emirati/Gulf Arabic and English, often switching mid-sentence,
 and they frequently discuss things that are NOT on screen - other games, work,
@@ -17418,6 +17507,16 @@ _TITLE_TALLY_RULE = (
     "carries the tally.)\n")
 
 
+# 3.34 K: what the re-ask says when a title used the label as a name.
+# Beside the guard, not inside it - the guard is arithmetic and is
+# lifted on its own by the roster.
+_TITLE_DISCORD_LAW = (
+    "\n'Discord' is not a person. The lines marked 'Discord:' are "
+    "his friends on the voice call: say 'a friend on the call', "
+    "'his friends', or the name a line carries - never 'Discord' as "
+    "a name, and never 'the player'.")
+
+
 def _title_guard(title, said):
     """Why a title is not a name for the night, or '' when it is.
 
@@ -17442,6 +17541,17 @@ def _title_guard(title, said):
         return "a list"
     if any(w in _TITLE_MOOD for w in toks):
         return "a mood word, not an event"
+    # 3.34 K: DISCORD IS NOT A PERSON. The transcript labels his
+    # friends' lines "Discord:" so the model knows whose voice it is,
+    # and a model told that will happily title the night "Discord
+    # scores". A word that is only ever a place to talk gets a
+    # preposition or an article in front of it; standing bare at the
+    # head of a title, or in a list of names, it is being used as one.
+    for _i, _w in enumerate(toks):
+        if _w == "discord" and (_i == 0 or toks[_i - 1] not in (
+                "on", "over", "in", "the", "a", "via", "through",
+                "from", "off")):
+            return "Discord as a name"
     if toks and (toks[-1] in _TITLE_FILLER or toks[0] in _TITLE_FILLER):
         return "a transcript fragment"
     # the overlap is counted on the words that carry meaning - "the"
@@ -17526,6 +17636,14 @@ def _title_evidence(ev):
                if ev.get("places") else "")
             + ("THE EYE saw: %s.\n" % "; ".join(ev.get("creatures") or [])
                if ev.get("creatures") else "")
+            # 3.34: the eye's sentences (what it read off the screen is
+            # the best evidence of the event); absent byte-for-byte on a
+            # night without looks
+            + ("WHAT THE EYE SAW (each look, in its own words):\n"
+               + "\n".join("  %d:%02d  %s" % (int(t0 // 60), int(t0 % 60),
+                                          str(s0)[:240])
+                           for t0, s0 in (ev.get("seen") or [])[:4])
+               + "\n" if ev.get("seen") else "")
             + "\nWRITE:\n" + _TITLE_WRITE)
     return body
 
@@ -18462,6 +18580,14 @@ def _seg_layer(sg):
     return "room"
 
 
+# 3.34 K THE NIGHT'S SOURCES, where the dressing can reach them. An
+# extra argument would have changed _dress_line's shape, and the
+# roster holds that shape to a HEAD copy; a module-level cell set the
+# moment the night's transcript is opened costs nothing and cannot
+# race, because one job slot describes one recording at a time.
+_DRESS_SRC = {}
+
+
 def _room_words(segs):
     """Words the ROOM said - what the 'nothing was said' verdict counts."""
     return sum(len((sg.get("t") or "").split()) for sg in (segs or [])
@@ -18497,6 +18623,23 @@ def _dress_line(sg, i, sns):
                       else str(_w).strip()[:24] + ": ")
         except Exception:
             pass
+    # WHO IS TALKING, BY NAME (3.34 K). "YOU" is what a machine calls
+    # the person it is recording; his own name is what a friend would
+    # call him, and the story reads like a person wrote it the moment
+    # the model knows it. On a night the Voice tap opened, a room line
+    # that is not his and carries no typed name is a friend on the
+    # call by construction (the room IS the tap plus his mic, 3.31) -
+    # so it says so. A mix night has no such proof and stays bare, and
+    # with no name and no tap this line is HEAD's to the byte.
+    try:
+        if yv == "YOU: ":
+            _nm = _my_name()
+            if _nm:
+                yv = _nm + ": "
+        elif not yv and not sg.get("g") and _DRESS_SRC.get("voice"):
+            yv = "Discord: "
+    except Exception:
+        pass
     return f"[#{i} {t // 60}:{t % 60:02d}] {yv}{txt}{gl}"
 
 
@@ -18549,11 +18692,20 @@ def _insights_one(video_path, forced=False, fresh=False):
         return False
     if not forced and not _insights_wanted():
         return False
+    _stt_doc = {}
     try:
         with open(_ai_sidecar(video_path, "stt"), encoding="utf-8") as fh:
-            segs = (json.load(fh) or {}).get("segments") or []
+            _stt_doc = json.load(fh) or {}
+        segs = _stt_doc.get("segments") or []
     except Exception:
         segs = []
+    # 3.34 K: this night's sources, for the dressing and the two
+    # prompts below. Set here, before any road can dress a line, so a
+    # previous night's tap can never label this one's friends.
+    _stt_src = (_stt_doc.get("sources")
+                if isinstance(_stt_doc.get("sources"), dict) else {})
+    _DRESS_SRC.clear()
+    _DRESS_SRC.update(_stt_src)
     dur = _video_duration(video_path) or 0.0
     if dur < 20:
         # A COLD 40 GB FILE ON A BUSY SPINNING DISK can time the probe out -
@@ -19118,25 +19270,9 @@ def _insights_one(video_path, forced=False, fresh=False):
     _heard.sort()
     # WHAT THE EYE ACTUALLY SAW. The looks it banked, phrased as one line
     # each, so a chapter can be named after the corridor it happened in
-    # instead of after the only noun in the transcript.
-    _seen = []
-    try:
-        with open(_ai_sidecar(video_path, "vis"), encoding="utf-8") as fh:
-            _vd0 = json.load(fh) or {}
-        if not _vd0.get("failed"):
-            for _lk0 in (_vd0.get("looks") or []):
-                if not isinstance(_lk0, dict):
-                    continue
-                bits = str(_lk0.get("place") or "")
-                if _lk0.get("creature"):
-                    bits += (" - " if bits else "") + str(_lk0["creature"])
-                if _lk0.get("doing") and len(bits) < 55:
-                    bits += ("; " if bits else "") + str(_lk0["doing"])
-                if bits.strip():
-                    _seen.append((float(_lk0.get("t") or 0), bits[:90]))
-    except Exception:
-        pass
-    _seen.sort()
+    # instead of after the only noun in the transcript - and, since 3.34,
+    # with the eye's own sentence on every line (_eye_seen says why).
+    _seen = _eye_seen(video_path)
 
     def _win_owes(w):
         """A window that stopped early with budget left is not done."""
@@ -19347,18 +19483,11 @@ def _insights_one(video_path, forced=False, fresh=False):
             # night and on a night whose game has no pack.
             ears += _outcome_block(_outs, lo, hi)
             saw_here = [(t0, s0) for t0, s0 in _seen if lo <= t0 < hi]
-            eyes = ""
-            if saw_here:
-                # TEN LOOKS AT MOST. This head shares its context with the
-                # transcript and five pictures; a slow night can leave a
-                # dozen looks inside one window, and pasting them all in
-                # spends exactly the room the words needed.
-                eyes = ("The tome LOOKED at this window and saw:\n"
-                        + "\n".join(
-                            f"  {int(t0 // 60)}:{int(t0 % 60):02d} {s0}"
-                            for t0, s0 in saw_here[:10])
-                        + "\nName the places when you write the chapters; "
-                          "never name one it did not see.\n")
+            # TWELVE LOOKS AT MOST, the ones nearest the marked moments
+            # first (3.34: each look is a sentence now, and this head
+            # shares its context with the transcript and five pictures)
+            eyes = _eye_block(_eye_lines(saw_here, lo, hi,
+                                         [t0 for t0, _k0 in mk_here], 12))
             # THE STORY SO FAR. Windows were described in isolation, so
             # a window could not know what the ones before it had found:
             # "remember the elevator?" at minute 34 landed in a window
@@ -19458,7 +19587,9 @@ def _insights_one(video_path, forced=False, fresh=False):
                           f"{want} stretches.\n\n")
                 got = None
                 for _attempt in range(2):
-                    txt = srv.ask(_DESC_SYSTEM, head + body,
+                    txt = srv.ask(_DESC_SYSTEM
+                                  + _who_law(bool(_stt_src.get(
+                                      "voice"))), head + body,
                                   max_tokens=out_cap,
                                   schema=_DESC_SCHEMA,
                                   images=imgs if _first else None)
@@ -19726,9 +19857,15 @@ def _insights_one(video_path, forced=False, fresh=False):
                        "creatures": [str(c.get("name") or "")[:40]
                                      for c in (_vd1.get("creatures") or [])
                                      if isinstance(c, dict)
-                                     and c.get("name")][:6]}
+                                     and c.get("name")][:6],
+                       # 3.34: the eye's own sentences, the four nearest
+                       # the moments - the banner it read is the event
+                       "seen": _eye_lines(_seen, 0.0, float("inf"),
+                                          [m.get("t") for m in _moms
+                                           if isinstance(m, dict)], 4)}
                 t_ask = _title_evidence(_ev)
-                t_sys = _TITLE_SYS
+                t_sys = _TITLE_SYS + _who_law(
+                    bool(_stt_src.get("voice")))
                 t_max = 360
                 # every line the page showed it, chapter quotes and the
                 # moments' whys alike - the guard compares against all
@@ -19791,7 +19928,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                         + "\" is " + _why + ". Name what HAPPENED instead "
                         "- a subject and a verb, in your own words: no "
                         "quotation, no swearing, no colon, no list, no "
-                        "mood word. Same JSON.",
+                        "mood word. Same JSON."
+                        # the guard that caught it is a law about a
+                        # label, so the re-ask restates the law rather
+                        # than only naming the crime
+                        + (_TITLE_DISCORD_LAW
+                           if _why == "Discord as a name" else ""),
                         max_tokens=t_max, schema=_TITLE_SCHEMA)
                     cand = cs = ""
                     try:
@@ -20040,15 +20182,20 @@ _EYE_GIVEUP = 8        # single frames refused before the ladder stops
 _EYE_SYSTEM = """You are the tome's eye. You are shown still frames from
 one recording of a game, and you say only what is ACTUALLY THERE.
 
-- "place" is where the picture is: a room, a corridor, a street, a shop, a
-  menu, a map, a loading screen. Name it the way somebody who was there
-  would - "a yellow wallpaper corridor", "an office full of cubicles",
-  "the inventory screen". Three to eight words.
+- "place" is where the picture is, said the way somebody who was there
+  would say it: "the tavern", "the main menu", "the orange goal end of the
+  arena", "a hexagonal arena", "a yellow wallpaper corridor", "the
+  inventory screen". Three to eight words. NEVER the game's name alone -
+  the game is known already, and a place is somewhere INSIDE it.
 - "creature" is the thing in shot worth naming: a monster, an enemy, an
   NPC, another player. Only when one is visibly there. Nothing in shot is
   the ordinary case, and the honest answer for it is "none".
-- "doing" is what is happening at that instant, in a handful of words -
-  "reloading behind cover", "reading a note", "standing still".
+- "doing" is the one thing a person watching would say is happening: one
+  full sentence, up to thirty words. It MUST read what is legible on the
+  screen - the score, who scored, a timer, a countdown, a menu's title, a
+  boss's name, "WINNER", "GOAL", "YOU DIED" - text on screen is the best
+  evidence there is, so quote it. "a car lands after a goal, the banner
+  reads FARIS SCORED and the score is 2-1" beats "cars on a field".
 - Never invent a story between frames, never mention the frame, the image,
   the screenshot or the resolution, and never describe a frame you were
   not shown. A wrong answer is worth less than "none"."""
@@ -20111,6 +20258,96 @@ def _eye_norm(v, cap=70):
         # full of cubicles" in the middle of a sentence pays none
         s = s[:1].lower() + s[1:]
     return s[:cap]
+
+
+def _eye_seen(video_path):
+    """WHAT THE EYE ACTUALLY SAW, one line per look, in time order ->
+    [(t, "<place> - <creature> - <doing>")]. The doing is ALWAYS in: it
+    is the sentence that carries the content. 3.34, measured on a Rocket
+    League night: the eye said "stadium field" eight times and the one
+    look that read the banner off the screen never reached the describer,
+    because the old row took the doing only while the line was still
+    under 55 characters. Cut at 240, the eye's own sentence cap. A failed
+    or absent .vis is an empty list; a look with a junk clock is a bad
+    row, not a reason to lose the night's looks."""
+    out = []
+    try:
+        with open(_ai_sidecar(video_path, "vis"), encoding="utf-8") as fh:
+            vd = json.load(fh) or {}
+        if not vd.get("failed"):
+            for lk in (vd.get("looks") or []):
+                if not isinstance(lk, dict):
+                    continue
+                try:
+                    t = float(lk.get("t") or 0)
+                except (TypeError, ValueError):
+                    continue
+                bits = [str(lk.get(k) or "").strip()
+                        for k in ("place", "creature", "doing")]
+                line = " - ".join(b for b in bits if b)
+                if line:
+                    out.append((t, line[:240]))
+    except Exception:
+        pass
+    out.sort()
+    return out
+
+
+def _eye_lines(seen, lo, hi, marks=(), cap=12):
+    """The looks inside [lo, hi) worth the describer's context, at most
+    `cap`, in time order. When there are more than fit, the ones nearest
+    the marked moments are taken first (one per mark, the closest look
+    not yet taken), then an even spread of the rest - a slow night can
+    leave two dozen looks in one window, and the head shares its context
+    with the transcript and five pictures."""
+    here = [(t, s) for t, s in (seen or []) if lo <= t < hi]
+    if len(here) <= cap:
+        return here
+    # BY INDEX, NEVER BY VALUE. The eye repeats itself - two looks
+    # can be the same (t, sentence) pair - and removing the taken
+    # ones by value shrank `rest` below `need`, so the even spread
+    # stepped by less than one: measured 13 rows in, 11 distinct
+    # out, one look printed twice and two real looks lost.
+    taken = set()
+    for m in (marks or ()):
+        try:
+            m = float(m)
+        except (TypeError, ValueError):
+            continue
+        best = None
+        for i, row in enumerate(here):
+            if i in taken:
+                continue
+            d = abs(row[0] - m)
+            if best is None or d < best[0]:
+                best = (d, i)
+        if best is not None:
+            taken.add(best[1])
+        if len(taken) >= cap:
+            break
+    pick = [here[i] for i in sorted(taken)]
+    rest = [here[i] for i in range(len(here)) if i not in taken]
+    need = cap - len(pick)
+    if need > 0 and rest:
+        step = len(rest) / float(need)
+        pick += [rest[int(i * step)] for i in range(need)]
+    pick.sort()
+    return pick[:cap]
+
+
+def _eye_block(rows):
+    """The WHAT THE EYE SAW block of a window's head - '' with no look in
+    it. Each look on its own clock, in its own words, and the law under
+    it: the places are real, and what the eye read off the screen (a
+    score, a scorer, a timer, a banner) is fact."""
+    if not rows:
+        return ""
+    return ("WHAT THE EYE SAW (each look, in its own words):\n"
+            + "\n".join(f"  {int(t0 // 60)}:{int(t0 % 60):02d}  {s0}"
+                        for t0, s0 in rows)
+            + "\nName the places when you write the chapters, never one "
+              "it did not see; what it read off the screen (a score, a "
+              "scorer, a timer, a banner) is fact - use it.\n")
 
 
 def _eye_looks(video_path, cap=None):
@@ -20293,7 +20530,10 @@ def _eye_ask(srv, game, frames):
             f"nothing to say. Answer about every frame you were shown, and "
             f"about no others.")
     try:
-        txt = srv.ask(_EYE_SYSTEM, user, max_tokens=60 * len(frames) + 160,
+        # 3.34: "doing" is a sentence of up to thirty words, and 60 tokens
+        # a frame was sized for a handful - a full answer in JSON runs
+        # past 80 a frame, and a clipped answer is a malformed one
+        txt = srv.ask(_EYE_SYSTEM, user, max_tokens=120 * len(frames) + 160,
                       schema=_EYE_SCHEMA,
                       images=list(zip(labels, [b for _t, b in frames])))
     except Exception as e:
@@ -22568,6 +22808,49 @@ def _aud_voice(sns, a, b):
     return best if bov > 0 else ""
 
 
+# 3.34 THE WORDS THAT MEAN THE SAME EVENT. The eye writes "a car
+# after a goal" where the room shouts "he scored" - the same second,
+# no shared token, and a token test alone would call that silence.
+# One family each for the handful of events every game has.
+_AUD_EYE_FAM = (
+    frozenset({"goal", "scored", "score"}),
+    frozenset({"win", "winner", "victory", "won"}),
+    frozenset({"lose", "lost", "defeat"}),
+    frozenset({"kill", "killed", "dead", "died", "death"}),
+    frozenset({"boss"}),
+    frozenset({"menu", "lobby", "queue"}),
+    frozenset({"level", "tier", "upgrade"}))
+
+
+def _aud_eye_agrees(look, claim):
+    """Does this look say anything about THIS claim?
+
+    Measured on a Rocket League night (3.33): seventeen looks, eight
+    of them the words "rocket League stadium field", and the auditor
+    listed the eye as an agreeing witness on every beat of the night -
+    a witness that agrees with anything is not a witness. Agreement is
+    a content word in common (four letters or more, the auditor's own
+    stop set out) or one event family in common. The look may come as
+    the dict or as its sentence; either way, no words either side is
+    no agreement."""
+    if isinstance(look, dict):
+        look = (str(look.get("doing") or "") + " "
+                + str(look.get("place") or "") + " "
+                + str(look.get("creature") or ""))
+    lw = set(re.findall("[a-z]+", str(look or "").lower()))
+    cw = set(re.findall("[a-z]+", str(claim or "").lower()))
+    if not lw or not cw:
+        return False
+    lt = set(w for w in lw if len(w) >= 4 and w not in _AUD_STOP)
+    ct = set(w for w in cw if len(w) >= 4 and w not in _AUD_STOP)
+    if lt & ct:
+        return True
+    for fam in _AUD_EYE_FAM:
+        if (lw & fam) and (cw & fam):
+            return True
+    return False
+
+
 def _aud_says(t, src):
     """Which layers can show something for this second, and the one line
     each of them would say if asked. An empty answer is the whole point
@@ -22646,7 +22929,7 @@ def _aud_says(t, src):
                     break
             except (TypeError, ValueError):
                 continue
-    best, bd = "", _AUD_EYE
+    best, bd, _bdo = "", _AUD_EYE, ""
     for lk in ((src.get("vis") or {}).get("looks") or []):
         if not isinstance(lk, dict):
             continue
@@ -22661,13 +22944,21 @@ def _aud_says(t, src):
         if not (who2 or where):
             continue                  # a look that named nothing saw nothing
         bd = d
+        _bdo = str(lk.get("doing") or "").strip()
         if where and who2:
             best = where + " - " + who2
         else:
             best = where or who2
+    _look = ""
     if best:
-        lay.append("eye")
-        det["eye"] = best[:90]
+        # 3.34 THE SENTENCE, NOT THE PLACE NAME. det["eye"] carried
+        # `place - creature` cut at 90, so the one look that read the
+        # banner off the screen reached the panel as a room name. The
+        # doing is the line that carries the content; the place is
+        # what is left when there is none.
+        det["eye"] = (_bdo or best)[:200]
+        det["eye_near"] = True    # it was looking here, agreeing or not
+        _look = _bdo + " " + best
     ins = src.get("ins") or {}
     # THE REVIEW IS A RETELLING, NOT A WITNESS. A moment may stand
     # as a layer when it genuinely cites this second; a chapter label
@@ -22704,6 +22995,15 @@ def _aud_says(t, src):
             det["laugh"] = ("somebody screams" if kind == "scream"
                             else "somebody laughs")
             break
+    # THE EYE VOTES LAST, BECAUSE THE VOTE IS EARNED (3.34). Being
+    # pointed at the right second is not agreement - the claim and the
+    # look have to be about the same thing. It shows on the page
+    # either way (det["eye"], and eye_near says it was looking); what
+    # it no longer does is hold up a chapter it never saw.
+    if _look and _aud_eye_agrees(
+            _look, " ".join(str(det.get(k) or "")
+                            for k in ("words", "review", "laugh"))):
+        lay.append("eye")
     return [k for k in _AUD_LAYERS if k in lay], det
 
 
@@ -23445,6 +23745,30 @@ def _aud_look_unclear(video_path, garble):
     return n
 
 
+def _aud_who(sg, src):
+    """The speaker label one dossier line wears (3.34 K), by the
+    same rule the describer's transcript uses: his own name (or
+    "YOU") for his mic, "Discord: " for a room line that is not his
+    on a night the Voice tap opened, bare on a mix night.
+
+    The auditor's prompt is GIVEN the law that reads those labels
+    (_who_law), and until now its own dossier carried none - the
+    thinker was taught to read a mark that never appeared in the
+    only transcript it was shown. Same gate as the law: with no
+    name and no tap this is "" and the dossier is HEAD's to the
+    byte."""
+    try:
+        nm = _my_name()
+        voice = bool((src.get("sources") or {}).get("voice"))
+        if not nm and not voice:
+            return ""
+        if sg.get("src") == "you":
+            return (nm or "YOU") + ": "
+        return "Discord: " if voice else ""
+    except Exception:
+        return ""
+
+
 def _aud_dossier(g, src, ins):
     """Everything the night knows about the seconds around ONE doubtful
     line - the conversation (language-tagged), the tone, the nearest
@@ -23488,7 +23812,12 @@ def _aud_dossier(g, src, ins):
         else:
             lang = ("[ar]" if str(sg.get("lang") or "") == "arabic"
                     else "[en]")
-        outl.append(mark + lang + " " + txt[:110])
+        # THE TAG WAS JUDGED ABOVE, FROM THE RAW TEXT, AND THAT
+        # ORDER IS THE POINT: a Latin "Discord: " prefix flips a
+        # short Arabic line to [en], and the script detection that
+        # heals 4,178 mislabelled lines was hard-won. The label
+        # goes on after it, never before.
+        outl.append(mark + lang + " " + _aud_who(sg, src) + txt[:110])
         if len(outl) >= 14:
             break
     if _vid_near:
@@ -23604,8 +23933,12 @@ def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
     shown = [str(p.get("name") or "") for p in (places or [])[:10]]
     shown += [str(c.get("name") or "") for c in (crs or [])[:8]]
     for r in anchors:
-        for v in (r.get("say") or {}).values():
-            shown.append(str(v))
+        for k, v in (r.get("say") or {}).items():
+            # the layers only: eye_near is a flag about where
+            # the eye pointed, never a name shown to anybody,
+            # and "True" is not a name the drops can match
+            if k in _AUD_LAYERS:
+                shown.append(str(v))
     shown = [k for k in (_eye_key(s) for s in shown) if k]
     tail = ""
     told = []
@@ -24039,6 +24372,8 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
         # different ear rows always stay (the list is cut in place)
         body = _aud_ear_budget(video_path, anchors, drops, game, dur, src,
                                places, crs, garble, body)
+        _asys = _AUD_SYSTEM + _who_law(
+            bool((src.get("sources") or {}).get("voice")))
         asrv = _AUD_KEEP.get("srv")
         if asrv is not None and (asrv.pr is None
                                  or asrv.pr.poll() is not None):
@@ -24058,7 +24393,7 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
             _AI["proc"] = asrv.pr      # Stop and a game must reach it
             _AUD_KEEP["srv"] = asrv
             _AUD_KEEP["t"] = time.time()
-            txt = asrv.ask(_AUD_SYSTEM, body,
+            txt = asrv.ask(_asys, body,
                            max_tokens=1600 + 80 * len(garble or []))
             if not txt and not _AI["abort"]:
                 # THE DRIVER DROPS THE SERVER SOMETIMES - a null-read
@@ -24072,7 +24407,7 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
                 if asrv.start():
                     _AI["proc"] = asrv.pr
                     _AUD_KEEP["srv"] = asrv
-                    txt = asrv.ask(_AUD_SYSTEM, body,
+                    txt = asrv.ask(_asys, body,
                                    max_tokens=1600 + 80 * len(garble or []))
                 else:
                     asrv = None
@@ -24136,7 +24471,8 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
         # defensive since the day it was written, and the price of a
         # malformed answer is one retry - the price of the grammar was
         # 35 seconds a night across a 442-night backlog.
-        txt = srv.ask(_AUD_SYSTEM, body,
+        txt = srv.ask(_AUD_SYSTEM + _who_law(
+            bool((src.get("sources") or {}).get("voice"))), body,
                       max_tokens=900 + (60 * len(garble or [])))
         if not txt:
             return [], "", "no answer came back", True, False, []
@@ -25730,7 +26066,13 @@ def _audit_one(video_path, redo=False):
                 except (TypeError, ValueError):
                     continue
         src = {"stt": stt, "sns": sns, "vis": vis, "ins": ins,
-               "laughs": laughs}
+               "laughs": laughs,
+               # 3.34 K: who was on the call, for the prompt's
+               # labels - a tap night's room is the Voice tap plus
+               # his mic by construction
+               "sources": (stt_doc.get("sources")
+                           if isinstance(stt_doc.get("sources"), dict)
+                           else {})}
         try:
             dur = float(ins.get("vdur") or 0)
         except (TypeError, ValueError):
@@ -25740,6 +26082,15 @@ def _audit_one(video_path, redo=False):
 
         # TWO PASSES, because the first is what tells us whether the
         # second is entitled to an opinion at all.
+        # 3.34 I: STANDING IS COUNTED FROM THE SAME VOTES the eye
+        # now has to earn, so a night whose looks are all bare
+        # place names has no eye in `live` at all. Two knock-ons,
+        # both intended: fewer claims fall by eye-silence, and
+        # the "a sighting whose look is gone" road (guarded by
+        # "eye" in live) stops running on exactly those nights.
+        # A witness that agreed with everything never had
+        # standing; expect the drop counts on old Rocket League
+        # nights to fall when they are re-audited.
         seen = {}
         for e in events:
             try:
@@ -25930,8 +26281,13 @@ def _audit_one(video_path, redo=False):
         # audit shows quotes, and quotation cannot confabulate.
         beats = [{"t": a["t"],
                   "agrees": list(a.get("agrees") or []),
+                  # THE LAYERS ONLY. det also carries eye_near, the
+                  # flag that says the eye was pointed at this
+                  # second without voting (3.34 I) - str(True) in a
+                  # sidecar row reads like a witness who said "True".
                   "say": {k: str(v)[:200]
-                          for k, v in (a.get("say") or {}).items() if v}}
+                          for k, v in (a.get("say") or {}).items()
+                          if v and k in _AUD_LAYERS}}
                  for a in anchors if (a.get("agrees") or [])]
         beats.sort(key=lambda b: b["t"])
         # THE CORRECTIONS LAND NOW - before this audit stamps the layers'
@@ -29723,6 +30079,7 @@ class _JsApi:
                 "librarian_ready": _emb_ready(),
                 "second_ear": bool(SETTINGS.get("second_ear", True)),
                 "room_names": str(SETTINGS.get("room_names") or ""),
+                "my_name": _my_name(),
                 "version": APP_VERSION}
 
     def signature(self):
@@ -35143,6 +35500,7 @@ def lore_app(show_window=True):
         return
     load_settings()
     _seed_room_names()            # 3.33 once, from room_names.txt, if empty
+    _seed_my_name()               # 3.34 K once, from my_name.txt, if empty
     _hide_console()
     log(f"LORE v{APP_VERSION} is waking; the recorder starts first, "
         "then the tome opens.")

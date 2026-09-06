@@ -136,10 +136,12 @@ check("the physics gate runs before the accept", i_gate < i_last)
 check("...and the script-derivation sits between it and `last`",
       i_gate < i_lang < i_last)
 LSRC = io.open(r"D:\Gate LLC\lore.py", encoding="utf-8").read()
-check("the dossier derives [ar]/[en] from the characters",
+check("the dossier derives [ar]/[en] from the characters - BEFORE "
+      "3.34 K's speaker label, whose Latin 'Discord: ' would flip a "
+      "short Arabic line",
       "THE TAG IS THE MODEL'S GUESS" in LSRC
       and LSRC.index("_da / float(len(_dl)) > 0.5")
-          < LSRC.index('outl.append(mark + lang + " " + txt[:110])'))
+          < LSRC.index('outl.append(mark + lang + " " + _aud_who(sg, src)'))
 
 print("\n--- T4: the reader generation ---")
 import re as _re2

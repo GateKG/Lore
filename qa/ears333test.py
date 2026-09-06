@@ -738,7 +738,8 @@ check("both rows sit beside 'Your in-game name' (within the same page, "
           "divider(R,'Compatibility')"))
 check("MOCK settings carry both", "second_ear:true,room_names:''," in USRC)
 check("the MOCK state carries both",
-      "librarian_ready:true,second_ear:true,room_names:'',version:'3.34'"
+      "librarian_ready:true,second_ear:true,room_names:'',my_name:'',"
+      "version:'3.34'"
       in USRC)
 # the tests' three names must never reach the code: only the lines this
 # drop ADDS are judged (ui.html's own mock fixture says Marid since 3.2x)
