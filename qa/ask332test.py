@@ -589,8 +589,23 @@ check("it never registers in _AI['proc'] - the card's abort path must not "
       "reach it", '_AI["proc"]' not in es and "never _AI['proc']" in es)
 check("a stale abort flag from the last job does not gag a question",
       'if _AI["abort"] and _AI.get("busy") is not None:' in es)
-check("the parent describer server is untouched",
-      HSRC and fsrc(HSRC, "_DescServer", HTREE) == fsrc(SRC, "_DescServer", TREE))
+# 3.33 drop G switched the thinking OFF in ask()'s payload (Qwen3.8 is
+# the describer now); the server is 2b59d37's plus exactly those lines
+_G_OFF = (
+    '                # THINKING OFF, on every describer-road ask (3.33 drop G).\n'
+    '                # Qwen3.8 handed a json_schema and left to think spends\n'
+    '                # its whole budget in reasoning_content and returns an\n'
+    '                # EMPTY content (measured: 622 chars of thought,\n'
+    '                # finish_reason "length", nothing to parse). Both\n'
+    '                # switches, belt and braces: the budget for the server,\n'
+    '                # the template flag for the model. Gemma ignores both.\n'
+    '                "reasoning_budget": 0,\n'
+    '                "chat_template_kwargs": {"enable_thinking": False},\n')
+check("the parent describer server is untouched (drop G's thinking-off "
+      "pair aside)",
+      HSRC and _G_OFF in fsrc(SRC, "_DescServer", TREE)
+      and fsrc(HSRC, "_DescServer", HTREE)
+      == fsrc(SRC, "_DescServer", TREE).replace(_G_OFF, ""))
 check("the idle tick rides beside the ask server's at every call site",
       SRC.count("    _emb_idle_tick()\n") == 3
       and SRC.count("_ask_idle_tick()\n        _emb_idle_tick()\n"
@@ -947,7 +962,9 @@ if HSRC:
               "_ai_sidecar", "_ai_sidecar_fresh", "_model_have",
               "_free_port", "_DescServer", "_AsrServer", "_ask_negish",
               "_moment_of"):
-        same.append(fsrc(HSRC, f, HTREE) == fsrc(SRC, f, TREE))
+        # _DescServer: drop G's thinking-off pair aside (see _G_OFF)
+        same.append(fsrc(HSRC, f, HTREE)
+                    == fsrc(SRC, f, TREE).replace(_G_OFF, ""))
     check("the roads the box, the tail and the sidecars already used are "
           "byte-identical to HEAD (17 functions and classes)", all(same))
     _ask_new = fsrc(SRC, "_ask_llm", TREE)
@@ -965,10 +982,62 @@ if HSRC:
               '                ("the screen \\u00b7", "the librarian \\u00b7")):\n')
           == _ask_new and _ask_old != _ask_new)
     for m in ("ask_library", "ask_video", "search_words", "models_status",
-              "models_fetch", "have_flags"):
+              "have_flags"):
         same.append(msrc(HSRC, "_JsApi", m, HTREE) == msrc(SRC, "_JsApi", m, TREE))
+    # models_fetch: drop G's two fetch edits aside (one file budgeted once,
+    # present where the reads look - describer333test drives them); the
+    # method is 2b59d37's once they are swapped back
+    _G_FETCH = (
+        ('        need = 0\n'
+         '        seen = set()\n'
+         '        for kind, it in jobs:\n',
+         '        need = 0\n'
+         '        for kind, it in jobs:\n'),
+        ('                # ONE FILE, BUDGETED ONCE (3.33 drop G). The describer\n'
+         '                # and the thinker name the same 13.5 GB file; summing\n'
+         '                # the two sets asked the drive for 28 GB where 14.5\n'
+         '                # would land, and the bar would have ended near 52%.\n'
+         '                # The download itself was always once - work() below\n'
+         '                # finds the file present the second time round.\n'
+         '                for rel, _url, size in it["files"]:\n'
+         '                    p = _model_file(it["dir"], rel) if it["dir"] \\\n'
+         '                        else _model_file(rel)\n'
+         '                    if p in seen:\n'
+         '                        continue\n'
+         '                    seen.add(p)\n'
+         '                    try:\n'
+         '                        n = os.path.getsize(p)\n'
+         '                    except OSError:\n'
+         '                        n = 0\n'
+         '                    if n != size:\n'
+         '                        need += size\n',
+         '                _ok, got0, tot0 = _model_have(it)\n'
+         '                need += max(0, tot0 - got0)\n'),
+        ('                        # PRESENT WHERE THE READS LOOK, OR WHERE THE\n'
+         '                        # WRITES LAND (3.33 drop G). An install that\n'
+         '                        # keeps its models beside the exe in Program\n'
+         '                        # Files fetches into the data folder; asking\n'
+         '                        # only there would have fetched the thinker\'s\n'
+         '                        # 13.5 GB file a second time for the describer\n'
+         '                        # set, into a folder the describer never reads.\n'
+         '                        have0 = (_model_file(it["dir"], rel) if it["dir"]\n'
+         '                                 else _model_file(rel))\n'
+         '                        if any(os.path.isfile(q)\n'
+         '                               and os.path.getsize(q) == size\n'
+         '                               for q in (have0, dest)):\n'
+         '                            continue          # already here, in full\n',
+         '                        if os.path.isfile(dest) \\\n'
+         '                                and os.path.getsize(dest) == size:\n'
+         '                            continue          # already here, in full\n'),
+    )
+    _mf = msrc(SRC, "_JsApi", "models_fetch", TREE)
+    same.append(all(_mf.count(a) == 1 for a, _b in _G_FETCH))
+    for a, b in _G_FETCH:
+        _mf = _mf.replace(a, b)
+    same.append(msrc(HSRC, "_JsApi", "models_fetch", HTREE) == _mf)
     check("...and so are ask_library, ask_video, search_words, models_status, "
-          "models_fetch, have_flags", all(same[-6:]))
+          "have_flags - and models_fetch, drop G's two fetch edits aside",
+          all(same[-7:]))
     import difflib
     ha = fsrc(HSRC, "_ai_tick", HTREE).splitlines()
     na = fsrc(SRC, "_ai_tick", TREE).splitlines()

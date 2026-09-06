@@ -13933,20 +13933,28 @@ _MODEL_SETS = [
      ],
      "licence": "the excitement model is audeering's, under a "
                 "non-commercial research licence"},
+    # ONE MODEL (3.33 drop G). The describer is the thinker's Qwen3.8-27B
+    # - the very file the "thinker" set below names, so the fetcher
+    # finds it present and skips it - with unsloth's F16 projector as
+    # its eye. Measured on his card: the 13.5 GB file loads multimodal
+    # in 40 s, a real thumbnail was read correctly, and JSON with the
+    # thinking switched off parses clean at 31 tokens/s. Gemma 3 27B,
+    # a generation older, no longer downloads; a describe_model line
+    # set back to its name keeps working, projector and all.
     {"key": "describer", "tier": "full",
-     "title": "The describer and the eye",
-     "what": "writes the chapters, names the night, and looks at the "
-             "screen when the words cannot settle a line",
+     "title": "The describer",
+     "what": "Qwen3.8-27B, the same model as the thinker: one file on "
+             "disk, chapters, titles and the eye",
      "dir": "",
      "files": [
-         ("google_gemma-3-27b-it-Q3_K_M.gguf",
-          _HF % ("bartowski/google_gemma-3-27b-it-GGUF",
-                 "google_gemma-3-27b-it-Q3_K_M.gguf"), 13437356672),
-         ("mmproj-gemma-3-27b-it-f16.gguf",
-          _HF % ("bartowski/google_gemma-3-27b-it-GGUF",
-                 "mmproj-google_gemma-3-27b-it-f16.gguf"), 857739168),
-     ],
-     "licence": "Gemma is Google's, under the Gemma Terms of Use"},
+         ("Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf",
+          _HF % ("jrell/Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller",
+                 "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf"),
+          13543869408),
+         ("mmproj-Qwen3.8-27B-F16.gguf",
+          _HF % ("unsloth/Qwen3.8-27B-GGUF", "mmproj-F16.gguf"),
+          927607488),
+     ]},
     {"key": "thinker", "tier": "full",
      "title": "The auditor's thinker",
      "what": "reads every layer back against the others and repairs "
@@ -17044,36 +17052,32 @@ _DESC_CTX = 8192
 def _describer_paths():
     """(llama-server, model) for the local describer, or None."""
     exe = os.path.join(_runtime_dir("llama"), "llama-server.exe")
-    # Q3_K_M is the default since 2.91: measured on his own frames and
-    # lines against Q4_K_M - indistinguishable quality, 1.6x faster,
-    # and the whole model fits the card instead of leaving 24 layers on
-    # the CPU. The Q4 file stays on disk; one settings line goes back.
+    # THE THINKER'S FILE IS THE DEFAULT (3.33 drop G). Gemma Q3_K_M held
+    # this line since 2.91; now one model does both jobs - no 45-second
+    # swap between two 13 GB files, the same weights warm in the OS
+    # cache for the describe and for the audit. A describe_model line
+    # in settings still names any file; the Gemma one goes back with a
+    # single edit.
     want = str(SETTINGS.get("describe_model")
-               or "google_gemma-3-27b-it-Q3_K_M.gguf")
+               or "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf")
     mdl = _model_file(want)
     if not os.path.isfile(mdl):
         try:
-            # THE LAST RESORT, AND WHAT IT MUST NOT PICK. "the first
-            # .gguf that is not an mmproj" is the AUDITOR's Qwen by
-            # the alphabet - the describer would have tried to write
-            # chapters with the thinker. Look for a gemma; never adopt
-            # the audit model.
+            # THE LAST RESORT. This used to refuse the auditor's Qwen
+            # by name, so a describer would never write chapters with
+            # the thinker; the audit model IS the describer now. A
+            # qwen3.8 file is the first choice, a gemma the second,
+            # and only then whatever else is on the shelf.
             names = sorted(os.listdir(_models_dir()))
-            aud = str(SETTINGS.get("audit_model")
-                      or "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf")
             pick = None
-            for f in names:
-                if (f.endswith(".gguf") and not f.startswith("mmproj")
-                        and f != aud and "gemma" in f.lower()):
-                    pick = f
-                    break
-            if pick is None:
+            for key in ("qwen3.8", "gemma", ""):      # "" = anything
                 for f in names:
-                    if (f.endswith(".gguf")
-                            and not f.startswith("mmproj")
-                            and f != aud):
+                    if (f.endswith(".gguf") and not f.startswith("mmproj")
+                            and key in f.lower()):
                         pick = f
                         break
+                if pick is not None:
+                    break
             if pick is None:
                 return None
             mdl = _model_file(pick)
@@ -17595,9 +17599,19 @@ def _descrub(text):
 
 
 def _desc_mmproj():
-    """gemma's vision tower, if it shipped. One file turns the describer
-    multimodal; its absence turns all of this code off."""
-    p = _model_file("mmproj-gemma-3-27b-it-f16.gguf")
+    """The describer's vision tower, if it shipped. One file turns the
+    describer multimodal; its absence turns all of this code off. Which
+    file follows the model (3.33 drop G): Qwen3.8's projector for a
+    qwen3.8 describer, gemma's for a describe_model set back to gemma -
+    either way the describer keeps its eye."""
+    dp = _describer_paths()
+    name = os.path.basename(dp[1]) if dp else str(
+        SETTINGS.get("describe_model")
+        or "Qwen3.8-27B-i1-IQ4_XS-GGUF-Smaller.gguf")
+    if "qwen3.8" in name.lower():
+        p = _model_file("mmproj-Qwen3.8-27B-F16.gguf")
+    else:
+        p = _model_file("mmproj-gemma-3-27b-it-f16.gguf")
     return p if os.path.isfile(p) else None
 
 
@@ -17748,6 +17762,15 @@ class _DescServer:
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": content}],
                 "max_tokens": max_tokens, "temperature": 0.4,
+                # THINKING OFF, on every describer-road ask (3.33 drop G).
+                # Qwen3.8 handed a json_schema and left to think spends
+                # its whole budget in reasoning_content and returns an
+                # EMPTY content (measured: 622 chars of thought,
+                # finish_reason "length", nothing to parse). Both
+                # switches, belt and braces: the budget for the server,
+                # the template flag for the model. Gemma ignores both.
+                "reasoning_budget": 0,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "stream": False}
             if schema:
                 # GRAMMAR, not hope: llama-server compiles the schema to a
@@ -31332,14 +31355,31 @@ class _JsApi:
             return {"ok": False, "why": "everything asked for is "
                                         "already here"}
         need = 0
+        seen = set()
         for kind, it in jobs:
             if kind == "runtime":
                 # the zip AND what it unpacks to - budgeting only the
                 # download let a full disk kill the extraction
                 need += it["bytes"] * 4
             else:
-                _ok, got0, tot0 = _model_have(it)
-                need += max(0, tot0 - got0)
+                # ONE FILE, BUDGETED ONCE (3.33 drop G). The describer
+                # and the thinker name the same 13.5 GB file; summing
+                # the two sets asked the drive for 28 GB where 14.5
+                # would land, and the bar would have ended near 52%.
+                # The download itself was always once - work() below
+                # finds the file present the second time round.
+                for rel, _url, size in it["files"]:
+                    p = _model_file(it["dir"], rel) if it["dir"] \
+                        else _model_file(rel)
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    try:
+                        n = os.path.getsize(p)
+                    except OSError:
+                        n = 0
+                    if n != size:
+                        need += size
         free = _free_bytes(_models_dir(True))
         if free and need > free - (2 << 30):
             _DL["busy"] = None
@@ -31397,8 +31437,18 @@ class _JsApi:
                         dest = (os.path.join(_root, it["dir"], rel)
                                 if it["dir"]
                                 else os.path.join(_root, rel))
-                        if os.path.isfile(dest) \
-                                and os.path.getsize(dest) == size:
+                        # PRESENT WHERE THE READS LOOK, OR WHERE THE
+                        # WRITES LAND (3.33 drop G). An install that
+                        # keeps its models beside the exe in Program
+                        # Files fetches into the data folder; asking
+                        # only there would have fetched the thinker's
+                        # 13.5 GB file a second time for the describer
+                        # set, into a folder the describer never reads.
+                        have0 = (_model_file(it["dir"], rel) if it["dir"]
+                                 else _model_file(rel))
+                        if any(os.path.isfile(q)
+                               and os.path.getsize(q) == size
+                               for q in (have0, dest)):
                             continue          # already here, in full
                         _DL["file"] = os.path.basename(rel)
                         _DL["state"] = "downloading"
