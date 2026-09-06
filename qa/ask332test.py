@@ -1148,15 +1148,15 @@ check("_EmbServer.start refuses without the model (no spawn, no port sweep)",
 
 # =========================================================================
 print("\n--- the UI, read from its source ---")
-check("the stamps: 3.33 in both mocks, lore.py APP_VERSION 3.33, no 3.32 "
-      "version left", USRC.count("version:'3.33'") == 2
-      and "version:'3.32'" not in USRC and 'APP_VERSION = "3.33"' in SRC)
+check("the stamps: 3.34 in both mocks, lore.py APP_VERSION 3.34, no 3.33 "
+      "version left (3.34 drop H)", USRC.count("version:'3.34'") == 2
+      and "version:'3.33'" not in USRC and 'APP_VERSION = "3.34"' in SRC)
 check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "librarian_ready, so the harness box is never dead",
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
       and "librarian_ready:true,second_ear:true,room_names:'',"
-          "version:'3.33'" in USRC)
+          "version:'3.34'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "

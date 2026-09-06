@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.33"
+APP_VERSION = "3.34"
 
 try:
     import psutil
@@ -16995,8 +16995,9 @@ def _speech_times(video_path):
         except Exception:
             continue
         txt = (sg.get("t") or "").strip().lower()
-        if not txt:
-            continue
+        if not txt or sg.get("nn"):
+            continue        # 3.34 a struck line said nothing: the re-pick
+            #                 must not seat a gold mark on its second
         # a video's 'no way' or an NPC's line is not the room reacting
         # (3.31 sources: src 'media' / 'game'; absent = the room, as today)
         if str(sg.get("src") or "") in ("media", "game"):
@@ -19535,6 +19536,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                         # does
                         _mdrop[0] += 1
                         continue
+                    if m_sg.get("nn"):
+                        # 3.34 nor a struck line: the model read
+                        # "[unintelligible]", wrote a why for it, and
+                        # the mark then wore those words as its own
+                        _mdrop[0] += 1
+                        continue
                     why = _m_qcheck(mm, why, use)
                     wmoments.append(
                         {"t": round(((m_sg.get("a") or 0)
@@ -20349,9 +20356,13 @@ def _eye_map(frames, rows, answered=None):
             # spend twenty seconds to be told none again - while a frame
             # it ignored has not, and that is the one worth asking alone.
             answered.add(round(float(t), 1))
-        place = _eye_norm(r.get("place"))
+        # 3.34 THE SENTENCE IS KEPT. The prompt asks for a handful of
+        # words and the model writes a sentence; clipped at 90 the panel
+        # read "...'PIXEL SCORED!' displayed on the scre" (measured
+        # 2026-09-06, rocketleague). 240 holds a sentence, a place 120.
+        place = _eye_norm(r.get("place"), 120)
         cre = _eye_norm(r.get("creature"))
-        doing = _eye_norm(r.get("doing"), 90)
+        doing = _eye_norm(r.get("doing"), 240)
         if not (place or cre or doing):
             continue           # a row of polite nothings is not a sighting
         out.append({"t": round(float(t), 1), "place": place,
@@ -21578,6 +21589,21 @@ def _aud_ed(a, b):
 
 _AUD_VOCAB = {"at": 0.0, "freq": None, "low": None}
 _AUD_VOCAB_LOCK = threading.Lock()
+# 3.34 A THIN VOCABULARY JUDGES NOTHING. The archive (2026-09-06) moved
+# every transcript off the shelf; the library then "knew" one night, so
+# every ordinary word was one it had never seen, ten lines of thirty-three
+# were shortlisted and the thinker - told that noise is a good answer -
+# struck six clear sentences ("You gotta own it, bro."). The reverter
+# guards 1000 words and the names 200; the strike road had no guard.
+_AUD_VOCAB_MIN = 5000
+
+
+def _aud_thin(freq):
+    """Too thin to call a word "never seen"? Under _AUD_VOCAB_MIN distinct
+    words the audit holds its shortlist (the ear-gap witness needs no
+    vocabulary and still runs). Held at the call site, not inside
+    _aud_garble - that function is pinned byte for byte."""
+    return len(freq or {}) < _AUD_VOCAB_MIN
 
 
 def _aud_vocab():
@@ -21596,17 +21622,68 @@ def _aud_vocab():
                 and time.time() - _AUD_VOCAB["at"] < 3600:
             return _AUD_VOCAB["freq"], _AUD_VOCAB["low"]
         freq, low = {}, {}
+        # 3.34 THE ARCHIVE COUNTS. His words did not stop being his when
+        # the install bat moved every sidecar to .lore_archive\<date>: with
+        # only the shelf read, one night was the whole library and the
+        # auditor struck clear sentences as words "never seen". The same
+        # skip rules apply to an archived transcript; nothing is written.
+        # The shelf's .lore_thumbs, then the top level of each dated folder
+        # under .lore_archive beside it (its .attic holds superseded
+        # readings and is not walked) - derived from _thumb_dir, so a
+        # penned-in test shelf never reaches the real archive.
+        files = []
+        td = _thumb_dir(SETTINGS.get("output_dir", ""))
         try:
-            d = _thumb_dir(SETTINGS.get("output_dir", ""))
-            for fn in os.listdir(d):
-                if not fn.endswith(".stt.json"):
+            for fn in sorted(os.listdir(td)):
+                if fn.endswith(".stt.json"):
+                    files.append((os.path.join(td, fn), False))
+        except Exception:
+            pass
+        try:
+            arc = os.path.join(os.path.dirname(os.path.abspath(td)),
+                               ".lore_archive")
+            for day in sorted(os.listdir(arc)):
+                ad = os.path.join(arc, day)
+                if day.startswith(".") or not os.path.isdir(ad):
                     continue
                 try:
-                    with open(os.path.join(d, fn), encoding="utf-8") as fh:
+                    for fn in sorted(os.listdir(ad)):
+                        if fn.endswith(".stt.json"):
+                            files.append((os.path.join(ad, fn), True))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        seen = ({}, {})            # distinct words per origin, for the log
+
+        def _tally(txt, sn):
+            for w in re.findall(r"[A-Za-z']{2,}", txt):
+                lw = w.lower()
+                freq[lw] = freq.get(lw, 0) + 1
+                if w[0].islower():
+                    low[lw] = low.get(lw, 0) + 1
+                sn[lw] = 1
+            # THE ARABIC COUNTS TOO. Four hundred transcripts of real
+            # Gulf speech are the only authority on what is an Arabic
+            # word HERE - and the sense gate tests every proposed
+            # correction against them.
+            for w in re.findall(r"[\u0600-\u06ff]{2,}", txt):
+                freq[w] = freq.get(w, 0) + 1
+                sn[w] = 1
+        try:
+            for fp, arc in files:
+                sn = seen[1 if arc else 0]
+                try:
+                    with open(fp, encoding="utf-8") as fh:
                         doc = json.load(fh)
                 except Exception:
                     continue
                 for sg in (doc.get("segments") or []):
+                    if not isinstance(sg, dict):
+                        continue   # 3.34 review: one bad row skips ONE row.
+                        #            sg.get on a str raised into the outer
+                        #            try and every file after it - the whole
+                        #            archive, read last - left the vocabulary
                     if isinstance(sg, dict) \
                             and sg.get("src") in ("media", "game"):
                         continue       # 3.31: what THIS house says is the
@@ -21621,14 +21698,7 @@ def _aud_vocab():
                         # poisoning its own judge, again (review 303)
                         txt = str(sg.get("t") or "").replace(
                             "[unintelligible]", " ")
-                        for w in re.findall(r"[A-Za-z']{2,}", txt):
-                            lw = w.lower()
-                            freq[lw] = freq.get(lw, 0) + 1
-                            if w[0].islower():
-                                low[lw] = low.get(lw, 0) + 1
-                        for w in re.findall(r"[\u0600-\u06ff]{2,}",
-                                            txt):
-                            freq[w] = freq.get(w, 0) + 1
+                        _tally(txt, sn)
                         continue
                     # A CORRECTION MUST NEVER FEED THE VOCABULARY THAT
                     # JUDGES CORRECTIONS. Last night's gibberish passed
@@ -21641,21 +21711,18 @@ def _aud_vocab():
                         txt = str(sg.get("was") or "")
                     else:
                         txt = str(sg.get("t") or "")
-                    for w in re.findall(r"[A-Za-z']{2,}", txt):
-                        lw = w.lower()
-                        freq[lw] = freq.get(lw, 0) + 1
-                        if w[0].islower():
-                            low[lw] = low.get(lw, 0) + 1
-                    # THE ARABIC COUNTS TOO. Four hundred transcripts of
-                    # real Gulf speech are the only authority on what is
-                    # an Arabic word HERE - and the sense gate below
-                    # tests every proposed correction against them.
-                    for w in re.findall(r"[\u0600-\u06ff]{2,}", txt):
-                        freq[w] = freq.get(w, 0) + 1
+                    _tally(txt, sn)
         except Exception:
             pass
         _AUD_VOCAB["freq"], _AUD_VOCAB["low"] = freq, low
         _AUD_VOCAB["at"] = time.time()
+        try:
+            # once per build (the hour cache keeps it at that)
+            log("The auditor's vocabulary: " + str(len(seen[0]))
+                + " words from the shelf and " + str(len(seen[1]))
+                + " from the archive.")
+        except Exception:
+            pass
         return freq, low
 
 
@@ -22522,11 +22589,12 @@ def _aud_says(t, src):
         if a > t + _AUD_WORDS:
             break                     # the transcript is in time order
         txt = str(sg.get("t") or "").strip()
-        if len(txt.split()) < 2 or sg.get("g") \
+        if len(txt.split()) < 2 or sg.get("g") or sg.get("nn") \
                 or sg.get("src") in ("media", "game"):
             continue                  # only the room is a witness (3.31:
             #                           a video's sentence or an NPC line
-            #                           is not a witness to the room)
+            #                           is not a witness to the room;
+            #                           3.34: nor is a struck line)
         # THE LINE THAT COVERS THE SECOND WINS. Taking the first row
         # in the window and stopping handed the thinker a sentence
         # from a different moment 45.7% of the time, and in 813 of
@@ -24499,7 +24567,10 @@ def _shelf_migrations():
         done = set()          # an older or unreadable marker means
         #                       "nothing is proven" - the walks run
     todo = [w for w in _MIG_WALKS if w not in done]
-    if not todo:
+    # 3.34 the thin-strike walk keeps its own marker (strikes.mig, keyed
+    # the same way): it arrived after shelf.mig had retired the five
+    thin = not _thin_mig_done(lib)
+    if not todo and not thin:
         return
     if _MIG_BUSY[0]:
         return
@@ -24555,6 +24626,19 @@ def _shelf_migrations():
                     _MIG_SKIPPED[0] = 0
                     continue
                 done.add(key)
+            if thin:
+                # LAST: it rewrites transcripts the strike walks read
+                # and moves audits aside for the sweep to run again;
+                # it stamps strikes.mig itself when it read everything
+                try:
+                    _thin_strike_migration()
+                except Exception as e:
+                    log("The thin-strike walk stumbled: " + str(e)[:120])
+                if _MIG_SKIPPED[0]:
+                    log("The thin-strike walk could not read "
+                        + str(_MIG_SKIPPED[0]) + " file(s) - it will "
+                        "run again rather than be written off.")
+                    _MIG_SKIPPED[0] = 0
             _MIG_BANKED.clear()
             try:
                 with open(mark, "w", encoding="utf-8") as fh:
@@ -24946,6 +25030,108 @@ def _echo_strike_migration():
             "the sweep.")
 
 
+def _thin_mig_mark():
+    return os.path.join(_data_dir(), "strikes.mig")
+
+
+def _thin_mig_done(lib):
+    """Has the thin-strike walk finished on THIS library? Its own
+    marker, keyed like shelf.mig - a name can only retire itself."""
+    try:
+        with open(_thin_mig_mark(), encoding="utf-8") as fh:
+            got = json.load(fh)
+        return isinstance(got, dict) and got.get("lib") == lib
+    except Exception:
+        return False
+
+
+def _thin_strike_migration():
+    """3.34, once: the strikes an audit made under the thin vocabulary,
+    put back.
+
+    The archive (2026-09-06) left one night on the shelf; the audits
+    written since judged every ordinary word "never seen" and struck
+    six clear lines on the first night he reviewed. An audit that knew
+    its vocabulary writes vocab_n (3.34); one without it was the thin
+    auditor. For each such night every struck line (nn set, never a
+    pin) gets the swap Put-it-back does - t <- was, the markers off -
+    with the transcript banked first; the aud.json moves to the attic
+    (a copy would stand as fresh and the sweep would never re-run it);
+    the owing cache forgets the night, so the audit runs again with the
+    real vocabulary. A night whose aud.json carries vocab_n is never
+    touched, nor a failed stub (complete False - it struck nothing and
+    its tries are the sweep's ledger), and nothing is written that did
+    not change - the clock is lineage. Returns (lines put back, nights)."""
+    out = SETTINGS.get("output_dir", "")
+    lib = os.path.normcase(os.path.abspath(out or "?"))
+    if _thin_mig_done(lib):
+        return 0, 0
+    skipped0 = _MIG_SKIPPED[0]
+    total = nights = 0
+    for d0, kind in _library_dirs(out):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            ap = _ai_sidecar(p, "aud")
+            if not os.path.isfile(ap):
+                continue
+            try:
+                with open(ap, encoding="utf-8") as fh:
+                    ad = json.load(fh)
+            except Exception:
+                _MIG_SKIPPED[0] += 1
+                continue
+            if not isinstance(ad, dict) or "vocab_n" in ad or not ad.get("complete"):
+                continue          # an audit that knew its vocabulary - or a
+                #                   stub that judged nothing (a failed sweep,
+                #                   tries counted): atticking THAT hands a
+                #                   given-up night three more model runs
+            sp = _ai_sidecar(p, "stt")
+            back, sd = 0, None
+            if os.path.isfile(sp):
+                try:
+                    with open(sp, encoding="utf-8") as fh:
+                        sd = json.load(fh) or {}
+                except Exception:
+                    _MIG_SKIPPED[0] += 1
+                    continue
+                for sg in (sd.get("segments") or []):
+                    if not isinstance(sg, dict) or not sg.get("nn") \
+                            or sg.get("pin") or sg.get("was") is None:
+                        continue
+                    _aud_unstrike_seg(sg)
+                    back += 1
+            try:
+                if back:
+                    _mig_bank(p, "stt")
+                    _atomic_write_json(sp, sd)
+                att = _attic_dir()
+                os.makedirs(att, exist_ok=True)
+                base = os.path.splitext(os.path.basename(p))[0]
+                stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                shutil.move(ap, os.path.join(
+                    att, "%s.aud.%s.json" % (base, stamp)))
+                _AUD_OWE_CACHE.pop(os.path.normcase(os.path.abspath(p)),
+                                   None)
+            except Exception:
+                _MIG_SKIPPED[0] += 1
+                continue
+            total += back
+            nights += 1
+    if nights:
+        log("Put back " + str(total) + " struck line(s) on " + str(nights)
+            + " night(s) audited under the thin vocabulary; their audits "
+            "will run again.")
+    if _MIG_SKIPPED[0] == skipped0:
+        # a walk that could not read part of the shelf is not finished
+        try:
+            with open(_thin_mig_mark(), "w", encoding="utf-8") as fh:
+                json.dump({"lib": lib, "when": int(time.time()),
+                           "put_back": total, "nights": nights}, fh)
+        except Exception:
+            pass
+    return total, nights
+
+
 def _aud_refresh_whys(video_path, garble):
     """The re-judge's fresh reasoning lands on the standing correction
     it just judged. The old whys were cut at 160 characters by the
@@ -25231,6 +25417,22 @@ def _aud_retell(video_path, changed_ts, refill=True):
     except Exception:
         pass
     return len(dirty)
+
+
+def _aud_unstrike_seg(sg):
+    """The field swap that puts ONE line back the way it was heard:
+    t <- was, and the fx/nn/pn/fxw/fxo markers off it. The original
+    never left - it sat under "was" since the correction landed - so
+    this is exact. Shared by Put-it-back (which then pins) and the
+    3.34 thin-strike walk (which does not: the next audit re-judges)."""
+    sg["t"] = sg.pop("was")
+    sg.pop("fx", None)
+    # a STRUCK line comes all the way back: the nn flag is what hides
+    # it from search, the vocabulary and the said column, and the
+    # why/odd markers belong to the strike, not to him
+    for k in ("nn", "pn", "fxw", "fxo"):
+        sg.pop(k, None)
+    return sg
 
 
 def _aud_bank_orig(video_path, kind):
@@ -25624,6 +25826,16 @@ def _audit_one(video_path, redo=False):
                 src["stt"] = stt
             _beat("shortlisting doubtful lines", 0.16)
             garble = _aud_garble(stt, _freq)
+            if _aud_thin(_freq):
+                # 3.34 A THIN VOCABULARY SHORTLISTS NOTHING: with one
+                # night on the shelf every word was "never seen" and six
+                # clear lines were struck (the archive night, 2026-09-06).
+                # Once per night, so the log says why nothing was struck;
+                # the ear-gap witness below needs no vocabulary.
+                garble = []
+                log("the library's vocabulary is thin ("
+                    + str(len(_freq or {})) + " words) - the auditor "
+                    "holds its strikes on " + name + ".")
             # 3.33 F THE DISAGREEMENT IS A WITNESS: the room lines the
             # two ears heard differently join the shortlist. A night
             # whose stt carries no `d` adds nothing - same rows, same
@@ -25786,6 +25998,9 @@ def _audit_one(video_path, redo=False):
         doc = {"v": _AUD_V, "complete": done,
                "tries": tries,
                "when": int(time.time()),
+               # 3.34 the vocabulary this audit judged with - an audit
+               # without it was the thin auditor (the migration's key)
+               "vocab_n": len(_freq or {}),
                "thread": beats, "dropped": drops, "merged": merged,
                "names": names, "garble": garble, "fixes": fixes,
                "names_fixed": names_fixed, "corrected": corrected,
@@ -32106,15 +32321,7 @@ class _JsApi:
                 hit, best = sg, abs(a - t)
             if hit is None:
                 return {"ok": False, "why": "no corrected line there"}
-            hit["t"] = hit.pop("was")
-            hit.pop("fx", None)
-            # a STRUCK line comes all the way back: the nn flag is what
-            # hides it from search, the vocabulary and the said column,
-            # and the why/odd markers belong to the strike, not to him
-            hit.pop("nn", None)
-            hit.pop("pn", None)
-            hit.pop("fxw", None)
-            hit.pop("fxo", None)
+            _aud_unstrike_seg(hit)      # 3.34 one swap, shared
             # PINNED. He heard the second and chose this reading; the
             # next audit would otherwise flag the same line again and
             # re-apply the very correction he just removed. A pin says

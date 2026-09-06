@@ -422,9 +422,14 @@ for nm in ("_aud_src", "_aud_owing", "_aud_owing_swept", "_aud_covers_now",
            "_aud_done_current"):
     check(nm + " is byte-identical to HEAD's (count-undoing / mtime laws)",
           seg(LSRC, LTREE, nm) == seg(HSRC, HTREE, nm))
+# 3.34 drop H: ONE more, by name - the thin-strike walk puts struck
+# lines back into the transcript (as the echo walk did in 3.30); the
+# auditor itself still writes only its own sidecars.
 check("the auditor still writes only its own sidecars: no new "
-      "_atomic_write_json in the drop",
-      LSRC.count("_atomic_write_json(") == HSRC.count("_atomic_write_json("))
+      "_atomic_write_json in the drop beyond the thin-strike walk's one",
+      LSRC.count("_atomic_write_json(") == HSRC.count("_atomic_write_json(") + 1
+      and seg(LSRC, LTREE, "_thin_strike_migration").count(
+          "_atomic_write_json(") == 1)
 check("_aud_dossier differs from HEAD's ONLY by the appended witness",
       seg(LSRC, LTREE, "_aud_dossier").replace(
           '\n            + "\\n".join(outl)\n'

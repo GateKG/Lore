@@ -1360,6 +1360,9 @@ body.vfull.vseen #vstage video{max-width:calc(100vw - 352px)}
 .tnoise{font-family:var(--serif);font-style:italic;color:#c9a15e;
   opacity:.85;margin:2px 0}
 .sline.sunint span{opacity:.45;font-style:italic}
+#vsaid .sgap{font:italic 11.5px var(--serif);color:#c9a15e;opacity:.8;padding:4px 8px;
+  cursor:pointer;border-radius:6px;user-select:none}
+#vsaid .sgap:hover{background:rgba(232,181,99,.1);opacity:1}
 #vseen .erow{display:flex;gap:10px;padding:7px 9px;border-radius:6px;
   cursor:pointer;font-family:var(--serif);font-size:12.5px;line-height:1.5;
   color:#d6c7ac}
@@ -1368,6 +1371,9 @@ body.vfull.vseen #vstage video{max-width:calc(100vw - 352px)}
 #vseen .erow b{flex:0 0 auto;color:var(--gold);opacity:.75;font-weight:600;
   font-size:11px;padding-top:1px;font-variant-numeric:tabular-nums}
 #vseen .etx{flex:1 1 auto;min-width:0}
+/* 3.34 nothing clips: the eye keeps its sentence now (240) and the row wraps it */
+#vseen .etx,#vseen .etx div,#vseen .esub{white-space:normal;overflow:visible;
+  text-overflow:clip;overflow-wrap:break-word}
 #vseen .esub{font-size:11.5px;color:rgba(214,199,172,.68);
   line-height:1.5;margin-top:1px}
 #vseen .ewho{display:flex;align-items:baseline;gap:8px;padding:7px 9px 2px}
@@ -2924,7 +2930,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,second_ear:true,room_names:'',version:'3.33'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',version:'3.34'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3113,7 +3119,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.33'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.34'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -8841,6 +8847,14 @@ async function openViewer(vid,seekTo){
     const rp=resPoint(vid.path);
     if(rp){
       const once=()=>{if(req!==_viewerReq)return;
+        /* 3.34 review: HIS SEEK OUTRANKS THE RESUME. A cold 40 GB file
+           gives up its metadata seconds after the marks are on the bar; a
+           mark pressed in that gap set the playhead, then this resume
+           landed on top of it - 6:33 asked, 6:47 (the place saved while
+           he watched on) answered, after the jump's 300 ms guard had stood
+           down. Every mark/said/chapter jump stamps V.userSeekReq with its
+           open; a stamp from THIS open retires the resume. */
+        if(V.userSeekReq===req)return;
         const d=vd.duration;
         if(d&&isFinite(d)&&rp.t<d-5){
           try{vd.currentTime=rp.t;}catch(e){}
@@ -9102,6 +9116,7 @@ function paintSeen(){
       /* land ON the second, not a second early - the old 1s cushion put
          the playhead inside the PREVIOUS row's span, so the row above
          lit up and the video sat in the prior look */
+      V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
       try{$('#vvideo').currentTime=Math.max(0,t);}catch(_){}
       if(rEl){box.querySelectorAll('.erow.now').forEach(x=>x.classList.remove('now'));
         rEl.classList.add('now');box._pin={el:rEl,t:t};}
@@ -9353,11 +9368,33 @@ async function renderHlMarks(vid,req){
          swallow the click before it ever reached the mark. */
       const jump=e=>{
         e.preventDefault(); e.stopPropagation();
+        /* 3.34 review: the last recording's marks stand on the bar until
+           THIS one's render replaces them - a press on one of those must
+           not seek this video to another night's clock (the chapter marks'
+           bug, the other half). It swallows the press: a ghost is not a
+           bar click either. */
+        if(req!==_viewerReq)return;
         if(e.ctrlKey){ momTogglePick(m); return; }   /* Ctrl+click picks, it does not seek */
         const cur=m._ev||ev, said=m._said;     /* what this mark shows NOW */
         try{
           const to=Math.max(0,cur.t-2);        /* land BEFORE it happens */
-          vd.currentTime=to;
+          /* 3.34 THE PLAYER AT CLICK TIME, never the one this render closed
+             over - the chapter marks' cure (a stale node seeking another
+             recording's player). And the mark sits over a range input that
+             binds its own pointer handling: if anything drags the playhead
+             off `to` inside 300 ms, it is put back ONCE, on the player's own
+             seeking/seeked tick. Measured 2026-09-06: the card said 6:33,
+             the playhead sat at 6:47 after the click. */
+          const v=$('#vvideo')||vd;
+          V.userSeekReq=req;   /* 3.34 his seek outranks the resume (openViewer) */
+          v.currentTime=to;
+          {let armed=true;
+           const off=()=>{armed=false;
+             v.removeEventListener('seeking',guard);v.removeEventListener('seeked',guard);};
+           const guard=()=>{ if(!armed)return;
+             if(Math.abs((v.currentTime||0)-to)>0.5){ off(); try{v.currentTime=to;}catch(_){} } };
+           v.addEventListener('seeking',guard); v.addEventListener('seeked',guard);
+           setTimeout(off,300);}
           V.ed&&(V.ed.preview=false);
           /* MOVE THE PLAYHEAD, NOT THE VIEW. This used to force a re-page,
              which threw the window's START to the moment you clicked - so
@@ -9562,10 +9599,18 @@ function saidWire(body){
   if(body._swired)return; body._swired=true;
   /* one delegated click, not one listener per line */
   body.addEventListener('click',e=>{
+    const gap=e.target&&e.target.closest?e.target.closest('.sgap'):null;
+    if(gap){                                    /* 3.34 the fold row */
+      /* review: the line beside the row anchors the scroll - the next
+         visible line, else (the tail fold) the one before it */
+      const sl=n=>(n&&n.classList&&n.classList.contains('sline'))?n:null;
+      const an=sl(gap.nextElementSibling)||sl(gap.previousElementSibling);
+      saidStruckToggle(an&&an.dataset.i!=null?+an.dataset.i:null); return; }
     const row=e.target&&e.target.closest?e.target.closest('.sline'):null;
     if(!row||row.dataset.i==null)return;
     const ln=_said.lines[+row.dataset.i]; if(!ln)return;
     const vd=$('#vvideo');
+    V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
     try{vd.currentTime=ln.t;}catch(e2){}
     if(vd.paused)vd.play().catch(()=>{});
   });
@@ -9612,7 +9657,9 @@ function saidRender(center){
   const frag=document.createDocumentFragment();
   const top=el('div','ssp'); top.style.height=Math.round(w0*est)+'px';
   frag.append(top);
+  const gaps=_said.gaps||{};
   for(let vi=w0;vi<w1;vi++){
+    if(gaps[vi])frag.append(saidGapRow(gaps[vi]));   /* 3.34 struck lines fold here */
     const di=vis[vi], ln=_said.lines[di];
     const r=el('div','sline'); r.dataset.i=String(di);
     if(di===_said.at)r.classList.add('now');
@@ -9654,6 +9701,7 @@ function saidRender(center){
     else r.append(b,p);
     _said.els[di]=r; frag.append(r);
   }
+  if(w1===vis.length&&gaps[vis.length])frag.append(saidGapRow(gaps[vis.length]));   /* the tail */
   const bot=el('div','ssp'); bot.style.height=Math.round((vis.length-w1)*est)+'px';
   frag.append(bot);
   body.innerHTML=''; body.append(frag);
@@ -9682,6 +9730,58 @@ function saidVisible(lines,low,q,showMedia){
   }
   return {vis,pos};
 }
+function saidFold(vis,pos,lines,showStruck){
+  /* 3.34 STRUCK LINES ARE HIDDEN BY DEFAULT. Six struck rows in a 45-line
+     night read as a wall of "unintelligible"; where they fall one collapsed
+     row counts them and a press shows them (remembered in localStorage).
+     A post-pass over saidVisible's answer (that loop is pinned to 3.30's):
+     vis and pos are rewritten in place, and gaps[k] = {n, shown} says n
+     struck lines sit before visible row k (k may be vis.length - they were
+     the tail); shown, the same row heads the run it reveals and folds it. */
+  const gaps={}, kept=[];
+  let run=-1, runEnd=-1;
+  for(const i of vis){
+    const l=lines[i];
+    if(l.nn){
+      if(!showStruck){
+        pos[i]=-1;
+        const g=gaps[kept.length]||(gaps[kept.length]={n:0,shown:false}); g.n++;
+        continue; }
+      if(run>=0&&kept.length===runEnd){ gaps[run].n++; runEnd++; }
+      else{ run=kept.length; runEnd=run+1; gaps[run]={n:1,shown:true}; }
+    }
+    pos[i]=kept.length; kept.push(i);
+  }
+  vis.length=0; for(const i of kept)vis.push(i);
+  return gaps;
+}
+function saidGapRow(g){
+  const r=el('div','sgap');
+  r.textContent=g.n+' struck line'+(g.n===1?'':'s')
+    +(g.shown?' shown \u00b7 hide':' hidden \u00b7 show');
+  r.title=g.shown
+    ?'the auditor struck these as unintelligible \u2014 press to fold them away again'
+    :'the auditor struck these as unintelligible (two ears heard no readable words) \u2014 press to read what the reader first wrote';
+  return r;
+}
+function saidStruckToggle(anchor){
+  /* 3.34 review: THE READER STAYS WHERE HE PRESSED. saidFilter re-centres
+     on row 0; the fold row sits mid-list at the very line he was reading,
+     so the line beside it (anchor, a line index) is centred again after
+     the re-filter - the nearest line still visible from it forward (the
+     one after the run he just folded or showed), else backward. */
+  SAID_STRUCK=!SAID_STRUCK;
+  try{localStorage.setItem('lore.said.struck',SAID_STRUCK?'1':'0');}catch(_){}
+  saidFilter(($('#vsq')&&$('#vsq').value)||'');
+  if(anchor!=null){
+    const pos=_said.pos||[]; let vi=-1;
+    for(let i=anchor;i<pos.length&&vi<0;i++)vi=(pos[i]==null?-1:pos[i]);
+    for(let i=anchor-1;i>=0&&vi<0;i--)vi=(pos[i]==null?-1:pos[i]);
+    if(vi>=0)saidRender(vi);
+  }
+  whisper(SAID_STRUCK?'the struck lines are shown \u2014 what the reader first wrote, before the auditor called it noise'
+                     :'the struck lines are folded away');
+}
 /* the toggle beside Search/Ask: hidden for a night with no video lines (no
    control for a thing that cannot happen), a count while they are folded */
 function saidMediaPaint(){
@@ -9698,7 +9798,8 @@ function saidFilter(q){
   const t=String(q||'').trim().toLowerCase();
   const n=_said.lines.length;
   const {vis,pos}=saidVisible(_said.lines,_said.low||[],q,SAID_MEDIA);
-  _said.vis=vis;_said.pos=pos;
+  const gaps=saidFold(vis,pos,_said.lines,SAID_STRUCK);   /* 3.34 struck lines fold in place */
+  _said.vis=vis;_said.pos=pos;_said.gaps=gaps;
   if(n)saidRender(0);
   /* a filter must announce itself: a transcript that is ALL video must not
      look unread */
@@ -11050,6 +11151,9 @@ try{ const m=JSON.parse(localStorage.getItem('lore.marks')||'{}');
    viewer like the mark chips (a private window simply forgets) */
 let SAID_MEDIA=false;
 try{ SAID_MEDIA=localStorage.getItem('lore.said.media')==='1'; }catch(e){}
+/* 3.34 struck lines hidden by default; the fold is remembered like the media one */
+let SAID_STRUCK=false;
+try{ SAID_STRUCK=localStorage.getItem('lore.said.struck')==='1'; }catch(e){}
 /* bring the stretch that owns this second into view, and light it */
 function chapterInView(t){
   const box=$('#vchaps .vchapbody'); if(!box)return;
@@ -11101,6 +11205,7 @@ function insMarksPlace(){
          exact bug once; same cure. */
       m.addEventListener('click',e=>{e.stopPropagation();
         const c=m._c; if(!c)return;
+        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
         try{$('#vvideo').currentTime=c.t;}catch(_){}
         chapterInView(c.t);
         whisper(fmtT(c.t)+'  \u00b7  '+(c.label||'chapter'));
@@ -11180,6 +11285,7 @@ function usrPlace(){
       m.addEventListener('pointerdown',e=>{
         e.preventDefault(); e.stopPropagation();
         const t=m._t; if(t==null)return;
+        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
         try{ $('#vvideo').currentTime=Math.max(0,t-2); V.tlPin=true; tlPaint(); }catch(_){}
         whisper('your mark \u00b7 '+fmtT(t));
       });
@@ -11265,6 +11371,7 @@ function renderMoments(){
     const c=el('div','vmchip');
     c.append(el('b',null,fmtT(m.t)),el('span',null,esc(m.why)));
     c.addEventListener('click',e=>{e.stopPropagation();
+      V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
       try{$('#vvideo').currentTime=Math.max(0,m.t-2);}catch(_){}
       V.tlPin=true; tlPaint(); whisper(m.why);});
     box.append(c);
@@ -11282,6 +11389,8 @@ function tipWordsAt(t){
   if(!segs||!segs.length)return null;
   let best=null,bd=1e9;
   for(const s of segs){
+    if(s.nn)continue;   /* 3.34 a struck line is never the mark's words: the
+                           next nearest unstruck line in the window, else none */
     const a=(s.a||0)/1000, b=(s.b||0)/1000;
     if(t>=a-0.2&&t<=b+0.2)return (s.t||'').trim();
     const dd=Math.min(Math.abs(a-t),Math.abs(b-t));
@@ -11570,6 +11679,7 @@ function paintChapters(){
       r._to=(c.b&&c.b>c.t)?c.b:(ch[i+1]?ch[i+1].t:Infinity);
       /* the row IS the chapter - there is no second copy of the time */
       r.addEventListener('click',e=>{e.stopPropagation();
+        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
         try{$('#vvideo').currentTime=Math.max(0,r._t-1);}catch(_){}
         V.tlPin=true; whisper(c.label);});
       box.append(r);
@@ -11588,6 +11698,7 @@ function paintChapters(){
         r.append(el('b',null,fmtT(m.t)),
                  el('i','mkind '+(k||'plain'),esc(k||'moment')),tx);
         r.addEventListener('click',e=>{e.stopPropagation();
+          V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
           try{$('#vvideo').currentTime=Math.max(0,m.t-2);}catch(_){}
           V.tlPin=true; whisper(m.why);});
         box.append(r);
@@ -12667,6 +12778,7 @@ function wireViewer(){
       j.append(el('b',null,fmtT((h.t_ms||0)/1000)),
                el('span',null,esc(h.text||'')));
       j.addEventListener('click',()=>{
+        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
         try{$('#vvideo').currentTime=Math.max(0,(h.t_ms||0)/1000-1.5);}catch(_){}
         V.tlPin=true; tlPaint();
       });
