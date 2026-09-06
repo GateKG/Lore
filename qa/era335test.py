@@ -64,7 +64,15 @@ def check(name, cond):
     print(("  OK   " if cond else "  FAIL ") + name)
 
 
-def head_of(rel, rev="HEAD"):
+# THE PARITY BASE IS A COMMIT, NOT HEAD (6 Sep). While a drop is
+# uncommitted "HEAD" is the file before it; the moment it lands "HEAD"
+# IS the drop, and every twin lifted here becomes its own subject.
+# 350e70b is 3.34 - the last worker before the split road counted the
+# coverage it measures.
+PARITY_BASE = "350e70b"
+
+
+def head_of(rel, rev=PARITY_BASE):
     r = subprocess.run(["git", "show", rev + ":" + rel], cwd=ROOT,
                        capture_output=True)
     return r.stdout.decode("utf-8", "replace")
