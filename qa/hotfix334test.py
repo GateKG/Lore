@@ -531,12 +531,14 @@ check("review fix (node): a seek he made on this open keeps the playhead "
       jr.get("yield") == 391.2 and jr.get("resume") == 407 and jr.get("fresh") == 407
       and jr.get("w") == ["resumed at 407", "resumed at 407"])
 STAMP = "V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */"
-check("review fix: the said row, the Eye row, the chapter mark, your mark, "
-      "the moment chip, the chapter row, the moment row and the ask hit all "
-      "stamp V.userSeekReq before they seek (8)",
-      USRC.count(STAMP) == 8
-      and "    const vd=$('#vvideo');\n    " + STAMP + "\n    try{vd.currentTime=ln.t;}catch(e2){}" in USRC
-      and "        const c=m._c; if(!c)return;\n        " + STAMP + "\n        try{ $('#vvideo').currentTime=c.t; V.tlPin=true; tlPaint(); }catch(_){}" in USRC)
+check("review fix: the said row, the Eye row, your mark, the moment chip, "
+      "the chapter row, the moment row and the ask hit all stamp "
+      "V.userSeekReq before they seek (7 - the chapter notch was retired "
+      "on 6 Sep, the split IS the chapter)",
+      USRC.count(STAMP) == 7
+      and "    const vd=$('#vvideo');\n    " + STAMP + "\n    try{vd.currentTime=ln.t;}catch(e2){}" in USRC)
+check("...and the notch that carried the eighth is gone with its builder",
+      "m.className='chnotch'" not in USRC and "ch=[];" in USRC)
 tw = USRC[USRC.index("function tipWordsAt(t){"):USRC.index("function markCardShow(m){")]
 check("tipWordsAt skips a struck line - the next nearest unstruck line, "
       "else none", "if(s.nn)continue;" in tw

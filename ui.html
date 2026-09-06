@@ -1865,6 +1865,11 @@ body:not(.vhype) #vhype{display:none}
   box-shadow:0 10px 30px rgba(0,0,0,.75)}
 #vpeek.on{display:block}
 #vpeek video{display:block;width:236px;height:auto;background:#000}
+#vpeekw{max-width:236px;padding:5px 8px 6px;font:400 11px/1.35 var(--ui);
+  color:#d9c69c;background:rgba(28,20,10,.96);text-align:left;
+  border-top:1px solid rgba(140,110,70,.4)}
+#vpeek #vpeekt{position:static;background:rgba(28,20,10,.96);
+  padding:4px 8px;text-align:left}
 #vpeekt{position:absolute;left:0;right:0;bottom:0;text-align:center;
   font:600 11px var(--ui);color:#fff3dc;padding:3px 0;
   background:linear-gradient(180deg,rgba(0,0,0,0),rgba(0,0,0,.82));
@@ -2490,7 +2495,7 @@ body.hc .shint,body.hc .srow .lab small{color:#54431f}
        while something actually is. The Working page lists the whole library;
        this answers the narrower question you ask while looking at a video. -->
   <div id="vjob"><span class="jd"></span><span class="jt"></span></div>
-  <div id="vpeek"><video id="vpeekv" muted preload="metadata"></video><div id="vpeekt">0:00</div></div>
+  <div id="vpeek"><video id="vpeekv" muted preload="metadata"></video><div id="vpeekt">0:00</div><div id="vpeekw"></div></div>
   <div id="vbar">
     <button class="vbtn" id="vplay" title="Play / pause"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M3.2 1.8h2.9v10.4H3.2Zm4.7 0h2.9v10.4H7.9Z"/></svg></button>
     <button class="tlpan" id="vpanL" title="Show the stretch before this one">‹</button>
@@ -9597,8 +9602,15 @@ function peekShow(clientX, t, anchorTopY){
   if(!src)return;
   if(_peek.src!==src){ _peek.src=src; try{pv.src=src;}catch(e){} }
   box.classList.add('on');
-  const _cn=(typeof chapName==='function')?chapName(t):'';
+  /* 3.34: the chapter reads off the thumbnail - its name beside the
+     clock, what happened in it underneath. This is the only place the
+     sections speak now: no notch, no second tip. */
+  const _cp=(typeof chapAt==='function')?chapAt(t):null;
+  const _cn=(_cp&&_cp.label)?String(_cp.label):'';
+  const _cw=(_cp&&_cp.what&&_cp.what!==_cp.label)?String(_cp.what):'';
   $('#vpeekt').textContent=fmtT(Math.max(0,t))+(_cn?'  \u00b7  '+_cn:'');
+  const _pw=$('#vpeekw');
+  if(_pw){ _pw.textContent=_cw; _pw.style.display=_cw?'':'none'; }
   /* place it above the bar, kept fully on screen */
   const w=box.offsetWidth||236;
   const x=Math.max(8,Math.min(innerWidth-w-8,clientX-w/2));
@@ -11461,32 +11473,14 @@ function chapSegsPaint(){
    seeks to the second you pressed - scrubbing is sacred - so 'go to the
    START of this chapter' needs a target of its own. */
 function chapNotchPlace(ch){
+  /* 3.34: HIS WORD - "remove the red dot of the chapter, the split in
+     the timeline is perfectly sufficient". The sections ARE the
+     chapters; the thumbnail says which one you are over. Kept as a
+     sweeper so a bar drawn by the old code cleans itself up. */
+  ch=[];
   const wrap=$('#vseekwrap'); if(!wrap)return;
   let nodes=wrap._chNodes||[];
-  if(nodes.length!==ch.length){
-    nodes.forEach(n=>n.remove()); nodes=[];
-    ch.forEach(()=>{
-      const m=document.createElement('div'); m.className='chnotch';
-      /* no role, no tabindex: the gold marks have never carried either, and
-         the notch and the moment mark mirror them exactly rather than
-         inventing a focus story for one third of the bar. */
-      /* THE CHAPTER LIVES ON THE NODE, re-stamped every place() - a node
-         reused by index still holding the PREVIOUS recording's closure sent
-         clicks to another video's chapter times. Same cure as the gold: the
-         fact is read off the node, and the player is read live. */
-      m.addEventListener('pointerdown',e=>{
-        e.preventDefault(); e.stopPropagation();
-        const c=m._c; if(!c)return;
-        V.userSeekReq=_viewerReq;   /* 3.34 his seek outranks the resume */
-        try{ $('#vvideo').currentTime=c.t; V.tlPin=true; tlPaint(); }catch(_){}
-        chapterInView(c.t);
-        m.classList.add('hot'); setTimeout(()=>m.classList.remove('hot'),260);
-        whisper(fmtT(c.t)+'  \u00b7  '+(c.label||'chapter'));
-      });
-      m.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();});
-      wrap.append(m); nodes.push(m);
-    });
-  }
+  if(nodes.length){ nodes.forEach(n=>n.remove()); nodes=[]; }
   wrap._chNodes=nodes;
   if((_tlG?_tlG.width:wrap.getBoundingClientRect().width)<20)return;
   const win=tlWin();
@@ -13225,7 +13219,6 @@ function wireViewer(){
       if(e.target.closest&&e.target.closest('.hlmark,.insmark,.usrmark,.chnotch,#marktip,#markcard')){peekHide();return;}
       const r=swrap.getBoundingClientRect();
       peekShow(e.clientX,tlTimeAt(e.clientX),r.top);
-      chapTipAtX(e.clientX);      /* 3.34 J: and the section it is in */
     });
     swrap.addEventListener('mouseleave',()=>{peekHide();markTipHide();});
     /* N5: every mark explains itself - the signal that made it, and the

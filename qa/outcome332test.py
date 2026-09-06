@@ -36,7 +36,12 @@ WSRC = io.open(os.path.join(ROOT, "ai", "ocr_worker.py"),
 USRC = io.open(os.path.join(ROOT, "ui.html"), encoding="utf-8").read()
 TREE = ast.parse(SRC)
 try:
-    HSRC = subprocess.run(["git", "show", "HEAD:lore.py"], cwd=ROOT,
+    # THE PARITY BASE IS A COMMIT, NOT HEAD. The day drops I and J
+    # landed, "HEAD" became a lore.py whose own _aud_says calls a
+    # helper this namespace does not lift, and the suite died where
+    # it meant to compare. 9cfe020 is the last lore.py before the
+    # eye became a witness.
+    HSRC = subprocess.run(["git", "show", "9cfe020:lore.py"], cwd=ROOT,
                           capture_output=True, timeout=60).stdout \
         .decode("utf-8", "replace").replace("\r\n", "\n")
 except Exception:

@@ -154,40 +154,25 @@ check('the two tints alternate, and only they',
   check('each section knows which chapter it is',
     s[2]._c === CH[2] && s[2]._a === 600 && s[2]._b === 900);
 }
-check('a notch rides at every chapter start', notches().length === 4);
-check('the notches sit on their chapter, 3px either side of it',
-  notches().every((n, i) => Math.round(px(n)) === Math.round(F.tlPx(CH[i].t) - 3)));
+check('no notch is drawn - the split IS the chapter (his word, 6 Sep)',
+  notches().length === 0);
+check('chapNotchPlace is a sweeper now, never a builder',
+  /function chapNotchPlace\(ch\)\{[\s\S]{0,600}?ch=\[\];/.test(src) &&
+  src.indexOf("m.className='chnotch'") < 0);
 
-console.log('\n--- the notch is the chapter\'s handle ---');
+console.log('\n--- hovering names the section ON THE THUMBNAIL ---');
 {
-  notches()[3].fire('pointerdown');
-  check('a press on a notch seeks to the chapter\'s start', video.currentTime === 900);
-  check('...and brings its row into view', inView.length === 1 && inView[0] === 900);
-  check('...and says which chapter it was', said.some(s => s.indexOf('after') >= 0));
-}
-{
-  // the stale-closure law: the node is re-stamped, the player read live
-  const before = video;
-  video = { currentTime: 0, duration: DUR };
-  F.chapSegsPaint();                       // a re-place, not a rebuild
-  notches()[1].fire('pointerdown');
-  check('a notch seeks the LIVE player, never the one it was built with',
-    video.currentTime === 300 && before.currentTime === 900);
-}
-
-console.log('\n--- hovering the track names the section under the pointer ---');
-{
-  const x = BAR.left + 7 + (700 / DUR) * (BAR.width - 14);   // inside chapter 3
-  F.chapTipAtX(x);
-  const tip = wrap._tip;
-  check('the tip is up', !!tip && tip.classList.contains('on'));
-  check('its title line carries the chapter\'s label',
-    tip.children[0].innerHTML.indexOf('the final fight') >= 0);
-  check('and its own sentence sits beneath',
-    tip.children[1].innerHTML === CH[2].what);
-  F.chapTipAtX(BAR.left + 7 + (100 / DUR) * (BAR.width - 14));
-  check('sweeping into another section retells the tip',
-    tip.children[0].innerHTML.indexOf('warm-up') >= 0);
+  const t = 700;                                  // inside chapter 3
+  const c = F.chapAt(t);
+  check('the pointer finds the chapter it is over',
+    !!c && c.label === CH[2].label);
+  check('the clock line names it, the sentence sits under the frame',
+    src.indexOf("$('#vpeekt').textContent=fmtT(Math.max(0,t))+(_cn?'  \\u00b7  '+_cn:'')") > 0 &&
+    src.indexOf("_pw.textContent=_cw") > 0);
+  check('a chapter whose what repeats its label shows no sentence',
+    src.indexOf("_cp.what!==_cp.label") > 0);
+  check('the track no longer raises a tip of its own',
+    src.indexOf('chapTipAtX(e.clientX)') < 0);
 }
 
 console.log('\n--- the moments are the red marks below ---');
@@ -226,10 +211,10 @@ check('the moments chip puts the red row away',
 ENV.MARKS.told = true; F.momMarksPlace();
 check('...and brings it back', lit(moms()).length === 4);
 ENV.MARKS.red = false; F.chapSegsPaint();
-check('the chapter chip takes the sections AND their notches away',
-  segs().length === 0 && lit(notches()).length === 0);
+check('the chapter chip takes the sections away',
+  segs().length === 0);
 ENV.MARKS.red = true; F.chapSegsPaint();
-check('...and puts them back', segs().length === 4 && lit(notches()).length === 4);
+check('...and puts them back', segs().length === 4);
 
 console.log('\n--- zoomed to one chapter ---');
 boot({ chapters: CH, moments: MOM }, null, { zoom: 250, winA: 300 });
@@ -238,8 +223,6 @@ check('the window really is 300 -> 550',
   Math.round(F.tlWin().a) === 300 && Math.round(F.tlWin().b) === 550);
 check('only the section that is on screen is drawn',
   segs().length === 1 && segs()[0]._c === CH[1]);
-check('only its notch is lit',
-  lit(notches()).length === 1 && lit(notches())[0]._c === CH[1]);
 check('and only the moments inside it',
   moms().length === 1 && moms()[0]._m === MOM[1]);
 
