@@ -94,8 +94,8 @@ check("a line lifted from a MOMENT is caught too (the said-list carries "
                                           "the crash"]) == "a line somebody said"
       and "_said = ([c.get(\"q\") for c in cinfo]" in SRC
       and '+ [str(m.get("why") or "") for m in _moms])' in SRC
-      and SRC.count("_title_guard(title, _said)") == 1
-      and SRC.count("_title_guard(cand, _said)") == 1)
+      and SRC.count("_title_guard(title, _said, _bare)") == 1
+      and SRC.count("_title_guard(cand, _said, _bare)") == 1)
 check("an empty title is nothing to guard", guard("", SAID) == "")
 check("an Arabic event passes",
       guard("\u0633\u0642\u0637 \u0627\u0644\u0648\u062d\u0634 "
@@ -158,7 +158,7 @@ check("the quote's transcript dressing is stripped before it is shown",
 check("the gold marks are counted by kind per chapter",
       '_c["gk"][_k0] = _c["gk"].get(_k0, 0) + 1' in SRC)
 check("the guard re-asks ONCE and keeps a clean answer",
-      '_why = (_title_guard(title, _said)' in SRC
+      '_why = (_title_guard(title, _said, _bare)' in SRC
       and "asked again, it named the night" in SRC
       and "the re-ask did no better - it stands" in SRC)
 check("a re-ask that still swears has the swearing cut",

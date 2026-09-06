@@ -1039,8 +1039,45 @@ if HSRC:
           "have_flags - and models_fetch, drop G's two fetch edits aside",
           all(same[-7:]))
     import difflib
+    # 3.35 L: DROP L'S RANK BAND, LIFTED OUT THE WAY DROP G'S FETCH
+    # EDITS ARE. _ai_tick's only drop-L edit is rank-then-recency plus
+    # the tail's note that it rides the same list. Undo it here and
+    # hold what is LEFT to drop H's list exactly - a comparator that
+    # grows a looser key every drop stops guarding anything.
+    # review 335 made the band ONE ask per candidate; the literal
+    # moves with it. Update it, never drop the pair - a comparator
+    # that forgets a line stops guarding the function it watches.
+    _L_NEW = (
+        '        # 3.35 L: RANK, THEN RECENCY. The walk still takes the newest\n'
+        '        # owed night, but only inside its band: "first" games come\n'
+        '        # before "normal", "later" ones after. A "never" game is not\n'
+        '        # in this list at all - not queued, not swept, not owed. With\n'
+        '        # no ranks set this is the plain recency sort it always was.\n'
+        '        # It orders the SWEEP: a direct ask still runs, rank or no.\n'
+        '        # ONE ASK PER PATH, READ BEFORE EITHER PASS. SETTINGS is\n'
+        '        # re-bound by load_settings() on the pywebview thread, so a\n'
+        '        # chip pressed between the filter and the sort key left the\n'
+        '        # sort reading a rank the filter never saw - _RANK_ORDER\n'
+        '        # raised KeyError on a path that had just become "never" and\n'
+        '        # the beat was lost (review 335). Ask once, and the filter\n'
+        '        # and the sort can no longer disagree about the same path.\n'
+        '        rk = {pm[0]: _game_rank(pm[0]) for pm in vids}\n'
+        '        vids = [pm for pm in vids if rk[pm[0]] != "never"]\n'
+        '        vids.sort(key=lambda pm: (_RANK_ORDER[rk[pm[0]]], -pm[1]))\n')
+    _L_OLD = '        vids.sort(key=lambda pm: -pm[1])\n'
+    _L_TAIL = (
+        '    # 3.35 L: the tail walks the SAME sorted, never-filtered list the\n'
+        '    # walk above did - the screen reader and the librarian inherit the\n'
+        '    # rank for free, and never open a game he told to stay out.\n')
+    _L_RANK = ((_L_NEW, _L_OLD), (_L_TAIL, ""))
+    _at = fsrc(SRC, "_ai_tick", TREE)
+    check("drop L touches _ai_tick in exactly two places: the rank "
+          "sort and the tail's note that it rides the same list",
+          all(_at.count(a) == 1 for a, _b in _L_RANK))
+    for _a, _b in _L_RANK:
+        _at = _at.replace(_a, _b)
     ha = fsrc(HSRC, "_ai_tick", HTREE).splitlines()
-    na = fsrc(SRC, "_ai_tick", TREE).splitlines()
+    na = _at.splitlines()
     added = [ln for ln in difflib.unified_diff(ha, na, lineterm="", n=0)
              if ln.startswith("+") and not ln.startswith("+++")]
     removed = [ln for ln in difflib.unified_diff(ha, na, lineterm="", n=0)
@@ -1149,15 +1186,15 @@ check("_EmbServer.start refuses without the model (no spawn, no port sweep)",
 
 # =========================================================================
 print("\n--- the UI, read from its source ---")
-check("the stamps: 3.34 in both mocks, lore.py APP_VERSION 3.34, no 3.33 "
-      "version left (3.34 drop H)", USRC.count("version:'3.34'") == 2
-      and "version:'3.33'" not in USRC and 'APP_VERSION = "3.34"' in SRC)
+check("the stamps: 3.35 in both mocks, lore.py APP_VERSION 3.35, no 3.34 "
+      "version left (3.35 drop L)", USRC.count("version:'3.35'") == 2
+      and "version:'3.34'" not in USRC and 'APP_VERSION = "3.35"' in SRC)
 check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "librarian_ready, so the harness box is never dead",
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
       and "librarian_ready:true,second_ear:true,room_names:'',"
-          "my_name:'',version:'3.34'" in USRC)
+          "my_name:'',game_rank:{},version:'3.35'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "

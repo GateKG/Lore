@@ -1392,6 +1392,39 @@ def _group_spans(span_list, arr_of, sr, kind):
     return groups
 
 
+def _mic_claim(mfrac, split):
+    """WHOSE LINE IS THIS: "you" (the mic carried it), "micp" (the mic
+    had only part of it) or "" (the room's, and nobody is named).
+
+    `mfrac` is the share of a group's samples the MIC'S OWN DETECTOR
+    put his voice in, as _span_audio counted them; `split` says the
+    Voice tap and the Mic were separate tracks on this night. Read
+    that word carefully: ROUTING is not counting. _span_audio still
+    hands back the room's audio for any span a friend may share, and
+    on the MIX road it counts the same way it routes (0 or the whole
+    span), so mfrac there is HEAD's 0-or-1 exactly. Only on the split
+    road is mfrac a real coverage figure - see _span_audio.
+
+    THE 0.9 GATE WAS WRITTEN FOR A MIX, where the mic was the only clean
+    layer and a shared span belonged to the room by default. On a SPLIT
+    night the room IS the Voice tap plus his mic, so any utterance with
+    a friend's tap open at the same time scores well under 0.9 - and his
+    own words are filed as everyone's. Measured on his own shelf, 6 Sep:
+    a split night carrying 102.6 seconds of mic speech and mic_lines 0.
+    Half is the strongest claim the data in `g` can honestly make - a
+    group holds per-layer SAMPLE counts, not energies - so the split
+    road asks for the louder share by time (0.5) and the mix road keeps
+    0.9 to the byte.
+
+    NOTHING IS RE-OWED BY THIS. It lands on nights read from here on;
+    READER stays 7, because the hearing did not change - only the
+    attribution of a line already heard - and a re-read is his own
+    "again, fresh" to ask for."""
+    if mfrac >= (0.5 if split else 0.9):
+        return "you"
+    return "micp" if mfrac > 0 else ""
+
+
 def main(src, dst, mic=None):
     import numpy as np
     import soundfile as sf
@@ -1609,7 +1642,20 @@ def main(src, dst, mic=None):
 
     def _span_audio(s):
         """(slice, mic-samples): the clean mic when its own detector
-        says these samples carry his voice, the room (or mix) otherwise."""
+        says these samples carry his voice, the room (or mix) otherwise.
+
+        3.35 M THE ROUTING IS A VOTE, THE COUNT IS A MEASUREMENT.
+        Which array comes back is still all-or-nothing and must stay
+        that way (see the 0.9 below). The SAMPLE COUNT was the same
+        vote, and that made mfrac downstream a 0-or-1 flag wearing a
+        fraction's clothes: on the 6 Sep split night every mix span
+        was 0.75 his - a friend's tap opened a second early - so every
+        span scored 0 mic samples, every group scored mfrac 0.0, and
+        102.6 seconds of his voice went to nobody. On the SPLIT road
+        the measured overlap is reported instead, so _mic_claim's 0.5
+        has something real to compare. The mix road keeps the vote to
+        the byte: there the room is not the tap plus his mic, and a
+        partial overlap is not evidence of anything."""
         s0, e0 = s["start"], s["end"]
         if s.get("mix"):
             return mixa[s0:e0], 0     # handed back by the dead-Voice guard
@@ -1626,6 +1672,11 @@ def main(src, dst, mic=None):
             # safely his alone. TAGGED, NEVER FILTERED still holds.
             if ov >= 0.9 * max(1, e0 - s0):
                 return ma[s0:e0], e0 - s0
+            if has_voice:
+                # the room's audio, HIS measured share of it: the
+                # friend in the span is still never erased, and the
+                # line is no longer filed as nobody's
+                return a[s0:e0], max(0, min(ov, e0 - s0))
         return a[s0:e0], 0
 
     # HIS VOICE CAN START A LINE. The mic detector used to be allowed
@@ -2090,10 +2141,13 @@ def main(src, dst, mic=None):
                       "b": int(g["end"] / sr * 1000), "t": txt,
                       "lang": lang or last}
             mfrac = g.get("mic", 0) / float(max(1, g["len"]))
-            if mfrac >= 0.9:
+            # 3.35 M the gate is the night's, not a constant: 0.9 on a
+            # mix, 0.5 once the tap and the mic are separate tracks
+            _claim = _mic_claim(mfrac, has_voice)
+            if _claim == "you":
                 sg_new["src"] = "you"       # read from his clean mic
                 stats["mic_lines"] += 1
-            elif mfrac > 0:
+            elif _claim == "micp":
                 # partially mic-sourced: say HOW much, never a binary
                 # that would be wrong in both directions
                 sg_new["micp"] = round(mfrac, 2)

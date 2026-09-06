@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.34"
+APP_VERSION = "3.35"
 
 try:
     import psutil
@@ -92,6 +92,14 @@ DEFAULTS = {
     # fails open on a typo is no guard: see the $10 night above.)
     "ai_budget_cents":   500.0,
     "ai_spent_cents":    0.0,
+    # WHERE A GAME STANDS IN THE SWEEP (3.35 L). A chapter key ->
+    # "first" | "normal" | "later" | "never". The shelf walks newest
+    # first, so one solo night used to stand in front of every night
+    # he actually wanted told, and there was no per-game control
+    # anywhere. This orders the SWEEP only: asking for a night by
+    # name always runs, whatever its game's rank - "never" means
+    # "never on its own", not "refused".
+    "game_rank":         {},
 
     # Video / quality
     "framerate":         60,
@@ -683,6 +691,13 @@ def _migrate_settings_shape():
     s.pop("hotkey_stop", None)
 
 
+# THE FOUR WORDS (3.35 L). "never" is deliberately NOT in _RANK_ORDER:
+# a never game is filtered out of the walk entirely, so it has no place
+# in the ordering at all - a KeyError here would mean it slipped in.
+_GAME_RANKS = ("first", "normal", "later", "never")
+_RANK_ORDER = {"first": 0, "normal": 1, "later": 2}
+
+
 def _sanitize_settings(d):
     """Coerce/clamp values loaded from settings.json so a corrupt or hand-edited file
     can't feed a bad value (e.g. framerate 0, bitrate -5) straight into ffmpeg. Each
@@ -754,6 +769,26 @@ def _sanitize_settings(d):
         d.get("room_names", DEFAULTS["room_names"]))
     d["my_name"] = str(d.get("my_name", DEFAULTS["my_name"])
                        or "").strip()[:40].strip()
+    # 3.35 L: a settings file is untrusted input, and this dict is read
+    # inside the sweep's hot loop. Keys are chapter keys (short
+    # strings), values are the four words, and a hand-edited file
+    # cannot grow it past two hundred games. Anything else is dropped.
+    try:
+        raw = d.get("game_rank")
+        if not isinstance(raw, dict):
+            raise TypeError("game_rank is not a dict")
+        clean = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k.strip() or len(k) > 80:
+                continue
+            if not isinstance(v, str) or v.lower() not in _GAME_RANKS:
+                continue
+            clean[k.strip().lower()] = v.lower()
+            if len(clean) >= 200:
+                break
+        d["game_rank"] = clean
+    except Exception:
+        d["game_rank"] = dict(DEFAULTS["game_rank"])
 
 
 def load_settings():
@@ -6291,6 +6326,10 @@ def _stt_reader_of(video_path):
 
 
 _STT_TRK_CACHE = {}
+
+# 3.35 M: (stt path) -> (mtime, era). A read cache, never a
+# write: nothing on the shelf is re-owed by knowing this.
+_ERA_CACHE = {}
 
 
 def _stt_has_layers(video_path):
@@ -12391,6 +12430,39 @@ def _game_sources_key(file_name):
     return _display_name(_parse_clip_name(file_name)).lower()
 
 
+_GAME_RANK_KEY = {}      # path -> chapter key; a path never changes game
+
+
+def _game_rank(path):
+    """Where this recording's game stands in the sweep's walk:
+    first / normal / later / never. An unknown game is "normal".
+
+    CHEAP ON PURPOSE: the sweep asks this of every candidate on every
+    beat, over thirteen hundred paths, so the path -> chapter key
+    mapping is cached for the life of the process (a path never
+    changes which game it belongs to). The RANK itself is read from
+    SETTINGS on every call, so a press in the panel lands on the next
+    beat instead of waiting for a restart.
+
+    THE RANK ORDERS THE SWEEP; IT IS NEVER A REFUSAL. Asking for a
+    night by name - Everything, or a row's own ask - runs whatever
+    this says, "never" included.
+    """
+    try:
+        k = _GAME_RANK_KEY.get(path)
+        if k is None:
+            if len(_GAME_RANK_KEY) > 20000:
+                _GAME_RANK_KEY.clear()   # a shelf that big is a new run
+            # the SHELF'S own key, so a press on a chapter header and
+            # the sweep's question cannot drift apart
+            k = _cap_game_key(path)
+            _GAME_RANK_KEY[path] = k
+        v = (SETTINGS.get("game_rank") or {}).get(k)
+        return v if v in _GAME_RANKS else "normal"
+    except Exception:
+        return "normal"
+
+
 def _game_sources_night_ok(tdir, base, sources):
     """May this night vote? Not when the reader stood media detection
     down (the Voice tap was not trusted), and not when the recorder's
@@ -12981,7 +13053,14 @@ def _ai_next_sweep():
             for d, kind in _library_dirs(out):
                 for v in _scan_dir_mp4s(d, kind):
                     vids.append((v["path"], v.get("mtime") or 0))
-            vids.sort(key=lambda pm: -pm[1])
+            # 3.35 L: THE SAME ORDER THE WALK TAKES. This preview and
+            # _ai_tick must never disagree about what comes next.
+            # One ask per path, like the walk: a chip pressed between
+            # the two passes must not hand the sort a rank the filter
+            # never read (review 335).
+            rk = {pm[0]: _game_rank(pm[0]) for pm in vids}
+            vids = [pm for pm in vids if rk[pm[0]] != "never"]
+            vids.sort(key=lambda pm: (_RANK_ORDER[rk[pm[0]]], -pm[1]))
             do_stt = (SETTINGS.get("ai_transcribe", True)
                       and _reader_paths() is not None
                       and not held.get("hearing"))
@@ -13005,19 +13084,22 @@ def _ai_next_sweep():
                 if do_hl and (not _ai_sidecar_fresh(p, "hl")
                               or not _ai_sidecar_fresh(p, "lvl")):
                     val = {"name": os.path.basename(p),
-                           "kind": "listening"}
+                           "kind": "listening",
+                           "rank": _game_rank(p)}
                     break
                 if do_stt and (not _ai_sidecar_fresh(p, "stt")
                                or (SETTINGS.get("reread_old")
                                    and _stt_stale_reader(p))):
                     val = {"name": os.path.basename(p),
-                           "kind": "hearing"}
+                           "kind": "hearing",
+                           "rank": _game_rank(p)}
                     break
                 if (do_ins and (_ins_owing(p) or _sns_owing(p))
                         and _ai_sidecar_fresh(p, "hl")
                         and _ai_sidecar_fresh(p, "stt")):
                     val = {"name": os.path.basename(p),
-                           "kind": "thinking"}
+                           "kind": "thinking",
+                           "rank": _game_rank(p)}
                     break
                 if (SETTINGS.get("insights_auto", True)
                         and not held.get("auditing")
@@ -13025,7 +13107,8 @@ def _ai_next_sweep():
                         and _ai_sidecar_fresh(p, "hl")
                         and _ai_sidecar_fresh(p, "stt")):
                     val = {"name": os.path.basename(p),
-                           "kind": "auditing"}
+                           "kind": "auditing",
+                           "rank": _game_rank(p)}
                     break
     except Exception:
         val = None
@@ -17139,7 +17222,82 @@ def _describer_paths():
     return None
 
 
-def _who_law(voice=False, name=None):
+def _night_era(video_path):
+    """WHICH ERA THIS NIGHT BELONGS TO (3.35 M) - "split" | "mic" |
+    "mixed" - read from the night's OWN stt sidecar, never from the
+    setting and never from the file's date:
+
+      split  the Voice tap and the Mic were separate tracks
+             (sources.voice) - his mic can be told from the call.
+      mic    no tap, but the mic layer ran (sources.mic_s > 0, or a
+             line carries src == "you" / micp) - his voice can be told
+             from the room's, and nobody else can be told apart.
+      mixed  neither: one microphone-shaped blur. Everything before
+             the mic layer.
+
+    WHY THIS EXISTS (his words, 6 Sep: "anything dated before yesterday
+    shouldn't have the <me> vs Discord title... now I'm afraid
+    everything is gonna be '<me> said'" - his own name stays in his
+    settings, never here). 3.34's law taught every ask
+    "the recording belongs to <him>" on EVERY night - including a 2024
+    night with no mic layer at all and not one line that is his. The
+    prose then narrated a whole room as one person. A name is a claim,
+    and a claim needs evidence this night can actually carry.
+
+    Unreadable, absent or half-written stt -> "mixed", the humblest
+    answer. Cached on the sidecar's mtime like every other read; this
+    re-owes nothing, because it is read at ask time and written
+    nowhere."""
+    sp = _ai_sidecar(video_path, "stt")
+    try:
+        mt = os.path.getmtime(sp)
+    except OSError:
+        return "mixed"
+    key = os.path.normcase(sp)
+    hit = _ERA_CACHE.get(key)
+    if hit and hit[0] == mt:
+        return hit[1]
+    era = "mixed"
+    try:
+        with open(sp, encoding="utf-8") as fh:
+            d = json.load(fh) or {}
+        srcs = d.get("sources") if isinstance(d.get("sources"), dict) else {}
+        if srcs.get("voice"):
+            era = "split"
+        else:
+            try:
+                _ms = float(srcs.get("mic_s") or 0)
+            except (TypeError, ValueError):
+                _ms = 0.0
+            if _ms > 0 or any(
+                    sg.get("src") == "you" or sg.get("micp")
+                    for sg in (d.get("segments") or [])
+                    if isinstance(sg, dict)):
+                era = "mic"
+    except Exception:
+        era = "mixed"
+    if len(_ERA_CACHE) > 4096:
+        _ERA_CACHE.clear()
+    _ERA_CACHE[key] = (mt, era)
+    return era
+
+
+def _night_mine(segs):
+    """How many lines of this night the MIC itself claimed. A partly-mic
+    line (micp) is not a claim - it is the mic saying it only had part
+    of the utterance - so it does not count. Zero is the whole point of
+    the count: a night with a name and no line to attach it to."""
+    n = 0
+    for sg in (segs or []):
+        try:
+            if sg.get("src") == "you":
+                n += 1
+        except AttributeError:
+            continue
+    return n
+
+
+def _who_law(voice=False, name=None, era=None, mine=None):
     """WHO IS TALKING, BY NAME (3.34 K): the one law appended to the
     describer's, the title's and the auditor's prompt at ask time.
 
@@ -17161,21 +17319,86 @@ def _who_law(voice=False, name=None):
     transcript carries is worse than one that changed. The price
     is stated plainly: from 3.34 on, titles baked from a 3.31+
     tap night are no longer byte-comparable with the ones before
-    it - nights with neither a name nor a tap still are."""
+    it - nights with neither a name nor a tap still are.
+
+    3.35 M: `era` is _night_era's answer for THIS night and `mine` how
+    many lines its own mic claimed, and together they decide which of
+    three laws is affordable - see the branches below. era=None is
+    3.34's road, unchanged."""
     nm = _my_name() if name is None else str(name or "").strip()[:40]
-    if not nm and not voice:
+    if era is None:
+        # 3.34's road, kept whole: a caller with no night in its hand
+        # (and the roster's copy of the 3.34 ask) still gets 3.34's
+        # answer to the byte.
+        if not nm and not voice:
+            return ""
+        me = nm or "the person recording"
+        law = ("\n- The recording belongs to " + me + " (lines marked '"
+               + (nm or "YOU") + ":' are theirs).")
+        if voice:
+            law += (" Lines marked 'Discord:' are " + me + "'s friends "
+                    "on the voice call - in chapters, titles, summaries "
+                    "and moments NEVER write 'Discord' as if it were a "
+                    "person's name: say 'a friend on the call', 'his "
+                    "friend', 'the friends', 'the boys on the call', or "
+                    "the name a line carries.")
+        return law + " Never 'the player' or 'the players'."
+    # ---- 3.35 M: the night says which law it can afford --------------
+    tail = " Never 'the player' or 'the players'."
+    friends = (" in chapters, titles, summaries and moments NEVER write "
+               "'Discord' as if it were a person's name: say 'a friend "
+               "on the call', 'his friend', 'the friends', 'the boys on "
+               "the call', or the name a line carries.")
+    if era == "mixed":
+        # ONE MICROPHONE-SHAPED BLUR. Nothing in this night can tell
+        # his voice from anyone else's, so there is nothing to teach
+        # and the ask is the pre-3.34 one to the byte.
         return ""
     me = nm or "the person recording"
-    law = ("\n- The recording belongs to " + me + " (lines marked '"
-           + (nm or "YOU") + ":' are theirs).")
-    if voice:
+    if era == "split":
+        if mine is not None and int(mine) <= 0:
+            # THE NAME WITHOUT THE EVIDENCE. 6 Sep, his own shelf: a
+            # split night with 102.6 s of mic speech and not one line
+            # tagged his. The label is still in the transcript, so the
+            # label is still explained - but a person the recording
+            # never identified may not be given a line or a deed.
+            return ("\n- Lines marked 'Discord:' are the friends on the "
+                    "voice call -" + friends
+                    + (" Nobody in this recording has been identified as "
+                       + nm + ": never attribute a line or an action to "
+                       "him by name." if nm else
+                       " No line in this recording has been identified as "
+                       "the person recording's own voice: never attribute "
+                       "a line or an action to them.")
+                    # A WORD TO USE, NOT ONLY WORDS TO AVOID. 3.34
+                    # could afford " Never 'the player'" because it
+                    # had just handed over a name. Here the name is
+                    # forbidden too, and the only people-words left
+                    # in this law are the FRIENDS - so a model told
+                    # to name whoever is playing would reach for one
+                    # of them, and a wrong name would have become a
+                    # wrong person. It gets a word of its own.
+                    + " Where whoever is playing must be named at "
+                      "all, write 'the one recording' - never 'the "
+                      "player', never 'the players', and never one "
+                      "of the friends' names.")
+        law = ("\n- The recording belongs to " + me + " (lines marked '"
+               + (nm or "YOU") + ":' are theirs).")
         law += (" Lines marked 'Discord:' are " + me + "'s friends "
-                "on the voice call - in chapters, titles, summaries "
-                "and moments NEVER write 'Discord' as if it were a "
-                "person's name: say 'a friend on the call', 'his "
-                "friend', 'the friends', 'the boys on the call', or "
-                "the name a line carries.")
-    return law + " Never 'the player' or 'the players'."
+                "on the voice call -" + friends)
+        return law + tail
+    # era == "mic": his mic was a track of its own, the room was not.
+    # With no typed name there is no word to teach that 'YOU:' does not
+    # already say, so this stays "" and the ask is HEAD's.
+    if not nm:
+        return ""
+    return ("\n- The recording belongs to " + nm + " (lines marked '"
+            + nm + ":' are theirs). Every other voice is someone in the "
+            "room whose name this recording cannot know - never guess "
+            "one (a line that carries a name is the exception: that "
+            "name is his own, typed against a voice he recognised), "
+            "and never call anyone Discord: no voice call was "
+            "recorded apart from the room on this night." + tail)
 
 
 _DESC_SYSTEM = """You are given part of the transcript of one recorded gaming session.
@@ -17517,7 +17740,17 @@ _TITLE_DISCORD_LAW = (
     "a name, and never 'the player'.")
 
 
-def _title_guard(title, said):
+# 3.35 M: what the re-ask says when a title named a person the night
+# could not hear. Beside the guard, like the Discord law.
+_TITLE_UNHEARD = "his name, on a night that could not hear him"
+_TITLE_NAME_LAW = (
+    "\nThis recording cannot tell whose voice is whose - no line in it "
+    "has been identified as his. Do not put his name in the title or "
+    "the summary, and do not give anyone a name the transcript does not "
+    "carry: name what HAPPENED instead.")
+
+
+def _title_guard(title, said, unheard=""):
     """Why a title is not a name for the night, or '' when it is.
 
     The shapes the model still reaches for after being told not to,
@@ -17552,6 +17785,15 @@ def _title_guard(title, said):
                 "on", "over", "in", "the", "a", "via", "through",
                 "from", "off")):
             return "Discord as a name"
+    # 3.35 M: A NIGHT MAY NOT BE TITLED AFTER A PERSON IT COULD NOT
+    # HEAR. `unheard` is his name ONLY on a night whose own transcript
+    # never identified him (a mixed night, or a split one with no line
+    # the mic claimed) - "" on every other, so this is arithmetic that
+    # never fires unless the caller has the evidence in hand.
+    if unheard:
+        _un = [w for w in re.findall(r"[\w']+", str(unheard).lower()) if w]
+        if _un and all(w in toks for w in _un):
+            return _TITLE_UNHEARD
     if toks and (toks[-1] in _TITLE_FILLER or toks[0] in _TITLE_FILLER):
         return "a transcript fragment"
     # the overlap is counted on the words that carry meaning - "the"
@@ -18614,6 +18856,7 @@ def _dress_line(sg, i, sns):
     # none - an invitation to guess. _aud_voice is overlap-only by
     # design (a nameless quote is worth more than a wrong one), so
     # nameless nights and game audio stay bare.
+    _vp = False        # 3.35 M: a "YOU: " the VOICEPRINT claimed, not the mic
     if not yv and not sg.get("g"):
         try:
             _w = _aud_voice(sns, (sg.get("a") or 0) / 1000.0,
@@ -18621,6 +18864,7 @@ def _dress_line(sg, i, sns):
             if _w:
                 yv = ("YOU: " if str(_w).strip().lower() == "you"
                       else str(_w).strip()[:24] + ": ")
+                _vp = yv == "YOU: "
         except Exception:
             pass
     # WHO IS TALKING, BY NAME (3.34 K). "YOU" is what a machine calls
@@ -18632,11 +18876,45 @@ def _dress_line(sg, i, sns):
     # so it says so. A mix night has no such proof and stays bare, and
     # with no name and no tap this line is HEAD's to the byte.
     try:
-        if yv == "YOU: ":
+        # 3.35 M THE ERA THIS NIGHT BELONGS TO, from the cell above:
+        # "split" (the tap and the mic were separate tracks), "mic"
+        # (the mic alone), "mixed" (one blur - neither label may
+        # appear). A caller that set only the sources gets 3.34's
+        # answer, so the roster's copy of the 3.34 dressing stands.
+        _era = (str(_DRESS_SRC.get("era") or "")
+                or ("split" if _DRESS_SRC.get("voice") else "mic"))
+        # how many lines the MIC claimed on this night - the same
+        # count _who_law was handed. None means a caller that never
+        # measured it (3.34's road), and nothing below fires.
+        _mine = _DRESS_SRC.get("mine")
+        # A `micp` LINE IS THE MIC'S OWN ADMISSION that it only had
+        # part of the utterance. Neither his name nor his friends'
+        # label may be written over it: that is how one voice becomes
+        # everybody's, in both directions.
+        _part = bool(sg.get("micp")) and sg.get("src") != "you"
+        if _era == "mixed":
+            pass                     # the pre-3.34 dressing, to the byte
+        elif _part:
+            if yv == "YOU: ":
+                yv = ""
+        elif (_vp and _era == "split"
+              and _mine is not None and int(_mine) <= 0):
+            # A CLAIM THE LAW CANNOT SEE. _night_mine counts only
+            # lines the MIC claimed, so on a nameless split night
+            # the ask is at that moment saying "nobody in this
+            # recording has been identified as <him>" - and a
+            # voiceprint he once typed 'you' on must not put his
+            # name into the same transcript. The count and the
+            # dressing have to agree or the model must pick one.
+            # Bare, and deliberately NOT 'Discord:' either (the
+            # branch below is skipped by this elif): the print says
+            # this line is not one of the friends'.
+            yv = ""
+        elif yv == "YOU: ":
             _nm = _my_name()
             if _nm:
                 yv = _nm + ": "
-        elif not yv and not sg.get("g") and _DRESS_SRC.get("voice"):
+        elif not yv and not sg.get("g") and _era == "split":
             yv = "Discord: "
     except Exception:
         pass
@@ -18706,6 +18984,14 @@ def _insights_one(video_path, forced=False, fresh=False):
                 if isinstance(_stt_doc.get("sources"), dict) else {})
     _DRESS_SRC.clear()
     _DRESS_SRC.update(_stt_src)
+    # 3.35 M: the era, and how many lines the mic itself claimed. Both
+    # are read from this night's own sidecar and travel no further than
+    # the two asks below - nothing is written, nothing is re-owed.
+    _ins_era = _night_era(video_path)
+    _ins_mine = _night_mine(segs)
+    _DRESS_SRC["era"] = _ins_era
+    _DRESS_SRC["mine"] = _ins_mine    # 3.35 M the dressing reads the
+    #                                   same count the law does
     dur = _video_duration(video_path) or 0.0
     if dur < 20:
         # A COLD 40 GB FILE ON A BUSY SPINNING DISK can time the probe out -
@@ -19589,7 +19875,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                 for _attempt in range(2):
                     txt = srv.ask(_DESC_SYSTEM
                                   + _who_law(bool(_stt_src.get(
-                                      "voice"))), head + body,
+                                      "voice")), None, _ins_era,
+                                      _ins_mine), head + body,
                                   max_tokens=out_cap,
                                   schema=_DESC_SCHEMA,
                                   images=imgs if _first else None)
@@ -19865,7 +20152,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                                            if isinstance(m, dict)], 4)}
                 t_ask = _title_evidence(_ev)
                 t_sys = _TITLE_SYS + _who_law(
-                    bool(_stt_src.get("voice")))
+                    bool(_stt_src.get("voice")), None, _ins_era,
+                    _ins_mine)
                 t_max = 360
                 # every line the page showed it, chapter quotes and the
                 # moments' whys alike - the guard compares against all
@@ -19920,7 +20208,14 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # in its own words, the model usually finds the event.
                 # If it insists, the swearing is cut and the rest stands
                 # - a line the room said is still truer than a list.
-                _why = (_title_guard(title, _said)
+                # 3.35 M: only a night that could not hear him arms
+                # the name guard - on every other one this is "" and
+                # the guard is 3.34's arithmetic exactly.
+                _bare = (_my_name()
+                         if (_ins_era == "mixed"
+                             or (_ins_era == "split" and _ins_mine <= 0))
+                         else "")
+                _why = (_title_guard(title, _said, _bare)
                         if (_TITLE_GEN >= 1 and title) else "")
                 if _why:
                     t2 = srv.ask(
@@ -19932,6 +20227,8 @@ def _insights_one(video_path, forced=False, fresh=False):
                         # the guard that caught it is a law about a
                         # label, so the re-ask restates the law rather
                         # than only naming the crime
+                        + (_TITLE_NAME_LAW
+                           if _why == _TITLE_UNHEARD else "")
                         + (_TITLE_DISCORD_LAW
                            if _why == "Discord as a name" else ""),
                         max_tokens=t_max, schema=_TITLE_SCHEMA)
@@ -19944,7 +20241,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                                           or summary).strip())
                     except Exception:
                         pass
-                    if cand and not _title_guard(cand, _said):
+                    if cand and not _title_guard(cand, _said, _bare):
                         log("The title \"" + title[:60] + "\" was " + _why
                             + " - asked again, it named the night \""
                             + cand[:60] + "\".")
@@ -23760,11 +24057,18 @@ def _aud_who(sg, src):
     try:
         nm = _my_name()
         voice = bool((src.get("sources") or {}).get("voice"))
-        if not nm and not voice:
+        # 3.35 M the same three eras the describer's dressing uses; a
+        # caller that carries only the sources gets 3.34's answer.
+        era = str(src.get("era") or "") or ("split" if voice else "mic")
+        if era == "mixed":
+            return ""           # one blur: no mark may be written at all
+        if not nm and era != "split":
             return ""
+        if sg.get("micp") and sg.get("src") != "you":
+            return ""           # partly-mic: neither his, nor theirs
         if sg.get("src") == "you":
             return (nm or "YOU") + ": "
-        return "Discord: " if voice else ""
+        return "Discord: " if era == "split" else ""
     except Exception:
         return ""
 
@@ -24373,7 +24677,8 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
         body = _aud_ear_budget(video_path, anchors, drops, game, dur, src,
                                places, crs, garble, body)
         _asys = _AUD_SYSTEM + _who_law(
-            bool((src.get("sources") or {}).get("voice")))
+            bool((src.get("sources") or {}).get("voice")), None,
+            src.get("era"), src.get("mine"))
         asrv = _AUD_KEEP.get("srv")
         if asrv is not None and (asrv.pr is None
                                  or asrv.pr.poll() is not None):
@@ -24472,7 +24777,8 @@ def _aud_thread(video_path, anchors, drops, src, places, crs, dur,
         # malformed answer is one retry - the price of the grammar was
         # 35 seconds a night across a 442-night backlog.
         txt = srv.ask(_AUD_SYSTEM + _who_law(
-            bool((src.get("sources") or {}).get("voice"))), body,
+            bool((src.get("sources") or {}).get("voice")), None,
+            src.get("era"), src.get("mine")), body,
                       max_tokens=900 + (60 * len(garble or [])))
         if not txt:
             return [], "", "no answer came back", True, False, []
@@ -25630,7 +25936,14 @@ def _ai_ask_first(path, want="think", why=""):
     automatic repair there started the describer on his game's card
     five seconds after a game interrupted an audit (review 314,
     critical). The focus only REORDERS the walk: every gate - playing,
-    held, paused, shut down - still decides whether anything runs."""
+    held, paused, shut down - still decides whether anything runs.
+
+    3.35 L: A "NEVER" GAME FORGOES THIS REPAIR. The focus only
+    REORDERS the walk, and a never-ranked night is not in that walk
+    at all, so the guarded hoist finds nothing and the night keeps a
+    description the audit already knows is wrong - until he asks for
+    it by name. That is what "never on its own" means; the by-name
+    road still repairs it in full."""
     try:
         _AI["focus"] = path       # first in line, next time the sweep looks
         _AI["failed"].pop(path, None)   # and it may try again
@@ -26072,7 +26385,12 @@ def _audit_one(video_path, redo=False):
                # his mic by construction
                "sources": (stt_doc.get("sources")
                            if isinstance(stt_doc.get("sources"), dict)
-                           else {})}
+                           else {}),
+               # 3.35 M: which era this night is, and how many lines
+               # its own mic claimed - the dossier's labels and the
+               # law it is read under have to agree with each other
+               "era": _night_era(video_path),
+               "mine": _night_mine(stt)}
         try:
             dur = float(ins.get("vdur") or 0)
         except (TypeError, ValueError):
@@ -27798,7 +28116,22 @@ def _ai_tick(ctl):
         for d, kind in _library_dirs(out):
             for v in _scan_dir_mp4s(d, kind):
                 vids.append((v["path"], v.get("mtime") or 0))
-        vids.sort(key=lambda pm: -pm[1])
+        # 3.35 L: RANK, THEN RECENCY. The walk still takes the newest
+        # owed night, but only inside its band: "first" games come
+        # before "normal", "later" ones after. A "never" game is not
+        # in this list at all - not queued, not swept, not owed. With
+        # no ranks set this is the plain recency sort it always was.
+        # It orders the SWEEP: a direct ask still runs, rank or no.
+        # ONE ASK PER PATH, READ BEFORE EITHER PASS. SETTINGS is
+        # re-bound by load_settings() on the pywebview thread, so a
+        # chip pressed between the filter and the sort key left the
+        # sort reading a rank the filter never saw - _RANK_ORDER
+        # raised KeyError on a path that had just become "never" and
+        # the beat was lost (review 335). Ask once, and the filter
+        # and the sort can no longer disagree about the same path.
+        rk = {pm[0]: _game_rank(pm[0]) for pm in vids}
+        vids = [pm for pm in vids if rk[pm[0]] != "never"]
+        vids.sort(key=lambda pm: (_RANK_ORDER[rk[pm[0]]], -pm[1]))
         vids = [p for p, _m in vids]
     except Exception:
         return
@@ -28356,6 +28689,9 @@ def _ai_tick(ctl):
     #                                   ^ once a beat, never once a night
     emb_ok = emb_ok and (time.time() - float(_EMB.get("down_t") or 0)
                          >= _EMB_STANDDOWN)   # one dead librarian, one visit
+    # 3.35 L: the tail walks the SAME sorted, never-filtered list the
+    # walk above did - the screen reader and the librarian inherit the
+    # rank for free, and never open a game he told to stay out.
     if do_hl and not playing:
         for p in vids:
             if _ai_skipped_recently(p) or _queued_finish_badge(p):
@@ -28459,6 +28795,7 @@ def _ai_tally():
     if c and now - c["t"] < 30:
         return c
     total = 0
+    held_back = 0   # nights on a game he ranked "never on its own"
     left = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
     secs = {"listening": 0.0, "hearing": 0.0, "thinking": 0.0,
             "auditing": 0.0}
@@ -28469,6 +28806,19 @@ def _ai_tally():
             for v in _scan_dir_mp4s(d, kind):
                 total += 1
                 p = v["path"]
+                # 3.35 L: THE HELD-BACK SHARE, COUNTED AND SAID.
+                # A "never" game is out of the sweep's walk, so its
+                # nights sit in 'left' for ever. The law is that a
+                # rank may reorder the walk but never un-owe a night,
+                # so the count stays honest - and the Working page
+                # says how many of them will not drain on their own.
+                # A number that can never reach zero must explain
+                # itself, the way the next-pick line does (rev 335).
+                try:
+                    if _game_rank(p) == "never":
+                        held_back += 1
+                except Exception:
+                    pass
                 for job, side in (("hearing", "stt"), ("listening", "hl"),
                                   ("thinking", "ins")):
                     # DONE MEANS FINISHED, not "given up on". "Not owed"
@@ -28504,7 +28854,8 @@ def _ai_tally():
                     pass
     except Exception:
         pass
-    out = {"t": now, "total": total, "gaveup": gaveup}
+    out = {"t": now, "total": total, "gaveup": gaveup,
+           "held_back": held_back}
     for job in ("listening", "hearing", "thinking", "auditing"):
         out[job] = {"left": left[job], "done": done[job], "secs": secs[job]}
     _AI["_tally"] = out
@@ -30373,6 +30724,9 @@ class _JsApi:
                     # true once this machine has timed a job of this kind
                     "measured": bool(_AI["rate"].get(kind)),
                     "done": k["done"], "left": k["left"], "total": t["total"],
+                    # the shelf-wide held-back share, so the tally
+                    # line can say why 'left' will not drain (3.35 L)
+                    "held": t.get("held_back", 0),
                     "pct": (int(k["done"] / t["total"] * 100) if t["total"] else 100),
                     # x realtime, the way a person would say it
                     "speed": (round(1.0 / rate, 1) if rate else None),
@@ -31103,15 +31457,23 @@ class _JsApi:
                 gate = "waiting for your edit"
             elif time.time() - _MEDIA.get("last_read", 0) < 20:
                 gate = "waiting while you watch"
-        # where it stands in the sweep's newest-first walk (one scan, no
-        # sidecar stats - a click must not storm a spun-down platter)
+        # where it stands in the sweep's walk (one scan, no sidecar
+        # stats - a click must not storm a spun-down platter). 3.35 L:
+        # THE SAME BAND THE WALK USES. A place counted off a different
+        # order is a number that was never true; a "never" game is not
+        # in the walk at all, so it has no place to report - the rank
+        # below is what the plate says instead.
         pos = total = None
         try:
             vids = []
             for d2, k2 in _library_dirs(SETTINGS.get("output_dir", "")):
                 for v2 in _scan_dir_mp4s(d2, k2):
                     vids.append((v2["path"], v2.get("mtime") or 0))
-            vids.sort(key=lambda pm: -pm[1])
+            # one ask per path, like the walk (review 335): the
+            # filter and the sort must not read two different ranks.
+            rk = {pm[0]: _game_rank(pm[0]) for pm in vids}
+            vids = [pm for pm in vids if rk[pm[0]] != "never"]
+            vids.sort(key=lambda pm: (_RANK_ORDER[rk[pm[0]]], -pm[1]))
             total = len(vids)
             ap = os.path.normcase(os.path.abspath(p))
             for i2, (p2, _m2) in enumerate(vids):
@@ -31131,7 +31493,8 @@ class _JsApi:
         except Exception:
             pass
         return {"ok": True, "path": p, "kinds": kinds, "gate": gate,
-                "queue": pos, "total": total, "asked": asked}
+                "queue": pos, "total": total, "asked": asked,
+                "rank": _game_rank(p)}
 
     def ai_spend(self):
         """What the AI has cost so far and what it is allowed to cost. An
@@ -32087,8 +32450,12 @@ class _JsApi:
         for it in q:
             w = it[1] if len(it) > 1 else "all"
             lanes = _ai_want_lanes(w)
+            # 3.35 L: a row he ASKED for on a held-back game still
+            # runs - the word only says why it would never have come
+            # up on its own.
             row = {"name": os.path.basename(it[0]),
                    "path": it[0], "want": w,
+                   "rank": _game_rank(it[0]),
                    "redo": bool(it[2]) if len(it) > 2 else False,
                    "held": any(held.get(k) for k in lanes)}
             if str(w).lower() == "audit" and not row["held"]:
@@ -32355,6 +32722,19 @@ class _JsApi:
         except Exception:
             pass
         return []
+
+    def night_era(self, path):
+        """3.35 M: "split" | "mic" | "mixed" for ONE recording - what
+        this night can honestly say about whose voice is whose. The
+        panel prints it in a line, because a name is a claim and the
+        reader deserves to know what backs it."""
+        p = self._safe_path(path)
+        if not p:
+            return "mixed"
+        try:
+            return _night_era(p)
+        except Exception:
+            return "mixed"
 
     def ai_versions(self, path):
         """Every kept version of this recording's transcript, review and

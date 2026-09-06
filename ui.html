@@ -567,6 +567,14 @@ body.intro #dragpill,body.vfull #dragpill{display:none}
 .grow .gcount{font-size:11px;color:var(--ink-soft);font-style:italic;white-space:nowrap}
 /* 3.31: what the game-sources ledger knows - a quiet chip in the shelf's own type */
 .grow .gvoice{font:italic 10px var(--serif);color:var(--ink-faint);padding:1px 6px;border:1px solid rgba(200,160,95,.35);border-radius:8px;margin-left:4px;white-space:nowrap;flex:0 0 auto}
+/* 3.35 L: where a game stands in the sweep's walk - a chip in the shelf's
+   own type, pressed to cycle. It ORDERS the AI suite and nothing else:
+   asking for a night by name always runs, 'never on its own' included. */
+.grow .grank{font:italic 10px var(--serif);color:var(--ink-faint);padding:1px 7px;border:1px solid rgba(200,160,95,.35);border-radius:8px;margin-left:4px;white-space:nowrap;flex:0 0 auto;background:transparent;cursor:pointer;transition:color .18s,border-color .18s,opacity .18s}
+.grow .grank:hover{color:var(--ink);border-color:rgba(200,160,95,.75)}
+.grow .grank.r-first{color:var(--gold);border-color:rgba(200,160,95,.8)}
+.grow .grank.r-later{opacity:.72}
+.grow .grank.r-never{opacity:.55;text-decoration:line-through}
 .grow .garrow{color:var(--ink-faint);font-size:14px;transition:transform .18s}
 .grow:hover .garrow{transform:translateX(3px);color:var(--acc,var(--ink-soft))}
 
@@ -1556,6 +1564,9 @@ body.vfull.vthread #vstage video{max-width:calc(100vw - 392px)}
 #vsaid .vsrch button:hover:not(:disabled){background:rgba(232,181,99,.2);color:#fff1cf}
 #vsaid .vsrch button.on{background:var(--gold);color:#231705}
 #vsaid .vsrch button:disabled{opacity:.35;cursor:help}
+/* 3.35 M: which era this night belongs to - one quiet line, no panel */
+#vsaid .sera{margin:2px 11px 7px;font:italic 11px var(--serif);
+  color:#bda57e;opacity:.85;line-height:1.45}
 #vsaid .vans{margin:2px 11px 8px;padding:8px 10px;border-radius:8px;
   background:rgba(232,181,99,.1);border-left:2px solid var(--gold);
   font:500 12px var(--serif);color:#f0e2c6;line-height:1.55}
@@ -2950,7 +2961,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',version:'3.34'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.35'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3012,6 +3023,9 @@ function makeMock(){
     highlights:async()=>(location.hash.includes('eye')
       ?[{t:96,z:3.2,kind:'creature'},{t:301,z:2.6,kind:'creature'},
         {t:455,z:2.1,kind:'creature'}]:[]),
+    /* 3.35 M: #mic / #mixed in the address to see the other two eras */
+    night_era:async()=>(location.hash.includes('mixed')?'mixed'
+      :(location.hash.includes('mic')?'mic':'split')),
     transcript:async()=>[{a:4000,b:7000,t:'Right, we are going in.'},
       {a:9000,b:12000,t:'Watch the left side, someone is rotating.'},
       {a:15500,b:18000,t:'That was a clean one.'},
@@ -3035,13 +3049,13 @@ function makeMock(){
         kinds:[
           {kind:'listening',label:'Sound & gold moments',on:true,
            done:1380,left:377,total:1757,pct:78,speed:64.0,measured:true,
-           eta_s:1980,backlog_s:126720},
+           eta_s:1980,backlog_s:126720,held:214},
           {kind:'hearing',label:'Transcripts',on:true,
            done:412,left:1345,total:1757,pct:23,speed:10.5,measured:false,
-           eta_s:43200,backlog_s:453600},
+           eta_s:43200,backlog_s:453600,held:214},
           {kind:'thinking',label:'Titles, chapters & clips',on:true,
            done:0,left:1757,total:1757,pct:0,speed:900,measured:false,
-           eta_s:1900,backlog_s:1710000}]};},
+           eta_s:1900,backlog_s:1710000,held:214}]};},
     delete_video:async()=>({ok:true}),post_discord:async()=>true,
     clip_to_discord:async(p,a,n)=>({ok:true,seconds:n}),
     ai_force_many:async(ps,w,rd)=>{const n=(ps||[]).length;
@@ -3073,7 +3087,7 @@ function makeMock(){
     models_fetch:async()=>({ok:true,n:1,bytes:13.3e9}),
     models_cancel:async()=>({ok:true}),
     ai_queue_list:async()=>({ok:true,queue:window.__mockQ||[],
-      next:{name:'mock night.mp4',kind:'listening'},
+      next:{name:'mock night.mp4',kind:'listening',rank:'later'},
       shutdown:!!window.__mockSd}),
     afk_ai_status:async()=>({enabled:!!window.__mockAfk,minutes:15,
       running:false,idle_s:12,kbms_s:12,pad_s:null,pad_seen:false,
@@ -3111,7 +3125,7 @@ function makeMock(){
       {path:'C:/mock/Hearthstone/session_2.mp4',kind:'file',
        why:'would not read - left alone until the file changes'}],
     ai_whynot:async(p)=>({ok:true,path:p,gate:'resting while you play',
-      queue:14,total:1757,asked:null,
+      queue:14,total:1757,asked:null,rank:'later',
       kinds:[{kind:'hl',done:true,owed:false,why:'finished'},
              {kind:'stt',done:false,owed:true,why:'waiting its turn'},
              {kind:'ins',done:false,owed:false,tries:3,
@@ -3131,7 +3145,7 @@ function makeMock(){
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,handle:'',
-      second_ear:true,room_names:'',my_name:'',
+      second_ear:true,room_names:'',my_name:'',game_rank:{},
       popup_style:'slide',popup_size:'large',sfx_volume:25,
       hotkey_record:'ctrl+alt+f7',hotkey_replay:'ctrl+alt+f9',
       hotkey_pause:'ctrl+alt+f10',hotkey_clip_discord:'ctrl+alt+f8',clip_hotkey_seconds:60,
@@ -3139,7 +3153,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.34'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.35'}),
     set_settings:async(p)=>api.get_settings(),
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
@@ -4099,8 +4113,15 @@ function whynotShow(ev,path){
       b.append(row);
     });
     if(a.gate)b.append(el('div','wngate','right now: '+esc(a.gate)));
+    /* 3.35 L: the place is counted off the RANKED walk now, so the
+       word that changed it rides beside the number - and a game the
+       sweep passes by has no place at all, which is the answer. */
     if(a.queue!=null&&a.total)b.append(el('div','wngate',
-      'place in the sweep: '+(a.queue+1)+' of '+a.total+' (newest first)'));
+      'place in the sweep: '+(a.queue+1)+' of '+a.total
+      +(rankWord(a.rank)?' \u2014 '+esc(rankWord(a.rank)):' (newest first)')));
+    else if(a.rank==='never')b.append(el('div','wngate',
+      'never on its own \u2014 the sweep passes this game by. Asking '
+      +'for this night by name still runs it.'));
     if(a.asked!=null)b.append(el('div','wngate',
       'in your asked-for batch: number '+(a.asked+1)));
   })();
@@ -4833,6 +4854,47 @@ function voiceBadges(g){
     w.append(c);any=true;}
   return any?w:null;
 }
+/* ---- 3.35 L: THE GAME DECIDES ITS PLACE IN THE QUEUE ----
+   The sweep walked the shelf newest-first, so one solo night stood in
+   front of every night he actually wanted told. Four words, one chip on
+   the chapter's own row, a press cycles. It orders the SWEEP; a direct
+   ask - Everything, or a row's own 'ask for this' - always runs. */
+const RANKS=['first','normal','later','never'];
+const RANKW={first:'ahead of the rest',normal:'in its turn',
+  later:'when the rest are done',never:'never on its own'};
+function rankMap(){return (S.settings&&S.settings.settings
+  &&S.settings.settings.game_rank)||{};}
+function rankOf(key){const v=rankMap()[key];
+  return RANKS.indexOf(v)>=0?v:'normal';}
+/* the word only when there is something to say - 'in its turn' is the
+   default and saying it everywhere would be noise, not news */
+function rankWord(r){return (r&&r!=='normal'&&RANKW[r])?RANKW[r]:'';}
+function aiSuiteOn(){const st=S.settings&&S.settings.settings;
+  return !!(st&&(st.ai_highlights||st.ai_transcribe||st.insights_auto));}
+function rankChip(g){
+  if(!aiSuiteOn())return null;      /* no suite, no queue to order */
+  const c=el('button','grank','');
+  const dress=()=>{const r=rankOf(g.key);
+    c.className='grank r-'+r;c.textContent=RANKW[r];
+    c.title=(r==='first'?'the tome reads this game before the rest'
+      :r==='later'?'the tome reads this game only when the rest are done'
+      :r==='never'?'the tome never picks this game on its own'
+      :'the tome reads this game in its turn, newest night first')
+      +' \u2014 asking for a night by name always works';};
+  dress();
+  c.addEventListener('click',ev=>{
+    ev.stopPropagation();           /* the row opens the chapter */
+    const r=RANKS[(RANKS.indexOf(rankOf(g.key))+1)%RANKS.length];
+    const next=Object.assign({},rankMap());
+    /* 'normal' is the absence of a rank, never a stored word - the
+       clamp only keeps two hundred games, so the dict must not grow
+       a row for every chapter he merely pressed twice */
+    if(r==='normal')delete next[g.key];else next[g.key]=r;
+    queueSave({game_rank:next});
+    dress();
+    whisper(g.display+' \u2014 '+RANKW[r]);});
+  return c;
+}
 function renderContents(cL,cR,spreadIdx){
   const _cm=_loreCMode();   /* B7: what the left leaf shows is the reader's choice */
   ptitle(cL,'the tome remembers',
@@ -5355,6 +5417,7 @@ function renderContents(cL,cR,spreadIdx){
     if(g.sessions.length)cparts.push(`${g.sessions.length} session${g.sessions.length>1?'s':''}`);
     if(g.clips.length)cparts.push(`${g.clips.length} clip${g.clips.length>1?'s':''}`);
     r.append(el('div','gcount',esc(cparts.join(' · ')||'—')));
+    const rc=rankChip(g); if(rc)r.append(rc);   /* 3.35 L */
     r.append(el('div','garrow','➺'));
     if(has)r.addEventListener('click',()=>requestTurn(chapterStart(g.key)));
     else r.title='nothing here in this view';
@@ -6123,15 +6186,20 @@ function queuePlate(){
     try{ if(api.ai_queue_list)q=await api.ai_queue_list(); }catch(e){}
     const items=(q&&q.queue)||[], nx=q&&q.next, sd=!!(q&&q.shutdown);
     const s2=JSON.stringify([items.map(x=>[x.path,x.want,!!x.held,
-      !!x.redo,x.wait||'']),nx&&nx.name,nx&&nx.kind,sd]);
+      !!x.redo,x.wait||'',x.rank||'']),nx&&nx.name,nx&&nx.kind,
+      nx&&nx.rank,sd]);
     if(s2===sig)return; sig=s2;
     box.innerHTML='';
     const rf=()=>{sig=null;paint();};
     if(sd)box.append(el('div','qnote','everything is paused for your '
       +'game \u2014 the line waits exactly as it is'));
+    /* 3.35 L: a game he told the sweep to hold back says so right
+       here, so the line never looks stuck for a reason he cannot
+       see - and a rank is never why a night refuses to run. */
     if(nx&&!sd)box.append(el('div','qnote','next from the shelf: '
       +esc(String(nx.name||'').replace(/\.mp4$/i,''))
-      +'  ('+esc(nx.kind||'')+')'));
+      +'  ('+esc(nx.kind||'')+')'
+      +(rankWord(nx.rank)?'  \u00b7  '+esc(rankWord(nx.rank)):'')));
     /* THE DOOR BACK IS DRAWN ON BOTH PATHS. It used to live at the
        bottom of the row list, and paint() returns early when the line
        is empty - so letting the WHOLE line go, which is the press it
@@ -6167,7 +6235,10 @@ function queuePlate(){
         +'  \u00b7  '+esc(it.want||'all')
         +(it.redo?' (again)':'')
         +(it.held?'  \u00b7  waits for Resume':'')
-        +(it.wait&&!it.held?'  \u00b7  waits: '+esc(it.wait):'')));
+        +(it.wait&&!it.held?'  \u00b7  waits: '+esc(it.wait):'')
+        /* he ASKED for this one - the word says only that it would
+           never have come up on its own */
+        +(rankWord(it.rank)?'  \u00b7  '+esc(rankWord(it.rank)):'')));
       const up=el('button','wbtn mini','\u2191');up.title='Sooner';
       const dn=el('button','wbtn mini','\u2193');dn.title='Later';
       const rm=el('button','wbtn mini danger','\u00d7');
@@ -6544,6 +6615,12 @@ function workPlate(){
       const tally=k?('the whole shelf: '+[
         num(k.done)+' of '+num(k.total)+' done',
         (k.left?num(k.left)+' left':'nothing left'),
+        /* 3.35 L: THE HELD-BACK SHARE SAYS ITSELF. A game ranked
+           'never on its own' is out of the sweep's walk but still
+           owed - the count is honest, so 'left' can never reach
+           zero. The line carrying that number now carries the
+           reason too, the same way the next pick names its state. */
+        (k.held?num(k.held)+' never on their own':null),
         (k.left&&k.eta_s!=null?est+'about '+dur(k.eta_s)+' for all of them':null),
         (k.speed!=null?est+k.speed+'\u00d7 realtime'
                        +(kind==='thinking'?' averaged over the library':'')
@@ -8972,18 +9049,25 @@ function myName(){
 /* 3.34 K: does THIS night's transcript carry a voice tap? A room line that
    is not his own mic came in through Discord's own stream - so an unnamed
    cluster is not "Voice 2" to him, it is Discord. */
-function saidVoiceTap(){
-  return !!(_said&&(_said.lines||[]).some(l=>l&&l.src==='room'));
-}
 function snsWhoAt(t){
+  /* ONLY HE IS NAMED (6 Sep, his screenshot: 'Voice 2', 'Voice 3',
+     'a voice' and blank, down one panel, for two or three people).
+     The voiceprints cannot hold a name, and a label that is wrong is
+     worse than none - so a voice he NAMED himself keeps its name and
+     everyone else carries nothing. His own lines are labelled by the
+     mic, not by this. The cluster number still rides in the chip's
+     title wherever there is one, so naming a voice is unchanged. */
   const n=snsWhoNumAt(t); if(n==null)return null;
-  const named=n?((_sns.names||{})[String(n)]||''):'';
-  if(named)return named;             /* a typed name always wins */
-  /* the number is not lost - it lives on in the chip's title, so naming
-     a voice still works exactly as it did */
-  if(saidVoiceTap())return 'Discord';
-  if(!n)return 'a voice';            /* honest beats a wrong name */
-  return 'Voice '+n;
+  const named=(n?((_sns.names||{})[String(n)]||''):'')||null;
+  if(named)return named;              /* a name he typed always wins */
+  /* 3.35 M4 THE ONE THING THE EVIDENCE DOES SUPPORT. On a SPLIT night
+     the room IS the voice tap plus his own mic, so a clustered line
+     that is not his came in through the call - that is a fact about
+     the tracks, not a guess about a person. Never on a mic or mixed
+     night, where no call was recorded apart from the room, and never
+     on an overlap (n===0: the ears cannot honestly say whose it is). */
+  if(n&&_said&&_said.era==='split')return 'Discord';
+  return null;
 }
 function snsWireWho(){
   const body=$('#vsaid .vsaidbody'); if(!body||body._whoWired)return;
@@ -9858,6 +9942,24 @@ function saidMediaPaint(){
     ?'the video\u2019s lines are shown \u2014 what a video, a stream or a song was saying while you played. Not you, not your friends. Press to fold them away again.'
     :('the video\u2019s lines \u2014 '+n+' line'+(n===1?'':'s')+' a video or a song said while you played, folded away. Not you, not your friends. Press to read them.');
 }
+/* 3.35 M WHICH ERA THIS NIGHT BELONGS TO. The prompts are built on the
+   same three answers (_night_era in lore.py): a name is a claim, and the
+   line says what this recording can back it with. Pure, so the roster can
+   lift it; "" for anything else, so an unknown era prints nothing. */
+function saidEraLine(era){
+  if(era==='split')return 'Recorded with the sources told apart \u2014 the tome can tell your own mic from the voice call, and the call from you.';
+  if(era==='mic')return 'Recorded before the sources were split \u2014 the tome can tell your mic from the room, but not one friend from another.';
+  if(era==='mixed')return 'Recorded on one mixed track \u2014 the tome cannot tell who is speaking.';
+  return '';
+}
+/* it sits BEFORE the transcript body, like the ask's answer: saidRender
+   rebuilds the body on every scroll and would eat anything inside it */
+function saidEraPaint(era){
+  const body=$('#vsaid .vsaidbody'); if(!body)return;
+  const old=$('#vsaid .sera'); if(old)old.remove();
+  const s=saidEraLine(era); if(!s)return;
+  body.before(el('div','sera',s));
+}
 function saidFilter(q){
   const t=String(q||'').trim().toLowerCase();
   const n=_said.lines.length;
@@ -9877,6 +9979,7 @@ function saidFilter(q){
 async function loadSaid(v,req){
   const body=$('#vsaid .vsaidbody');
   _said={lines:[],path:v.path,at:-1};
+  saidEraPaint('');   /* 3.35 M: the last night's era must not sit over this one */
   saidMediaPaint();   /* 3.31: no lines yet = no toggle (it repaints below) */
   body.innerHTML='';
   body.append(el('div','vempty','listening back…'));
@@ -9901,6 +10004,17 @@ async function loadSaid(v,req){
   saidMediaPaint();
   saidWire(body);
   saidFilter(($('#vsq')&&$('#vsq').value)||'');   /* honour a query already typed */
+  /* 3.35 M last, and never fatal: an old build with no night_era simply
+     prints no line rather than losing the transcript that is already up */
+  let _era='';
+  try{ if(api&&api.night_era)_era=(await api.night_era(v.path))||''; }catch(e){}
+  if(req!==_viewerReq)return;
+  /* 3.35 M4: the chips ask the state for the era, so it has to live
+     there - and the rows were built before this answer arrived, so
+     the split night's labels are painted in on this beat. */
+  _said.era=_era;
+  if(_era==='split'&&_said.lines.length)saidRender(null);
+  saidEraPaint(_era);
 }
 /* follow the playhead - cheap: a linear walk from the last known line */
 function saidFollow(now){

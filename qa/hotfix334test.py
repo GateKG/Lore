@@ -655,14 +655,14 @@ print("\n--- (i) the stamps ---")
 VT = io.open(os.path.join(ROOT, "version.txt"), encoding="utf-8").read()
 ISS = io.open(os.path.join(ROOT, "installer.iss"), encoding="utf-8").read()
 BAT = io.open(os.path.join(ROOT, "qa", "run_all.bat"), encoding="utf-8").read()
-check("lore.py APP_VERSION 3.34", 'APP_VERSION = "3.34"' in SRC)
-check("ui.html version:'3.34' x2, no 3.33 stamp left",
-      USRC.count("version:'3.34'") == 2 and "version:'3.33'" not in USRC)
-check("version.txt 3.34", "filevers=(3, 34, 0, 0)" in VT
-      and "prodvers=(3, 34, 0, 0)" in VT and VT.count("'3.34.0.0'") == 2
+check("lore.py APP_VERSION 3.35", 'APP_VERSION = "3.35"' in SRC)
+check("ui.html version:'3.35' x2, no 3.34 stamp left",
+      USRC.count("version:'3.35'") == 2 and "version:'3.34'" not in USRC)
+check("version.txt 3.35", "filevers=(3, 35, 0, 0)" in VT
+      and "prodvers=(3, 35, 0, 0)" in VT and VT.count("'3.35.0.0'") == 2
       and "3, 33" not in VT and "3.33" not in VT)
-check("installer.iss 3.34", "AppVersion=3.34\n" in ISS.replace("\r\n", "\n")
-      and "VersionInfoVersion=3.34.0\n" in ISS.replace("\r\n", "\n"))
+check("installer.iss 3.35", "AppVersion=3.35\n" in ISS.replace("\r\n", "\n")
+      and "VersionInfoVersion=3.35.0\n" in ISS.replace("\r\n", "\n"))
 check("the roster lists hotfix334test", "hotfix334test" in BAT)
 added = "\n".join(
     ln[1:] for ln in subprocess.run(

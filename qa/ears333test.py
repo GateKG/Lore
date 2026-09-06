@@ -711,18 +711,18 @@ check("the auditor adds the folded names to the merged list "
 
 # =========================================================================
 print("--- T9: the stamps and the settings page ---")
-check("APP_VERSION 3.34 (drop H)", 'APP_VERSION = "3.34"' in LSRC)
-check("ui.html version:'3.34' x2 and no 3.33 stamp left (3.34 drop H)",
-      USRC.count("version:'3.34'") == 2 and "version:'3.33'" not in USRC)
+check("APP_VERSION 3.35 (drop L)", 'APP_VERSION = "3.35"' in LSRC)
+check("ui.html version:'3.35' x2 and no 3.34 stamp left (3.35 drop L)",
+      USRC.count("version:'3.35'") == 2 and "version:'3.34'" not in USRC)
 VT = io.open(os.path.join(ROOT, "version.txt"), encoding="utf-8").read()
-check("version.txt (3, 34, 0, 0) x2 + '3.34.0.0' x2 (drop H)",
-      VT.count("(3, 34, 0, 0)") == 2 and VT.count("'3.34.0.0'") == 2
+check("version.txt (3, 35, 0, 0) x2 + '3.35.0.0' x2 (drop L)",
+      VT.count("(3, 35, 0, 0)") == 2 and VT.count("'3.35.0.0'") == 2
       and "3, 32" not in VT and "3.32" not in VT)
 ISS = io.open(os.path.join(ROOT, "installer.iss"), encoding="utf-8",
               errors="replace").read()
-check("installer.iss AppVersion=3.34 / VersionInfoVersion=3.34.0 (drop H)",
-      "AppVersion=3.34\n" in ISS.replace("\r\n", "\n")
-      and "VersionInfoVersion=3.34.0\n" in ISS.replace("\r\n", "\n"))
+check("installer.iss AppVersion=3.35 / VersionInfoVersion=3.35.0 (drop L)",
+      "AppVersion=3.35\n" in ISS.replace("\r\n", "\n")
+      and "VersionInfoVersion=3.35.0\n" in ISS.replace("\r\n", "\n"))
 check("the settings page: the second ear toggle with its note",
       "row(R,'The second ear',ctlToggle('second_ear')," in USRC
       and "about a minute of CPU for every minute of talk, never the card"
@@ -737,9 +737,9 @@ check("both rows sit beside 'Your in-game name' (within the same page, "
       < USRC.index("ctlText('room_names'") < USRC.index(
           "divider(R,'Compatibility')"))
 check("MOCK settings carry both", "second_ear:true,room_names:''," in USRC)
-check("the MOCK state carries both",
+check("the MOCK state carries both (and 3.35 L's game_rank beside them)",
       "librarian_ready:true,second_ear:true,room_names:'',my_name:'',"
-      "version:'3.34'"
+      "game_rank:{},version:'3.35'"
       in USRC)
 # the tests' three names must never reach the code: only the lines this
 # drop ADDS are judged (ui.html's own mock fixture says Marid since 3.2x)
