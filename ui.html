@@ -715,6 +715,13 @@ body.resizing .dustmote{display:none!important}
 .everylist .amarks i.on{background:var(--gold);color:#241806}
 /* SILVER: real work that an older hand did, or a review an audit has
    torn open - it must never look the same as "nothing here yet" */
+/* 3.36 AUDIT UI-A1: GIVEN UP wears a struck pen. A night the describer
+   gave up on (three tries spent) painted the same dark pen as a night
+   never tried, with the tip "not described yet" - a promise the sweep
+   will never keep. The backend now says why at level 0; the pen shows it. */
+.everylist .amarks i.gone{background:repeating-linear-gradient(135deg,
+  rgba(150,70,45,.22) 0 2px,rgba(120,95,55,.10) 2px 5px);
+  color:rgba(150,60,40,.7);text-decoration:line-through}
 .everylist .amarks i.part{background:linear-gradient(160deg,#d8d8dc,#a9adb4);
   color:#2b2b30;box-shadow:inset 0 0 0 1px rgba(255,255,255,.35)}
 .everylist .azap{flex:0 0 auto;border:0;background:transparent;color:#9a7f4e;
@@ -996,6 +1003,16 @@ body.reduced .proj-glare::after{animation:none}
   font-family:var(--serif);overflow:hidden;white-space:pre-line;
   display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
   line-height:1.35}
+/* 3.36 AUDIT UI-G2: THE TALLY IS ITS OWN LINE, AND IT IS NEVER CUT. The
+   whole-shelf tally rode the same node as the job sentence, and the clamp
+   above ate it: at the size the app boots at the AI review row held six
+   lines and showed two - the "never on their own" count, the ETA and the
+   week's arithmetic (3.35 L, 3.36 N6) were shipped to be read and could
+   not be. The plate scrolls already, so this node simply takes its lines.
+   The clamp stays on .lname for the job sentence alone. */
+.lab .ltally{font-size:10.5px;color:var(--ink-faint);font-style:italic;
+  font-family:var(--serif);white-space:pre-line;line-height:1.35;
+  margin-top:1px}
 .lab .lbar{height:3px;border-radius:2px;margin-top:5px;background:rgba(90,70,40,.22);overflow:hidden}
 .lab .lbar i{display:block;height:100%;width:0;border-radius:2px;
   background:linear-gradient(90deg,#c79a45,var(--gold));transition:width .5s ease}
@@ -2961,7 +2978,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.35'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.36'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3131,8 +3148,6 @@ function makeMock(){
              {kind:'stt',done:false,owed:true,why:'waiting its turn'},
              {kind:'ins',done:false,owed:false,tries:3,
               why:'gave up after three tries - asking by name still works'}]}),
-    have_flags:async ps=>{const o={};(ps||[]).forEach((p,i)=>{
-      o[p]={hl:i%3!==0,stt:i%2===0,ins:i%5===0};});return o;},
     ai_stop_current:async()=>({ok:true,queued_dropped:0,lane:null}),
     record_drop:async()=>{st.status='watching';return true;},
     edit_video:async(p,segs,rep,disc,cap,mute,crop)=>{window.__mockCrop=crop||null;window.__mockEd={pct:0,phase:(cap>0?'squeezing':'cutting'),done:false,ok:false,name:'mock_edit.mp4',cap:cap||0};return {ok:true,id:'m'};},
@@ -3154,8 +3169,9 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.35'}),
-    set_settings:async(p)=>api.get_settings(),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.36'}),
+    /* 3.36 AUDIT UI-E1: the mock keeps the patch, as the real backend does */
+    set_settings:async(p)=>{window.__mockSet=Object.assign(window.__mockSet||{},p||{});const r=await api.get_settings();Object.assign(r.settings,window.__mockSet);return r;},
     set_games:async(l)=>l,set_ignore:async(l)=>l,
     audio_devices:async()=>({outputs:['Speakers (Realtek)'],mics:['HyperX QuadCast']}),
     test_sound:async()=>true,preview_popup:async()=>true,browse_folder:async()=>null,
@@ -3815,6 +3831,13 @@ function markPaint(b,f,k){
            :(f[k]?2:0);
   b.classList.toggle('on',lvl===2);
   b.classList.toggle('part',lvl===1);
+  /* 3.36 AUDIT UI-A1: LEVEL 0 WITH A REASON IS NOT "NOT YET". A night the
+     describer gave up on comes back at level 0 with a why ('gave up after
+     three tries ...'); the pen wears a struck look and the tip says so,
+     instead of promising a description the sweep will never write. */
+  const why0=(lvl===0)?(({aud:f.aud_why,ins:f.ins_why,
+                          stt:f.stt_why,hl:f.hl_why}[k])||''):'';
+  b.classList.toggle('gone',/^gave up/.test(why0));   /* UI-A2: only a gave-up night is struck */
   if(lvl===1){
     /* SILVER SAYS WHY, in the backend's own words: the audit either
        never read this description or read an older one. Either way
@@ -3836,7 +3859,7 @@ function markPaint(b,f,k){
       : (k==='ins' ? 'described, and the audit has read this version'
                    : AV_HAS[k]);
   }else{
-    b.title=AV_NOT[k];
+    b.title=why0||AV_NOT[k];
   }
 }
 const AV_HAS={hl:'has sound & gold moments',stt:'has a transcript',
@@ -3845,11 +3868,16 @@ const AV_NOT={hl:'no sound pass yet',stt:'no transcript yet',
               ins:'not described yet',aud:'the auditor has not been over it'};
 function avStatLine(list){
   list=list||AV.rows||[];
-  let bytes=0,noStt=0,noHl=0,noIns=0,unknown=0;
+  let bytes=0,noStt=0,noHl=0,noIns=0,gaveUp=0,unknown=0;
   list.forEach(v=>{bytes+=(v.size||0);
     const f=_have.get(v.path);
     if(!f){unknown++;return;}       /* [44] not looked at is not "missing" */
     if(!(f.stt_lvl|0))noStt++; if(!(f.hl_lvl|0))noHl++;
+    /* 3.36 AUDIT UI-A1: a gave-up night is level 0 WITH a reason - it is
+       not "not described", it is given up, and the header says which */
+    /* 3.36 AUDIT UI-A2: an honestly-empty night carries a reason too
+       ('nothing here to tell') - it is done, neither given up nor missing */
+    if(!(f.ins_lvl|0)&&f.ins_why){ if(/^gave up/.test(f.ins_why))gaveUp++; return; }
     /* COUNT WHAT THE MARK SHOWS. This read the old complete-only
        boolean, so a night with ninety-four chapters and a lit pen was
        still counted "not described" in the same header - which is the
@@ -3860,6 +3888,7 @@ function avStatLine(list){
   if(noHl)bits.push(noHl.toLocaleString()+' with no sound pass');
   if(noStt)bits.push(noStt.toLocaleString()+' with no transcript');
   if(noIns)bits.push(noIns.toLocaleString()+' not described');
+  if(gaveUp)bits.push(gaveUp.toLocaleString()+' given up');
   if(unknown)bits.push('reading the shelf\u2026');
   const st=avNode('everystat'); if(st)st.textContent=bits.join('  \u00b7  ');
 }
@@ -4071,7 +4100,9 @@ function qlookShow(v){
       if(lvl===1)return ({aud:'audited, older',
         ins:'described, audit owed', stt:'transcript, older reader',
         hl:'sound pass, older'}[k]||'older');
-      return AV_NOT[k];
+      /* 3.36 AUDIT UI-A1: level 0 with a reason (given up) says the reason */
+      return ({aud:f.aud_why,ins:f.ins_why,stt:f.stt_why,hl:f.hl_why}[k])
+             ||AV_NOT[k];
     }).join('  \u00b7  '))));
   q.append(card); q.classList.add('on');
   loadThumb(v.path,im,v.mtime);
@@ -4236,24 +4267,45 @@ async function flagsWatch(){
   if(!a||a.done_rev==null)return;
   if(_doneRev===null){ _doneRev=a.done_rev; return; }  /* adopt, don't bust */
   if(a.done_rev===_doneRev)return;
-  const jumped=a.done_rev-_doneRev;
+  const was=_doneRev, jumped=a.done_rev-was;
   _doneRev=a.done_rev;
-  const p=a.done_path;
-  if(!p)return;
-  /* two jobs can land inside one 4s tick and only the last path is named -
-     on a jump, re-ask about EVERYTHING we knew (clearing without refetching
-     just greyed the marks out until a page revisit) */
+  const p=a.done_path||null;
   const _haveBefore=(typeof V==='object'&&V&&V.cur)
     ?JSON.stringify(_have.get(V.cur.path)||null):null;
-  const stale=jumped>1?[..._have.keys()]:[p];
-  if(jumped>1)_have.clear(); else _have.delete(p);
+  /* 3.36 AUDIT UI-W1: THE SIGNAL NAMES ITS PATHS. This used to re-ask
+     have_flags for EVERY recording it knew whenever done_rev moved by
+     more than one - and one landing bumps it twice (the sidecar write,
+     then the job's finally), so every audit or ears landing with the
+     tome open re-read the whole shelf's sidecars (~5 files a night,
+     1,366 nights) for one changed night. The status now carries a ring
+     of the recently landed paths (done_paths: [{rev,path},...]); only
+     those are asked again. The blanket stays as the safety net for a
+     gap the ring cannot cover (a ring that does not reach back to the
+     rev we last saw, or does not reach the rev we are being told).
+     Without a ring (an older backend) a jump of two with a named path
+     is that one landing's double bump; only a bigger jump blankets. */
+  const ringAll=Array.isArray(a.done_paths)
+    ?a.done_paths.filter(e=>e&&e.path&&isFinite(e.rev)):null;
+  let stale, blanket=false;
+  if(ringAll){
+    const revs=ringAll.map(e=>+e.rev);
+    blanket=!revs.length||Math.min(...revs)>was+1
+            ||Math.max(...revs)<a.done_rev;
+    stale=[...new Set(ringAll.filter(e=>+e.rev>was).map(e=>String(e.path)))];
+  }else{
+    blanket=jumped>2;
+    stale=p?[p]:[];
+  }
+  if(!blanket&&!stale.length)return;   /* a bump that named nothing */
+  if(blanket){ stale=[..._have.keys()]; _have.clear(); }
+  else stale.forEach(q=>_have.delete(q));
   let r=null;
   try{
     if(api.have_flags){
       r={};
       for(let i=0;i<stale.length;i+=300)
         Object.assign(r,await api.have_flags(stale.slice(i,i+300))||{});
-      if(!stale.includes(p))Object.assign(r,await api.have_flags([p])||{});
+      if(p&&!stale.includes(p))Object.assign(r,await api.have_flags([p])||{});
     }
   }catch(e){}
   if(r)Object.keys(r).forEach(k=>_have.set(k,r[k]));
@@ -4271,8 +4323,8 @@ async function flagsWatch(){
      own flags actually moved. */
   try{
     if(V&&V.cur){
-      const mine=p===V.cur.path;
-      const moved=jumped>1&&stale.includes(V.cur.path)
+      const mine=(p===V.cur.path)||(!blanket&&stale.includes(V.cur.path));
+      const moved=blanket&&stale.includes(V.cur.path)
         &&_haveBefore!==JSON.stringify(_have.get(V.cur.path)||null);
       if(mine||moved){
         const req=_viewerReq;
@@ -6407,8 +6459,9 @@ function workPlate(){
     const r=el('div','lab idle');
     const d=el('span','ldot'); const mid=el('div','lmid');
     const what=el('div','lwhat'); const name=el('div','lname');
+    const tally=el('div','ltally'); tally.style.display='none';
     const bar=el('div','lbar'); const fill=el('i'); bar.append(fill);
-    mid.append(what,name,bar);
+    mid.append(what,name,tally,bar);
     r.style.flex='0 0 auto';               /* never squashed by the scroller */
     const pct=el('div','lpct');
     const alt=el('button','wbtn','');       /* hold / let go, per row */
@@ -6426,8 +6479,8 @@ function workPlate(){
     const acts=el('div','lacts');
     acts.append(go,alt,redo,stop);
     r.append(d,mid,pct,acts);
-    return {r:r,dot:d,what:what,name:name,bar:bar,fill:fill,pct:pct,
-            go:go,alt:alt,redo:redo,stop:stop,acts:acts};
+    return {r:r,dot:d,what:what,name:name,tally:tally,bar:bar,fill:fill,
+            pct:pct,go:go,alt:alt,redo:redo,stop:stop,acts:acts};
   };
   /* THE READER IS TWO JOBS, not one. Listening (the sound curve and the gold
      moments) is one pass over the audio and takes seconds; reading (the
@@ -6458,19 +6511,29 @@ function workPlate(){
     o.r.classList.toggle('idle',!live);
     o.dot.classList.toggle('on',!!live);
     o.dot.classList.toggle('next',!live&&!!queued);
-    o.what.textContent=what; o.name.textContent=name||'';
+    /* 3.36 AUDIT UI-F1: the same words are not written again - a poll
+       that rewrote every row's text killed any selection on the page */
+    if(o.what.textContent!==what)o.what.textContent=what;
+    /* 3.36 AUDIT UI-G2: the FIRST line is the job sentence (clamped to two);
+       everything after the first newline is the standing tally and goes to
+       its own unclamped node, so no figure is silently cut. */
+    const nm=String(name||''), nl=nm.indexOf('\n');
+    const head=nl<0?nm:nm.slice(0,nl), rest=nl<0?'':nm.slice(nl+1);
+    if(o.name.textContent!==head)o.name.textContent=head;
+    o.name.style.display=head?'':'none';
+    if(o.tally){ if(o.tally.textContent!==rest)o.tally.textContent=rest; o.tally.style.display=rest?'':'none'; }
     const has=(pct!=null&&isFinite(pct));
     o.bar.style.display=has?'':'none';
     o.r.classList.toggle('haspct',has);
     if(has)o.fill.style.width=Math.max(0,Math.min(100,pct))+'%';
-    o.pct.textContent=has?Math.round(pct)+'%':'';
+    const _pt=has?Math.round(pct)+'%':''; if(o.pct.textContent!==_pt)o.pct.textContent=_pt;
     o.stop.style.display=onStop?'':'none';
     o.stop.onclick=onStop||null;
     /* THIS BUTTON IS SHARED BY EVERY LABOUR ON THE PLATE - the reader,
        an export, a save, colour being restored. Naming it at creation
        renamed it for all of them; only the job that IS a skip says
        so, and everything else keeps the honest default. */
-    o.stop.textContent=stopLabel||'Stop';
+    if(o.stop.textContent!==(stopLabel||'Stop'))o.stop.textContent=stopLabel||'Stop';
     o.alt.style.display='none'; o.alt.onclick=null;
     o.go.style.display='none'; o.go.onclick=null;
     o.redo.style.display='none'; o.redo.onclick=null;
@@ -6544,7 +6607,7 @@ function workPlate(){
     const chasing=!!(ai&&ai.catchup);
     /* one switch, two views - the mirror now rides ask() with the
        shutdown state; this older call stays for non-work pages */
-    if(window._paintAnyread)_paintAnyread(chasing);
+    if(!ai&&window._paintAnyread)_paintAnyread(chasing);   /* 3.36 AUDIT UI-F1: once per poll */
     /* THIS WAS THE SWITCH FROM THE BOTTOM BAR, PRINTED AGAIN. Same
        setting, two places, and in here it read as "Turn it on" with no
        hint of what "it" was. The bar owns that switch; the rows keep
@@ -6622,6 +6685,9 @@ function workPlate(){
            zero. The line carrying that number now carries the
            reason too, the same way the next pick names its state. */
         (k.held?num(k.held)+' never on their own':null),
+        /* 3.36 AUDIT UI-A1: the given-up count rides the same line - a
+           night the describer gave up on is neither done nor coming */
+        (k.gaveup?num(k.gaveup)+' given up':null),
         (k.left&&k.eta_s!=null?est+'about '+dur(k.eta_s)+' for all of them':null),
         (k.speed!=null?est+k.speed+'\u00d7 realtime'
                        +(kind==='thinking'?' averaged over the library':'')
@@ -6724,7 +6790,7 @@ function workPlate(){
         : chasing ? ''
         : 'turn Background work ON (right of the book) to run it now';
       set(o,false,title+' \u2014 '+stateWord,
-          (advice?advice+'\n':'')+tally,null,null,!!busyWith);
+          (advice||'')+'\n'+tally,null,null,!!busyWith);
       if(ai){ holdBtn(o,kind); catchBtn(o,k); redoBtn(o,kind); }
     };
     try{if(ai&&window._paintShutdown)window._paintShutdown(!!ai.shutdown);}catch(e){}

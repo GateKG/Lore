@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.35"
+APP_VERSION = "3.36"
 
 try:
     import psutil
@@ -1516,6 +1516,35 @@ def _afk_idle_recent(max_age=2.0):
     return _afk_idle_seconds()
 
 
+def _afk_person_seconds(fresh=False):
+    """ONE CLOCK FOR THE RECORDER AND THE CATCH-UP (3.36 AFK-1):
+    seconds since a PERSON was last here - keyboard, mouse, a real
+    controller input, or the mic hearing him. The recorder's beat
+    polls afresh (fresh=True); everything else reads that poll while
+    it is fresh, through _afk_idle_recent.
+
+    A VOICE IS A PERSON. He talks through cutscenes with his
+    friends; a mic heard in the last minute holds the countdown even
+    when both hands are off the pad. This fold used to live in
+    _afk_track alone, so the catch-up read the raw input clock
+    beside it and armed at ten quiet-handed minutes of a LIVE
+    recording - announcing that the tome was taking the whole suite,
+    lifting his holds, counting a wake - and then doing nothing at
+    all, because the live-session gate refuses every job until he
+    touches something (191 h of log: 45 arms, 0 recorder pauses).
+    Outside a capture the mic callback does not run, so its stamp is
+    old and the fold changes nothing: between recordings the
+    catch-up arms exactly as it did."""
+    idle = _afk_idle_seconds() if fresh else _afk_idle_recent()
+    try:
+        _mheard = _MICWATCH.get("last_sound")
+        if _mheard:
+            idle = min(idle, max(0.0, time.time() - float(_mheard)))
+    except Exception:
+        pass
+    return idle
+
+
 def _inp_beat(session):
     """THE INPUT CHRONICLE: one cheap sample per healthy watcher beat -
     how many keys/buttons are held and how far the mouse moved - kept on
@@ -1616,16 +1645,10 @@ def _afk_track(ctl, session, current):
         thresh = max(60, int(SETTINGS.get("afk_minutes", 4)) * 60)
     except Exception:
         thresh = 240
-    idle = _afk_idle_seconds()
-    try:
-        # A VOICE IS A PERSON. He talks through cutscenes with his
-        # friends; a mic heard in the last minute holds the countdown
-        # even when both hands are off the pad.
-        _mheard = _MICWATCH.get("last_sound")
-        if _mheard:
-            idle = min(idle, max(0.0, time.time() - float(_mheard)))
-    except Exception:
-        pass
+    # the recorder's beat is THE fresh poll of the one clock the
+    # catch-up reads too - the mic fold lives in _afk_person_seconds
+    # (3.36 AFK-1), so the two can never disagree on the same beat
+    idle = _afk_person_seconds(fresh=True)
     if getattr(session, "afk_paused", False):
         if idle < 5.0:
             # They're back. ONLY clear the flag - the watcher's suspended
@@ -12977,7 +13000,7 @@ def _afk_ai_release(why=""):
     return True
 
 
-def _afk_ai_tick():
+def _afk_ai_tick(ctl=None):
     """One beat of the catch-up: are you away, and for how long?
 
     Runs BEFORE every other gate on purpose - the whole point is to
@@ -12990,7 +13013,9 @@ def _afk_ai_tick():
             mins = max(1, int(SETTINGS.get("afk_ai_minutes") or 15))
         except Exception:
             mins = 15
-        idle = _afk_idle_recent()
+        # THE RECORDER'S OWN READING, mic and all (3.36 AFK-1): while
+        # a recording is rolling because he is talking, he is here.
+        idle = _afk_person_seconds()
         _AFKAI["idle"] = idle
         if _AFKAI.get("on"):
             # BACK AT THE DESK. Five seconds, not zero: the clock is
@@ -13001,6 +13026,21 @@ def _afk_ai_tick():
             return False
         if idle < mins * 60:
             return False
+        # 3.36 AUDIT AFK-2: NOT WHILE A RECORDING IS ROLLING. With the
+        # recorder's own clock (AFK-1) the two agree whenever the
+        # recorder pauses first; when it does not (its own pause
+        # switched off, or a longer threshold than this one) the
+        # catch-up used to arm beside a live session - holds lifted,
+        # "taking the whole suite" said - while the gate in _ai_tick
+        # refused every job. A SUSPENDED session (the recorder itself
+        # paused for AFK) is what this exists for, and still arms.
+        if ctl is not None:
+            try:
+                _s = getattr(ctl, "session", None)
+                if _s is not None and not getattr(_s, "suspended", False):
+                    return False
+            except Exception:
+                pass
         with _AFKAI_LOCK:
             if _AFKAI.get("on"):
                 return False        # someone armed it between the two
@@ -13061,6 +13101,24 @@ def _ai_next_sweep():
             rk = {pm[0]: _game_rank(pm[0]) for pm in vids}
             vids = [pm for pm in vids if rk[pm[0]] != "never"]
             vids.sort(key=lambda pm: (_RANK_ORDER[rk[pm[0]]], -pm[1]))
+            # 3.36 AUDIT F4: THE SAME HEAD THE WALK TAKES. The walk keeps
+            # the night it is on at the head until it owes nothing that
+            # can run (3.35); this preview still walked newest-first, so
+            # between two jobs on a focused night the plate named some
+            # other recording. And the describer and the audit are gated
+            # on a game being played exactly as the walk gates them, so
+            # the plate never names a job the walk will not take.
+            _focus = _AI.get("focus")
+            if _focus:
+                vids = ([pm for pm in vids if pm[0] == _focus]
+                        + [pm for pm in vids if pm[0] != _focus])
+            try:
+                _c = _AI.get("ctl")
+                playing = bool((_c is not None
+                                and getattr(_c, "session", None) is not None)
+                               or _game_has_focus())
+            except Exception:
+                playing = False
             do_stt = (SETTINGS.get("ai_transcribe", True)
                       and _reader_paths() is not None
                       and not held.get("hearing"))
@@ -13068,7 +13126,8 @@ def _ai_next_sweep():
                      and not held.get("listening"))
             do_ins = (SETTINGS.get("insights_auto", True)
                       and not held.get("thinking")
-                      and _describer_paths() is not None)
+                      and _describer_paths() is not None
+                      and not playing)
             for p, mt in vids:
                 if _queued_finish_badge(p):
                     continue
@@ -13102,6 +13161,7 @@ def _ai_next_sweep():
                            "rank": _game_rank(p)}
                     break
                 if (SETTINGS.get("insights_auto", True)
+                        and not playing
                         and not held.get("auditing")
                         and _aud_owing_swept(p)
                         and _ai_sidecar_fresh(p, "hl")
@@ -19473,7 +19533,16 @@ def _insights_one(video_path, forced=False, fresh=False):
             # gaps override a spent budget made a night the model
             # cannot tell owed forever, which is the card grinding on
             # a night that will never improve.
-            _legacyw = any(not isinstance(w, dict) or "asks" not in w
+            # 3.36: ONLY A DICT WITHOUT A BUDGET IS LEGACY. The bare []
+            # below is this writer's own "a silent half hour is done"
+            # marker - settled and budgetless by design, not the
+            # pre-budget shape. Counting it as legacy armed the gap
+            # rule against every night that also held a spent or a
+            # told-empty window: the write stamped cov.owed, the owe
+            # outlived the write, and the sweep re-told the whole
+            # night every beat with tries back at 0 (58 of 554 shelf
+            # reviews carry a [] window).
+            _legacyw = any(isinstance(w, dict) and "asks" not in w
                            for w in done_map.values())
             _owed = (any(_win_owes(w) for w in done_map.values())
                      or (_legacyw
@@ -19786,6 +19855,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                            else [(0, len(part))])
             got = None
             imgs = []
+            _cut = False        # an ask killed under us (3.36 AFK-4)
             # a black night is told so, and shown nothing: told it is
             # shown 0 frames the model may still narrate a picture
             _black_pic = _pic_black(video_path)
@@ -19993,12 +20063,33 @@ def _insights_one(video_path, forced=False, fresh=False):
                             break
                         except Exception:
                             got = None
+                    if _AI["abort"] or _AI.get("wind"):
+                        # AN INTERRUPTION IS NOT A PARSE FAILURE
+                        # (3.36 AFK-4). The catch-up's end, a Stop,
+                        # a game starting: each kills the describer
+                        # under the open request, and this loop
+                        # asked the dead server a second time, logged
+                        # it as the model's failure and spent one of
+                        # the window's five asks on it - five such
+                        # ends settled a half hour as FINISHED with
+                        # nothing told. No retry, nothing counted.
+                        _cut = True
+                        break
                     if _attempt == 0:
                         guard_retry += 1    # the parse retry fired
                     # THE SAME LINES, ASKED AGAIN. Halving the body on
                     # the retry was the even-row loss wearing a second
                     # hat: a parse failure says nothing about how many
                     # rows the model can read.
+                if got is None and _cut:
+                    # nothing came back because the server was taken
+                    # from under the ask: nothing spent, nothing
+                    # logged, and the range it was asked for goes
+                    # back on the pile (it was popped at the top;
+                    # breaking here skips the foot that would have
+                    # put it back)
+                    pending.insert(0, (r0, r1))
+                    break
                 if got is None:
                     # 3.36 N1 AND IT SAYS WHAT IT ASKED FOR. The log read
                     # "window 0-30 min -> 0 stretch(es), 3 moment(s)" and
@@ -20136,6 +20227,14 @@ def _insights_one(video_path, forced=False, fresh=False):
                     pending = []
                 if got is None:
                     break
+            if _cut and asked == _asked0:
+                # INTERRUPTED BEFORE THIS RUN SPENT ANYTHING HERE
+                # (3.36 AFK-4): the window stands exactly as it was
+                # on disk - not banked, not logged as a window that
+                # answered nothing. An ask that DID land before the
+                # kill falls through and is banked below, the rest
+                # of its rows pending.
+                break
             # THE SCREEN'S VERDICTS ARE MOMENTS PLANTED BY CODE (3.32):
             # the model can name a win, it cannot invent one. Outside
             # the schema's enum (kind 'outcome', line -1), never within
@@ -22922,7 +23021,7 @@ def _aud_revert_nonsense(video_path, freq):
         if ok:
             continue
         sg["t"] = sg.get("was")
-        for k in ("was", "fx", "fxo", "fxw"):
+        for k in ("was", "fx", "fxo", "fxw", "fxe"):
             sg.pop(k, None)
         n += 1
     if n:
@@ -23023,6 +23122,11 @@ def _aud_garble(stt, freq):
                "text": txt[:200], "odd": odd[:5]}
         if sg.get("fx") and sg.get("was") is not None:
             row["standing"] = str(sg.get("t") or "")[:200]
+            if sg.get("fxe"):
+                # 3.36 R4-1 the ear that admitted the standing guess
+                # rides along: the confirmation doors judge the guess
+                # with it, as the admit did
+                row["fxe"] = str(sg.get("fxe") or "")[:160]
         out.append(row)
     out.sort(key=lambda r: -len(r["odd"]))
     # foreign-script strikes ride OUTSIDE the cap - they cost no model
@@ -23167,10 +23271,19 @@ def _aud_ear_extra(g, video_path=None):
     """What counts as a seen word when a fix weighs the two ears: the
     second ear's own tokens, the room's names, the game's words off the
     filename. None for a row without `d` - the sense gate runs exactly
-    as it always did."""
-    if not isinstance(g, dict) or not g.get("d"):
+    as it always did.
+
+    3.36 R4-1 `fxe` counts too: the relisten ear that ADMITTED a
+    standing fix, banked on the segment by _aud_apply_fixes. The fix
+    was let in because that ear backed it; judged without it at the
+    next audit it was taken back, re-listened, re-admitted and re-told
+    - every audit. A segment with neither d nor fxe still hands None,
+    so every older night is judged byte for byte as before."""
+    if not isinstance(g, dict) or not (g.get("d") or g.get("fxe")):
         return None
     ex = set(_aud_ear_toks(g.get("d"), stop=False))
+    if g.get("fxe"):
+        ex.update(_aud_ear_toks(g.get("fxe"), stop=False))
     try:
         for p in _room_names():
             for a in p:
@@ -24471,6 +24584,24 @@ def _aud_body(anchors, drops, game, dur, src, places, crs, garble=None):
             + "\n\nReturn only fixes.")
 
 
+def _aud_ear_backs(row, heard):
+    """Does this row's non-junk relisten ear back these words - the
+    ear's tokens verbatim (whole-list equality), or by skeleton? The
+    one test the admit exemption and the two confirmation doors share
+    (3.36 R4-1), so what the ear let in the ear also keeps. A row the
+    ear never reached, or whose ear was junk, backs nothing."""
+    if not isinstance(row, dict):
+        return False
+    er = str(row.get("ear") or "").strip()
+    if not er or row.get("ear_junk"):
+        return False
+    ea = re.findall(r"[a-z0-9]+", _aud_lat(er))
+    if not ea:
+        return False
+    return (ea == re.findall(r"[a-z0-9]+", _aud_lat(str(heard or "")))
+            or _aud_ear_agrees(er, str(heard or "")))
+
+
 def _aud_parse(got, garble, video_path=None):
     """One parser for whichever thinker answered - the fixes with the
     sense gate, and the INVESTIGATION VERDICTS: a line the model checked
@@ -24493,8 +24624,15 @@ def _aud_parse(got, garble, video_path=None):
             # heard cannot be voted "right" into permanence - the gate
             # that judges fixes judges rubber-stamps too.
             if v == "right" and row.get("standing"):
+                # 3.36 R4-1 ...judged with the evidence that admitted
+                # the guess (its banked ear, the room, the game), or
+                # a fix the ear let in was struck as noise the moment
+                # the thinker confirmed it
                 okC, _bw = _aud_sense(row.get("standing"),
-                                      (_AUD_VOCAB.get("freq") or {}))
+                                      (_AUD_VOCAB.get("freq") or {}),
+                                      _aud_ear_extra(row, video_path))
+                if not okC and _aud_ear_backs(row, row.get("standing")):
+                    okC = True
                 if not okC:
                     v = "noise"
             # A STRIKE NEEDS THE RECORDING'S OWN TESTIMONY. The ear
@@ -24557,7 +24695,11 @@ def _aud_parse(got, garble, video_path=None):
             # ...and re-affirming a standing guess VERBATIM is the same
             # rubber-stamp through the other door - it too meets the
             # gate, or it becomes noise
-            okC, _bw = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}))
+            okC, _bw = _aud_sense(heard, (_AUD_VOCAB.get("freq") or {}),
+                                  _aud_ear_extra((garble or [])[i],
+                                                 video_path))
+            if not okC and _aud_ear_backs((garble or [])[i], heard):
+                okC = True      # 3.36 R4-1 the same evidence that let it in
             (garble or [])[i]["verdict"] = "right" if okC else "noise"
             (garble or [])[i]["vwhy"] = \
                 _aud_clip(str(f.get("why") or "").strip())
@@ -24576,14 +24718,8 @@ def _aud_parse(got, garble, video_path=None):
             # first-and-last-name the library never met is the
             # motivating case, and the old order refused it upstream
             # of the identity exemption.
-            _erS = str((garble or [])[i].get("ear") or "").strip()
-            if _erS and not (garble or [])[i].get("ear_junk"):
-                _eaS = re.findall(r"[a-z0-9]+", _aud_lat(_erS))
-                if _eaS and (
-                        _eaS == re.findall(r"[a-z0-9]+",
-                                           _aud_lat(heard))
-                        or _aud_ear_agrees(_erS, heard)):
-                    okS = True
+            if _aud_ear_backs((garble or [])[i], heard):
+                okS = True
         if not okS:
             gated.append(str((garble or [])[i].get("t")))
             (garble or [])[i].setdefault("verdict", "unclear")
@@ -24650,10 +24786,16 @@ def _aud_parse(got, garble, video_path=None):
                     "words (\"" + heard[:50] + "\" vs ear \""
                     + _er2[:50] + "\").")
                 continue
-        fixes.append({"t": (garble or [])[i].get("t"), "was": was,
-                      "heard": heard[:200],
-                      "why": _aud_clip(str(f.get("why") or "").strip()),
-                      "odd": (garble or [])[i].get("odd") or []})
+        _fxrow = {"t": (garble or [])[i].get("t"), "was": was,
+                  "heard": heard[:200],
+                  "why": _aud_clip(str(f.get("why") or "").strip()),
+                  "odd": (garble or [])[i].get("odd") or []}
+        if _er2 and not (garble or [])[i].get("ear_junk"):
+            # 3.36 R4-1 the ear that stood witness rides with the fix
+            # to the transcript (fxe), so the next audit's reverter
+            # and confirmation doors judge it by the same evidence
+            _fxrow["ear"] = _er2[:160]
+        fixes.append(_fxrow)
     # A FIX AND A NOISE VERDICT FOR THE SAME LINE CANNOT BOTH STAND -
     # the strike would land on the just-fixed segment and destroy the
     # fix. The fix passed the sense gate, so the fix is the answer.
@@ -24995,6 +25137,26 @@ def _aud_read(video_path, kind):
     return d, False
 
 
+def _ins_new_live(np0):
+    """Is this staged .new a LIVE staging - a resume point the sweep
+    will still walk (3.36 R4-2)? The same bound _ins_owing_raw stops
+    resuming at: a windowed, incomplete doc under two tries when it
+    names what a retell cut (its "retold" ledger), under three for an
+    upgrade. A retell that came back empty twice sits at tries 2 and
+    is not live: the served review IS the telling, left as it was, and
+    the audit that read it still covers it. Unreadable, or a shape
+    this writer never staged, reads as live - the old answer."""
+    try:
+        with open(np0, encoding="utf-8") as fh:
+            nd = json.load(fh) or {}
+    except Exception:
+        return True
+    if not isinstance(nd.get("windows"), dict) or nd.get("complete"):
+        return True
+    return (int(nd.get("tries") or 0)
+            < (2 if isinstance(nd.get("retold"), list) else 3))
+
+
 def _aud_covers_now(video_path, aud=None):
     """Did this night's audit read the DESCRIPTION that is on disk now?
 
@@ -25027,8 +25189,13 @@ def _aud_covers_now(video_path, aud=None):
         # the words this audit read are queued for replacement. 55 of
         # 281 gold nights were in exactly that state; the audit's own
         # owing test already knew, and only the shelf still said gold.
+        # 3.36 R4-2 ...WHILE IT IS LIVE. Two empty retells leave the
+        # .new at tries 2 for ever (N3's quit, by design: not owed, not
+        # filed) and the one file kept the night silver and the tally
+        # counting an audit left that nothing would ever run.
         try:
-            if os.path.isfile(_ai_sidecar(video_path, "ins") + ".new"):
+            _np0 = _ai_sidecar(video_path, "ins") + ".new"
+            if os.path.isfile(_np0) and _ins_new_live(_np0):
                 return False
         except Exception:
             pass
@@ -26477,7 +26644,7 @@ def _aud_unstrike_seg(sg):
     # a STRUCK line comes all the way back: the nn flag is what hides
     # it from search, the vocabulary and the said column, and the
     # why/odd markers belong to the strike, not to him
-    for k in ("nn", "pn", "fxw", "fxo"):
+    for k in ("nn", "pn", "fxw", "fxo", "fxe"):
         sg.pop(k, None)
     return sg
 
@@ -26558,6 +26725,17 @@ def _aud_apply_fixes(video_path, fixes):
             odd = [str(x)[:30] for x in (f.get("odd") or [])][:4]
             if odd:
                 sg["fxo"] = odd
+            # 3.36 R4-1 THE EAR THAT ADMITTED IT. A fix let in on a
+            # non-junk relisten ear banks that ear here; the reverter
+            # and the confirmation doors fold it into the sense gate's
+            # extra, so a fix is never taken back for lacking the very
+            # evidence that admitted it. A fix without an ear clears a
+            # stale one - a re-correction stands on its own witness.
+            _fe = str(f.get("ear") or "").strip()
+            if _fe:
+                sg["fxe"] = _fe[:160]
+            else:
+                sg.pop("fxe", None)
             # a line corrected INTO Arabic script is an Arabic line now -
             # the display groups by this, nothing else does
             ar = sum(1 for ch in heard if "\u0600" <= ch <= "\u06ff")
@@ -28373,7 +28551,7 @@ def _ai_tick(ctl):
     # BEFORE EVERY GATE. The catch-up exists to speak over a master
     # switch that returns two lines below this one, so it cannot live
     # any further down.
-    _afk_ai_tick()
+    _afk_ai_tick(ctl)
     # A FORCED ASK IS NOT SUBJECT TO THE TWO SWITCHES. With Transcribe and
     # Mark-loud-moments both off in Settings this returned at the first
     # line, before the forced loop below could run - so pressing
@@ -28627,18 +28805,44 @@ def _ai_tick(ctl):
                     fw = (_AI.get("force_want")
                           if _AI.get("force") == path else None)
                     fredo = bool(_AI.get("force_redo")) and fw is not None
+                    # THE CHAIN'S HEAD REMEMBERS TOO (3.36 F6). A resumed
+                    # redo-all used to hear and look again from scratch
+                    # on every resume - ~40 s of senses and a five-minute
+                    # eye per interruption, the ask's own sns filed to
+                    # the attic each time - because only the whole KIND
+                    # was memoed as ran, and 'thinking' lands only when
+                    # the describer finishes. The senses and the eye
+                    # stamp their own names into the ask's memory the
+                    # moment they land (the 4-tuple already carries a
+                    # list of strings through ai_state.json); a fresh
+                    # ask (ran=[]) still does both from scratch, and an
+                    # owed sns/vis still runs through its own arm.
+                    fran = ((_AI.get("force_ran") or set())
+                            if fredo else set())
                     ok_sns = True
                     if not _AI.get("wind") \
-                            and (_sns_owing(path) or (fredo and fw == "all")):
+                            and (_sns_owing(path)
+                                 or (fredo and fw == "all"
+                                     and "sns" not in fran)):
                         ok_sns = _senses_one(path)
+                        if ok_sns and fredo and not _AI["abort"] \
+                                and _AI.get("force") == path:
+                            _AI.setdefault("force_ran", set()).add("sns")
+                            _AI["_qdirty"] = True
                     # THE EYE GOES BETWEEN. The senses hear, the eye looks,
                     # and only then does the describer write - so a chapter
                     # can be named after the room it happened in. A redo-all
                     # looks again too; that is what the press means.
                     ok_vis = True
                     if not _AI.get("wind") \
-                            and (_vis_owing(path) or (fredo and fw == "all")):
+                            and (_vis_owing(path)
+                                 or (fredo and fw == "all"
+                                     and "vis" not in fran)):
                         ok_vis = _eyes_one(path)
+                        if ok_vis and fredo and not _AI["abort"] \
+                                and _AI.get("force") == path:
+                            _AI.setdefault("force_ran", set()).add("vis")
+                            _AI["_qdirty"] = True
                     # asked BY NAME describes again; a gap-fill "all" only
                     # describes what a description is owed on - without the
                     # _ins_owing arm, a senses-only visit under "All of it"
@@ -28733,6 +28937,44 @@ def _ai_tick(ctl):
                     if n >= 3:      # three gentle refusals = a real refusal;
                         soft = False    # without this a cold file re-ran the
                 #                        whole job every idle beat forever
+                # SAID DONE TWICE, WROTE NOTHING (3.36 F1). The sweep's
+                # only guard against a writer that returns ok without
+                # extinguishing its owe was that writer's honesty:
+                # nothing memoed, nothing logged, the same job every
+                # beat for ever (the 1,776-audit night's shape). This is
+                # a memo of the writer's OWN OUTPUT - the mp4's clock and
+                # the clocks of the sidecars this lane owns (and their
+                # staged .new twins), as the run left them. A second ok
+                # run that left every one of them exactly as the first
+                # did is the refusal it is: said once in the log, and
+                # the night skipped until the file changes (the sweep's
+                # own memo below; asking by name pops it, Resume clears
+                # it). Not an owe cache - it never answers "is it owed",
+                # only "did this exact run already happen". Sweep spawns
+                # only: a forced ask is bounded by force_ran and always
+                # runs; a tail visit writes outside the lane's attic.
+                if ok and not tail and not _AI["abort"] \
+                        and not _AI.get("wind") \
+                        and _AI.get("force") != path:
+                    try:
+                        _sig = [mt]
+                        for _k in _ATTIC_OF.get(kind, ()):
+                            for _sfx in ("", ".new"):
+                                _sp = _ai_sidecar(path, _k) + _sfx
+                                _sig.append(os.path.getmtime(_sp)
+                                            if os.path.isfile(_sp)
+                                            else None)
+                        _sig = tuple(_sig)
+                        _rs = _AI.setdefault("ran_sig", {})
+                        if _rs.get((path, kind)) == _sig:
+                            log(f"The {kind} job on {os.path.basename(path)}"
+                                " said done twice and wrote nothing new -"
+                                " leaving it; ask by name to try again.")
+                            _AI["failed"][path] = mt
+                        else:
+                            _rs[(path, kind)] = _sig
+                    except Exception:
+                        pass
                 if not ok and not _AI["abort"] and not soft \
                         and not _AI.get("wind"):
                     _AI["failed"][path] = mt   # skip until the file changes
@@ -28931,6 +29173,19 @@ def _ai_tick(ctl):
             owed_hl = owed_hl and not held0.get("listening")
             owed_stt = owed_stt and not held0.get("hearing")
             owed_ins = owed_ins and not held0.get("thinking")
+            if want == "all" and "hearing" in owe and "hearing" not in ran:
+                # THE REVIEW IS TOLD FROM THE WORDS (3.36 F5). Under
+                # 'all' it waits for them, held or not. A held words
+                # lane zeroed owed_stt above and left owed_ins standing,
+                # so the describer was spawned on a night with no
+                # transcript, refused ('has no transcript yet'), and
+                # was stamped ran anyway - on Resume the words ran and
+                # the ask cleared satisfied with the review never
+                # written. With the words still owed the chain's next
+                # kind is the words; if their lane is held the ask
+                # parks at the front with its memory (the road below),
+                # exactly as a held sound lane always did.
+                owed_ins = False
             if not (owed_stt or owed_hl or owed_ins):
                 with _AI_FORCE_LOCK:
                     _AI["force_queue"] = ([(fp, want, redo, sorted(ran))]
@@ -29170,7 +29425,21 @@ def _aud_done_current(video_path):
         st = os.stat(ap)
     except OSError:
         return False
-    key = (st.st_mtime, st.st_size)
+    # 3.36 R4-2 THE KEY IS EVERYTHING THE ANSWER READ. Keyed on the
+    # audit's own clock alone, the answer outlived a .new being staged
+    # or let go beside it: the Working page said done in-session and
+    # left after a restart for the same files on disk.
+    _ip = _ai_sidecar(video_path, "ins")
+    try:
+        _ist = os.stat(_ip)
+        _ik = (_ist.st_mtime, _ist.st_size)
+    except OSError:
+        _ik = None
+    try:
+        _nk = os.stat(_ip + ".new").st_mtime
+    except OSError:
+        _nk = None
+    key = (st.st_mtime, st.st_size, _ik, _nk)
     hit = _AUD_VCACHE.get(ap)
     if hit and hit[0] == key:
         return hit[1]
@@ -29343,6 +29612,11 @@ def _ai_tally():
         return c
     total = 0
     held_back = 0   # nights on a game he ranked "never on its own"
+    # 3.36 F2 ...AND OF THE LEFT, PER LANE. The number the Working page
+    # prints beside a lane's 'left' is how many of THOSE will not drain
+    # on their own. The shelf-wide count above rode every row once a
+    # never game's nights were done: '1 left - 2 never on their own'.
+    held = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
     left = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
     secs = {"listening": 0.0, "hearing": 0.0, "thinking": 0.0,
             "auditing": 0.0}
@@ -29370,8 +29644,10 @@ def _ai_tally():
                 # says how many of them will not drain on their own.
                 # A number that can never reach zero must explain
                 # itself, the way the next-pick line does (rev 335).
+                rank = None
                 try:
-                    if _game_rank(p) == "never":
+                    rank = _game_rank(p)
+                    if rank == "never":
                         held_back += 1
                 except Exception:
                     pass
@@ -29392,6 +29668,8 @@ def _ai_tally():
                         #                    could never reach zero
                     else:
                         left[job] += 1
+                        if rank == "never":
+                            held[job] += 1   # 3.36 F2 of THIS lane's left
                         # the duration is already in the library scan; falling
                         # back to a probe here would stat-storm the whole disk
                         secs[job] += _secs_no_probe(v)
@@ -29411,6 +29689,8 @@ def _ai_tally():
                             done["auditing"] += 1
                         else:
                             left["auditing"] += 1
+                            if rank == "never":
+                                held["auditing"] += 1
                             secs["auditing"] += _secs_no_probe(v)
                 except Exception:
                     pass
@@ -29420,7 +29700,8 @@ def _ai_tally():
            "held_back": held_back,
            "eye_left": (eye_left if _eye_on else None)}
     for job in ("listening", "hearing", "thinking", "auditing"):
-        out[job] = {"left": left[job], "done": done[job], "secs": secs[job]}
+        out[job] = {"left": left[job], "done": done[job], "secs": secs[job],
+                    "held": held[job]}
     _AI["_tally"] = out
     return out
 
@@ -31287,9 +31568,14 @@ class _JsApi:
                     # true once this machine has timed a job of this kind
                     "measured": bool(_AI["rate"].get(kind)),
                     "done": k["done"], "left": k["left"], "total": t["total"],
-                    # the shelf-wide held-back share, so the tally
-                    # line can say why 'left' will not drain (3.35 L)
-                    "held": t.get("held_back", 0),
+                    # this lane's held-back share OF ITS LEFT, so the
+                    # tally line can say why 'left' will not drain
+                    # (3.35 L; per lane since 3.36 F2 - the shelf-wide
+                    # number counted a never game's finished nights)
+                    "held": k.get("held", 0),
+                    # 3.36 AUDIT UI-A1: this lane's given-up count, so
+                    # the tally line can say it beside 'left'
+                    "gaveup": int((t.get("gaveup") or {}).get(kind) or 0),
                     "pct": (int(k["done"] / t["total"] * 100) if t["total"] else 100),
                     # x realtime, the way a person would say it
                     "speed": (round(1.0 / rate, 1) if rate else None),
@@ -31862,6 +32148,28 @@ class _JsApi:
                               and bool(d.get("chapters")))
             except Exception:
                 pass
+            # 3.36 AUDIT UI-A1/A2 A DARK PEN SAYS WHY. A night the
+            # describer gave up on (three tries spent) and a night it
+            # honestly found nothing in both came back exactly like a
+            # night never tried - level 0, no reason - so the mark's
+            # tip read "not described yet" over a night the tally had
+            # already counted as given up, or as done. The level stays
+            # 0 (there is nothing to show); the reason is what the tip
+            # and the shelf's header can say. Asked only when a review
+            # file exists without chapters - the minority - so a batch
+            # of 300 stays cheap.
+            if not _has_desc:
+                try:
+                    if os.path.isfile(_ai_sidecar(p, "ins")):
+                        if _ins_done_honest(p):
+                            row["ins_why"] = ("described - the tome found "
+                                              "nothing here to tell")
+                        elif not _ins_owing(p):
+                            row["ins_why"] = (
+                                "gave up after three tries - Ask again on "
+                                "the Working page's Given up on shelf")
+                except Exception:
+                    pass
             # AUDITED means audited BY THIS AUDITOR. An audit from an
             # older version answered a smaller question (v1-2 never read
             # the transcript), so it reads as not-audited - which is the
@@ -32002,8 +32310,25 @@ class _JsApi:
         except Exception:
             pass
         if _ins_done_honest(p):
+            # 3.36 R4-2 a retell that came back empty twice is left as
+            # it was (done, not owed) - and the page says so, instead
+            # of 'finished' over a staged file only the log explained
+            _qwhy = ""
+            try:
+                with open(_ai_sidecar(p, "ins") + ".new",
+                          encoding="utf-8") as fh:
+                    _nd = json.load(fh) or {}
+                if isinstance(_nd.get("retold"), list) \
+                        and isinstance(_nd.get("windows"), dict) \
+                        and not _nd.get("complete") \
+                        and int(_nd.get("tries") or 0) >= 2:
+                    _qwhy = ("its retold minutes came back empty twice "
+                             "- it is left as it was; ask for it by "
+                             "name to try again")
+            except Exception:
+                _qwhy = ""
             kinds.append({"kind": "ins", "done": True, "owed": False,
-                          "tries": tries, "why": "finished"})
+                          "tries": tries, "why": _qwhy or "finished"})
         else:
             owed = _ins_owing(p)
             if _describer_paths() is None:

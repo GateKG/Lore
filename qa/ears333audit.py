@@ -131,6 +131,10 @@ def build(src, tree, ns=None):
     if "def _aud_who(" in src:
         for nm in ("_my_name", "_aud_who"):
             extract(src, tree, nm, ns)
+    # 3.36 R4-1: the parser's ear-backing test is one shared helper the
+    # parity base does not have
+    if "def _aud_ear_backs(" in src:
+        extract(src, tree, "_aud_ear_backs", ns)
     return ns
 
 
@@ -363,9 +367,75 @@ check("with d the same fix passes: matched by second + was, why kept",
       and r1[5][0]["why"].startswith("the game words"))
 check("_aud_parse still answers the old two-argument call",
       NS["_aud_parse"]({"fixes": []}, [])[5] == [])
-check("_aud_apply_fixes is byte-identical to HEAD's (item 7)",
-      seg(LSRC, LTREE, "_aud_apply_fixes")
-      == seg(HSRC, HTREE, "_aud_apply_fixes"))
+# 3.36 R4-1 / R4-2 (the no-loops audit): five functions each gained ONE
+# named block and nothing else - the ear that admitted a fix is banked
+# on the segment (fxe) and read back by the reverter and the
+# confirmation doors, and a .new condemns the served review only while
+# it is live. So these pins move from byte-identity to "differs only
+# by", the way _aud_owing's did in N5. Everything is read-side: no owe
+# cache, no _AUD_V, no reader bump, no clock moved.
+FXE_BANK = ('            # 3.36 R4-1 THE EAR THAT ADMITTED IT. A fix let in on a\n'
+            '            # non-junk relisten ear banks that ear here; the reverter\n'
+            '            # and the confirmation doors fold it into the sense gate\'s\n'
+            '            # extra, so a fix is never taken back for lacking the very\n'
+            '            # evidence that admitted it. A fix without an ear clears a\n'
+            '            # stale one - a re-correction stands on its own witness.\n'
+            '            _fe = str(f.get("ear") or "").strip()\n'
+            '            if _fe:\n'
+            '                sg["fxe"] = _fe[:160]\n'
+            '            else:\n'
+            '                sg.pop("fxe", None)\n')
+FXE_ROW = ('            if sg.get("fxe"):\n'
+           '                # 3.36 R4-1 the ear that admitted the standing guess\n'
+           '                # rides along: the confirmation doors judge the guess\n'
+           '                # with it, as the admit did\n'
+           '                row["fxe"] = str(sg.get("fxe") or "")[:160]\n')
+NEW_LIVE = ('        # 3.36 R4-2 ...WHILE IT IS LIVE. Two empty retells leave the\n'
+            '        # .new at tries 2 for ever (N3\'s quit, by design: not owed, not\n'
+            '        # filed) and the one file kept the night silver and the tally\n'
+            '        # counting an audit left that nothing would ever run.\n'
+            '        try:\n'
+            '            _np0 = _ai_sidecar(video_path, "ins") + ".new"\n'
+            '            if os.path.isfile(_np0) and _ins_new_live(_np0):\n'
+            '                return False\n'
+            '        except Exception:\n'
+            '            pass\n')
+OLD_LIVE = ('        try:\n'
+            '            if os.path.isfile(_ai_sidecar(video_path, "ins") + ".new"):\n'
+            '                return False\n'
+            '        except Exception:\n'
+            '            pass\n')
+NEW_KEY = ('    # 3.36 R4-2 THE KEY IS EVERYTHING THE ANSWER READ. Keyed on the\n'
+           '    # audit\'s own clock alone, the answer outlived a .new being staged\n'
+           '    # or let go beside it: the Working page said done in-session and\n'
+           '    # left after a restart for the same files on disk.\n'
+           '    _ip = _ai_sidecar(video_path, "ins")\n'
+           '    try:\n'
+           '        _ist = os.stat(_ip)\n'
+           '        _ik = (_ist.st_mtime, _ist.st_size)\n'
+           '    except OSError:\n'
+           '        _ik = None\n'
+           '    try:\n'
+           '        _nk = os.stat(_ip + ".new").st_mtime\n'
+           '    except OSError:\n'
+           '        _nk = None\n'
+           '    key = (st.st_mtime, st.st_size, _ik, _nk)\n')
+OLD_KEY = '    key = (st.st_mtime, st.st_size)\n'
+
+
+def lf(s):
+    return s.replace("\r\n", "\n")
+
+
+def only_by(nm, new, old):
+    """The tree's function with its R4 block put back the old way is the
+    parity base's, byte for byte - and the block is there exactly once."""
+    t = lf(seg(LSRC, LTREE, nm))
+    return t.count(new) == 1 and t.replace(new, old) == lf(seg(HSRC, HTREE, nm))
+
+
+check("_aud_apply_fixes differs from HEAD's ONLY by the 3.36 R4-1 fxe "
+      "bank (item 7)", only_by("_aud_apply_fixes", FXE_BANK, ""))
 
 # =========================================================================
 print("--- T7: the room's first spelling in the name check ---")
@@ -441,12 +511,20 @@ check("the union sits right after the garble shortlist, before the hints "
 check("_AUD_V is 7, the value at HEAD",
       NS["_AUD_V"] == 7 == HN["_AUD_V"]
       and assign_src(LSRC, LTREE, "_AUD_V") == "_AUD_V = 7")
-for nm in ("_aud_src", "_aud_owing_swept", "_aud_covers_now",
-           "_aud_corrected", "_aud_garble", "_aud_carry",
-           "_aud_apply_strikes", "_aud_relisten",
-           "_aud_done_current"):
+for nm in ("_aud_src", "_aud_owing_swept",
+           "_aud_corrected", "_aud_carry",
+           "_aud_apply_strikes", "_aud_relisten"):
     check(nm + " is byte-identical to HEAD's (count-undoing / mtime laws)",
           seg(LSRC, LTREE, nm) == seg(HSRC, HTREE, nm))
+check("_aud_covers_now differs from HEAD's ONLY by the 3.36 R4-2 live "
+      "test on the .new (count-undoing / mtime laws)",
+      only_by("_aud_covers_now", NEW_LIVE, OLD_LIVE))
+check("_aud_garble differs from HEAD's ONLY by the 3.36 R4-1 fxe rider "
+      "on a standing row (count-undoing / mtime laws)",
+      only_by("_aud_garble", FXE_ROW, ""))
+check("_aud_done_current differs from HEAD's ONLY by the 3.36 R4-2 cache "
+      "key (the review and the .new beside the audit's own clock)",
+      only_by("_aud_done_current", NEW_KEY, OLD_KEY))
 # 3.36 N5: _aud_owing gained ONE gate and nothing else - the session's
 # settled set, read first (a night audited twice inside ten minutes with
 # nothing to fix, strike, fold or re-tell is left alone until a layer
@@ -506,11 +584,15 @@ RV = seg(LSRC, LTREE, "_aud_revert_nonsense")
 RV_HEAD = seg(HSRC, HTREE, "_aud_revert_nonsense")
 RV_NEW = ('        ok, bad = _aud_sense(sg.get("t"), freq,\n'
           '                             _aud_ear_extra(sg, video_path))\n')
+RV_POP_NEW = '        for k in ("was", "fx", "fxo", "fxw", "fxe"):\n'
+RV_POP_OLD = '        for k in ("was", "fx", "fxo", "fxw"):\n'
 check("_aud_revert_nonsense differs from HEAD's ONLY by the extra it hands "
-      "the sense gate (its comment aside)",
-      RV.count(RV_NEW) == 1
+      "the sense gate and the 3.36 R4-1 fxe it pops with a taken-back fix "
+      "(its comment aside)",
+      RV.count(RV_NEW) == 1 and RV.count(RV_POP_NEW) == 1
       and re.sub(r"(?m)^        # .*\n", "", RV).replace(
-          RV_NEW, '        ok, bad = _aud_sense(sg.get("t"), freq)\n')
+          RV_NEW, '        ok, bad = _aud_sense(sg.get("t"), freq)\n').replace(
+          RV_POP_NEW, RV_POP_OLD)
       == re.sub(r"(?m)^        # .*\n", "", RV_HEAD)
       and "_aud_ear_extra" not in RV_HEAD)
 check("the run_all roster lists ears333audit right after ears333test",
@@ -615,8 +697,9 @@ check("a pinned eared fix is never re-judged",
       night(NS, [dict(GIB[0], pin=1)]) and NS["_aud_revert_nonsense"](VPF, freq) == 0)
 check("every sidecar written sat under the scratch dirs, never the library",
       WRITES and all(p.startswith(TMP_T) or p.startswith(TMP_H) for p in WRITES))
-check("_aud_apply_fixes / _aud_apply_strikes still byte-identical to HEAD's",
-      seg(LSRC, LTREE, "_aud_apply_fixes") == seg(HSRC, HTREE, "_aud_apply_fixes")
+check("_aud_apply_fixes differs from HEAD's only by the R4-1 fxe bank; "
+      "_aud_apply_strikes still byte-identical to HEAD's",
+      only_by("_aud_apply_fixes", FXE_BANK, "")
       and seg(LSRC, LTREE, "_aud_apply_strikes")
       == seg(HSRC, HTREE, "_aud_apply_strikes"))
 

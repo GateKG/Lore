@@ -67,14 +67,69 @@ def reset(afk_on=True, mins=15, shutdown=False, held=None):
 print("--- it uses the RECORDER'S OWN clock, not a second one ---")
 src = io.open(r"D:\Gate LLC\lore.py", encoding="utf-8").read()
 tick = src.split("def _afk_ai_tick")[1].split("\ndef ")[0]
+# 3.36 AFK-1: NOT A STRING PROXY ANY MORE. The old lines checked
+# that both readers CALLED _afk_idle_seconds - true while the
+# recorder folded the mic in beside it and the catch-up did not,
+# so they disagreed on every beat he talked through with his
+# hands off the pad. The outcome is the proof: the readings the
+# recorder keeps rolling on leave the catch-up un-armed.
 check("the catch-up reads the recorder's own reading",
-      "_afk_idle_recent()" in tick)
-check("...which is backed by _afk_idle_seconds and nothing else",
-      "_afk_idle_seconds()" in src.split("def _afk_idle_recent")[1]
+      "_afk_person_seconds()" in tick)
+check("...which is the same reading the recording pause makes",
+      "_afk_person_seconds(fresh=True)" in src.split("def _afk_track")[1]
       .split("\ndef ")[0])
-check("...which is the same call the recording pause makes",
-      "_afk_idle_seconds()" in src.split("def _afk_track")[1]
-      .split("\ndef ")[0])
+
+
+class _S1(object):
+    afk_paused = False
+    suspended = False
+    audio = None
+
+    def suspend(self):
+        self.suspended = True
+
+
+class _C1(object):
+    status = ""
+    saving = 0
+
+    def __init__(self, s):
+        self.session = s
+
+    def set_status(self, s0):
+        self.status = s0
+
+    def notify(self, *a, **k):
+        pass
+
+
+_real_deaf, _real_snd = lore._afk_deaf_seconds, lore._loop_sound
+lore._afk_deaf_seconds = lambda c, s: 0.0
+lore._loop_sound = lambda *a, **k: None
+lore.SETTINGS["afk_pause"] = True
+lore.SETTINGS["afk_minutes"] = 4
+try:
+    reset(mins=10, held={k: True for k in LANES})
+    lore._AI["paused"] = True
+    idle(900)                       # 15 min no keyboard/mouse/pad
+    lore._MICWATCH["last_sound"] = time.time() - 20   # ...talking
+    _s1 = _S1()
+    lore._afk_track(_C1(_s1), _s1, "game.exe")
+    lore._afk_ai_tick()
+    check("a voice is a person for BOTH clocks: the recorder keeps "
+          "rolling and the catch-up does not arm on the same beat",
+          not _s1.suspended and lore._AFKAI["on"] is False
+          and all(lore._AI["held"].values())
+          and not any("AFK catch-up:" in m for m in SAID))
+    lore._MICWATCH["last_sound"] = time.time() - 900   # ...quiet
+    lore._afk_track(_C1(_s1), _s1, "game.exe")
+    lore._afk_ai_tick()
+    check("...and once the room is quiet too, both fire on one beat",
+          _s1.suspended and lore._AFKAI["on"] is True)
+finally:
+    lore._MICWATCH["last_sound"] = None
+    lore._afk_deaf_seconds, lore._loop_sound = _real_deaf, _real_snd
+    reset()
 check("and that clock reads keyboard/mouse AND the controller",
       "_kbms_idle_ms()" in src.split("def _afk_idle_seconds")[1]
       .split("\ndef ")[0]

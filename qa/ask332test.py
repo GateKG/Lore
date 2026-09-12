@@ -981,9 +981,38 @@ if HSRC:
               '        if _busy and not str(_busy[1] or "").startswith(\n'
               '                ("the screen \\u00b7", "the librarian \\u00b7")):\n')
           == _ask_new and _ask_old != _ask_new)
-    for m in ("ask_library", "ask_video", "search_words", "models_status",
-              "have_flags"):
+    for m in ("ask_library", "ask_video", "search_words", "models_status"):
         same.append(msrc(HSRC, "_JsApi", m, HTREE) == msrc(SRC, "_JsApi", m, TREE))
+    # have_flags: the 3.36 audit's dark-pen reason (UI-A1/A2) lifted out,
+    # the rest byte-identical to the base
+    _A1_WHY = (
+        '            # 3.36 AUDIT UI-A1/A2 A DARK PEN SAYS WHY. A night the\n'
+        '            # describer gave up on (three tries spent) and a night it\n'
+        '            # honestly found nothing in both came back exactly like a\n'
+        "            # night never tried - level 0, no reason - so the mark's\n"
+        '            # tip read "not described yet" over a night the tally had\n'
+        '            # already counted as given up, or as done. The level stays\n'
+        '            # 0 (there is nothing to show); the reason is what the tip\n'
+        "            # and the shelf's header can say. Asked only when a review\n"
+        '            # file exists without chapters - the minority - so a batch\n'
+        '            # of 300 stays cheap.\n'
+        '            if not _has_desc:\n'
+        '                try:\n'
+        '                    if os.path.isfile(_ai_sidecar(p, "ins")):\n'
+        '                        if _ins_done_honest(p):\n'
+        '                            row["ins_why"] = ("described - the tome found "\n'
+        '                                              "nothing here to tell")\n'
+        '                        elif not _ins_owing(p):\n'
+        '                            row["ins_why"] = (\n'
+        '                                "gave up after three tries - Ask again on "\n'
+        '                                "the Working page\'s Given up on shelf")\n'
+        '                except Exception:\n'
+        '                    pass\n'
+    )
+    _hf = msrc(SRC, "_JsApi", "have_flags", TREE)
+    same.append(_hf.count(_A1_WHY) == 1
+                and msrc(HSRC, "_JsApi", "have_flags", HTREE)
+                == _hf.replace(_A1_WHY, ""))
     # models_fetch: drop G's two fetch edits aside (one file budgeted once,
     # present where the reads look - describer333test drives them); the
     # method is 2b59d37's once they are swapped back
@@ -1070,11 +1099,128 @@ if HSRC:
         '    # walk above did - the screen reader and the librarian inherit the\n'
         '    # rank for free, and never open a game he told to stay out.\n')
     _L_RANK = ((_L_NEW, _L_OLD), (_L_TAIL, ""))
+    # 3.36 AUDIT: THE THREE LOOP EDITS, LIFTED OUT THE SAME WAY. The
+    # said-done-twice memo (F1), the review waiting for the words
+    # under 'all' (F5) and the chain's head remembering its senses
+    # and eye (F6) are undone here so what is left is still held to
+    # the keyed list below. Update a pair when its block moves; never
+    # drop one.
+    _N_FRAN = (
+        "                    # THE CHAIN'S HEAD REMEMBERS TOO (3.36 F6). A resumed\n"
+        '                    # redo-all used to hear and look again from scratch\n'
+        '                    # on every resume - ~40 s of senses and a five-minute\n'
+        "                    # eye per interruption, the ask's own sns filed to\n"
+        '                    # the attic each time - because only the whole KIND\n'
+        "                    # was memoed as ran, and 'thinking' lands only when\n"
+        '                    # the describer finishes. The senses and the eye\n'
+        "                    # stamp their own names into the ask's memory the\n"
+        '                    # moment they land (the 4-tuple already carries a\n'
+        '                    # list of strings through ai_state.json); a fresh\n'
+        '                    # ask (ran=[]) still does both from scratch, and an\n'
+        '                    # owed sns/vis still runs through its own arm.\n'
+        '                    fran = ((_AI.get("force_ran") or set())\n'
+        '                            if fredo else set())\n'
+    )
+    _N_SNS_NEW = (
+        '                            and (_sns_owing(path)\n'
+        '                                 or (fredo and fw == "all"\n'
+        '                                     and "sns" not in fran)):\n'
+    )
+    _N_SNS_OLD = (
+        '                            and (_sns_owing(path) or (fredo and fw == "all")):\n'
+    )
+    _N_SNS_STAMP = (
+        '                        if ok_sns and fredo and not _AI["abort"] \\\n'
+        '                                and _AI.get("force") == path:\n'
+        '                            _AI.setdefault("force_ran", set()).add("sns")\n'
+        '                            _AI["_qdirty"] = True\n'
+    )
+    _N_VIS_NEW = (
+        '                            and (_vis_owing(path)\n'
+        '                                 or (fredo and fw == "all"\n'
+        '                                     and "vis" not in fran)):\n'
+    )
+    _N_VIS_OLD = (
+        '                            and (_vis_owing(path) or (fredo and fw == "all")):\n'
+    )
+    _N_VIS_STAMP = (
+        '                        if ok_vis and fredo and not _AI["abort"] \\\n'
+        '                                and _AI.get("force") == path:\n'
+        '                            _AI.setdefault("force_ran", set()).add("vis")\n'
+        '                            _AI["_qdirty"] = True\n'
+    )
+    _N_F1 = (
+        "                # SAID DONE TWICE, WROTE NOTHING (3.36 F1). The sweep's\n"
+        '                # only guard against a writer that returns ok without\n'
+        "                # extinguishing its owe was that writer's honesty:\n"
+        '                # nothing memoed, nothing logged, the same job every\n'
+        "                # beat for ever (the 1,776-audit night's shape). This is\n"
+        "                # a memo of the writer's OWN OUTPUT - the mp4's clock and\n"
+        '                # the clocks of the sidecars this lane owns (and their\n'
+        '                # staged .new twins), as the run left them. A second ok\n'
+        '                # run that left every one of them exactly as the first\n'
+        '                # did is the refusal it is: said once in the log, and\n'
+        "                # the night skipped until the file changes (the sweep's\n"
+        '                # own memo below; asking by name pops it, Resume clears\n'
+        '                # it). Not an owe cache - it never answers "is it owed",\n'
+        '                # only "did this exact run already happen". Sweep spawns\n'
+        '                # only: a forced ask is bounded by force_ran and always\n'
+        "                # runs; a tail visit writes outside the lane's attic.\n"
+        '                if ok and not tail and not _AI["abort"] \\\n'
+        '                        and not _AI.get("wind") \\\n'
+        '                        and _AI.get("force") != path:\n'
+        '                    try:\n'
+        '                        _sig = [mt]\n'
+        '                        for _k in _ATTIC_OF.get(kind, ()):\n'
+        '                            for _sfx in ("", ".new"):\n'
+        '                                _sp = _ai_sidecar(path, _k) + _sfx\n'
+        '                                _sig.append(os.path.getmtime(_sp)\n'
+        '                                            if os.path.isfile(_sp)\n'
+        '                                            else None)\n'
+        '                        _sig = tuple(_sig)\n'
+        '                        _rs = _AI.setdefault("ran_sig", {})\n'
+        '                        if _rs.get((path, kind)) == _sig:\n'
+        '                            log(f"The {kind} job on {os.path.basename(path)}"\n'
+        '                                " said done twice and wrote nothing new -"\n'
+        '                                " leaving it; ask by name to try again.")\n'
+        '                            _AI["failed"][path] = mt\n'
+        '                        else:\n'
+        '                            _rs[(path, kind)] = _sig\n'
+        '                    except Exception:\n'
+        '                        pass\n'
+    )
+    _N_F5 = (
+        '            if want == "all" and "hearing" in owe and "hearing" not in ran:\n'
+        '                # THE REVIEW IS TOLD FROM THE WORDS (3.36 F5). Under\n'
+        "                # 'all' it waits for them, held or not. A held words\n"
+        '                # lane zeroed owed_stt above and left owed_ins standing,\n'
+        '                # so the describer was spawned on a night with no\n'
+        "                # transcript, refused ('has no transcript yet'), and\n"
+        '                # was stamped ran anyway - on Resume the words ran and\n'
+        '                # the ask cleared satisfied with the review never\n'
+        "                # written. With the words still owed the chain's next\n"
+        '                # kind is the words; if their lane is held the ask\n'
+        '                # parks at the front with its memory (the road below),\n'
+        '                # exactly as a held sound lane always did.\n'
+        '                owed_ins = False\n'
+    )
+    # and AFK-2: the catch-up beat is handed the ctl so it never arms
+    # beside a live recording (the lead's leftover from the audit)
+    _N_AFK2 = ('    _afk_ai_tick(ctl)\n', '    _afk_ai_tick()\n')
+    _N_LOOPS = ((_N_FRAN, ""), (_N_SNS_NEW, _N_SNS_OLD),
+                (_N_SNS_STAMP, ""), (_N_VIS_NEW, _N_VIS_OLD),
+                (_N_VIS_STAMP, ""), (_N_F1, ""), (_N_F5, ""), _N_AFK2)
     _at = fsrc(SRC, "_ai_tick", TREE)
     check("drop L touches _ai_tick in exactly two places: the rank "
           "sort and the tail's note that it rides the same list",
           all(_at.count(a) == 1 for a, _b in _L_RANK))
     for _a, _b in _L_RANK:
+        _at = _at.replace(_a, _b)
+    check("the 3.36 audit touches _ai_tick in exactly eight places: the"
+          " chain's memory (F6 x5), the said-done-twice memo (F1), the"
+          " review waiting for the words (F5) and the catch-up's ctl (AFK-2)",
+          all(_at.count(a) == 1 for a, _b in _N_LOOPS))
+    for _a, _b in _N_LOOPS:
         _at = _at.replace(_a, _b)
     ha = fsrc(HSRC, "_ai_tick", HTREE).splitlines()
     na = _at.splitlines()
@@ -1186,15 +1332,15 @@ check("_EmbServer.start refuses without the model (no spawn, no port sweep)",
 
 # =========================================================================
 print("\n--- the UI, read from its source ---")
-check("the stamps: 3.35 in both mocks, lore.py APP_VERSION 3.35, no 3.34 "
-      "version left (3.35 drop L)", USRC.count("version:'3.35'") == 2
-      and "version:'3.34'" not in USRC and 'APP_VERSION = "3.35"' in SRC)
+check("the stamps: 3.36 in both mocks, lore.py APP_VERSION 3.36, no 3.35 "
+      "version left (3.35 drop L)", USRC.count("version:'3.36'") == 2
+      and "version:'3.35'" not in USRC and 'APP_VERSION = "3.36"' in SRC)
 check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "librarian_ready, so the harness box is never dead",
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
       and "librarian_ready:true,second_ear:true,room_names:'',"
-          "my_name:'',game_rank:{},version:'3.35'" in USRC)
+          "my_name:'',game_rank:{},version:'3.36'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "

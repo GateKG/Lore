@@ -345,7 +345,7 @@ check("...and the repaint signature moves when the rank does, or the "
 check("MOCK carries game_rank in both settings and state, and a ranked "
       "next pick, so the preview page draws it",
       "second_ear:true,room_names:'',my_name:'',game_rank:{}," in USRC
-      and "my_name:'',game_rank:{},version:'3.35'" in USRC
+      and "my_name:'',game_rank:{},version:'3.36'" in USRC
       and "next:{name:'mock night.mp4',kind:'listening',rank:'later'}" in USRC)
 
 # =======================================================================
@@ -437,13 +437,49 @@ SET["game_rank"] = {"alpha": "never", "beta": "never",
 TA = _tally()
 check("a shelf held back end to end says so, and still owes every "
       "night of it", TA.get("held_back") == 4
-      and TA["thinking"]["left"] == 4)
+      and TA["thinking"]["left"] == 4
+      # 3.36 F2: ...and each lane's held is OF ITS LEFT (4 of 4 here)
+      and all(TA[j]["held"] == 4 for j in ("listening", "hearing",
+                                            "thinking")))
 check("the counter rides the walk the tally already makes - no second "
       "pass over the shelf for a number",
       func_src("_ai_tally").count("_game_rank(p)") == 1
       and func_src("_ai_tally").count("for v in _scan_dir_mp4s") == 1)
-check("the status road hands the share to the page",
-      '"held": t.get("held_back", 0),' in SRC)
+check("the status road hands the share to the page - each lane's own "
+      "(3.36 F2), never the shelf-wide number",
+      '"held": k.get("held", 0),' in SRC
+      and '"held": t.get("held_back", 0),' not in SRC)
+
+# ---- 3.36 F2: the held-back share is OF THE LEFT. Two never nights
+# fully done on every lane and one normal night owing everything used
+# to print '1 left - 2 never on their own' on every row.
+_doneN = set()
+nsT2 = dict(nsT)
+nsT2["_AI"] = {}
+nsT2["_ai_sidecar_fresh"] = lambda p, s: p in _doneN
+nsT2["_ins_done_honest"] = lambda p: p in _doneN
+nsT2["_ins_owing"] = lambda p: p not in _doneN
+nsT2["_aud_done_current"] = lambda p: p in _doneN
+_tally2 = extract("_ai_tally", nsT2)
+SET["game_rank"] = {"alpha": "never", "beta": "never"}
+_doneN.update({P_ALPHA_A, P_BETA_A})
+TD = _tally2()
+check("two never nights done on every lane, two normal nights owing: "
+      "held is 0 on every lane (the never nights are not 'left')",
+      all(TD[j]["left"] == 2 and TD[j]["held"] == 0
+          for j in ("listening", "hearing", "thinking"))
+      and TD["auditing"]["left"] == 0 and TD["auditing"]["held"] == 0
+      and TD.get("held_back") == 2)
+_doneN.discard(P_BETA_A)
+nsT2["_AI"].clear()
+TD2 = _tally2()
+check("...un-do one never night and it is back in left AND in held - "
+      "a rank never un-owes a night, and held <= left on every lane",
+      TD2["thinking"]["left"] == 3 and TD2["thinking"]["held"] == 1
+      and all(TD2[j]["held"] <= TD2[j]["left"]
+              for j in ("listening", "hearing", "thinking", "auditing")))
+nsT["_AI"].clear()
+SET["game_rank"] = {}
 
 # ---- and the Working page spends it
 check("the standing tally says the held-back share in words, beside "
@@ -479,12 +515,12 @@ check("the sweep's ONE JOB SLOT is untouched - the band reorders "
       and "_game_rank" not in func_src("_afk_ai_tick"))
 check("the finish queue is not ranked", "_game_rank" not in
       func_src("_queued_finish_badge"))
-check("the stamps: APP_VERSION 3.35, ui.html x2, version.txt, installer",
-      'APP_VERSION = "3.35"' in SRC
-      and USRC.count("version:'3.35'") == 2
-      and "(3, 35, 0, 0)" in io.open(
+check("the stamps: APP_VERSION 3.36, ui.html x2, version.txt, installer",
+      'APP_VERSION = "3.36"' in SRC
+      and USRC.count("version:'3.36'") == 2
+      and "(3, 36, 0, 0)" in io.open(
           os.path.join(ROOT, "version.txt"), encoding="utf-8").read()
-      and "AppVersion=3.35" in io.open(
+      and "AppVersion=3.36" in io.open(
           os.path.join(ROOT, "installer.iss"), encoding="utf-8",
           errors="replace").read())
 # a pin on a string is a proxy; ranktest.js RUNS the chip, so the
