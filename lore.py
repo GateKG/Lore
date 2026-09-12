@@ -18738,9 +18738,18 @@ def _ins_owing_raw(video_path):
         try:
             with open(sp + ".new", encoding="utf-8") as fh:
                 nd = json.load(fh) or {}
+            # 3.36 N3 A RETELL HAS A TELLING TO FALL BACK ON. A staged
+            # doc that names what the audit cut (its "retold" ledger)
+            # re-asks minutes the served review already tells, so two
+            # tries that came back with nothing leave it as it was. An
+            # upgrade has no fallback and keeps its three. Read here,
+            # in the one place the sweep asks, so the bound the hoist
+            # refuses at is the bound the walk stops at - a third ask
+            # from the sweep would be the circle by another road.
             if (isinstance(nd.get("windows"), dict)
                     and not nd.get("complete")
-                    and int(nd.get("tries") or 0) < 3
+                    and int(nd.get("tries") or 0)
+                    < (2 if isinstance(nd.get("retold"), list) else 3)
                     and int(nd.get("gen") or _INS_GENERATION)
                     >= int(d.get("gen") or 0)):
                 # at least the SERVED doc's generation: a staged
@@ -19025,10 +19034,6 @@ def _insights_one(video_path, forced=False, fresh=False):
         # (the echo wall dropping fake lines), and stamping empty over a
         # rich review unbanked would be the one unrecoverable write in
         # the whole redo path.
-        try:
-            _bank_sidecar(video_path, "ins")
-        except Exception:
-            pass
         # STAMPED WITH THE EAR IT WAS BUILT ON, like every other review.
         # An empty review carried no src_stt, and the owing judge reads
         # a missing stamp as "built on reader zero" - so on any night
@@ -19042,6 +19047,25 @@ def _insights_one(video_path, forced=False, fresh=False):
             _sst0 = {"mt": os.path.getmtime(_ai_sidecar(video_path, "stt")),
                      "reader": _stt_reader_of(video_path)}
         except OSError:
+            pass
+        # 3.36 N5 THE CLOCK BELONGS TO A CHANGE (the mtime law). The
+        # same empty review, asked for again by any road, used to be
+        # rewritten byte-identical - a moved clock over unchanged
+        # words, which re-owed the audit, which rode the worker back
+        # here. A doc that already stands on disk is left exactly as it
+        # is, clock and all; nothing is banked because nothing changed.
+        try:
+            with open(_ai_sidecar(video_path, "ins"),
+                      encoding="utf-8") as fh:
+                if (json.load(fh) or {}) == {"v": 3, "empty": True,
+                                             "complete": True,
+                                             "src_stt": _sst0}:
+                    return True
+        except Exception:
+            pass
+        try:
+            _bank_sidecar(video_path, "ins")
+        except Exception:
             pass
         _atomic_write_json(_ai_sidecar(video_path, "ins"),
                            {"v": 3, "empty": True, "complete": True,
@@ -19232,6 +19256,11 @@ def _insights_one(video_path, forced=False, fresh=False):
                    and not os.path.isfile(side_p + ".new"))
     staged = upgrade and not cov_only and not retitle
     work_p = side_p + ".new" if staged else side_p
+    # 3.36 N2 WHICH WINDOWS THE AUDIT CUT. Only a staged doc carries the
+    # ledger, and only a doc that carries it may be merged with the
+    # served review below - a .new written before this drop says nothing
+    # about what was cut, so it resumes exactly as it does today.
+    _retold = None
     if cov_only or retitle:
         windows = prior["windows"]
         # THE FIELD, READ THE WAY THE OWING TEST READS IT. Defaulting
@@ -19252,8 +19281,43 @@ def _insights_one(video_path, forced=False, fresh=False):
         # fresh means the TRANSCRIPT was just replaced in this same ask -
         # a partial's landed windows describe words that no longer exist,
         # so resuming would splice two transcripts into one review
+        _wiped = False
         if forced and windows and (fresh or wdoc.get("complete")):
             windows = {}
+            _wiped = True
+        # 3.36 N2 A RESUME MERGES; IT DOES NOT FORGET. The staged doc
+        # holds what the retell has landed, and what the audit CUT is
+        # named in its own ledger - so every other window the served
+        # review already told is carried in rather than described from
+        # scratch. A cut window is never resurrected: the ledger is the
+        # one thing that can tell "not told yet" from "sent back".
+        # AND ONLY WITHIN ONE LINEAGE. The ledger names the windows
+        # the audit CUT; it says nothing about windows the staged
+        # doc has SUPERSEDED. A .new can be a REBUILD - the eye-era
+        # generation, or a newer reader's words - that an audit's
+        # retell happened to land on, and merging then carries the
+        # OLD engine's windows into it. _assemble would stamp the
+        # result at the current gen and the current src_stt.reader,
+        # so the owing test can never re-owe those windows: the
+        # upgrade is silently consumed, a stamp moved forward over
+        # words nobody re-described. Measured on a 3-window fixture
+        # (served gen 2 / reader 5, rebuild interrupted after window
+        # 0, audit correcting window 60): the merge kept two windows
+        # of the old telling inside a review stamped gen 3 / reader
+        # 7. In a plain retell the .new is a copy of the served doc,
+        # so both tests hold with equality and nothing changes.
+        if not _wiped and isinstance(wdoc.get("retold"), list) \
+                and isinstance(prior.get("windows"), dict) \
+                and int(prior.get("gen") or 0) \
+                >= int(wdoc.get("gen") or 0) \
+                and int((prior.get("src_stt") or {}).get("reader")
+                        or 0) \
+                >= int((wdoc.get("src_stt") or {}).get("reader")
+                       or 0):
+            _retold = set(str(x) for x in wdoc["retold"])
+            for _k5, _w5 in prior["windows"].items():
+                if _k5 not in windows and _k5 not in _retold:
+                    windows[_k5] = _w5
         tries = 0 if forced else int(wdoc.get("tries") or 0)
         # THE GENERATION BELONGS TO THE WORDS, NOT THE RUN. Windows
         # kept from an older telling keep their generation, so the
@@ -19421,9 +19485,18 @@ def _insights_one(video_path, forced=False, fresh=False):
             # for it, or the card grinds on a night that will never
             # improve - but if rows are still untold the review must
             # SAY so rather than read as a whole telling.
-            _short = any(int((w or {}).get("left") or 0) >= 6
-                         for w in done_map.values()
-                         if isinstance(w, dict))
+            # AND A SPENT WINDOW LEAVES NO "left" TO SAY IT WITH.
+            # The told-empty settlement clears the pending ranges, so
+            # the window banks left=0 and the only witness of the
+            # minutes nobody told is the gap: measured on a 2-window
+            # night whose first window came back empty, cov.frac 0.5
+            # with an untold gap over 0-1800s read as a WHOLE telling.
+            _short = (any(int((w or {}).get("left") or 0) >= 6
+                          for w in done_map.values()
+                          if isinstance(w, dict))
+                      or any(g.get("kind") == "untold"
+                             and int(g.get("rows") or 0) >= 6
+                             for g in _gaps))
             _cov = {"rows": len(_rows), "told": _in,
                     "frac": round(_in / float(len(_rows) or 1), 3),
                     "gaps": _gaps[:24], "owed": bool(_owed),
@@ -19461,6 +19534,12 @@ def _insights_one(video_path, forced=False, fresh=False):
                "windows": done_map, "win_len": int(WIN),
                "vdur": round(vdur, 1),
                "complete": bool(complete), "tries": int(tries_now)}
+        if _retold and not complete:
+            # 3.36 N2 the cut list rides the staged doc for as long as it
+            # is unfinished, or the next resume would merge the served
+            # review's old telling back over the very minutes the audit
+            # sent back
+            out["retold"] = sorted(_retold)
         if complete and not raw:
             # every window answered with nothing: that is an EMPTY review,
             # not a limbo one - without this flag it was never done, never
@@ -19682,6 +19761,14 @@ def _insights_one(video_path, forced=False, fresh=False):
             wmoments = list(_pw.get("moments") or [])
             asked = int(_pw.get("asks") or 0)
             _lf = int(_pw.get("left") or 0)
+            # 3.36 N1 WHAT THIS RUN SPENDS, THIS RUN BANKS. An ask whose
+            # answer came back unusable was thrown away WITH the window
+            # (see the record at the foot of this loop), so the next beat
+            # made the identical ask and threw that away too. Measured on
+            # his shelf 8 Sep: one night asked the same half hour four
+            # times in six minutes, 37 "is unfinished" lines across 21
+            # nights since the 3.33 install.
+            _asked0 = asked
             # THE RANGES THEMSELVES, not just how much was left. A
             # hole in the middle of a window is owed exactly like a
             # tail is, and only the ranges can say where it is.
@@ -19819,6 +19906,25 @@ def _insights_one(video_path, forced=False, fresh=False):
             while pending and asked < 5 and not _AI["abort"] \
                     and not _AI.get("wind"):
                 r0, r1 = pending.pop(0)
+                # 3.36 N1 A WINDOW WITH NOTHING TOLD HAS NO "REST".
+                # The continuation head says "this is the REST of a
+                # window whose start you already described - do not
+                # describe those minutes again" and drops the evidence
+                # block with it. Now that a spent ask is banked on the
+                # window (the foot of this loop), a resumed window that
+                # told nothing would wear that head with both halves
+                # false - a consequence of the banking, NOT the shelf's
+                # cause: on the measured night the window was never
+                # banked, all three asks were first tellings with the
+                # full evidence head, and none of them parsed; the same
+                # night then parsed on 11 Sep (12 stretches) with no
+                # code change, which points at the model, not the
+                # prompt. The diagnostic line below is what will say
+                # why, once it has run on a real night - read its first
+                # occurrences before touching the prompt. Until a
+                # stretch actually lands, every ask for this window is
+                # a first telling.
+                _first = (asked == 0 or not mapped)
                 # the longest contiguous run of this range that fits
                 # BUDGETED AGAINST WHAT WILL ACTUALLY BE SENT. room
                 # reserves a fixed 900 for the answer, but a long run
@@ -19827,7 +19933,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # context by fourteen hundred tokens, and a truncated
                 # answer does not parse.
                 _hd = (_tokens(see + ears + eyes + so_far) + 260
-                       if asked == 0 else 60)
+                       if _first else 60)
                 _avail = max(600, room + 900 - _hd - 130)
                 j = r1
                 while True:
@@ -19853,7 +19959,6 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # stretch count: 3 -> 27 lines, 5 -> 48, 8 -> 100.
                 want = max(3, min(12, -(-len(use) // 12)))
                 out_cap = min(1500, 900 + 100 * max(0, want - 5))
-                _first = (asked == 0)
                 head = (("NOBODY IN THE ROOM SPOKE in this window. Every "
                          "line is what a video, a stream or a song was "
                          "saying on his screen while he played. Write one "
@@ -19894,8 +19999,35 @@ def _insights_one(video_path, forced=False, fresh=False):
                     # the retry was the even-row loss wearing a second
                     # hat: a parse failure says nothing about how many
                     # rows the model can read.
+                if got is None:
+                    # 3.36 N1 AND IT SAYS WHAT IT ASKED FOR. The log read
+                    # "window 0-30 min -> 0 stretch(es), 3 moment(s)" and
+                    # every one of those three was planted by code, not
+                    # answered by the model - the line looked like a
+                    # model that had nothing to say when in truth nothing
+                    # came back at all. The size of the ask, the room it
+                    # was given and the head of whatever did arrive are
+                    # the only evidence the next reading of this log has.
+                    log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} "
+                        f"min asked {_tokens(head + body)} token(s) over "
+                        f"{len(use)} line(s) for up to {out_cap}, and the "
+                        f"answer did not parse - "
+                        + ("nothing came back at all."
+                           if not txt else
+                           str(len(txt)) + " char(s) came back: "
+                           + " ".join(str(txt)[:200].split())))
+                # A RE-ASK IS A RE-ASK EVEN WHEN NOTHING WAS TOLD.
+                # _first is widened above so an empty window is asked
+                # afresh rather than headed "the REST of a window you
+                # already described" - but reading the counter off it
+                # silenced the tally on exactly the road this drop is
+                # about, so a retell that asked twice printed "0
+                # coverage re-ask(s)". The window's own spent budget
+                # is the honest witness. Telemetry only: guard_cov is
+                # printed, never budgeted against.
+                _cont = asked > 0       # ... before this ask lands
                 asked += 1
-                if not _first:
+                if _cont:
                     guard_cov += 1          # a continuation ask
                     ip = _AI.get("ins_prog")
                     if isinstance(ip, dict):
@@ -19985,6 +20117,23 @@ def _insights_one(video_path, forced=False, fresh=False):
                     _gaps2.append((_cur, r1))
                 for _g4 in reversed(_gaps2):
                     pending.insert(0, _g4)
+                # 3.36 N1 A WINDOW THAT ANSWERED NOTHING TWICE IS TOLD-
+                # EMPTY - ANSWERED. A parsed answer that speaks for no
+                # row is the model's own word that these minutes hold
+                # nothing; two of those settle the window: honestly
+                # empty, done, with the coverage gaps naming the minutes
+                # that went untold. An answer that did NOT PARSE is no
+                # word at all: the window stays owed and the run spends
+                # a try (the foot of this loop), so on a retell the
+                # served telling is never replaced by a hole made of
+                # unparsed answers - settling both alike swapped an
+                # empty window over three real stretches (chapters 6 ->
+                # 3) on the fix-first review's own fixture, and the N3
+                # bound could never fire because the swap counted as
+                # progress. A window that told SOMETHING keeps its
+                # whole budget.
+                if got is not None and not mapped and asked >= 2:
+                    pending = []
                 if got is None:
                     break
             # THE SCREEN'S VERDICTS ARE MOMENTS PLANTED BY CODE (3.32):
@@ -20001,7 +20150,11 @@ def _insights_one(video_path, forced=False, fresh=False):
                     f"at a video's or the game's line and were dropped - "
                     f"neither is the room.")
                 _mdrop[0] = 0
-            if mapped or got is not None:
+            # AN ASK SPENT IS AN ASK BANKED (3.36 N1): without the
+            # last clause a window whose answer would not parse left no
+            # trace at all - not the spent budget, not the moments the
+            # screen's verdicts planted - so nothing ever counted down.
+            if mapped or got is not None or asked > _asked0:
                 windows[str(int(lo))] = {"segments": mapped,
                                          "moments": wmoments,
                                          "asks": asked,
@@ -20010,8 +20163,14 @@ def _insights_one(video_path, forced=False, fresh=False):
                                                   for a4, b4 in pending],
                                          "left": sum(b4 - a4 for a4, b4
                                                      in pending)}
-                progress = True
-                tries = 0
+                # BANKED IS NOT TOLD. The spent ask rides the window so
+                # the next beat does not repeat it, but an answer that
+                # never parsed is no progress: the try is spent at the
+                # foot of this run, which is what bounds the retell (N3)
+                # and keeps a staged doc from completing over a hole.
+                if mapped or got is not None:
+                    progress = True
+                    tries = 0
                 # ON DISK NOW - an interruption after this line loses
                 # nothing that was already described
                 _assemble(windows, False, tries)
@@ -20440,8 +20599,26 @@ def _insights_one(video_path, forced=False, fresh=False):
         # The model never got to fail; no try is spent.
         tries_now = tries if (progress or _AI["abort"]) else tries + 1
         _assemble(windows, False, tries_now)
+        # 3.36 N3 THE BOUND IS SAID ON THE ROAD THAT REACHES IT. A
+        # staged retell whose corrected minutes came back unparsed
+        # twice has just spent its second try HERE - the sweep's own
+        # beat made that ask and nobody hoists after it, so a sentence
+        # that lived only in _retell_head was never said on the very
+        # road it was written for. Said once, the focus let go; the
+        # served review was never touched and keeps its telling.
+        if staged and not progress and tries_now >= 2 \
+                and isinstance(wdoc.get("retold"), list):
+            _retell_quit(video_path)
+        # THE COUNT IS OF WINDOWS TOLD, not of keys on disk: a window
+        # banked mid-budget is a resume point, not a finished half hour,
+        # and counting it done would read "2 of 2" on a review that is
+        # plainly not (3.36 N1 banks such a window, so this line had to
+        # learn the difference).
+        _done_n = sum(1 for _l5, _h5 in edges
+                      if str(int(_l5)) in windows
+                      and not _win_owes(windows[str(int(_l5))]))
         log(f"Description of {name} is unfinished: "
-            f"{len(windows)} of {len(edges)} window(s) done - "
+            f"{_done_n} of {len(edges)} window(s) done - "
             f"it will be resumed, not redone.")
         return False
     finally:
@@ -24884,6 +25061,72 @@ def _aud_src(video_path):
 
 
 _AUD_OWE_CACHE = {}
+# 3.36 N5 the nights left alone for this session, keyed by path: NOT an
+# owe cache (nothing here is an answer to "owed?" - it is the signature
+# of what the night looked like when the audit twice found nothing to
+# do, and a night whose layers move past that signature is a night
+# again). And when each night's last change-free audit landed.
+_AUD_SETTLED = {}
+_AUD_LAST = {}
+
+
+def _aud_settle_sig(video_path):
+    """What a settled night is settled AGAINST: every layer's clock but
+    the review's, and the review's BYTES in place of its clock - the
+    loop this guards was the review's clock moving over an unchanged
+    file (an empty review rewritten byte-identical every beat, 1,776
+    audits in three hours on 4 Sep), so the clock is the one witness
+    that must not count here."""
+    import hashlib
+    src = _aud_src(video_path)
+    src.pop("ins", None)
+    try:
+        with open(_ai_sidecar(video_path, "ins"), "rb") as fh:
+            h = hashlib.sha1(fh.read()).hexdigest()
+    except OSError:
+        h = ""
+    return (tuple(sorted(src.items())), h)
+
+
+def _aud_settled(video_path):
+    """Left alone for the session - unless something real moved since."""
+    sig = _AUD_SETTLED.get(video_path)
+    if sig is None:
+        return False
+    try:
+        if _aud_settle_sig(video_path) == sig:
+            return True
+    except Exception:
+        pass
+    _AUD_SETTLED.pop(video_path, None)     # a layer moved: a night again
+    _AUD_LAST.pop(video_path, None)
+    return False
+
+
+def _aud_settle_note(video_path, applied, struck, merged, respelt,
+                     retold):
+    """The hard backstop, whatever the cause (3.36 N5): a night audited
+    twice inside ten minutes with no fix, no strike, no name folded or
+    respelt and no minute re-told is marked settled for the session, the
+    focus is released if it is that night, and it is said once. Returns
+    True while the night is settled."""
+    now = time.time()
+    if applied or struck or merged or respelt or retold:
+        _AUD_LAST.pop(video_path, None)
+        _AUD_SETTLED.pop(video_path, None)
+        return False
+    prev = _AUD_LAST.get(video_path)
+    _AUD_LAST[video_path] = now
+    if prev is None or now - prev > 600:
+        return False
+    if video_path in _AUD_SETTLED:
+        return True
+    _AUD_SETTLED[video_path] = _aud_settle_sig(video_path)
+    if _AI.get("focus") == video_path:
+        _AI["focus"] = None
+    log(os.path.basename(video_path)
+        + " has nothing left to settle - leaving it.")
+    return True
 
 
 def _aud_owing_swept(video_path):
@@ -24940,6 +25183,11 @@ def _aud_owing(video_path):
         if not _ins_done_honest(video_path):
             return False
     except Exception:
+        return False
+    # 3.36 N5 A NIGHT LEFT ALONE STAYS ALONE - until a layer other than
+    # the review's clock moves (see _aud_settled). Asking by name never
+    # reads this judge, so the button still audits it in full.
+    if _aud_settled(video_path):
         return False
     ap = _ai_sidecar(video_path, "aud")
     try:
@@ -25181,6 +25429,94 @@ _MIG_WALKS = ("refold", "eye", "strike", "echo", "black")
 _MIG_BUSY = [False]
 _MIG_BANKED = set()
 _MIG_SKIPPED = [0]      # files a walk could not read this pass
+_NEW_SWEPT = [False]    # the stale-.new sweep: once per run, not per shelf
+
+
+def _ins_new_sweep():
+    """A .new that outlived its describe goes to the attic (3.36 N4).
+
+    The staged file is a resume point: a review being rebuilt while the
+    served one keeps being read. A finished rebuild is swapped in and
+    the .new is gone with it - so a .new that is OLDER than the review
+    beside it AND has spent its three tries belongs to a describe that
+    ended without one, and resuming from it tells the night with fewer
+    windows than it already has. Both halves are needed: the clock
+    alone catches every night whose served review some other writer
+    touched, and the tries are the same bound the owing test stops
+    resuming at. Moved, never deleted: it is still the only copy of
+    whatever those windows said."""
+    moved = 0
+    for d0, kind in _library_dirs(SETTINGS.get("output_dir", "")):
+        for v0 in _scan_dir_mp4s(d0, kind):
+            p = v0["path"]
+            sp = _ai_sidecar(p, "ins")
+            np0 = sp + ".new"
+            try:
+                if not os.path.isfile(np0):
+                    continue
+                if os.path.getmtime(np0) >= os.path.getmtime(sp):
+                    # NEWER THAN THE REVIEW IT STAGES is a live resume
+                    # point (an upgrade, a retell mid-flight) and it is
+                    # left alone.
+                    continue
+                with open(np0, encoding="utf-8") as fh:
+                    nd = json.load(fh) or {}
+                with open(sp, encoding="utf-8") as fh:
+                    d = json.load(fh) or {}
+            except Exception:
+                continue
+            # BUT A CLOCK IS NOT A VERDICT. The served review is
+            # rewritten in place by writers that never touch the .new -
+            # _aud_apply_names respells it on every audit, and an audit
+            # is re-owed precisely while a retell is staged - so an
+            # older .new is as often a LIVE retell as a dead one. The
+            # app's own owing test resumes a .new until three tries are
+            # spent; the attic waits for the same bound, or the sweep
+            # files work the app is still going to ask for. Measured
+            # read-only on the shelf, 8 Sep: 90 staged files, 7 older
+            # than their review, and the only 3 the old gate would have
+            # filed were all live - tries 0, real described windows,
+            # each beside a review with exactly one window more (the
+            # audit's cut signature).
+            if int(nd.get("tries") or 0) < 3:
+                continue
+            if not (d.get("complete") and d.get("chapters")):
+                continue      # the served review is itself unfinished -
+                #               the .new IS the work in progress
+            # AND A REFUSED UPGRADE KEEPS ITS MARKER. On a served review
+            # from an older engine, with the eye installed, the owing
+            # judge reads a tries-3 .new as "the upgrade refused three
+            # times - the old review simply stays". Filing that .new
+            # takes the marker with it, and the judge answers owed again
+            # on the next beat: a full re-describe of a night the drop
+            # gave up on, which this drop's own law forbids (measured on
+            # the fix-first review's fixture: moved=1, owed False ->
+            # True). It stays where it is; nothing resumes from it, the
+            # judge already reads it as spent.
+            if int(d.get("gen") or 2) < _INS_GENERATION \
+                    and _desc_mmproj() is not None:
+                continue
+            try:
+                att = _attic_dir()
+                os.makedirs(att, exist_ok=True)
+                base = os.path.splitext(os.path.basename(p))[0]
+                stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                shutil.move(np0, os.path.join(
+                    att, "%s.ins.new.%s.json" % (base, stamp)))
+            except Exception:
+                continue
+            # THE OWING JUDGE READS THE .new, so its answer changed the
+            # moment the file did. The cache is popped; no clock moves,
+            # nothing is re-owed, and no review is re-described - the
+            # one class where filing WOULD re-owe (an older-engine
+            # review with the eye installed) is left alone above.
+            _INS_OWE_CACHE.pop(os.path.normcase(os.path.abspath(p)), None)
+            moved += 1
+    if moved:
+        log("Filed away " + str(moved) + " stale part-description(s): a "
+            ".new older than the finished review beside it, out of tries, "
+            "belongs to a describe that never came back.")
+    return moved
 
 
 def _shelf_migrations():
@@ -25212,7 +25548,11 @@ def _shelf_migrations():
     # 3.34 the thin-strike walk keeps its own marker (strikes.mig, keyed
     # the same way): it arrived after shelf.mig had retired the five
     thin = not _thin_mig_done(lib)
-    if not todo and not thin:
+    # 3.36 N4 the stale-.new sweep is not a migration but a boot check -
+    # once per RUN, because any night can end a describe without a swap.
+    # It only stats the shelf; the walks below are what open it.
+    sweep = not _NEW_SWEPT[0]
+    if not todo and not thin and not sweep:
         return
     if _MIG_BUSY[0]:
         return
@@ -25235,6 +25575,13 @@ def _shelf_migrations():
                 # migrated here would retire every walk forever on a
                 # shelf nobody has read.
                 return
+            if sweep:
+                _NEW_SWEPT[0] = True
+                try:
+                    _ins_new_sweep()
+                except Exception as e:
+                    log("The stale part-description sweep stumbled: "
+                        + str(e)[:120])
             _MIG_BANKED.clear()
             for key, fn, nm in (("refold", _hl_refold_migration,
                                  "re-fold"),
@@ -25956,6 +26303,50 @@ def _ai_ask_first(path, want="think", why=""):
         return False
 
 
+_RETELL_QUIT = set()     # nights given up on, so it is said once
+
+
+def _retell_head(video_path, why):
+    """The head of the queue - but never in a circle (3.36 N3).
+
+    A staged retell that has come back with nothing twice will not come
+    back with anything on the third beat, and the focus is the ONE slot
+    the sweep has: a night parked in it spends the card on the same
+    refused ask every few minutes. Two spent tries and the night is left
+    exactly as it was - the served review was never touched, so it keeps
+    the telling it has, and asking for it by name still retells it in
+    full."""
+    try:
+        with open(_ai_sidecar(video_path, "ins") + ".new",
+                  encoding="utf-8") as fh:
+            _t = int((json.load(fh) or {}).get("tries") or 0)
+    except Exception:
+        _t = 0
+    if _t < 2:
+        return _ai_ask_first(video_path, "think", why)
+    _retell_quit(video_path)
+    return False
+
+
+def _retell_quit(video_path):
+    """Two empty retells: said once, the focus let go (3.36 N3).
+
+    Reached from the describe that spent the second try (the road the
+    sweep's beat walks) and from the audit's hoist; whichever comes
+    first speaks and the other is silent. The focus is the one slot the
+    sweep has, and a night parked in it with nothing it can finish keeps
+    the whole shelf waiting behind it."""
+    if _AI.get("focus") == video_path:
+        _AI["focus"] = None
+    if video_path in _RETELL_QUIT:
+        return False
+    _RETELL_QUIT.add(video_path)
+    log(os.path.basename(video_path) + ": its retold minutes came "
+        "back empty twice - it is left as it was; ask for it by "
+        "name to try again.")
+    return True
+
+
 def _aud_retell(video_path, changed_ts, refill=True):
     """The corrected minutes get their description back - JUST those.
 
@@ -26027,6 +26418,13 @@ def _aud_retell(video_path, changed_ts, refill=True):
                 d = nd0
         except Exception:
             pass
+    # 3.36 N2 THE CUT NAMES ITSELF. A resume can then carry in every
+    # window the served review already told without ever resurrecting
+    # one the audit sent back - the ledger is the only thing that can
+    # tell those two apart, and a staged doc that lost a window to an
+    # interruption used to drag the night back to its first minute.
+    _rt0 = d.get("retold") if isinstance(d.get("retold"), list) else []
+    d["retold"] = sorted(set(str(x) for x in _rt0) | set(dirty))
     try:
         _atomic_write_json(sp + ".new" if was_complete else sp, d)
     except Exception:
@@ -26045,9 +26443,9 @@ def _aud_retell(video_path, changed_ts, refill=True):
         # the sweep alone - that queue is hundreds of nights deep, and
         # waiting there is exactly how a night ends up wearing a
         # finished audit over a review with its windows torn out.
-        _ai_ask_first(video_path, "think",
-                      "the audit re-told part of it and the "
-                      "description must catch up")
+        _retell_head(video_path,
+                     "the audit re-told part of it and the "
+                     "description must catch up")
         return len(dirty)
     _aud_keep_drop()               # one model on the card, ever
     try:
@@ -26060,9 +26458,9 @@ def _aud_retell(video_path, changed_ts, refill=True):
     # to the front of the line rather than waiting on the sweep.
     try:
         if _ins_owing_raw(video_path):
-            _ai_ask_first(video_path, "think",
-                          "its description is still missing the "
-                          "minutes the audit re-told")
+            _retell_head(video_path,
+                         "its description is still missing the "
+                         "minutes the audit re-told")
     except Exception:
         pass
     return len(dirty)
@@ -26624,7 +27022,7 @@ def _audit_one(video_path, redo=False):
                     "why(s) on " + name + " with its fresh reasoning.")
         except Exception:
             pass
-        _aud_apply_names(video_path, names)
+        _resp = _aud_apply_names(video_path, names)
         # THE DESCRIPTION FOLLOWS THE WORDS. Lines just fixed or struck
         # sit inside chapters written from the OLD words - those windows
         # are re-described (only those), and the title follows.
@@ -26701,6 +27099,16 @@ def _audit_one(video_path, redo=False):
                "src": _aud_src(video_path)}
         _put(doc)
         _AI.pop("aud_prog", None)
+        # 3.36 N5 THE BACKSTOP RIDES THE AUDIT'S OWN WRITE. Whatever
+        # re-owes a night that changes nothing (the empty-review clock
+        # was one cause, closed at 3.35; the next one is not known yet),
+        # the second change-free audit inside ten minutes is the last.
+        try:
+            if done:
+                _aud_settle_note(video_path, applied, struck, merged,
+                                 _resp, retold)
+        except Exception:
+            pass
         try:
             if done:
                 _ai_note_rate("auditing", _AI.get("job_secs") or dur or 0.0,
@@ -28784,6 +29192,145 @@ def _aud_done_current(video_path):
     return ok
 
 
+_WEEK = {"t": 0.0, "out": None}     # the log's last seven days, read
+_WEEK_DAYS = 7.0                    # once every ten minutes at most
+
+
+def _log_stamped(path, end_ts):
+    """The log's lines, each with an absolute clock (3.36 N6).
+
+    A line carries only [HH:MM:SS]. The LAST line is anchored to END_TS
+    - the file's own mtime, which is when it was last appended to - and
+    walking backwards, a time-of-day LATER than the line after it means
+    the day rolled. A night the app slept through cannot be seen this
+    way (two quiet days read as one), which only ever makes the window
+    older than it says, never the rate wrong: the rate is nights over
+    hours away, and both are counted from the same lines."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return out
+    end = _dt.datetime.fromtimestamp(end_ts)
+    day = end.date()
+    end_tod = end.hour * 3600 + end.minute * 60 + end.second
+    prev = None
+    for ln in reversed(lines):
+        if len(ln) < 11 or ln[0] != "[" or ln[9] != "]":
+            continue
+        try:
+            hh, mm, ss = int(ln[1:3]), int(ln[4:6]), int(ln[7:9])
+        except ValueError:
+            continue
+        tod = hh * 3600 + mm * 60 + ss
+        if prev is not None and tod > prev:
+            day -= _dt.timedelta(days=1)
+        elif prev is None and tod > end_tod + 5:
+            # the last line is LATER in the day than the file's own
+            # clock: it was written before midnight and the file was
+            # touched after it (a log that stopped the night before)
+            day -= _dt.timedelta(days=1)
+        prev = tod
+        try:
+            ts = _dt.datetime.combine(day, _dt.time(hh, mm, ss)).timestamp()
+        except (ValueError, OverflowError, OSError):
+            continue
+        out.append((ts, ln[11:]))
+    out.reverse()
+    return out
+
+
+def _ai_week_rate(paths=None, now=None):
+    """What the last seven days actually cost, from the log alone (3.36
+    N6): the hours the AFK catch-up was running (its own two lines open
+    and close every window), how many distinct nights were described in
+    them, how many describes that took (repeats included), and what the
+    eye's looks cost. Never a guess: with under an hour measured the
+    answer says so, and the Working page prints that instead of a
+    number. Cached ten minutes - the log is four megabytes."""
+    now = time.time() if now is None else now
+    live = paths is None          # the app's own log, cached; a test
+    if live:                      # hands in its own files, never cached
+        c = _WEEK.get("out")
+        if c and now - _WEEK["t"] < 600:
+            return c
+        paths = [os.path.join(_data_dir(), nm)
+                 for nm in ("lore.log.1", "lore.log")]
+    rows = []
+    end_last = None
+    for lp in paths:
+        try:
+            end_last = os.path.getmtime(lp)
+        except OSError:
+            continue
+        rows += _log_stamped(lp, end_last)
+    cut = now - _WEEK_DAYS * 86400.0
+    afk = 0.0
+    open_t = None
+    nights = set()
+    describes = looks = 0
+    eye_s = 0.0
+    first = None
+    for ts, msg in rows:
+        if ts < cut:
+            continue
+        if first is None:
+            first = ts
+        if msg.startswith("AFK catch-up: no keyboard"):
+            if open_t is not None:
+                # opened twice = the app came back mid-window; the
+                # first window ends where the second begins
+                afk += max(0.0, ts - open_t)
+            open_t = ts
+        elif msg.startswith("AFK catch-up ended"):
+            if open_t is not None:
+                afk += max(0.0, ts - open_t)
+                open_t = None
+        elif msg.startswith("Described "):
+            nights.add(msg[10:].split(": ", 1)[0])
+            describes += 1
+        elif msg.startswith("The eye on "):
+            m = re.search(r": (\d+) look\(s\) of \d+ wanted.* - "
+                          r"(\d+)m(\d+)s\.$", msg)
+            if m:
+                looks += int(m.group(1))
+                eye_s += int(m.group(2)) * 60 + int(m.group(3))
+    if open_t is not None and end_last is not None:
+        # still away as the log stands: the window runs to the last
+        # line written, never to "now" - a log that stopped mid-window
+        # (the app was closed) must not go on earning hours
+        afk += max(0.0, end_last - open_t)
+    out = {"days": (round(min(_WEEK_DAYS, (now - first) / 86400.0), 1)
+                    if first else 0.0),
+           "afk_s": round(afk), "nights": len(nights),
+           "describes": describes, "eye_looks": looks,
+           "eye_s": round(eye_s),
+           # a look's measured price wants a dozen of them behind it
+           "per_look_s": (round(eye_s / float(looks), 1)
+                          if looks >= 12 else None),
+           "measured": afk >= 3600.0}
+    if live:
+        _WEEK["t"] = now
+        _WEEK["out"] = out
+    return out
+
+
+def _ai_week_eta(left, week=None):
+    """The one sentence's numbers: at the week's measured rate (nights
+    finished per hour away), how long LEFT nights would take. None when
+    nothing honest can be said - the page then says why."""
+    w = dict(week if week is not None else _ai_week_rate())
+    w["eta_s"] = None
+    try:
+        if w.get("measured") and int(w.get("nights") or 0) > 0 and left:
+            w["eta_s"] = round(float(left) * float(w["afk_s"])
+                               / float(w["nights"]))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return w
+
+
 def _ai_tally():
     """One walk of the library, answering everything the Working page asks:
     how many videos each job still owes, and HOW MANY SECONDS OF VIDEO those
@@ -28801,6 +29348,15 @@ def _ai_tally():
             "auditing": 0.0}
     done = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
     gaveup = {"listening": 0, "hearing": 0, "thinking": 0, "auditing": 0}
+    # 3.36 N6 the eye's backlog: looking is asked for, never swept, so
+    # this number moves only when he presses for it - it is counted so
+    # the line under eye_looks can say what the shelf would cost
+    eye_left = 0
+    try:
+        _eye_on = (_desc_mmproj() is not None
+                   and _describer_paths() is not None)
+    except Exception:
+        _eye_on = False
     try:
         for d, kind in _library_dirs(SETTINGS.get("output_dir", "")):
             for v in _scan_dir_mp4s(d, kind):
@@ -28839,6 +29395,12 @@ def _ai_tally():
                         # the duration is already in the library scan; falling
                         # back to a probe here would stat-storm the whole disk
                         secs[job] += _secs_no_probe(v)
+                if _eye_on:
+                    try:
+                        if _vis_owing(p):
+                            eye_left += 1
+                    except Exception:
+                        pass
                 # THE AUDIT COUNTS LIKE EVERY OTHER LABOUR - but only on
                 # nights it is UNLOCKED for (an honest review exists).
                 # The version matters: an audit from an older auditor
@@ -28855,7 +29417,8 @@ def _ai_tally():
     except Exception:
         pass
     out = {"t": now, "total": total, "gaveup": gaveup,
-           "held_back": held_back}
+           "held_back": held_back,
+           "eye_left": (eye_left if _eye_on else None)}
     for job in ("listening", "hearing", "thinking", "auditing"):
         out[job] = {"left": left[job], "done": done[job], "secs": secs[job]}
     _AI["_tally"] = out
@@ -30733,11 +31296,40 @@ class _JsApi:
                     # seconds of wall clock for everything still owed
                     "eta_s": (round(k["secs"] * rate) if rate else None),
                     "backlog_s": round(k["secs"]),
+                    # 3.36 N6 the plain arithmetic: at the rate of the
+                    # last seven days - the log's own AFK windows and
+                    # "Described" lines - how long the remaining nights
+                    # would take; never a guess, and the page says
+                    # "not enough measured yet" under an hour
+                    "week": (_ai_week_eta(k["left"])
+                             if kind == "thinking" else None),
                 })
             # the old flat fields, still used by the Settings plate
             out.update({"stt_done": t["hearing"]["done"],
                         "hl_done": t["listening"]["done"]})
         return out
+
+    def eye_cost(self):
+        """What one night costs the eye at the current eye_looks, and
+        what the shelf's backlog would cost at that setting (3.36 N6):
+        the per-look price is the log's own measure over the last seven
+        days (None until a dozen looks have been timed here - the page
+        then names the design figure and says it is unmeasured), and
+        the owed count is the tally's, so it is the same number the
+        shelf would show. The default is not touched: the line is what
+        lets him choose."""
+        w = _ai_week_rate()
+        t = (_ai_tally() if self._ctl.session is None
+             else (_AI.get("_tally") or {}))
+        try:
+            looks = int(SETTINGS.get("eye_looks", 24))
+        except (TypeError, ValueError):
+            looks = 24
+        return {"looks": max(1, min(60, looks)),
+                "per_look_s": w.get("per_look_s"),
+                "design_s": 21,
+                "owed": t.get("eye_left"),
+                "eye": _desc_mmproj() is not None}
 
     def insights(self, path):
         """A recording's title, summary, chapters, described moments and

@@ -28,6 +28,12 @@ try:
 except Exception:
     pass
 lore.SETTINGS["output_dir"] = r"D:\Records"
+# AND THE MASTER SWITCH IS PENNED LIKE THE LIBRARY WALK. load_settings
+# reads his real settings.json, and _bg_work_allowed answers off that:
+# with background work switched off in the app, every ask road below
+# refuses and four checks go red on his preference rather than on any
+# change to the code.
+lore.SETTINGS["bg_shutdown"] = False
 
 ok = bad = 0
 

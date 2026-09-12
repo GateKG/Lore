@@ -3089,6 +3089,7 @@ function makeMock(){
     ai_queue_list:async()=>({ok:true,queue:window.__mockQ||[],
       next:{name:'mock night.mp4',kind:'listening',rank:'later'},
       shutdown:!!window.__mockSd}),
+    eye_cost:async()=>({looks:24,per_look_s:21.4,design_s:21,owed:1263,eye:true}),
     afk_ai_status:async()=>({enabled:!!window.__mockAfk,minutes:15,
       running:false,idle_s:12,kbms_s:12,pad_s:null,pad_seen:false,
       source:'keyboard or mouse',left_s:888,since_s:0,times:0,
@@ -6624,7 +6625,26 @@ function workPlate(){
         (k.left&&k.eta_s!=null?est+'about '+dur(k.eta_s)+' for all of them':null),
         (k.speed!=null?est+k.speed+'\u00d7 realtime'
                        +(kind==='thinking'?' averaged over the library':'')
-                       +(k.measured?'':' (estimated until it has timed one)'):null)
+                       +(k.measured?'':' (estimated until it has timed one)'):null),
+        /* 3.36 N6 THE ARITHMETIC HE COULD NOT SEE. The estimate above
+           prices the backlog by video length; this one is the week as
+           it actually went - nights finished per hour away from the
+           PC, read off the log's own AFK windows and "Described" lines
+           - and it says "not enough measured yet" rather than guess
+           while the log holds under an hour away. */
+        (kind==='thinking'&&k.left&&k.week
+          ?(!k.week.measured
+             ?'at the rate of the last seven days: not enough measured yet '
+              +'(under an hour away from the PC in the log)'
+             :(k.week.nights
+                ?'at the rate of the last seven days ('+num(k.week.nights)
+                  +' night'+(k.week.nights===1?'':'s')+' finished in '
+                  +dur(k.week.afk_s)+' away from the PC) the remaining '
+                  +num(k.left)+' would take about '+dur(k.week.eta_s)
+                :'at the rate of the last seven days: no night finished in '
+                  +dur(k.week.afk_s)+' away from the PC, so the remaining '
+                  +num(k.left)+' cannot be timed yet'))
+          :null)
       ].filter(Boolean).join('  \u00b7  ')):'';
       if(k&&!k.on){ set(o,false,title+' \u2014 switched off','',null,null); return; }
       const paused=!!held[kind];
@@ -7271,6 +7291,36 @@ function renderSet(cL,cR,app,spreadIdx){
       +'Resume \u2014 is on the Working page, one place for all of it. '
       +'All of this runs on your own machine and never while a game '
       +'is on.');
+    /* 3.36 N6 THE EYE'S PRICE, UNDER THE NUMBER THAT SETS IT. Looking
+       is the expensive sense (about 21 s of the card a look, two dozen
+       a night) and the shelf is over a thousand nights deep: the number
+       is his call, and this line is what lets him make it. The per-look
+       cost is the log's own measure over the last seven days; until a
+       dozen looks have been timed on this machine it names the design
+       figure and says so. The default is not touched. */
+    const eyeN=ctlNum('eye_looks',1,60);
+    row(R,'Looks per night',eyeN,
+        'how many frames the eye may look at in one recording');
+    const eyeLine=el('div','shint','');R.append(eyeLine);
+    const eyeFill=async()=>{
+      let ec=null;try{if(api.eye_cost)ec=await api.eye_cost();}catch(e){}
+      if(!ec||!eyeLine.isConnected)return;
+      const looks=Math.max(1,parseInt(ec.looks||0)||1);
+      const per=(ec.per_look_s!=null)?+ec.per_look_s:null;
+      const sec=looks*(per!=null?per:(+ec.design_s||21));
+      const fmt=n=>String(n).replace(/\B(?=(\d{3})+(?!\d))/g,',');
+      let t=looks+' looks \u00d7 '
+        +(per!=null?'~'+Math.round(per)+' s'
+                   :'~'+(+ec.design_s||21)+' s (the design figure \u2014 no look '
+                    +'has been timed on this machine in the last seven days)')
+        +' = ~'+(Math.round(sec/6)/10)+' min per night';
+      if(ec.eye===false)t+='; there is no eye installed, so nothing is owed a look';
+      else if(ec.owed!=null)t+='; the '+fmt(ec.owed)+' night'+(ec.owed===1?'':'s')
+        +' still owed a look would take ~'+(Math.round(ec.owed*sec/360)/10)
+        +' h at this setting';
+      eyeLine.textContent=t;};
+    eyeFill();
+    eyeN.addEventListener('change',()=>setTimeout(eyeFill,1500));
     /* A SAVED KEY MAY NOT HIDE. The Claude section left, but a key
        that was pasted before still quietly pays to name NEW games -
        so if one exists, it says so, with the only control that

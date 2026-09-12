@@ -409,7 +409,9 @@ print("\n--- (e) wired into the shelf walks, behind its own marker ---")
 sm = func_src("_shelf_migrations")
 check("_shelf_migrations asks strikes.mig, not shelf.mig, for the thin walk",
       "thin = not _thin_mig_done(lib)" in sm
-      and "if not todo and not thin:" in sm)
+      # 3.36 N4 added the stale-.new sweep to the same early return,
+      # so the clause is quoted, not the whole line
+      and "if not todo and not thin" in sm)
 check("...runs it LAST inside work(), after the five, and reports a walk "
       "that could not read the shelf",
       "_thin_strike_migration()" in sm

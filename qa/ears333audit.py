@@ -441,12 +441,30 @@ check("the union sits right after the garble shortlist, before the hints "
 check("_AUD_V is 7, the value at HEAD",
       NS["_AUD_V"] == 7 == HN["_AUD_V"]
       and assign_src(LSRC, LTREE, "_AUD_V") == "_AUD_V = 7")
-for nm in ("_aud_src", "_aud_owing", "_aud_owing_swept", "_aud_covers_now",
+for nm in ("_aud_src", "_aud_owing_swept", "_aud_covers_now",
            "_aud_corrected", "_aud_garble", "_aud_carry",
            "_aud_apply_strikes", "_aud_relisten",
            "_aud_done_current"):
     check(nm + " is byte-identical to HEAD's (count-undoing / mtime laws)",
           seg(LSRC, LTREE, nm) == seg(HSRC, HTREE, nm))
+# 3.36 N5: _aud_owing gained ONE gate and nothing else - the session's
+# settled set, read first (a night audited twice inside ten minutes with
+# nothing to fix, strike, fold or re-tell is left alone until a layer
+# other than the review's clock moves). It NARROWS: a settled night
+# answers not-owed; it widens nothing, moves no clock, and asking by
+# name never reads this judge. So the pin moves from byte-identity to
+# "differs only by", the way _aud_dossier's did in drop F.
+OWE_GATE = ('    # 3.36 N5 A NIGHT LEFT ALONE STAYS ALONE - until a layer other than\n'
+            '    # the review\'s clock moves (see _aud_settled). Asking by name never\n'
+            '    # reads this judge, so the button still audits it in full.\n'
+            '    if _aud_settled(video_path):\n'
+            '        return False\n')
+OW = seg(LSRC, LTREE, "_aud_owing").replace("\r\n", "\n")
+check("_aud_owing differs from HEAD's ONLY by the 3.36 N5 settled gate "
+      "(count-undoing / mtime laws)",
+      OW.count(OWE_GATE) == 1
+      and OW.replace(OWE_GATE, "")
+      == seg(HSRC, HTREE, "_aud_owing").replace("\r\n", "\n"))
 # 3.34 drop H: ONE more, by name - the thin-strike walk puts struck
 # lines back into the transcript (as the echo walk did in 3.30); the
 # auditor itself still writes only its own sidecars.
