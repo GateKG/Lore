@@ -2978,7 +2978,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.36'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.37'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3089,9 +3089,11 @@ function makeMock(){
     have_flags:async ps=>{const o={};(ps||[]).forEach((p,i)=>{
       o[p]={hl:true,stt:true,lvl:true,
         ins:i%3!==1, ins_lvl:i%3===1?1:2,
-        ins_why:'no audit has read this description yet',
+        ins_why:'described by an older version (v2; v3 is installed) '
+                +'- it will be told again on its own',
         aud:i%3===2, aud_lvl:i%3===2?2:(i%3===0?1:0), aud_v:i%3===0?6:7,
-        aud_why:'it read an older description'};});
+        aud_why:'it read an older description - it will be audited '
+                +'again'};});
       return o;},
     ai_resume_all:async()=>({ok:true,woke:['listening']}),
     models_status:async()=>({ok:true,where:'C:/mock/models',
@@ -3169,7 +3171,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.36'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.37'}),
     /* 3.36 AUDIT UI-E1: the mock keeps the patch, as the real backend does */
     set_settings:async(p)=>{window.__mockSet=Object.assign(window.__mockSet||{},p||{});const r=await api.get_settings();Object.assign(r.settings,window.__mockSet);return r;},
     set_games:async(l)=>l,set_ignore:async(l)=>l,
@@ -3839,24 +3841,29 @@ function markPaint(b,f,k){
                           stt:f.stt_why,hl:f.hl_why}[k])||''):'';
   b.classList.toggle('gone',/^gave up/.test(why0));   /* UI-A2: only a gave-up night is struck */
   if(lvl===1){
-    /* SILVER SAYS WHY, in the backend's own words: the audit either
-       never read this description or read an older one. Either way
-       the answer is the same - run the audit again (\u26a1 Audit only). */
+    /* SILVER SAYS WHY, in the backend's own words - and silver means
+       the same on every mark (3.37 O1, his 13 Sep word): an older pass
+       made it, or its input has changed since, never that a DIFFERENT
+       pass is missing. The DO names the \u26a1 menu's own item for
+       that pass (the pen's is "Describe it"). */
     const why=({aud:f.aud_why,ins:f.ins_why,
                 stt:f.stt_why,hl:f.hl_why}[k])||'a fresh pass is owed';
     const DO={aud:'run the audit again (\u26a1 \u2192 Audit only)',
-              ins:'run the audit again (\u26a1 \u2192 Audit only)',
+              ins:'describe it again (\u26a1 \u2192 Describe it)',
               stt:'read it again (\u26a1 \u2192 Transcripts)',
               hl:'listen again (\u26a1 \u2192 Sound & gold moments)'};
-    const HEAD={aud:'audited at v'+(f.aud_v||'?')+', but ',
-                ins:'described \u2014 but ',
+    const HEAD={aud:(/^audited by v/.test(why)?'audited \u2014 but '
+                     :'audited at v'+(f.aud_v||'?')+', but '),
+                /* the two "described by an older version" whys open with
+                   the word already; a HEAD in front doubled it */
+                ins:(/^described by/.test(why)?'':'described \u2014 but '),
                 stt:'there is a transcript \u2014 but ',
                 hl:'there is a sound pass \u2014 but '};
     b.title=(HEAD[k]||'')+why+' \u2014 '+(DO[k]||'');
   }else if(lvl===2){
     b.title=(k==='aud')
       ? 'audited by v'+(f.aud_v||'?')+' against this description'
-      : (k==='ins' ? 'described, and the audit has read this version'
+      : (k==='ins' ? 'described by the current version'
                    : AV_HAS[k]);
   }else{
     b.title=why0||AV_NOT[k];
@@ -4097,9 +4104,15 @@ function qlookShow(v){
                :(k==='stt')?(f.stt_lvl|0):(k==='hl')?(f.hl_lvl|0)
                :(f[k]?2:0);
       if(lvl===2)return AV_HAS[k];
-      if(lvl===1)return ({aud:'audited, older',
-        ins:'described, audit owed', stt:'transcript, older reader',
-        hl:'sound pass, older'}[k]||'older');
+      /* 3.37 O1: silver says the backend's own why, cut at its first
+         " - " (what happens next is the tip's job) - never a word
+         about a different pass */
+      if(lvl===1){
+        const w=String(({aud:f.aud_why,ins:f.ins_why,stt:f.stt_why,
+                         hl:f.hl_why}[k])||'').split(' - ')[0].trim();
+        return w||({aud:'audited, older',ins:'described, older',
+          stt:'transcript, older reader',hl:'sound pass, older'}[k]
+          ||'older');}
       /* 3.36 AUDIT UI-A1: level 0 with a reason (given up) says the reason */
       return ({aud:f.aud_why,ins:f.ins_why,stt:f.stt_why,hl:f.hl_why}[k])
              ||AV_NOT[k];

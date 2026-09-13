@@ -601,11 +601,37 @@ _G_OFF = (
     '                # the template flag for the model. Gemma ignores both.\n'
     '                "reasoning_budget": 0,\n'
     '                "chat_template_kwargs": {"enable_thinking": False},\n')
+# 3.37 O2 records how the answer ended (last_finish / last_tokens) -
+# three pure insertions: the pair in __init__ under its comment, the
+# pair at the top of ask(), the record after the answer lands. The
+# bare pair (1) also sits inside (0), so (0) and (2) go first.
+_O2_ASK = (
+    '        # 3.37 O2: how the last answer ended, for the window loop\n'
+    '        self.last_finish = None\n'
+    '        self.last_tokens = None\n',
+    '        self.last_finish = None\n'
+    '        self.last_tokens = None\n',
+    '            # 3.37 O2 HOW THE ANSWER ENDED. A grammar-fenced answer that\n'
+    '            # will not parse was CUT at max_tokens (finish_reason\n'
+    '            # "length") - 22 of 60 windows since the 3.36 install, every\n'
+    '            # one of them "for up to 1500". The window loop reads these\n'
+    '            # to salvage what came whole and to double the ceiling.\n'
+    '            try:\n'
+    '                self.last_finish = (d.get("choices") or [{}])[0] \\\n'
+    '                    .get("finish_reason")\n'
+    '                _ct = (d.get("usage") or {}).get("completion_tokens")\n'
+    '                self.last_tokens = int(_ct) if _ct is not None else None\n'
+    '            except Exception:\n'
+    '                pass\n')
+_ds = fsrc(SRC, "_DescServer", TREE).replace(_G_OFF, "")
+_d1 = _ds.replace(_O2_ASK[2], "").replace(_O2_ASK[0], "")
 check("the parent describer server is untouched (drop G's thinking-off "
-      "pair aside)",
+      "pair and 3.37 O2's finish-reason lines aside)",
       HSRC and _G_OFF in fsrc(SRC, "_DescServer", TREE)
+      and _ds.count(_O2_ASK[2]) == 1 and _ds.count(_O2_ASK[0]) == 1
+      and _d1.count(_O2_ASK[1]) == 1
       and fsrc(HSRC, "_DescServer", HTREE)
-      == fsrc(SRC, "_DescServer", TREE).replace(_G_OFF, ""))
+      == _d1.replace(_O2_ASK[1], ""))
 check("the idle tick rides beside the ask server's at every call site",
       SRC.count("    _emb_idle_tick()\n") == 3
       and SRC.count("_ask_idle_tick()\n        _emb_idle_tick()\n"
@@ -962,9 +988,13 @@ if HSRC:
               "_ai_sidecar", "_ai_sidecar_fresh", "_model_have",
               "_free_port", "_DescServer", "_AsrServer", "_ask_negish",
               "_moment_of"):
-        # _DescServer: drop G's thinking-off pair aside (see _G_OFF)
-        same.append(fsrc(HSRC, f, HTREE)
-                    == fsrc(SRC, f, TREE).replace(_G_OFF, ""))
+        # _DescServer: drop G's thinking-off pair aside (see _G_OFF),
+        # and 3.37 O2's finish-reason lines (see _O2_ASK)
+        _cur = fsrc(SRC, f, TREE).replace(_G_OFF, "")
+        if f == "_DescServer":
+            for _blk in _O2_ASK:
+                _cur = _cur.replace(_blk, "")
+        same.append(fsrc(HSRC, f, HTREE) == _cur)
     check("the roads the box, the tail and the sidecars already used are "
           "byte-identical to HEAD (17 functions and classes)", all(same))
     _ask_new = fsrc(SRC, "_ask_llm", TREE)
@@ -1009,10 +1039,116 @@ if HSRC:
         '                except Exception:\n'
         '                    pass\n'
     )
+    # 3.37 O1 (the scale law): the pen's level and why, the audit's two
+    # whys and the block's comment, each NEW -> OLD, so have_flags is
+    # still 2b59d37's once they are swapped back
+    _O1_INS = (
+        '''            if _has_desc:
+                # _ins_owing is the count-undoing-cached judge; asked
+                # here for the minority of rows that carry a
+                # description (and in the 3.36 gave-up branch above,
+                # the one row without one that it must tell from
+                # "tries left"), so a batch of 300 stays cheap
+                _gen = int(d.get("gen") or 2)
+                try:
+                    _owed = bool(_ins_owing(p))
+                except Exception:
+                    _owed = False
+                if _gen >= _INS_GENERATION and not _owed:
+                    row["ins_lvl"] = 2
+                else:
+                    row["ins_lvl"] = 1
+                    if _gen < _INS_GENERATION:
+                        # an older describer made it: the sweep brings
+                        # it up on its own while the eye is mounted
+                        # and the upgrade has tries left; otherwise
+                        # only an ask by name does
+                        row["ins_why"] = (
+                            "described by an older version (v%d; v%d is "
+                            "installed) - " % (_gen, _INS_GENERATION)
+                            + ("it will be told again on its own"
+                               if _owed else
+                               "ask for it by name to bring it up to "
+                               "date"))
+                    elif os.path.isfile(_ai_sidecar(p, "ins") + ".new"):
+                        # THE LEDGER SAYS WHO ASKED. Only the audit's
+                        # retell writes a "retold" ledger into the
+                        # staged doc; a .new without one is his own
+                        # press (Describe it on a finished night), so
+                        # the tip never names an audit that did not
+                        # run. Measured on tempdir nights before this
+                        # read: a by-name redo, the same redo with a
+                        # try spent and an audit retell all wore the
+                        # one why.
+                        _nd = {}
+                        try:
+                            with open(_ai_sidecar(p, "ins") + ".new",
+                                      encoding="utf-8") as fh:
+                                _nd = json.load(fh) or {}
+                        except Exception:
+                            _nd = {}
+                        row["ins_why"] = (
+                            "the audit corrected lines inside it - "
+                            "those minutes are being told again"
+                            if isinstance(_nd.get("retold"), list) else
+                            "it is being described again - asked by "
+                            "name")
+                    else:
+                        row["ins_why"] = "a fresh telling is owed"
+''',
+        '''            if _has_desc:
+                row["ins_lvl"] = 2 if row["aud_lvl"] == 2 else 1
+                if row["ins_lvl"] == 1:
+                    row["ins_why"] = (
+                        "no audit has read this description yet"
+                        if row["aud_lvl"] == 0 else
+                        (row["aud_why"] or "the audit is owed again"))
+''')
+    _O1_HEAD = (
+        '''            # THE PEN MEANS WHAT EVERY OTHER MARK MEANS (3.37 O1).
+            # Until 13 Sep the pen went silver whenever the AUDIT was
+            # not gold - his 3.2x word, "silver would mean i need to
+            # rerun audit" - and on 13 Sep he replaced it: "silver
+            # should be for old versions of the suite.. if it's not
+            # audited I would know from it not having an audit icon
+            # from the beginning!" So, on all four marks: gold = this
+            # pass exists and is current; silver = it exists but an
+            # older version made it or its input has changed, and the
+            # why says which and what happens next; dark = it does not
+            # exist. Never silver because a DIFFERENT pass is missing -
+            # the audit mark speaks for the audit alone.
+''',
+        '''            # AND THE DESCRIPTION IS GOLD ONLY WHEN AN AUDIT HAS READ
+            # IT. "silver would mean i need to rerun audit, because the
+            # audit didnt hit this version of the description."
+''')
+    _O1_AUD = (
+        '''                        # newer auditor is installed. 3.37 O1: the why
+                        # says what happens next, with the real numbers.
+                        row["aud_lvl"] = 1
+                        row["aud_why"] = (
+                            "it read an older description - it will be "
+                            "audited again"
+                            if not _covers else
+                            "audited by v%d; auditor v%d is installed - "
+                            "it will be audited again" % (_v, _AUD_V))
+''',
+        '''                        # newer auditor is installed
+                        row["aud_lvl"] = 1
+                        row["aud_why"] = (
+                            "it read an older description"
+                            if not _covers else
+                            "auditor v%d is installed" % _AUD_V)
+''')
     _hf = msrc(SRC, "_JsApi", "have_flags", TREE)
     same.append(_hf.count(_A1_WHY) == 1
+                and all(_hf.count(a) == 1 for a, b in
+                        (_O1_INS, _O1_HEAD, _O1_AUD))
                 and msrc(HSRC, "_JsApi", "have_flags", HTREE)
-                == _hf.replace(_A1_WHY, ""))
+                == _hf.replace(_A1_WHY, "")
+                .replace(_O1_INS[0], _O1_INS[1])
+                .replace(_O1_HEAD[0], _O1_HEAD[1])
+                .replace(_O1_AUD[0], _O1_AUD[1]))
     # models_fetch: drop G's two fetch edits aside (one file budgeted once,
     # present where the reads look - describer333test drives them); the
     # method is 2b59d37's once they are swapped back
@@ -1222,6 +1358,19 @@ if HSRC:
           all(_at.count(a) == 1 for a, _b in _N_LOOPS))
     for _a, _b in _N_LOOPS:
         _at = _at.replace(_a, _b)
+    # 3.37 O1: the held-audit line says the audit MARK waits, not that
+    # the pen "stays silver" (silver is for an older telling now)
+    _O1_HELD = (
+        '                        log("The review of " + os.path.basename(path)\n'
+        '                            + " is done, but its audit is held - the "\n'
+        '                            "audit mark stays dark until the audit lane "\n'
+        '                            "runs.")\n',
+        '                        log("The review of " + os.path.basename(path)\n'
+        '                            + " is done, but its audit is held - it "\n'
+        '                            "stays silver until the audit lane runs.")\n')
+    check("3.37 O1 touches _ai_tick in exactly one place: the held-audit "
+          "log line", _at.count(_O1_HELD[0]) == 1)
+    _at = _at.replace(_O1_HELD[0], _O1_HELD[1])
     ha = fsrc(HSRC, "_ai_tick", HTREE).splitlines()
     na = _at.splitlines()
     added = [ln for ln in difflib.unified_diff(ha, na, lineterm="", n=0)
@@ -1332,15 +1481,15 @@ check("_EmbServer.start refuses without the model (no spawn, no port sweep)",
 
 # =========================================================================
 print("\n--- the UI, read from its source ---")
-check("the stamps: 3.36 in both mocks, lore.py APP_VERSION 3.36, no 3.35 "
-      "version left (3.35 drop L)", USRC.count("version:'3.36'") == 2
-      and "version:'3.35'" not in USRC and 'APP_VERSION = "3.36"' in SRC)
+check("the stamps: 3.37 in both mocks, lore.py APP_VERSION 3.37, no 3.36 "
+      "version left (3.35 drop L)", USRC.count("version:'3.37'") == 2
+      and "version:'3.36'" not in USRC and 'APP_VERSION = "3.37"' in SRC)
 check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "librarian_ready, so the harness box is never dead",
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
       and "librarian_ready:true,second_ear:true,room_names:'',"
-          "my_name:'',game_rank:{},version:'3.36'" in USRC)
+          "my_name:'',game_rank:{},version:'3.37'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "

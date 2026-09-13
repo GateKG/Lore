@@ -140,7 +140,10 @@ torn = night("torn",
 check("clocks match, but the review is in pieces -> NOT covered",
       lore._aud_covers_now(torn) is False)
 whole = night("whole",
-              ins={"complete": True, "chapters": [{"t": 0}]},
+              # 3.37 O1: whole AND current - gen stamped, counted, titled
+              ins={"complete": True, "chapters": [{"t": 0}],
+                   "gen": lore._INS_GENERATION, "cov": {"frac": 1.0},
+                   "tgen": lore._TITLE_GEN},
               aud={"complete": True, "v": lore._AUD_V}, covers=True)
 check("a whole review with a matching clock IS covered",
       lore._aud_covers_now(whole) is True)
@@ -154,8 +157,13 @@ check("empty: and no audit mark either (they cannot contradict)",
       f[empty]["aud_lvl"] == 0)
 check("whole: both GOLD",
       f[whole]["ins_lvl"] == 2 and f[whole]["aud_lvl"] == 2)
-check("torn: SILVER, and it says the audit read an older description",
-      f[torn]["ins_lvl"] == 1 and f[torn]["aud_lvl"] == 1)
+check("torn: SILVER on both marks, each for its own reason (3.37 O1): "
+      "the pen because an older telling is owed again, the scale because "
+      "it read an older description and will be audited again",
+      f[torn]["ins_lvl"] == 1 and f[torn]["aud_lvl"] == 1
+      and f[torn]["aud_why"]
+      == "it read an older description - it will be audited again"
+      and "audit" not in f[torn]["ins_why"] and f[torn]["ins_why"])
 
 print("\n--- S8: one meaning of 'audited' ---")
 check("the tally asks the same question the shelf does",

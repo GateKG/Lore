@@ -61,18 +61,23 @@ def night(name, ins=None, aud=None, covers=False):
     return p
 
 
-gold = night("gold", ins={"complete": True, "chapters": [{"t": 0}]},
+# 3.37 O1: a WHOLE review by the INSTALLED describer - gen stamped,
+# coverage counted, titled - is what the pen calls current. A review
+# with no gen key is a gen-2 telling and reads silver on its own.
+CUR = {"complete": True, "chapters": [{"t": 0}],
+       "gen": lore._INS_GENERATION, "cov": {"frac": 1.0},
+       "tgen": lore._TITLE_GEN}
+gold = night("gold", ins=dict(CUR),
              aud={"complete": True, "v": lore._AUD_V}, covers=True)
-silver_a = night("silver_audit",
-                 ins={"complete": True, "chapters": [{"t": 0}]},
+silver_a = night("silver_audit", ins=dict(CUR),
                  aud={"complete": True, "v": lore._AUD_V - 2})
-silver_d = night("silver_desc",
-                 ins={"complete": False, "chapters": [{"t": 0}],
-                      "windows": {"0": {}}},
-                 aud={"complete": True, "v": lore._AUD_V})
+# no audit at all - the pen is GOLD and the audit mark dark (his 13
+# Sep word: "if it's not audited I would know from it not having an
+# audit icon from the beginning")
+gold_d = night("gold_desc_no_audit", ins=dict(CUR))
 nothing = night("nothing")
 
-f = api.have_flags([gold, silver_a, silver_d, nothing])
+f = api.have_flags([gold, silver_a, gold_d, nothing])
 check("a current audit that read THIS description is GOLD",
       f[gold]["aud_lvl"] == 2)
 check("an audit that did not read this description is SILVER",
@@ -82,10 +87,15 @@ check("and it says WHICH version it was",
 check("no audit at all is nothing (0)", f[nothing]["aud_lvl"] == 0)
 check("a described night whose audit read it is GOLD",
       f[gold]["ins_lvl"] == 2)
-check("a description no audit has read is SILVER, not nothing",
-      f[silver_d]["ins_lvl"] == 1)
-check("and it says why, in his terms",
-      bool(f[silver_d]["ins_why"]))
+check("a current description no audit has read is GOLD - silver is "
+      "for an older telling, never for a missing audit (3.37 O1)",
+      f[gold_d]["ins_lvl"] == 2 and f[gold_d]["ins_why"] == "")
+check("and its audit mark is dark, with nothing to say",
+      f[gold_d]["aud_lvl"] == 0 and f[gold_d]["aud_why"] == "")
+check("a silver audit says what happens next (this one never read "
+      "today's description)",
+      f[silver_a]["aud_why"]
+      == "it read an older description - it will be audited again")
 check("no review at all is nothing", f[nothing]["ins_lvl"] == 0)
 lore._ai_sidecar = _real
 

@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.36"
+APP_VERSION = "3.37"
 
 try:
     import psutil
@@ -18085,6 +18085,9 @@ class _DescServer:
         self.pr = None
         self.port = int(port or _DESC_PORT)
         self.base = f"http://127.0.0.1:{self.port}"
+        # 3.37 O2: how the last answer ended, for the window loop
+        self.last_finish = None
+        self.last_tokens = None
 
     def start(self, budget=900):
         """Bring the model up. Returns True when it answers /health.
@@ -18160,6 +18163,8 @@ class _DescServer:
         a list of (label, base64-jpeg) shown to the model inline - each
         preceded by its label so what it sees is anchored in time."""
         import re as _re
+        self.last_finish = None
+        self.last_tokens = None
         if self.pr is None or self.pr.poll() is not None:
             if getattr(self, "borrowed", False):
                 # someone else's server (a running describe job's): NEVER
@@ -18211,6 +18216,18 @@ class _DescServer:
             # is watching - there it read as "thinking..." forever.
             with _urlreq.urlopen(req, timeout=max(5, int(timeout))) as r:
                 d = json.loads(r.read().decode("utf-8", "replace"))
+            # 3.37 O2 HOW THE ANSWER ENDED. A grammar-fenced answer that
+            # will not parse was CUT at max_tokens (finish_reason
+            # "length") - 22 of 60 windows since the 3.36 install, every
+            # one of them "for up to 1500". The window loop reads these
+            # to salvage what came whole and to double the ceiling.
+            try:
+                self.last_finish = (d.get("choices") or [{}])[0] \
+                    .get("finish_reason")
+                _ct = (d.get("usage") or {}).get("completion_tokens")
+                self.last_tokens = int(_ct) if _ct is not None else None
+            except Exception:
+                pass
             txt = (d.get("choices") or [{}])[0].get("message", {})                 .get("content", "")
             return _re.sub(r"<think>.*?</think>", "", txt, flags=_re.S).strip()
         except Exception as e:
@@ -19026,6 +19043,75 @@ def _window_parts(wpart):
 
 
 _INS_SAID = threading.local()
+
+
+def _desc_salvage(txt):
+    """The whole stretches of an answer cut at the cap (3.37 O2).
+
+    The describer's answer is grammar-fenced, so the only way it fails
+    json.loads is that max_tokens cut it before its closing brace - and a
+    cut answer still carries every segment it finished. Walk the
+    "segments" array with a string-aware brace count (a brace inside a
+    quote is text, not structure), cut after the last complete segment
+    object, close with ]} - the moments are dropped - and parse. Returns
+    the doc with >= 1 segment, never a partial one; the whole doc when
+    the answer was not cut at all; None when nothing whole came back.
+    Never raises. Nothing is written anywhere."""
+    try:
+        txt = str(txt or "")
+        try:
+            doc = json.loads(txt)
+            if isinstance(doc, dict) \
+                    and isinstance(doc.get("segments"), list) \
+                    and doc["segments"]:
+                return doc
+            return None
+        except Exception:
+            pass
+        i0 = txt.find("{")
+        if i0 < 0:
+            return None
+        ks = txt.find('"segments"', i0)
+        if ks < 0:
+            return None
+        ka = txt.find("[", ks)
+        if ka < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        last_end = -1
+        for i in range(ka + 1, len(txt)):
+            c = txt[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    last_end = i
+                elif depth < 0:
+                    break
+            elif c == "]" and depth == 0:
+                break               # the array closed: the cut was later
+        if last_end < 0:
+            return None
+        doc = json.loads(txt[i0:last_end + 1] + "]}")
+        if isinstance(doc, dict) and isinstance(doc.get("segments"), list) \
+                and doc["segments"]:
+            return doc
+        return None
+    except Exception:
+        return None
 
 
 def _insights_one(video_path, forced=False, fresh=False):
@@ -19973,6 +20059,7 @@ def _insights_one(video_path, forced=False, fresh=False):
                           "come back to it, say so plainly by its name.\n")
             except Exception:
                 so_far = ""
+            _dbl = False        # 3.37 O2: an answer of this window was cut
             while pending and asked < 5 and not _AI["abort"] \
                     and not _AI.get("wind"):
                 r0, r1 = pending.pop(0)
@@ -20028,7 +20115,20 @@ def _insights_one(video_path, forced=False, fresh=False):
                 # about twelve lines a stretch. Measured reach by
                 # stretch count: 3 -> 27 lines, 5 -> 48, 8 -> 100.
                 want = max(3, min(12, -(-len(use) // 12)))
-                out_cap = min(1500, 900 + 100 * max(0, want - 5))
+                # 3.37 O2 THE CAP IS A CEILING, NOT A TARGET. The answer
+                # is grammar-fenced, so it stops at its own closing
+                # brace: a higher ceiling costs nothing on an answer
+                # that fits and saves the whole window on one that does
+                # not. The old 900-1500 cut 22 of the 60 windows asked
+                # since the 3.36 install - the "quote" fields copy
+                # transcript lines, and the room's Arabic costs Qwen
+                # about two tokens a character, so a 12-stretch answer
+                # passed 1,200 before it closed. Hard ceilings: 4000
+                # here, 8000 on an ask after a cut. The body budget
+                # above (_c0) still reserves the old figure against the
+                # context; past that the context's end cuts like the cap
+                # did, and the salvage below catches it the same way.
+                out_cap = min(4000, 1500 + 150 * want)
                 head = (("NOBODY IN THE ROOM SPOKE in this window. Every "
                          "line is what a video, a stream or a song was "
                          "saying on his screen while he played. Write one "
@@ -20047,14 +20147,20 @@ def _insights_one(video_path, forced=False, fresh=False):
                           f"({0} to {len(use) - 1}). "
                           f"{want} stretches.\n\n")
                 got = None
+                _mt = out_cap
+                _fin = None
                 for _attempt in range(2):
+                    # an ask after a cut carries twice the ceiling - the
+                    # retry, and every later ask of this window
+                    _mt = min(8000, 2 * out_cap) if _dbl else out_cap
                     txt = srv.ask(_DESC_SYSTEM
                                   + _who_law(bool(_stt_src.get(
                                       "voice")), None, _ins_era,
                                       _ins_mine), head + body,
-                                  max_tokens=out_cap,
+                                  max_tokens=_mt,
                                   schema=_DESC_SCHEMA,
                                   images=imgs if _first else None)
+                    _fin = getattr(srv, "last_finish", None)
                     if txt:
                         try:
                             got = json.loads(
@@ -20063,6 +20169,28 @@ def _insights_one(video_path, forced=False, fresh=False):
                             break
                         except Exception:
                             got = None
+                    if _fin == "length":
+                        # CUT AT THE CAP (3.37 O2): what came whole
+                        # is kept. The stretches before the cut are
+                        # real; the coverage road below re-asks the
+                        # rows they did not reach exactly as it does
+                        # for any short answer. Nothing is re-owed
+                        # by this: a night already "unfinished"
+                        # resumes through its own tries as today,
+                        # and one that spent three stays given up
+                        # until asked by name. An EMPTY answer that
+                        # finished "length" (the 3.33 shape: thinking
+                        # spent the budget, content "") has nothing to
+                        # salvage but doubles the retry the same way.
+                        _dbl = True
+                        got = _desc_salvage(txt) if txt else None
+                        if got is not None:
+                            log(f"{name}: window {int(lo // 60)}-"
+                                f"{int(hi // 60)} min - salvaged "
+                                f"{len(got.get('segments') or [])} "
+                                f"stretch(es) from an answer cut at "
+                                f"the cap ({_mt}).")
+                            break
                     if _AI["abort"] or _AI.get("wind"):
                         # AN INTERRUPTION IS NOT A PARSE FAILURE
                         # (3.36 AFK-4). The catch-up's end, a Stop,
@@ -20099,14 +20227,27 @@ def _insights_one(video_path, forced=False, fresh=False):
                     # came back at all. The size of the ask, the room it
                     # was given and the head of whatever did arrive are
                     # the only evidence the next reading of this log has.
+                    # 3.37 O2: AND HOW IT ENDED - the finish reason, the
+                    # tokens spent and the last 80 chars, so a cut can
+                    # be told from anything else on the next reading.
+                    # The 200-char head and the 80-char tail are the
+                    # only evidence kept; the answer never goes to disk.
+                    _tk = getattr(srv, "last_tokens", None)
                     log(f"{name}: window {int(lo // 60)}-{int(hi // 60)} "
                         f"min asked {_tokens(head + body)} token(s) over "
-                        f"{len(use)} line(s) for up to {out_cap}, and the "
+                        f"{len(use)} line(s) for up to {_mt}, and the "
                         f"answer did not parse - "
-                        + ("nothing came back at all."
+                        + ("nothing came back at all (finish "
+                           + str(_fin or "?")
+                           + (", %d token(s)" % _tk if _tk is not None
+                              else "") + ")."
                            if not txt else
-                           str(len(txt)) + " char(s) came back: "
-                           + " ".join(str(txt)[:200].split())))
+                           str(len(txt)) + " char(s) came back (finish "
+                           + str(_fin or "?")
+                           + (", %d token(s)" % _tk if _tk is not None
+                              else "") + "): "
+                           + " ".join(str(txt)[:200].split())
+                           + " ... " + " ".join(str(txt)[-80:].split())))
                 # A RE-ASK IS A RE-ASK EVEN WHEN NOTHING WAS TOLD.
                 # _first is widened above so an empty window is asked
                 # afresh rather than headed "the REST of a window you
@@ -28878,8 +29019,9 @@ def _ai_tick(ctl):
                         # night came back described-but-still-silver,
                         # over and over, for weeks.
                         log("The review of " + os.path.basename(path)
-                            + " is done, but its audit is held - it "
-                            "stays silver until the audit lane runs.")
+                            + " is done, but its audit is held - the "
+                            "audit mark stays dark until the audit lane "
+                            "runs.")
                     if not _AI["abort"] and not _AI.get("wind") \
                             and not (_AI.get("held") or {}).get("auditing") \
                             and (_aud_owing(path)
@@ -32192,18 +32334,30 @@ class _JsApi:
                     else:
                         # SILVER: real work, owed again - either it read
                         # a description that has since changed, or a
-                        # newer auditor is installed
+                        # newer auditor is installed. 3.37 O1: the why
+                        # says what happens next, with the real numbers.
                         row["aud_lvl"] = 1
                         row["aud_why"] = (
-                            "it read an older description"
+                            "it read an older description - it will be "
+                            "audited again"
                             if not _covers else
-                            "auditor v%d is installed" % _AUD_V)
+                            "audited by v%d; auditor v%d is installed - "
+                            "it will be audited again" % (_v, _AUD_V))
                 row["aud"] = row["aud_lvl"] == 2
             except Exception:
                 pass
-            # AND THE DESCRIPTION IS GOLD ONLY WHEN AN AUDIT HAS READ
-            # IT. "silver would mean i need to rerun audit, because the
-            # audit didnt hit this version of the description."
+            # THE PEN MEANS WHAT EVERY OTHER MARK MEANS (3.37 O1).
+            # Until 13 Sep the pen went silver whenever the AUDIT was
+            # not gold - his 3.2x word, "silver would mean i need to
+            # rerun audit" - and on 13 Sep he replaced it: "silver
+            # should be for old versions of the suite.. if it's not
+            # audited I would know from it not having an audit icon
+            # from the beginning!" So, on all four marks: gold = this
+            # pass exists and is current; silver = it exists but an
+            # older version made it or its input has changed, and the
+            # why says which and what happens next; dark = it does not
+            # exist. Never silver because a DIFFERENT pass is missing -
+            # the audit mark speaks for the audit alone.
             if not _has_desc:
                 # NOTHING TO SHOW, SO SHOW NOTHING. A night the tome
                 # listened to and honestly found nothing in was wearing
@@ -32213,12 +32367,57 @@ class _JsApi:
                 row["aud"] = False
                 row["aud_why"] = ""
             if _has_desc:
-                row["ins_lvl"] = 2 if row["aud_lvl"] == 2 else 1
-                if row["ins_lvl"] == 1:
-                    row["ins_why"] = (
-                        "no audit has read this description yet"
-                        if row["aud_lvl"] == 0 else
-                        (row["aud_why"] or "the audit is owed again"))
+                # _ins_owing is the count-undoing-cached judge; asked
+                # here for the minority of rows that carry a
+                # description (and in the 3.36 gave-up branch above,
+                # the one row without one that it must tell from
+                # "tries left"), so a batch of 300 stays cheap
+                _gen = int(d.get("gen") or 2)
+                try:
+                    _owed = bool(_ins_owing(p))
+                except Exception:
+                    _owed = False
+                if _gen >= _INS_GENERATION and not _owed:
+                    row["ins_lvl"] = 2
+                else:
+                    row["ins_lvl"] = 1
+                    if _gen < _INS_GENERATION:
+                        # an older describer made it: the sweep brings
+                        # it up on its own while the eye is mounted
+                        # and the upgrade has tries left; otherwise
+                        # only an ask by name does
+                        row["ins_why"] = (
+                            "described by an older version (v%d; v%d is "
+                            "installed) - " % (_gen, _INS_GENERATION)
+                            + ("it will be told again on its own"
+                               if _owed else
+                               "ask for it by name to bring it up to "
+                               "date"))
+                    elif os.path.isfile(_ai_sidecar(p, "ins") + ".new"):
+                        # THE LEDGER SAYS WHO ASKED. Only the audit's
+                        # retell writes a "retold" ledger into the
+                        # staged doc; a .new without one is his own
+                        # press (Describe it on a finished night), so
+                        # the tip never names an audit that did not
+                        # run. Measured on tempdir nights before this
+                        # read: a by-name redo, the same redo with a
+                        # try spent and an audit retell all wore the
+                        # one why.
+                        _nd = {}
+                        try:
+                            with open(_ai_sidecar(p, "ins") + ".new",
+                                      encoding="utf-8") as fh:
+                                _nd = json.load(fh) or {}
+                        except Exception:
+                            _nd = {}
+                        row["ins_why"] = (
+                            "the audit corrected lines inside it - "
+                            "those minutes are being told again"
+                            if isinstance(_nd.get("retold"), list) else
+                            "it is being described again - asked by "
+                            "name")
+                    else:
+                        row["ins_why"] = "a fresh telling is owed"
             out[raw] = row
         return out
 
@@ -33029,13 +33228,16 @@ class _JsApi:
         # opening a JSON per row (13.0s cold on his disk) on the watcher
         # thread, every five seconds, for nothing.
         todo = [p for p in out if _force_owes(p, want, redo)]
-        # A SILVER ROW IS NOT "NOTHING TO DO". Its description is
-        # complete - that is why the describe-filter drops it - but its
-        # AUDIT is owed, and that is the work he selected it for. He
-        # picked every silver video tonight and this filter queued NONE
-        # of them. They are re-routed to the audit instead of silently
-        # discarded; a re-describe of a finished description is hours
-        # of model time to rebuild the same words.
+        # A ROW WHOSE DESCRIPTION IS DONE BUT UNAUDITED IS NOT "NOTHING
+        # TO DO". Its description is complete - that is why the
+        # describe-filter drops it - but its AUDIT is owed, and that is
+        # the work he selected it for. He picked every such video
+        # tonight (they wore a silver pen then; since 3.37 O1 a silver
+        # pen means an older telling, and the audit mark speaks for the
+        # audit) and this filter queued NONE of them. They are
+        # re-routed to the audit instead of silently discarded; a
+        # re-describe of a finished description is hours of model time
+        # to rebuild the same words.
         reroute = []
         if want in ("think", "all") and not redo:
             for p in out:

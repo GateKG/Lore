@@ -224,7 +224,7 @@ function flagsRig(text) {
   const rows = {
     never: { ins: false, ins_lvl: 0, ins_why: '' },
     gaveup: { ins: false, ins_lvl: 0, ins_why: GAVE },
-    silver: { ins: true, ins_lvl: 1, ins_why: 'no audit has read this description yet' },
+    silver: { ins: true, ins_lvl: 1, ins_why: 'described by an older version (v2; v3 is installed) - it will be told again on its own' },
     gold: { ins: true, ins_lvl: 2, ins_why: '' },
   };
   const MP = markRig(src);
