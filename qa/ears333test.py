@@ -711,18 +711,18 @@ check("the auditor adds the folded names to the merged list "
 
 # =========================================================================
 print("--- T9: the stamps and the settings page ---")
-check("APP_VERSION 3.37 (drop L)", 'APP_VERSION = "3.37"' in LSRC)
-check("ui.html version:'3.37' x2 and no 3.36 stamp left (3.35 drop L)",
-      USRC.count("version:'3.37'") == 2 and "version:'3.36'" not in USRC)
+check("APP_VERSION 3.38 (drop L)", 'APP_VERSION = "3.38"' in LSRC)
+check("ui.html version:'3.38' x2 and no 3.36 stamp left (3.35 drop L)",
+      USRC.count("version:'3.38'") == 2 and "version:'3.36'" not in USRC)
 VT = io.open(os.path.join(ROOT, "version.txt"), encoding="utf-8").read()
-check("version.txt (3, 37, 0, 0) x2 + '3.37.0.0' x2 (drop L)",
-      VT.count("(3, 37, 0, 0)") == 2 and VT.count("'3.37.0.0'") == 2
+check("version.txt (3, 38, 0, 0) x2 + '3.38.0.0' x2 (drop L)",
+      VT.count("(3, 38, 0, 0)") == 2 and VT.count("'3.38.0.0'") == 2
       and "3, 32" not in VT and "3.32" not in VT)
 ISS = io.open(os.path.join(ROOT, "installer.iss"), encoding="utf-8",
               errors="replace").read()
-check("installer.iss AppVersion=3.37 / VersionInfoVersion=3.37.0 (drop L)",
-      "AppVersion=3.37\n" in ISS.replace("\r\n", "\n")
-      and "VersionInfoVersion=3.37.0\n" in ISS.replace("\r\n", "\n"))
+check("installer.iss AppVersion=3.38 / VersionInfoVersion=3.38.0 (drop L)",
+      "AppVersion=3.38\n" in ISS.replace("\r\n", "\n")
+      and "VersionInfoVersion=3.38.0\n" in ISS.replace("\r\n", "\n"))
 check("the settings page: the second ear toggle with its note",
       "row(R,'The second ear',ctlToggle('second_ear')," in USRC
       and "about a minute of CPU for every minute of talk, never the card"
@@ -739,7 +739,7 @@ check("both rows sit beside 'Your in-game name' (within the same page, "
 check("MOCK settings carry both", "second_ear:true,room_names:''," in USRC)
 check("the MOCK state carries both (and 3.35 L's game_rank beside them)",
       "librarian_ready:true,second_ear:true,room_names:'',my_name:'',"
-      "game_rank:{},version:'3.37'"
+      "game_rank:{},version:'3.38'"
       in USRC)
 # the tests' three names must never reach the code: only the lines this
 # drop ADDS are judged (ui.html's own mock fixture says Marid since 3.2x)
@@ -953,7 +953,8 @@ check("the harness case: a six-word callout that is mostly names is an echo "
 print("--- T12: the app's side of the fixes ---")
 # the .ctl carries ear2 from the same question the budget asks
 BNS = {"os": os, "json": json, "_AI": {}, "_game_has_focus": lambda: False}
-for nm in ("_reader_playing", "_reader_threads", "_write_reader_budget"):
+for nm in ("_session_live", "_reader_playing", "_reader_threads",
+           "_write_reader_budget"):
     extract(LSRC, LTREE, nm, BNS)
 ctl = os.path.join(tmp, "x.wav.ctl")
 ncpu = os.cpu_count() or 8

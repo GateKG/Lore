@@ -2978,7 +2978,7 @@ function makeMock(){
         note:st.status==='recording'?'by source \u2014 the game, Discord and your mic '
           +'are each heard on their own. What you hear stays in the video; only '
           +'the room makes gold marks.':''},
-      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.37'};},
+      webhook:true,librarian_ready:true,second_ear:true,room_names:'',my_name:'',game_rank:{},version:'3.38'};},
     ai_catchup:async(on)=>{window.__mockCatch=(on==null)?!window.__mockCatch:!!on;
       return {ok:true,catchup:window.__mockCatch};},
     ai_pause:async(on)=>{window.__mockPaused=(on==null)?!window.__mockPaused:!!on;
@@ -3159,7 +3159,7 @@ function makeMock(){
     edit_cancel:async()=>{const m=window.__mockEd;if(m){m.done=true;m.ok=false;m.why='cancelled';}return {ok:true};},
     get_settings:async()=>({settings:{output_dir:'C:/mock',framerate:60,bitrate_mbps:25,
       encoder:'auto',amf_quality:'balanced',monitor_index:0,safe_capture:false,
-      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,game_audio_only:false,capture_by_source:true,voice_apps:['discord.exe','discordptb.exe','discordcanary.exe'],read_game_lines:true,ai_transcribe:true,ai_highlights:true,seek_step:'5',
+      detection_mode:'auto',capture_system:true,capture_mic:true,audio_output_device:'',afk_pause:true,afk_minutes:4,pause_close_minutes:0,game_audio_only:false,capture_by_source:true,voice_apps:['discord.exe','discordptb.exe','discordcanary.exe'],read_game_lines:true,ai_transcribe:true,ai_highlights:true,seek_step:'5',
       mic_name_contains:'',audio_mode:'mix',audio_offset_ms:0,replay_seconds:60,
       hdr_mode:'auto',sdr_finish:true,sdr_finish_max_min:30,max_storage_gb:0,
       notify_on_record:true,quiet_popups:true,capture_scope:'screen',black_guard:true,handle:'',
@@ -3171,7 +3171,7 @@ function makeMock(){
       discord_clip_seconds:15,discord_quality_mbps:6},
       games:['eldenring','hearthstone'],ignore:[],devices:{outputs:['Speakers (Realtek)','G95SC'],
       mics:['HyperX QuadCast']},monitors:2,autostart:true,
-      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.37'}),
+      popup_styles:[['slide','Slide in'],['rise','Float up'],['pop','Pop'],['glow','Glow'],['sweep','Light sweep'],['off','Instant']],version:'3.38'}),
     /* 3.36 AUDIT UI-E1: the mock keeps the patch, as the real backend does */
     set_settings:async(p)=>{window.__mockSet=Object.assign(window.__mockSet||{},p||{});const r=await api.get_settings();Object.assign(r.settings,window.__mockSet);return r;},
     set_games:async(l)=>l,set_ignore:async(l)=>l,
@@ -4229,7 +4229,7 @@ async function evLoadMarks(refresh){
   const all=avAll().map(v=>v.path);
   /* [10] flags can go stale the moment a zap or a background job lands a
      sidecar - a revisit re-asks about everything it has seen before */
-  const paths=refresh?all:all.filter(p=>!_have.has(p));
+  const paths=refresh?all:all.filter(p=>!_have.has(p)||_haveStale.has(p));   /* ...and what flagsWatch lost for good (3.38 P4 review) */
   if(!api.have_flags)return;
   for(let i=0;i<paths.length;i+=300){
     let r=null;
@@ -4242,7 +4242,7 @@ async function evLoadMarks(refresh){
     }
     if(gen!==_evGen)return;
     if(!r)continue;                 /* lost this pass; the REST still load */
-    Object.keys(r).forEach(k=>_have.set(k,r[k]));
+    Object.keys(r).forEach(k=>{_have.set(k,r[k]);_haveStale.delete(k);});
     if(!avNode('everylist'))return;       /* he turned the page - stop */
     /* [09/35] a batch of marks changes the little glyphs and the counts -
        not the rows. Rebuilding 1223 rows five times ate clicks mid-landing.
@@ -4274,15 +4274,31 @@ function _parked(fn){
 }
 document.addEventListener('visibilitychange',()=>{ if(!document.hidden)_visKick(); });
 let _doneRev=null;
+/* paths whose flags ask was lost for good (three tries) - their rows keep
+   their OLD flags in the map, never a hole, and they are asked first on
+   the next tick (3.38 P4 review) */
+const _haveStale=new Set();
+let _fwRun=false;
 async function flagsWatch(){
   if(_parked(flagsWatch))return;   /* [L22] its 4s interval keeps ticking; parking dedupes to one immediate run on wake */
+  /* ONE CHAIN AT A TIME (3.38 P4 review). The 4s interval kept ticking
+     through a five-batch blanket, so two chains could be in flight - a
+     batch asked before a night's audit landed but answered after the
+     direct hit's fresh answer put the OLDER flags back, and nothing
+     re-asked (the rev was consumed). A tick that finds a chain running
+     leaves done_rev unread and sees the jump next time. */
+  if(_fwRun)return;
+  _fwRun=true;
+  try{ await _flagsWatchRun(); }finally{ _fwRun=false; }
+}
+async function _flagsWatchRun(){
   let a=null; try{ if(api&&api.ai_status)a=await api.ai_status(); }catch(e){}
   if(!a||a.done_rev==null)return;
   if(_doneRev===null){ _doneRev=a.done_rev; return; }  /* adopt, don't bust */
-  if(a.done_rev===_doneRev)return;
+  if(a.done_rev===_doneRev&&!_haveStale.size)return;
   const was=_doneRev, jumped=a.done_rev-was;
   _doneRev=a.done_rev;
-  const p=a.done_path||null;
+  const p=jumped?(a.done_path||null):null;   /* an owed-only tick names no landing */
   const _haveBefore=(typeof V==='object'&&V&&V.cur)
     ?JSON.stringify(_have.get(V.cur.path)||null):null;
   /* 3.36 AUDIT UI-W1: THE SIGNAL NAMES ITS PATHS. This used to re-ask
@@ -4309,19 +4325,52 @@ async function flagsWatch(){
     blanket=jumped>2;
     stale=p?[p]:[];
   }
+  /* what an earlier tick lost for good is asked first (a blanket asks
+     every path anyway) */
+  if(_haveStale.size&&!blanket){
+    const s=new Set(stale);
+    stale=[..._haveStale].filter(q=>!s.has(q)).concat(stale);
+  }
+  _haveStale.clear();
   if(!blanket&&!stale.length)return;   /* a bump that named nothing */
-  if(blanket){ stale=[..._have.keys()]; _have.clear(); }
-  else stale.forEach(q=>_have.delete(q));
-  let r=null;
+  /* 3.38 P4: THE MAP IS NEVER EMPTIED. A blanket used to _have.clear()
+     and re-ask all 1,377 paths in batches of 300, and until the last
+     batch landed every count read off _have was partial - the
+     Everything header, the audited/unaudited sorts and above all the
+     "audited" chip, whose avMatch treats a row with no flags yet as
+     not matching. With the catch-up landing a transcript every two
+     minutes the list shrank to the refilled part and grew back on
+     every landing: "it keeps changing in front of me from 70 to 120"
+     (15 Sep). A blanket now re-asks the same paths IN PLACE, newest
+     first: each answer replaces its row as it lands and a row keeps
+     its old flags until then, so avMatch, the header and the sorts
+     never see a hole. A direct hit keeps its row the same way. */
+  if(blanket){
+    stale=[..._have.keys()];
+    try{ const mt=new Map(); avAll().forEach(v=>mt.set(v.path,v.mtime||0));
+         stale.sort((a,b)=>(mt.get(b)||0)-(mt.get(a)||0)); }catch(_){}
+  }
+  const land=part=>{ if(part)Object.keys(part).forEach(k=>_have.set(k,part[k])); };
+  /* A LOST BATCH RETRIES, spaced, the way evLoadMarks does (3.38 P4
+     review). With the map never emptied a batch lost for good would
+     leave its rows holding OLD flags that nothing re-asks - evLoadMarks
+     and markHave only ask paths the map does not have. Three tries,
+     then the paths are owed in _haveStale for the next tick. */
+  const ask=async ps=>{
+    for(let k=0;k<3;k++){
+      if(k)await new Promise(z=>setTimeout(z,700*k));
+      try{ return await api.have_flags(ps); }catch(e){}
+    }
+    ps.forEach(q=>_haveStale.add(q));
+    return null;
+  };
   try{
     if(api.have_flags){
-      r={};
       for(let i=0;i<stale.length;i+=300)
-        Object.assign(r,await api.have_flags(stale.slice(i,i+300))||{});
-      if(p&&!stale.includes(p))Object.assign(r,await api.have_flags([p])||{});
+        land(await ask(stale.slice(i,i+300)));   /* in place, as it lands */
+      if(p&&!stale.includes(p))land(await ask([p]));
     }
   }catch(e){}
-  if(r)Object.keys(r).forEach(k=>_have.set(k,r[k]));
   document.querySelectorAll('.proj-have').forEach(b=>{if(b._paint)b._paint();});
   /* a sort that reads the flags must follow them as they stream in */
   try{
@@ -7779,6 +7828,8 @@ function renderSet(cL,cR,app,spreadIdx){
     row(L,'Pause when I’m away',ctlToggle('afk_pause'));
     row(L,'…after how many minutes',ctlNum('afk_minutes',1,120));
     hint(L,'No mouse, keyboard or controller input for this long and the recording pauses itself — the moment you’re back it continues into the same video. Controllers count: an idle stick won’t fool it, a real press wakes it.');
+    row(L,'Save a paused recording after',ctlNum('pause_close_minutes',0,1440),'minutes · 0 = never (the default: a paused recording waits for you)');
+    hint(L,'A recording paused because you were away, or because the game’s window was minimised or lost, is saved once it has sat paused this long — instead of staying open all night and saving the moment you return. A pause you made yourself is never closed by this. The game is watched for again the moment you move the mouse, press the controller or say something into the mic.');
     row(L,'Always record these',listEditor(()=>S.settings.games,
       async l=>{const r=await api.set_games(l);S.settings.games=r||l;
         whisper('the always-record list is updated');},'e.g. eldenring',false));
@@ -8819,8 +8870,12 @@ function startDust(){
 }
 
 /* A live frame-rate / worst-frame readout so 60fps can be verified ON the real
-   window (the throttled dev preview lies). Hidden by default; toggle with F8
-   or open the app with #fps in the URL. */
+   window (the throttled dev preview lies). Hidden by default; the ONLY road to
+   it is opening the app with #fps in the URL. (3.38 P1: a bare F8 used to
+   toggle it - but his Discord-clip hotkey is ctrl+alt+F8, and a bare F8 also
+   arrives from game keybinds and some keyboards' media rows, so the meter came
+   on by itself: "wtf is this weird fps counter??? why do I have an fps
+   counter". No key toggles it any more.) */
 function fpsMeter(){
   const box=el('div');box.id='fpsmeter';box.style.display='none';
   document.body.appendChild(box);
@@ -8830,7 +8885,6 @@ function fpsMeter(){
     raf=requestAnimationFrame(loop);}
   function set(v){on=v;box.style.display=v?'block':'none';
     if(v){plast=performance.now();frames=0;acc=0;worst=0;raf=requestAnimationFrame(loop);}else cancelAnimationFrame(raf);}
-  addEventListener('keydown',e=>{if(e.key==='F8')set(!on);});
   set(location.hash.includes('fps'));
 }
 

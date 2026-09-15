@@ -198,6 +198,8 @@ check("the mock carries voice_apps",
       "voice_apps:['discord.exe','discordptb.exe','discordcanary.exe']" in mock)
 check("the mock carries read_game_lines:true", "read_game_lines:true" in mock)
 check("the mock still carries game_audio_only:false", "game_audio_only:false" in mock)
+check("the mock carries pause_close_minutes:0 (3.38 P3, off by default)",
+      "pause_close_minutes:0," in mock)
 aud = USRC[USRC.find("if(app.key==='audio'){"):USRC.find("if(app.key==='audio'){") + 4000]
 r1 = aud.find("row(L,'Tell the sources apart',ctlToggle('capture_by_source'))")
 r2 = aud.find("row(L,'Keep only the game in the video',ctlToggle('game_audio_only'))")

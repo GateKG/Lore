@@ -1021,6 +1021,12 @@ def q_ns(src, out, data, logs):
                "_ai_attic", "_sns_owing", "_vis_owing",
                "_atomic_write_json", "_ai_tick"):
         q_lift(src, fn, ns)
+    # 3.38 P: the beat's playing gate reads _session_live and its
+    # landing goes through _ai_landed - lifted where the source has
+    # them (the parity base predates both)
+    for fn in ("_session_live", "_ai_landed"):
+        if "def " + fn in src:
+            q_lift(src, fn, ns)
     for fn in ("_ask_idle_tick", "_emb_idle_tick", "_desc_keep_tick",
                "_aud_keep_tick", "_self_check_daily", "_game_sources_daily",
                "_shelf_migrations", "_ask_srv_drop", "_desc_keep_drop",
@@ -1996,6 +2002,8 @@ def f4_pick(src, focus, game_front, live, owes):
           "_sns_owing": lambda p_: False,
           "_aud_owing_swept": lambda p_: "aud" in owes.get(p_, set()),
           "_game_has_focus": lambda: game_front}
+    if "def _session_live" in src:     # 3.38 P2: the preview's playing
+        q_lift(src, "_session_live", ns)  # gate reads it (the base has none)
     q_lift(src, "_ai_next_sweep", ns)
     v = ns["_ai_next_sweep"]()
     return (v or {}).get("name"), (v or {}).get("kind")

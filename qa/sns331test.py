@@ -292,11 +292,13 @@ check("the only new log lines are the stamp and the feeders",
       == [m for m in old_log])
 
 print("\n--- 2. the fold's source gate ---")
-mns = {"os": os, "json": json, "_AI": {"done_rev": 0}, "log": LOG.append}
+mns = {"os": os, "json": json, "_AI": {"done_rev": 0}, "log": LOG.append,
+       "_AI_FORCE_LOCK": threading.RLock()}   # _ai_landed takes it (3.38 P4 review)
 extract(SRC, "_thumb_dir", mns)
 mns["SETTINGS"] = {"output_dir": SHELF}
 extract(SRC, "_ai_sidecar", mns)
 extract(SRC, "_atomic_write_json", mns)
+extract(SRC, "_ai_landed", mns)          # the fold's landing names the night (3.38 P4)
 extract(SRC, "_merge_sns_into_hl", mns)
 merge = mns["_merge_sns_into_hl"]
 

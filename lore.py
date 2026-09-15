@@ -45,7 +45,7 @@ import wave
 
 # Product version - shown in the window and used to tell releases apart.
 # Bump this (and AppVersion in installer.iss) on every release.
-APP_VERSION = "3.37"
+APP_VERSION = "3.38"
 
 try:
     import psutil
@@ -219,6 +219,15 @@ DEFAULTS = {
     "scratch_dir":       "auto",
     "afk_pause":         True,
     "afk_minutes":       4,
+    # A RECORDING PAUSED THIS LONG IS SAVED, NOT KEPT OPEN (3.38 P3): an
+    # AFK pause or a minimised/lost window that has captured footage and
+    # sat paused for this many minutes is finalised on the watcher's beat,
+    # and the game is watched for again the moment real input arrives.
+    # 0 = never (the pause waits for ever, as it did before 3.38). A pause
+    # he made himself is never closed by this.
+    "pause_close_minutes": 0,     # off unless he asks: his 15 Sep word,
+    #                               once he knew the game was open, was
+    #                               "it's nothing more"
     # AFK CATCH-UP. When he has been away this long, the tome is allowed
     # to work through EVERYTHING it owes - sound, transcripts, the
     # review, the audit - even if he left it paused or standing down.
@@ -715,7 +724,7 @@ def _sanitize_settings(d):
         "clip_hotkey_seconds": (1, 3600), "discord_max_mb": (1, 1000),
         "discord_clip_seconds": (1, 3600), "discord_quality_mbps": (1, 1000),
         "sdr_finish_max_min": (1, 600), "afk_minutes": (1, 120),
-        "afk_ai_minutes": (1, 240),
+        "afk_ai_minutes": (1, 240), "pause_close_minutes": (0, 1440),
     }
     for k, (lo, hi) in INT_BOUNDS.items():
         try:
@@ -1477,17 +1486,51 @@ def _afk_idle_seconds():
     pad_ago = now - _PAD["active_t"] if _PAD["active_t"] else 1e9
     got = min(idle, pad_ago)
     prev = _AFK_CLK["prev"]
+    # where the cursor is against the last poll: the log names it, and
+    # since 3.38 P3 it is one of the three signs that a PERSON is back
+    pos, ppos = _cursor_pos(), _AFK_CLK["pos"]
+    moved = (abs(pos[0] - ppos[0]) + abs(pos[1] - ppos[1])
+             if pos and ppos else -1)
     if prev > 120 and got < 5 and now - _AFK_CLK["said"] > 600:
         _AFK_CLK["said"] = now
-        pos, ppos = _cursor_pos(), _AFK_CLK["pos"]
-        moved = (abs(pos[0] - ppos[0]) + abs(pos[1] - ppos[1])
-                 if pos and ppos else -1)
         src = ("the controller" if pad_ago < 5 else
                f"keyboard/mouse (cursor travelled {moved} px)"
                if moved >= 0 else "keyboard/mouse")
         log(f"AFK countdown reset at {int(prev // 60)} min by {src}.")
+    if got < 5:
+        # HE IS BACK. A game whose paused recording was saved while he
+        # was away (3.38 P3) is watched for again from this input on -
+        # and not before: the suppression only lifts on a real input,
+        # never on the game merely being seen.
+        # AND "A REAL INPUT" IS MORE THAN THE KEYBOARD/MOUSE CLOCK
+        # READING FRESH. That clock is the one signal the AFK backstop
+        # was built to outvote ("An input device was claiming you were
+        # here; the silence outvoted it"). One phantom tick every
+        # half hour would lift this, re-detect the minimised game,
+        # film four idle minutes, pause, close, and go round again -
+        # the very night P3 set out to end. A person shows in one of
+        # three ways: the controller pressed, the cursor travelled
+        # since the last poll, or the mic heard him in the last minute.
+        # (A cursor that cannot be read at all falls back to the
+        # clock; on this box it always can.)
+        person = pad_ago < 5 or moved != 0
+        if not person:
+            try:
+                _mh = _MICWATCH.get("last_sound")
+                person = bool(_mh) and now - float(_mh) < 60
+            except Exception:
+                pass
+        try:
+            _c = _AI.get("ctl")
+            if person and _c is not None \
+                    and getattr(_c, "unsuppress_on_input", False):
+                _c.unsuppress_on_input = False
+                _c.suppressed_game = None
+                log("You're back - watching for the game again.")
+        except Exception:
+            pass
     _AFK_CLK["prev"] = got
-    _AFK_CLK["pos"] = _cursor_pos()
+    _AFK_CLK["pos"] = pos
     # every reader shares this one poll - see _afk_idle_recent
     _AFK_SEEN["t"] = now
     _AFK_SEEN["v"] = got
@@ -1681,6 +1724,82 @@ def _afk_track(ctl, session, current):
             "when you're back).")
         ctl.notify("Recording paused",
                    "You seem to be away - it continues when you're back.")
+
+
+def _pause_close_tick(ctl, session, current):
+    """3.38 P3: A RECORDING PAUSED FOR HOURS IS SAVED, NOT KEPT OPEN.
+
+    The AFK pause and the window pause both kept the session for ever,
+    waiting to resume. The Hearthstone recording of 14 Sep started at
+    23:57, was paused at 01:43 when the window was minimised, stayed
+    paused for fifteen hours, resumed at 16:44:52 the moment he restored
+    the window and was finalised at 16:45:10 when he closed the game -
+    "Finalising..." in front of him after a night and a day: "it's
+    saving after I didn't touch the thing for like 16 hours".
+
+    A session paused by AFK (afk_paused) or by a lost/minimised window
+    (win_paused) for longer than pause_close_minutes (0 = never, the
+    default; 30 is a sensible number for anyone who wants it)
+    THAT HAS CAPTURED FOOTAGE is finalised here, on the watcher's beat,
+    through the same road as Stop & Save. A born-paused empty session
+    just waits, and a pause he made himself (neither flag set) is never
+    ours to close. The game is suppressed until real input arrives - the
+    input poll in _afk_idle_seconds lifts it - so the night does not
+    become a four-minute idle clip every thirty-four minutes. The
+    worth-keeping mark every other automatic end applies (the
+    game-gone road) applies here too: a launcher that flashed the
+    game's window for five seconds and then sat minimised for half
+    an hour is "Not kept", not a five-second video. Returns True when
+    the session was closed; the watcher drops its handle, and the
+    session's own flags are cleared so a second call on the same
+    handle is a no-op rather than a second filing."""
+    try:
+        cap = int(SETTINGS.get("pause_close_minutes", 0))
+    except Exception:
+        cap = 30
+    if cap <= 0 or session is None \
+            or not getattr(session, "suspended", False):
+        return False
+    if not (getattr(session, "afk_paused", False)
+            or getattr(session, "win_paused", False)):
+        return False                       # his own pause: not ours to close
+    at = getattr(session, "paused_at", None)
+    if not at:
+        return False                       # born paused: never ran suspend()
+    mins = int((time.time() - at) // 60)
+    if mins < cap:
+        return False
+    if not _list_segments(session.tmp):
+        return False                       # nothing captured yet: it waits
+    _AI["ctl"] = ctl                       # the input poll finds it here
+    ctl.force_record.clear()
+    ctl.suppressed_game = current
+    ctl.unsuppress_on_input = True
+    with ctl.lock:
+        ctl.session = None
+    # done with this handle: a repeat call (a future hotkey or button)
+    # finds neither flag and returns False instead of filing it twice
+    session.afk_paused = session.win_paused = False
+    who = current or session.game
+    if _not_worth_keeping(session, False):
+        # the same three lines as the game-gone road: an open-and-shut
+        # under the mark goes in no queue and sits in no list
+        secs = _captured_seconds(session)
+        log(f"{who} was paused for {mins} min with {secs}s recorded - "
+            f"under the {int(SETTINGS.get('min_keep_seconds', 45))}s "
+            "worth-keeping mark, so it was not saved; a fresh recording "
+            "starts when you are back at it")
+        ctl.notify("Not kept",
+                   f"{who} was paused after {_fmt_secs(secs)} - too "
+                   "short to file. Settings > Replay to change the mark.")
+        _discard_soon(session)
+    else:
+        log(f"{who} was paused for {mins} min - saved what was "
+            "recorded; a fresh recording starts when you are back at it")
+        ctl.notify("Recording stopped", "Saving your video...", force=True)
+        _finalize_async(ctl, session)      # save in background; UI stays live
+    ctl.watching.set()
+    return True
 
 
 def _exe_has_any_window(pname):
@@ -8029,6 +8148,7 @@ class Session:
         self._gone_polls = 0           # consecutive polls the game looked closed
         self._pause_toasted = False    # auto-pause toast shown (once per session)
         self.afk_paused = False        # auto-paused: the user is away
+        self.paused_at = None          # when suspend() last ran (3.38 P3)
         self.cap_wh = None             # frame size this file is locked to
         self.file_hdr = None           # HDR mode this file is locked to
         self._restart_streak = 0       # capture restarts, decayed (see _note_restart)
@@ -8394,6 +8514,7 @@ class Session:
             return
         self._stop_run()
         self.suspended = True
+        self.paused_at = time.time()   # the pause-close cap reads it (3.38 P3)
         log("Recording paused (footage kept).")
 
     def resume(self):
@@ -8401,6 +8522,7 @@ class Session:
         if not self.suspended:
             return
         self.suspended = False
+        self.paused_at = None
         self._start_run()
         log("Recording resumed.")
 
@@ -9106,6 +9228,7 @@ class _Ctl:
         self.lock = threading.Lock()
         self.session = None
         self.suppressed_game = None            # game we manually stopped; don't re-grab
+        self.unsuppress_on_input = False       # ...until he is back (3.38 P3)
         self.status = "starting"
         self.icon = None
         self.icon_idle = None
@@ -10633,6 +10756,13 @@ def _watch_core(ctl):
                 session._gone_polls = session._gone_polls + 1 if game_gone else 0
                 if not game_gone:
                     _afk_track(ctl, session, current)   # resumes an AFK pause
+                    # ...or, paused for longer than the cap with footage
+                    # in hand, saves it and lets go (3.38 P3)
+                    if _pause_close_tick(ctl, session, current):
+                        session = current = None
+                        manual = False
+                        _interruptible_sleep(ctl, 0.3)
+                        continue
                     if not session.win_paused and not session.afk_paused:
                         if session.win:
                             # Re-aim before resuming: the window may have
@@ -10779,7 +10909,19 @@ def _watch_core(ctl):
                 # far more reliable than waiting for the process to exit: media apps
                 # like Stremio keep a background process alive, which used to leave
                 # them suppressed forever and never recording again.
-                if ctl.suppressed_game and ctl.suppressed_game != g:
+                # ...EXCEPT a game whose paused recording was saved while
+                # he was away (3.38 P3): that suppression lifts only on his
+                # input, so a minimised game left running all night is not
+                # re-recorded as a four-minute idle clip every half hour.
+                # The poll that lifts it lives in _afk_idle_seconds; keep
+                # it read here while nothing else would.
+                if ctl.unsuppress_on_input:
+                    try:
+                        _afk_idle_recent()
+                    except Exception:
+                        pass
+                if ctl.suppressed_game and ctl.suppressed_game != g \
+                        and not ctl.unsuppress_on_input:
                     ctl.suppressed_game = None
                 auto = bool(g) and g != ctl.suppressed_game and not ctl.force_record.is_set()
                 if not g and not ctl.force_record.is_set():
@@ -12653,6 +12795,38 @@ _AI = {"busy": None, "t_last": 0.0, "index": None, "index_t": 0.0,
        "held": {"listening": False, "hearing": False, "thinking": False,
                 "auditing": False}}
 
+
+def _ai_landed(path):
+    """A LANDED JOB ANNOUNCES ITSELF - AND NAMES ITS PATH (3.38 P4).
+
+    done_rev is how the tome's little marks learn a sidecar just changed
+    under them. The 3.36 audit's UI-W1 taught flagsWatch to re-ask only
+    the paths a ring of recent landings names - and recorded that the
+    backend had no such ring yet. Without it every bump the page could
+    not explain was a "blanket": it forgot every night's flags and
+    re-asked all 1,377 in batches of 300, and until the last batch
+    landed the audited count read off a half-filled map - "it keeps
+    changing in front of me from 70 to 120" (15 Sep). Every landing
+    site goes through here now: the count, the path, and a 16-entry
+    ring of {rev, path} the page can read back. Returns the new rev.
+
+    Under _AI_FORCE_LOCK: the audit thread, the sweep's worker, the
+    two ears' folds and the UI bridge all land here, and an unlocked
+    read-modify-write let two landings in the same instant compute the
+    same rev and each write its own copy of the ring - one entry
+    dropped, the ring still reaching done_rev, so the page saw no gap
+    and never re-asked that night. (An RLock: a caller already holding
+    it - the auditor's worker - is fine.)"""
+    with _AI_FORCE_LOCK:
+        rev = int(_AI.get("done_rev") or 0) + 1
+        _AI["done_rev"] = rev
+        _AI["done_path"] = path
+        ring = list(_AI.get("done_paths") or [])
+        ring.append({"rev": rev, "path": path})
+        _AI["done_paths"] = ring[-16:]
+        return rev
+
+
 # The two things the reader does, named for what they produce.
 AI_KINDS = ("listening", "hearing", "thinking")
 
@@ -12714,13 +12888,34 @@ def _game_has_focus():
         return False
 
 
-def _reader_playing():
-    """Does a game have the machine right now - a recording running, or
-    a game in front of him? One question, so the thread budget and the
-    second ear's gate (3.33) can never disagree about it."""
+def _session_live(ctl):
+    """Is a recording actually ROLLING - a session that is not suspended?
+
+    3.38 P2: a SUSPENDED session (the AFK pause, a minimised or lost
+    window) used to count as "playing" for the describer and the
+    audit, while the sweep's own live gate and 3.36's AFK-2 already
+    treated it as not live. On 15 Sep Hearthstone sat minimised from
+    01:43; the catch-up armed at 01:53 and ran until 16:44 - 254
+    transcripts and 255 sound passes on old nights and not one
+    description or audit in fifteen hours, because both were told a
+    game had the card. It did not: the game was minimised and the
+    reader was riding the GPU all night. His words: "it keeps
+    looping". One question for every gate, so they can never
+    disagree about a paused recording again."""
     try:
-        ctl = _AI.get("ctl")
-        if ctl is not None and ctl.session is not None:
+        return (ctl is not None and ctl.session is not None
+                and not getattr(ctl.session, "suspended", False))
+    except Exception:
+        return False
+
+
+def _reader_playing():
+    """Does a game have the machine right now - a recording rolling, or
+    a game in front of him? One question, so the thread budget and the
+    second ear's gate (3.33) can never disagree about it. A paused
+    recording is not a game having the machine (3.38 P2)."""
+    try:
+        if _session_live(_AI.get("ctl")):
             return True
     except Exception:
         pass
@@ -13113,9 +13308,8 @@ def _ai_next_sweep():
                 vids = ([pm for pm in vids if pm[0] == _focus]
                         + [pm for pm in vids if pm[0] != _focus])
             try:
-                _c = _AI.get("ctl")
-                playing = bool((_c is not None
-                                and getattr(_c, "session", None) is not None)
+                # a paused recording is not a game on the card (3.38 P2)
+                playing = bool(_session_live(_AI.get("ctl"))
                                or _game_has_focus())
             except Exception:
                 playing = False
@@ -13903,7 +14097,7 @@ def _merge_sns_into_hl(video_path, sns=None):
             hl["events"] = gold
             _atomic_write_json(_ai_sidecar(video_path, "hl"), hl)
         if added or pruned:
-            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+            _ai_landed(video_path)         # names the night (3.38 P4)
         if pruned:
             log(f"The ears took back {pruned} music mark(s) on "
                 f"{os.path.basename(video_path)} - they do not hear it "
@@ -21627,7 +21821,7 @@ def _merge_vis_into_hl(video_path, vis=None):
             hl["events"] = gold
             _atomic_write_json(_ai_sidecar(video_path, "hl"), hl)
         if added:
-            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
+            _ai_landed(video_path)         # names the night (3.38 P4)
         return added, None
     except Exception as e:
         return 0, str(e)[:120]
@@ -27047,8 +27241,7 @@ def _audit_one(video_path, redo=False):
                 except Exception:
                     pass
             _atomic_write_json(ap, doc)
-            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
-            _AI["done_path"] = video_path
+            _ai_landed(video_path)
         except Exception as e2:
             log("The auditor could not write its own sidecar for " + name
                 + ": " + str(e2)[:120])
@@ -27472,10 +27665,10 @@ _AUD_ASK = {"path": None, "named": False, "claim": None}
 def _aud_playing():
     """Is he playing right now? The story half loads the 15 GB describer
     onto the same card the game is drawing with, on a card that only has
-    16 GB - the same question every other heavy pass asks."""
+    16 GB - the same question every other heavy pass asks. A paused
+    recording is not him playing (3.38 P2)."""
     try:
-        c = _AI.get("ctl")
-        if c is not None and getattr(c, "session", None) is not None:
+        if _session_live(_AI.get("ctl")):
             return True
     except Exception:
         pass
@@ -27710,8 +27903,7 @@ def _audit_ask(video_path, redo=False, named=None):
                 _AI["busy"] = None
                 _AI["busy_path"] = None
                 _AI["started"] = 0.0
-            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
-            _AI["done_path"] = video_path
+            _ai_landed(video_path)
     threading.Thread(target=work, daemon=True).start()
     return True
 
@@ -28881,7 +29073,11 @@ def _ai_tick(ctl):
     # describing gated, and wander off to the next video's cheap jobs. The
     # reader learned this exact lesson in 2.55; the describer now asks the
     # same question it does: what is he LOOKING at.
-    playing = (ctl.session is not None or _game_has_focus())
+    # AND A PAUSED RECORDING IS NOT A GAME ON THE CARD (3.38 P2). On
+    # 15 Sep a minimised Hearthstone held this gate for fifteen hours
+    # while the catch-up did 254 transcripts and not one description -
+    # "it keeps looping". _session_live is the one question.
+    playing = (_session_live(ctl) or _game_has_focus())
     do_ins = (SETTINGS.get("insights_auto", True)
               and not (held.get("thinking") and not forced_now)
               and _describer_paths() is not None
@@ -29133,8 +29329,7 @@ def _ai_tick(ctl):
                 # A LANDED JOB ANNOUNCES ITSELF. The UI's little marks cache
                 # their first answer per recording; this counter is how they
                 # learn a sidecar just changed under them without a restart.
-                _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
-                _AI["done_path"] = path
+                _ai_landed(path)               # ...and the ring names it (3.38 P4)
                 _AI.pop("ins_prog", None)      # the window bar dies with it
                 _AI.pop("eye_prog", None)      # and so does the eye's
                 _AI["_counts"] = None          # the tally just moved
@@ -31676,6 +31871,9 @@ class _JsApi:
                "job": job, "kinds": [],
                "done_rev": int(_AI.get("done_rev") or 0),
                "done_path": _AI.get("done_path") or None,
+               # the ring of recent landings (3.38 P4): the page re-asks
+               # only these, and never empties its map
+               "done_paths": list(_AI.get("done_paths") or []),
                "queued": len(_AI.get("force_queue") or []),
                "shutdown": bool(SETTINGS.get("bg_shutdown")),
                "next": (_ai_next_sweep()
@@ -32542,7 +32740,7 @@ class _JsApi:
                 why = "held by you"
             elif not SETTINGS.get("insights_auto", True):
                 why = "only on request - the bolt asks for it"
-            elif ctl.session is not None or _game_has_focus():
+            elif _session_live(ctl) or _game_has_focus():
                 why = "waits while a game has the screen"
             else:
                 why = "waiting its turn"
@@ -33943,8 +34141,7 @@ class _JsApi:
             _AI["index"] = None
             _AI["shelf"] = None
             _AI["_tally"] = None
-            _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1
-            _AI["done_path"] = p
+            _ai_landed(p)
             log(f"Version switched: {kind} of {os.path.basename(p)} "
                 f"now shows the one from the bank.")
             return {"ok": True}

@@ -345,7 +345,7 @@ check("...and the repaint signature moves when the rank does, or the "
 check("MOCK carries game_rank in both settings and state, and a ranked "
       "next pick, so the preview page draws it",
       "second_ear:true,room_names:'',my_name:'',game_rank:{}," in USRC
-      and "my_name:'',game_rank:{},version:'3.37'" in USRC
+      and "my_name:'',game_rank:{},version:'3.38'" in USRC
       and "next:{name:'mock night.mp4',kind:'listening',rank:'later'}" in USRC)
 
 # =======================================================================
@@ -515,12 +515,12 @@ check("the sweep's ONE JOB SLOT is untouched - the band reorders "
       and "_game_rank" not in func_src("_afk_ai_tick"))
 check("the finish queue is not ranked", "_game_rank" not in
       func_src("_queued_finish_badge"))
-check("the stamps: APP_VERSION 3.37, ui.html x2, version.txt, installer",
-      'APP_VERSION = "3.37"' in SRC
-      and USRC.count("version:'3.37'") == 2
-      and "(3, 37, 0, 0)" in io.open(
+check("the stamps: APP_VERSION 3.38, ui.html x2, version.txt, installer",
+      'APP_VERSION = "3.38"' in SRC
+      and USRC.count("version:'3.38'") == 2
+      and "(3, 38, 0, 0)" in io.open(
           os.path.join(ROOT, "version.txt"), encoding="utf-8").read()
-      and "AppVersion=3.37" in io.open(
+      and "AppVersion=3.38" in io.open(
           os.path.join(ROOT, "installer.iss"), encoding="utf-8",
           errors="replace").read())
 # a pin on a string is a proxy; ranktest.js RUNS the chip, so the

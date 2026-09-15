@@ -37,7 +37,7 @@ for %%t in (codex327test codex326test codex325test codex324test codex323test asr
             hud330test echo330test title330test owing330test black332test outcome332test ask332test stall332test askstate332test
             picture332test ears333test ears333audit describer333test
             hotfix334test eye334test rank335test era335test retell336test loops336test
-            scale337test desc337test
+            scale337test desc337test pause338test
             tracks331test src331settingstest src331dumptest
             src331taptest src331watchtest src331runtest src331walktest
             src331test sources331_describer sources331_panel
@@ -68,6 +68,9 @@ if errorlevel 1 set FAILED=!FAILED! uiloops336
 echo ===== scaletest =====
 node "scaletest.js"
 if errorlevel 1 set FAILED=!FAILED! scaletest
+echo ===== pausetest =====
+node "pausetest.js"
+if errorlevel 1 set FAILED=!FAILED! pausetest
 echo ===== checkui =====
 node "checkui.js" "..\ui.html"
 if errorlevel 1 set FAILED=!FAILED! checkui

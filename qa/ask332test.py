@@ -1371,6 +1371,27 @@ if HSRC:
     check("3.37 O1 touches _ai_tick in exactly one place: the held-audit "
           "log line", _at.count(_O1_HELD[0]) == 1)
     _at = _at.replace(_O1_HELD[0], _O1_HELD[1])
+    # 3.38 P: the two drop-P edits, lifted out the same way. P2 - a
+    # paused recording is not a game on the card (the playing gate reads
+    # _session_live); P4 - the landing names its path through _ai_landed.
+    # Update a pair when its block moves; never drop one.
+    _P2_PLAY = (
+        '    # AND A PAUSED RECORDING IS NOT A GAME ON THE CARD (3.38 P2). On\n'
+        '    # 15 Sep a minimised Hearthstone held this gate for fifteen hours\n'
+        '    # while the catch-up did 254 transcripts and not one description -\n'
+        '    # "it keeps looping". _session_live is the one question.\n'
+        '    playing = (_session_live(ctl) or _game_has_focus())\n',
+        '    playing = (ctl.session is not None or _game_has_focus())\n')
+    _P4_LAND = (
+        '                _ai_landed(path)               # ...and the ring '
+        'names it (3.38 P4)\n',
+        '                _AI["done_rev"] = int(_AI.get("done_rev") or 0) + 1\n'
+        '                _AI["done_path"] = path\n')
+    check("3.38 P touches _ai_tick in exactly two places: the playing gate "
+          "(P2) and the landing that names its path (P4)",
+          _at.count(_P2_PLAY[0]) == 1 and _at.count(_P4_LAND[0]) == 1)
+    for _a, _b in (_P2_PLAY, _P4_LAND):
+        _at = _at.replace(_a, _b)
     ha = fsrc(HSRC, "_ai_tick", HTREE).splitlines()
     na = _at.splitlines()
     added = [ln for ln in difflib.unified_diff(ha, na, lineterm="", n=0)
@@ -1481,15 +1502,15 @@ check("_EmbServer.start refuses without the model (no spawn, no port sweep)",
 
 # =========================================================================
 print("\n--- the UI, read from its source ---")
-check("the stamps: 3.37 in both mocks, lore.py APP_VERSION 3.37, no 3.36 "
-      "version left (3.35 drop L)", USRC.count("version:'3.37'") == 2
-      and "version:'3.36'" not in USRC and 'APP_VERSION = "3.37"' in SRC)
+check("the stamps: 3.38 in both mocks, lore.py APP_VERSION 3.38, no 3.36 "
+      "version left (3.35 drop L)", USRC.count("version:'3.38'") == 2
+      and "version:'3.36'" not in USRC and 'APP_VERSION = "3.38"' in SRC)
 check("the MOCK bridge carries ask_shelf, ask_shelf_poll and "
       "librarian_ready, so the harness box is never dead",
       "ask_shelf:async(q)=>window.__mockShelf||{ok:true,shelf:true," in USRC
       and "ask_shelf_poll:async(t)=>window.__mockShelfAns||{state:'done'," in USRC
       and "librarian_ready:true,second_ear:true,room_names:'',"
-          "my_name:'',game_rank:{},version:'3.37'" in USRC)
+          "my_name:'',game_rank:{},version:'3.38'" in USRC)
 ab = USRC[USRC.index("const askShelfPaint=async(r,q)=>{"):USRC.index(
     "  sw.addEventListener('input',()=>{")]
 check("ask() takes the shelf road when the bridge has it, else the old "
